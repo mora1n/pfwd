@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.3.1"
+readonly VERSION="1.3.2"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -195,7 +195,7 @@ expand_port_spec() {
 
     IFS=',' read -ra parts <<< "$spec"
     for part in "${parts[@]}"; do
-        part=$(echo "$part" | tr -d '[:space:]')
+        part="${part//[[:space:]]/}"
         [[ -z "$part" ]] && continue
 
         if [[ "$part" =~ ^([0-9-]+):([0-9-]+)$ ]]; then
@@ -335,16 +335,21 @@ ensure_nft() {
 # get_local_ip - best-effort local IP for export metadata
 get_local_ip() {
     local ip
-    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[^/]+' | head -1)
+    ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }' || true)
     [[ -n "$ip" ]] && { echo "$ip"; return; }
-    ip=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+' | head -1)
+    ip=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 / { sub(/\/.*/, "", $2); print $2; exit }' || true)
     [[ -n "$ip" ]] && { echo "$ip"; return; }
     hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-# get_all_nics - get all up network interfaces except lo
+# get_all_nics - get all up network interfaces except lo and virtual NICs
 get_all_nics() {
-    ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -v '^lo$' | tr '\n' ',' | sed 's/,$//'
+    ip -o link show up 2>/dev/null | awk -F': ' '{
+        name = $2; sub(/@.*/, "", name)
+        if (name == "lo") next
+        if (name ~ /^(veth|docker|br-|virbr|vnet|tun|tap|dummy)/) next
+        nics = (nics ? nics "," : "") name
+    } END { print nics }'
 }
 
 # ensure_shortcut - install/update pfwd to /usr/local/bin on first run
@@ -488,7 +493,7 @@ nft_ensure_table() {
     # Flowtable setup with diagnostics
     local flowtable_ok=false
     local kver
-    kver=$(uname -r | grep -oE '^[0-9]+\.[0-9]+')
+    kver=$(uname -r | grep -oE '^[0-9]+\.[0-9]+' || echo "0.0")
     local kmajor kminor
     IFS='.' read -r kmajor kminor <<< "$kver"
 
@@ -605,8 +610,10 @@ nft_add_rule() {
 
             if [[ -n "$v4_target" ]]; then
                 if nft_rule_exists "$lport" "$p" "4"; then
-                    msg_warn "IPv4 $p rule for port $lport already exists, skipping"
-                elif nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
+                    msg_info "Replacing existing IPv4 $p rule for port $lport"
+                    nft_delete_port "$lport"
+                fi
+                if nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1; then
                     msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
                     ((added++)) || true
@@ -629,8 +636,10 @@ nft_add_rule() {
 
             if [[ -n "$v6_target" ]]; then
                 if nft_rule_exists "$lport" "$p" "6"; then
-                    msg_warn "IPv6 $p rule for port $lport already exists, skipping"
-                elif nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
+                    msg_info "Replacing existing IPv6 $p rule for port $lport"
+                    nft_delete_port "$lport"
+                fi
+                if nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1; then
                     msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
                     ((added++)) || true
@@ -668,7 +677,7 @@ nft_delete_port() {
     # Delete from all chains
     for chain in prerouting postrouting input; do
         local handles
-        handles=$(nft -a list chain $NFT_TABLE "$chain" 2>/dev/null | grep -E "dport $port\b" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+        handles=$(nft -a list chain $NFT_TABLE "$chain" 2>/dev/null | { grep -E "dport $port\b" || true; } | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
         for h in $handles; do
             nft delete rule $NFT_TABLE "$chain" handle "$h" 2>/dev/null && ((deleted++)) || true
         done
@@ -853,9 +862,9 @@ realm_install() {
     local download_url=""
 
     if command -v curl >/dev/null 2>&1; then
-        download_url=$(curl -s "$api_url" 2>/dev/null | grep "browser_download_url" | grep "$realm_arch" | grep -v ".sha256" | head -1 | grep -oE 'https://[^"]+')
+        download_url=$(curl -s "$api_url" 2>/dev/null | awk -v arch="$realm_arch" '/browser_download_url/ && $0 ~ arch && !/\.sha256/ { gsub(/.*"(https:)/, "https:"); gsub(/".*/, ""); print; exit }' || true)
     elif command -v wget >/dev/null 2>&1; then
-        download_url=$(wget -qO- "$api_url" 2>/dev/null | grep "browser_download_url" | grep "$realm_arch" | grep -v ".sha256" | head -1 | grep -oE 'https://[^"]+')
+        download_url=$(wget -qO- "$api_url" 2>/dev/null | awk -v arch="$realm_arch" '/browser_download_url/ && $0 ~ arch && !/\.sha256/ { gsub(/.*"(https:)/, "https:"); gsub(/".*/, ""); print; exit }' || true)
     fi
 
     if [[ -z "$download_url" ]]; then
@@ -969,10 +978,10 @@ realm_add_endpoint() {
 
     realm_ensure_config
 
-    # Check for duplicate realm endpoint
+    # Check for duplicate realm endpoint — replace if exists
     if [[ -f "$REALM_CONFIG" ]] && grep -q "listen = \".*:${lport}\"" "$REALM_CONFIG" 2>/dev/null; then
-        msg_warn "realm endpoint for port $lport already exists, skipping"
-        return 0
+        msg_info "Replacing existing realm endpoint for port $lport"
+        realm_delete_endpoint "$lport"
     fi
 
     # Determine listen address based on ip_ver
@@ -1065,7 +1074,7 @@ realm_delete_endpoint() {
     # Also remove traffic counter rules from nft
     if nft list table $NFT_TABLE >/dev/null 2>&1; then
         local handles
-        handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | grep -E "dport $port\b" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+        handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | { grep -E "dport $port\b" || true; } | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
         for h in $handles; do
             nft delete rule $NFT_TABLE input handle "$h" 2>/dev/null
         done
@@ -1122,7 +1131,7 @@ realm_list_endpoints() {
     while IFS='|' read -r listen remote comment; do
         # Extract port from listen address
         local lport
-        lport=$(echo "$listen" | grep -oE '[0-9]+$')
+        lport="${listen##*:}"
 
         local traffic_bytes=0
         if nft list table $NFT_TABLE >/dev/null 2>&1; then
@@ -1159,7 +1168,10 @@ realm_setup_traffic_counter() {
     local port="$1"
 
     # Ensure nftables table and input chain exist
-    nft_ensure_table 2>/dev/null || return 0
+    if ! nft_ensure_table 2>/dev/null; then
+        msg_dim "  Traffic counter skipped: nftables table setup failed"
+        return 0
+    fi
 
     # Check if counter already exists for this port
     if nft list chain $NFT_TABLE input 2>/dev/null | grep -qE "dport $port\b"; then
@@ -1218,7 +1230,7 @@ show_traffic_stats() {
     # realm input chain traffic
     if [[ -f "$REALM_CONFIG" ]] && nft list table $NFT_TABLE >/dev/null 2>&1; then
         local input_rules
-        input_rules=$(nft list chain $NFT_TABLE input 2>/dev/null | grep "counter" | grep "dport" || true)
+        input_rules=$(nft list chain $NFT_TABLE input 2>/dev/null | awk '/counter/ && /dport/' || true)
 
         if [[ -n "$input_rules" ]]; then
             has_rules=true
@@ -1459,7 +1471,7 @@ cmd_import() {
 
         case "$method" in
             nftables|nft)
-                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" 2>/dev/null; then
+                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto"; then
                     ((imported++)) || true
                 else
                     msg_warn "Failed to import nft rule :$lport -> $target:$tport"
@@ -1467,7 +1479,7 @@ cmd_import() {
                 fi
                 ;;
             realm)
-                if realm_add_endpoint "$lport" "$target" "$tport" "$ipver" "$comment" 2>/dev/null; then
+                if realm_add_endpoint "$lport" "$target" "$tport" "$ipver" "$comment"; then
                     ((imported++)) || true
                 else
                     msg_warn "Failed to import realm rule :$lport -> $target:$tport"
@@ -1958,10 +1970,11 @@ parse_cli_args() {
 show_header() {
     clear
 
-    # Count rules
+    # Count rules (cache nft output to avoid duplicate calls)
     local nft_count=0
-    if nft list chain $NFT_TABLE prerouting >/dev/null 2>&1; then
-        nft_count=$(nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -c 'dnat') || nft_count=0
+    local _nft_prerouting=""
+    if _nft_prerouting=$(nft list chain $NFT_TABLE prerouting 2>/dev/null); then
+        nft_count=$(echo "$_nft_prerouting" | grep -c 'dnat') || nft_count=0
     fi
     local realm_count=0
     if [[ -f "$REALM_CONFIG" ]]; then
@@ -2263,7 +2276,7 @@ menu_delete_rule() {
 
     IFS=',' read -ra ports_arr <<< "$ports_str"
     for port in "${ports_arr[@]}"; do
-        port=$(echo "$port" | tr -d '[:space:]')
+        port="${port//[[:space:]]/}"
         if ! validate_port "$port"; then
             msg_err "Invalid port: $port"
             continue

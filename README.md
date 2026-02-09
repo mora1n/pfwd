@@ -14,7 +14,8 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **Boot persistence** via systemd services
 - **Enhanced kernel optimization** (BBR, TCP tuning, conntrack, flowtable)
 - **Flowtable diagnostics** — kernel version detection, automatic module loading, actionable fix suggestions
-- **Duplicate port detection** — prevents adding duplicate nftables rules or realm endpoints for the same port
+- **Port mapping auto-replace** — re-adding a rule for an existing local port automatically replaces the old target instead of skipping
+- **Virtual NIC filtering** — flowtable setup automatically excludes virtual interfaces (veth, docker, virbr, etc.)
 - **Auto-persist nf_flow_table** — automatically writes `/etc/modules-load.d/nf_flow_table.conf` after loading the module
 
 ## Quick Start
@@ -34,8 +35,8 @@ pfwd -m nft -t 1.2.3.4 80,443,8080-8090
 pfwd -m realm -t example.com 80,443 -c "web"
 
 # CLI examples (legacy syntax)
-pfwd -m nft -4 --both 10280:1.2.3.4:10280
-pfwd -m realm -46 10280:example.com:10280
+pfwd -m nft -4 --both 3389:1.2.3.4:3389
+pfwd -m realm -46 3389:example.com:3389
 ```
 
 ## Usage
@@ -101,7 +102,7 @@ pfwd -m nft|realm [options] local_port:target:target_port[,...]
 
 ```bash
 # New syntax: nftables with port range
-pfwd -m nft -t 1.2.3.4 10280-10281
+pfwd -m nft -t 1.2.3.4 3389-8090
 
 # New syntax: nftables with mixed ports, IPv4 only, TCP+UDP
 pfwd -m nft -t 1.2.3.4 -4 --both 80,443,8080-8090
@@ -112,18 +113,21 @@ pfwd -m realm -t example.com 80,443 -c "web"
 # New syntax: port mapping (local 33389 -> remote 3389)
 pfwd -m nft -t 1.2.3.4 33389:3389
 
+# Replace existing rule: change port 3389's target from old to new
+pfwd -m nft -t 5.6.7.8 3389:3389
+
 # Legacy syntax: nftables IPv4 TCP+UDP forwarding
-pfwd -m nft -4 --both 10280:1.2.3.4:10280
+pfwd -m nft -4 --both 3389:1.2.3.4:3389
 
 # Legacy syntax: realm multiple endpoints
-pfwd -m realm -46 10280:example.com:10280,10281:example.com:10281
+pfwd -m realm -46 3389:example.com:3389,8090:example.com:8090
 
 # Legacy syntax: port range
 pfwd -m nft 8080-8090:1.2.3.4:3080-3090
 
 # Delete rules
-pfwd del -m nft 10280
-pfwd del -m realm 10280,10281
+pfwd del -m nft 3389
+pfwd del -m realm 3389,8090
 
 # Start/Stop/Restart
 pfwd stop nft
@@ -154,13 +158,13 @@ Flowtable requires Linux kernel >= 4.16 and the `nf_flow_table` module. pfwd wil
 - Persist the module to `/etc/modules-load.d/nf_flow_table.conf` for boot survival (idempotent)
 - Provide actionable suggestions if the module is unavailable (e.g. `apt install linux-modules-extra-$(uname -r)`)
 - Fall back gracefully to standard forwarding if flowtable is not available
-- Detect and skip duplicate rules when adding the same port/protocol/IP-version combination
+- Automatically replace existing rules when re-adding the same local port with a different target
 
 Best for: IP-based targets, maximum performance.
 
 ### realm
 
-Userspace proxy written in Rust. Supports domain-based targets natively. Duplicate endpoint detection prevents adding the same listen port twice.
+Userspace proxy written in Rust. Supports domain-based targets natively. Re-adding an existing listen port automatically replaces the old endpoint.
 
 Best for: Domain targets, environments where kernel-level forwarding is not suitable.
 
@@ -198,25 +202,25 @@ Install realm: `pfwd install`
   "export_info": {
     "version": "1.0.0",
     "tool": "pfwd",
-    "export_time": "2026-02-09T15:30:45",
+    "export_time": "2026-01-01T00:00:00",
     "source_ip": "1.2.3.4"
   },
   "forward_rules": [
     {
       "type": "nftables",
-      "local_port": "10280",
+      "local_port": "3389",
       "target_ip": "1.2.3.4",
-      "target_port": "10280",
+      "target_port": "3389",
       "protocol": "tcp",
       "ip_ver": "4"
     },
     {
       "type": "realm",
-      "local_port": "10281",
-      "target_ip": "ix.cnix.taphip.com",
-      "target_port": "10281",
+      "local_port": "3389",
+      "target_ip": "example.com",
+      "target_port": "3389",
       "ip_ver": "46",
-      "comment": "taphip-cnix"
+      "comment": "example"
     }
   ]
 }
