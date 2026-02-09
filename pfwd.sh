@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.1"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
