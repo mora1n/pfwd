@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -500,7 +500,13 @@ nft_ensure_table() {
             msg_info "Loading nf_flow_table kernel module..."
             if modprobe nf_flow_table 2>/dev/null; then
                 msg_ok "nf_flow_table module loaded"
-                msg_dim "  To persist across reboots: echo 'nf_flow_table' >> /etc/modules-load.d/nf_flow_table.conf"
+                # Auto-persist module (idempotent)
+                local modules_conf="/etc/modules-load.d/nf_flow_table.conf"
+                if [[ ! -f "$modules_conf" ]] || ! grep -q '^nf_flow_table$' "$modules_conf" 2>/dev/null; then
+                    mkdir -p /etc/modules-load.d
+                    echo 'nf_flow_table' >> "$modules_conf"
+                    msg_dim "  Module persisted to $modules_conf"
+                fi
             else
                 msg_warn "Cannot load nf_flow_table module (kernel may not support it)"
                 msg_dim "  Install: apt install linux-modules-extra-$(uname -r)  (Debian/Ubuntu)"
@@ -536,6 +542,18 @@ nft_ensure_table() {
     else
         msg_ok "nftables table created (without flowtable)"
     fi
+}
+
+# nft_rule_exists <lport> <proto> <ip_ver> -> 0=exists, 1=not found
+nft_rule_exists() {
+    local lport="$1" proto="$2" ip_ver="$3"
+    local ip_match
+    case "$ip_ver" in
+        4)  ip_match="ip protocol $proto" ;;
+        6)  ip_match="ip6 nexthdr $proto" ;;
+        *)  return 1 ;;
+    esac
+    nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -q "$ip_match.*dport $lport.*dnat"
 }
 
 # nft_add_rule <lport> <target> <tport> <ip_ver> <proto>
@@ -584,7 +602,9 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v4_target" ]]; then
-                if nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
+                if nft_rule_exists "$lport" "$p" "4"; then
+                    msg_warn "IPv4 $p rule for port $lport already exists, skipping"
+                elif nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1; then
                     msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
                     ((added++)) || true
@@ -606,7 +626,9 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v6_target" ]]; then
-                if nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
+                if nft_rule_exists "$lport" "$p" "6"; then
+                    msg_warn "IPv6 $p rule for port $lport already exists, skipping"
+                elif nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1; then
                     msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
                     ((added++)) || true
@@ -719,7 +741,7 @@ nft_list_rules() {
 nft_get_traffic() {
     local port="$1"
     local bytes
-    bytes=$(nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -E "dport $port\b.*counter" | grep -oE 'bytes [0-9]+' | awk '{sum+=$2} END{print sum+0}')
+    bytes=$(nft list chain $NFT_TABLE prerouting 2>/dev/null | { grep -E "dport $port\b.*counter" || true; } | grep -oE 'bytes [0-9]+' | awk '{sum+=$2} END{print sum+0}')
     echo "${bytes:-0}"
 }
 
@@ -945,6 +967,12 @@ realm_add_endpoint() {
 
     realm_ensure_config
 
+    # Check for duplicate realm endpoint
+    if [[ -f "$REALM_CONFIG" ]] && grep -q "listen = \".*:${lport}\"" "$REALM_CONFIG" 2>/dev/null; then
+        msg_warn "realm endpoint for port $lport already exists, skipping"
+        return 0
+    fi
+
     # Determine listen address based on ip_ver
     local listen_addr
     case "$ip_ver" in
@@ -1096,7 +1124,7 @@ realm_list_endpoints() {
 
         local traffic_bytes=0
         if nft list table $NFT_TABLE >/dev/null 2>&1; then
-            traffic_bytes=$(nft list chain $NFT_TABLE input 2>/dev/null | grep -E "dport $lport\b.*counter" | grep -oE 'bytes [0-9]+' | awk '{sum+=$2} END{print sum+0}')
+            traffic_bytes=$(nft list chain $NFT_TABLE input 2>/dev/null | { grep -E "dport $lport\b.*counter" || true; } | grep -oE 'bytes [0-9]+' | awk '{sum+=$2} END{print sum+0}')
         fi
         local traffic
         traffic=$(format_bytes "${traffic_bytes:-0}")
@@ -1525,13 +1553,13 @@ Examples (new syntax):
   pfwd -m nft -t 1.2.3.4 33389:3389
 
 Examples (legacy syntax):
-  pfwd -m nft -4 --both 10280:1.2.3.4:10280
+  pfwd -m nft -4 --both 3389:1.2.3.4:3389
   pfwd -m nft 8080-8090:1.2.3.4:3080-3090
-  pfwd -m realm -46 10280:example.com:10280,10281:example.com:10281
+  pfwd -m realm -46 3389:example.com:3389,10281:example.com:10281
 
 Other:
-  pfwd del -m nft 10280
-  pfwd del -m realm 10280
+  pfwd del -m nft 3389
+  pfwd del -m realm 3389
   pfwd list
   pfwd stats
   pfwd export ~/backup.json

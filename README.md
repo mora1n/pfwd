@@ -14,6 +14,8 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **Boot persistence** via systemd services
 - **Enhanced kernel optimization** (BBR, TCP tuning, conntrack, flowtable)
 - **Flowtable diagnostics** — kernel version detection, automatic module loading, actionable fix suggestions
+- **Duplicate port detection** — prevents adding duplicate nftables rules or realm endpoints for the same port
+- **Auto-persist nf_flow_table** — automatically writes `/etc/modules-load.d/nf_flow_table.conf` after loading the module
 
 ## Quick Start
 
@@ -149,14 +151,16 @@ Kernel-level DNAT forwarding with flowtable fast path acceleration. Established 
 Flowtable requires Linux kernel >= 4.16 and the `nf_flow_table` module. pfwd will automatically:
 - Detect kernel version and skip flowtable on older kernels
 - Attempt to load the `nf_flow_table` module via `modprobe`
+- Persist the module to `/etc/modules-load.d/nf_flow_table.conf` for boot survival (idempotent)
 - Provide actionable suggestions if the module is unavailable (e.g. `apt install linux-modules-extra-$(uname -r)`)
 - Fall back gracefully to standard forwarding if flowtable is not available
+- Detect and skip duplicate rules when adding the same port/protocol/IP-version combination
 
 Best for: IP-based targets, maximum performance.
 
 ### realm
 
-Userspace proxy written in Rust. Supports domain-based targets natively.
+Userspace proxy written in Rust. Supports domain-based targets natively. Duplicate endpoint detection prevents adding the same listen port twice.
 
 Best for: Domain targets, environments where kernel-level forwarding is not suitable.
 
@@ -177,6 +181,7 @@ Install realm: `pfwd install`
 
 | File | Purpose |
 |------|---------|
+| `/etc/modules-load.d/nf_flow_table.conf` | nf_flow_table module auto-persistence |
 | `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
 | `/etc/realm/config.toml` | realm configuration |
 | `/etc/systemd/system/realm-forward.service` | realm systemd service |
