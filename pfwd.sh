@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -27,6 +27,11 @@ readonly REALM_CONFIG_DIR="/etc/realm"
 readonly REALM_CONFIG="$REALM_CONFIG_DIR/config.toml"
 readonly REALM_SERVICE="/etc/systemd/system/realm-forward.service"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-pfwd.conf"
+
+# Install paths
+readonly INSTALL_DIR="/usr/local/bin"
+readonly INSTALLED_SCRIPT="$INSTALL_DIR/pfwd.sh"
+readonly SHORTCUT_LINK="$INSTALL_DIR/pfwd"
 
 # nftables names
 readonly NFT_TABLE="inet port_forward"
@@ -62,6 +67,11 @@ msg_warn()  { $QUIET || echo -e "${YELLOW}[WARN]${NC} $*"; }
 msg_err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 msg_dim()   { $QUIET || echo -e "${DIM}$*${NC}"; }
 
+wait_for_enter() {
+    echo ""
+    read -rp "Press Enter to return to main menu..."
+}
+
 # detect_ip_type <address> -> "ipv4" | "ipv6" | "domain" | "unknown"
 detect_ip_type() {
     local addr="$1"
@@ -80,6 +90,20 @@ detect_ip_type() {
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+# validate_port_range <spec> -> 0=valid, 1=invalid
+# Accepts "80" or "8080-8090"
+validate_port_range() {
+    local spec="$1"
+    if [[ "$spec" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+        (( s >= 1 && s <= 65535 && e >= 1 && e <= 65535 && s <= e ))
+    elif [[ "$spec" =~ ^[0-9]+$ ]]; then
+        (( spec >= 1 && spec <= 65535 ))
+    else
+        return 1
+    fi
 }
 
 # validate_target <target> -> 0=valid, 1=invalid
@@ -126,6 +150,138 @@ parse_rule() {
         msg_err "Invalid target address: $RULE_TARGET"
         return 1
     fi
+    return 0
+}
+
+# _expand_range_pair <lrange> <trange> <target> -> populates EXPANDED_RULES
+# Expands paired local/target port ranges into lport:target:tport triples
+_expand_range_pair() {
+    local lrange="$1" trange="$2" target="$3"
+
+    local lstart lend tstart tend
+    if [[ "$lrange" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        lstart="${BASH_REMATCH[1]}"; lend="${BASH_REMATCH[2]}"
+    else
+        lstart="$lrange"; lend="$lrange"
+    fi
+    if [[ "$trange" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        tstart="${BASH_REMATCH[1]}"; tend="${BASH_REMATCH[2]}"
+    else
+        tstart="$trange"; tend="$trange"
+    fi
+
+    local lcount=$(( lend - lstart + 1 ))
+    local tcount=$(( tend - tstart + 1 ))
+    if (( lcount != tcount )); then
+        msg_err "Port range length mismatch: $lrange ($lcount ports) vs $trange ($tcount ports)"
+        return 1
+    fi
+    if (( lcount > 500 )); then
+        msg_err "Port range too large: $lcount ports (max 500)"
+        return 1
+    fi
+
+    local i
+    for (( i=0; i<lcount; i++ )); do
+        EXPANDED_RULES+=("$(( lstart + i )):$target:$(( tstart + i ))")
+    done
+}
+
+# expand_port_spec <spec> <target> -> populates EXPANDED_RULES
+# Accepts: 80 / 80,443 / 8080-8090 / 33389:3389 / 8080-8090:3080-3090 / mixed
+expand_port_spec() {
+    local spec="$1" target="$2"
+    EXPANDED_RULES=()
+
+    IFS=',' read -ra parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        part=$(echo "$part" | tr -d '[:space:]')
+        [[ -z "$part" ]] && continue
+
+        if [[ "$part" =~ ^([0-9-]+):([0-9-]+)$ ]]; then
+            # Port mapping: lport:tport or lrange:trange
+            local lspec="${BASH_REMATCH[1]}" tspec="${BASH_REMATCH[2]}"
+            if ! validate_port_range "$lspec"; then
+                msg_err "Invalid local port spec: $lspec"; continue
+            fi
+            if ! validate_port_range "$tspec"; then
+                msg_err "Invalid target port spec: $tspec"; continue
+            fi
+            _expand_range_pair "$lspec" "$tspec" "$target" || continue
+        elif [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            # Port range with same local/target: 8080-8090
+            if ! validate_port_range "$part"; then
+                msg_err "Invalid port range: $part"; continue
+            fi
+            _expand_range_pair "$part" "$part" "$target" || continue
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            # Single port
+            if ! validate_port "$part"; then
+                msg_err "Invalid port: $part"; continue
+            fi
+            EXPANDED_RULES+=("$part:$target:$part")
+        else
+            msg_err "Invalid port spec: $part"; continue
+        fi
+    done
+
+    if (( ${#EXPANDED_RULES[@]} == 0 )); then
+        msg_err "No valid port specs found"
+        return 1
+    fi
+}
+
+# _expand_triple_range <lspec> <target> <tspec> -> populates EXPANDED_RULES
+# Expand ranges in legacy triple format: lspec:target:tspec
+_expand_triple_range() {
+    local lspec="$1" target="$2" tspec="$3"
+    EXPANDED_RULES=()
+    _expand_range_pair "$lspec" "$tspec" "$target"
+}
+
+# expand_rules <rule> -> populates EXPANDED_RULES
+# Compatibility layer for old triple format with range support
+# Detects ranges in lport:target:tport format, falls back to parse_rule for plain triples
+expand_rules() {
+    local rule="$1"
+    EXPANDED_RULES=()
+
+    # IPv6 bracket format: lspec:[ipv6]:tspec
+    if [[ "$rule" =~ ^([0-9-]+):\[([^\]]+)\]:([0-9-]+)$ ]]; then
+        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}" tspec="${BASH_REMATCH[3]}"
+        if [[ "$lspec" == *-* || "$tspec" == *-* ]]; then
+            _expand_triple_range "$lspec" "$target" "$tspec"
+            return $?
+        fi
+        # No range, single rule
+        EXPANDED_RULES=("$rule")
+        return 0
+    fi
+
+    # Standard format: lspec:target:tspec (target may contain dots/colons for domain/ipv4)
+    if [[ "$rule" =~ ^([0-9-]+):(.+):([0-9-]+)$ ]]; then
+        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}" tspec="${BASH_REMATCH[3]}"
+        if [[ "$lspec" == *-* || "$tspec" == *-* ]]; then
+            _expand_triple_range "$lspec" "$target" "$tspec"
+            return $?
+        fi
+        # No range, single rule
+        EXPANDED_RULES=("$rule")
+        return 0
+    fi
+
+    # lspec:target (no target port, same port as local) - with range support
+    if [[ "$rule" =~ ^([0-9-]+):(.+)$ ]]; then
+        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}"
+        # Only if target looks like an address (not a port)
+        if validate_target "$target" && [[ "$lspec" == *-* ]]; then
+            _expand_triple_range "$lspec" "$target" "$lspec"
+            return $?
+        fi
+    fi
+
+    # No range detected, return as-is for parse_rule
+    EXPANDED_RULES=("$rule")
     return 0
 }
 
@@ -189,6 +345,44 @@ get_local_ip() {
 # get_all_nics - get all up network interfaces except lo
 get_all_nics() {
     ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$' | tr '\n' ',' | sed 's/,$//'
+}
+
+# ensure_shortcut - install/update pfwd to /usr/local/bin on first run
+ensure_shortcut() {
+    local current_script
+    current_script="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")"
+
+    # Already running from installed location, just ensure symlink
+    if [[ "$current_script" == "$INSTALLED_SCRIPT" ]]; then
+        [[ ! -L "$SHORTCUT_LINK" ]] && ln -sf "$INSTALLED_SCRIPT" "$SHORTCUT_LINK"
+        return 0
+    fi
+
+    # First-time install
+    if [[ ! -f "$INSTALLED_SCRIPT" ]]; then
+        cp "$current_script" "$INSTALLED_SCRIPT"
+        chmod +x "$INSTALLED_SCRIPT"
+        ln -sf "$INSTALLED_SCRIPT" "$SHORTCUT_LINK"
+        msg_ok "Installed pfwd to $INSTALL_DIR (use 'pfwd' command from now on)"
+        return 0
+    fi
+
+    # Already exists: MD5 check for update
+    local cur_md5 inst_md5
+    cur_md5=$(md5sum "$current_script" 2>/dev/null | awk '{print $1}')
+    inst_md5=$(md5sum "$INSTALLED_SCRIPT" 2>/dev/null | awk '{print $1}')
+    if [[ "$cur_md5" != "$inst_md5" ]]; then
+        cp "$current_script" "$INSTALLED_SCRIPT"
+        chmod +x "$INSTALLED_SCRIPT"
+        [[ ! -L "$SHORTCUT_LINK" ]] && ln -sf "$INSTALLED_SCRIPT" "$SHORTCUT_LINK"
+        msg_ok "pfwd updated to latest version"
+    fi
+}
+
+# remove_shortcut - remove pfwd from /usr/local/bin
+remove_shortcut() {
+    rm -f "$SHORTCUT_LINK" "$INSTALLED_SCRIPT"
+    msg_ok "pfwd shortcut removed"
 }
 
 #===============================================================================
@@ -287,28 +481,61 @@ nft_ensure_table() {
         nics="eth0"
     fi
 
-    msg_info "Creating nftables table with flowtable acceleration..."
+    msg_info "Creating nftables table..."
 
     nft add table $NFT_TABLE
 
-    # Create flowtable for fast path offloading
-    nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>/dev/null || \
-        msg_warn "Flowtable creation failed (kernel may not support it), continuing without fast path"
+    # Flowtable setup with diagnostics
+    local flowtable_ok=false
+    local kver
+    kver=$(uname -r | grep -oE '^[0-9]+\.[0-9]+')
+    local kmajor kminor
+    IFS='.' read -r kmajor kminor <<< "$kver"
+
+    if (( kmajor < 4 || (kmajor == 4 && kminor < 16) )); then
+        msg_warn "Kernel $kver too old for flowtable (requires >= 4.16), skipping fast path"
+    else
+        # Try to load nf_flow_table module
+        if ! lsmod | grep -q nf_flow_table; then
+            msg_info "Loading nf_flow_table kernel module..."
+            if modprobe nf_flow_table 2>/dev/null; then
+                msg_ok "nf_flow_table module loaded"
+                msg_dim "  To persist across reboots: echo 'nf_flow_table' >> /etc/modules-load.d/nf_flow_table.conf"
+            else
+                msg_warn "Cannot load nf_flow_table module (kernel may not support it)"
+                msg_dim "  Install: apt install linux-modules-extra-$(uname -r)  (Debian/Ubuntu)"
+                msg_dim "  Or: modprobe nf_flow_table  (if module is available)"
+            fi
+        fi
+
+        # Try to create flowtable
+        if nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>/dev/null; then
+            flowtable_ok=true
+        else
+            msg_warn "Flowtable creation failed, continuing without fast path"
+        fi
+    fi
 
     # NAT chains
     nft add chain $NFT_TABLE prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'
     nft add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
 
-    # Forward chain with flowtable offload
+    # Forward chain with optional flowtable offload
     nft add chain $NFT_TABLE forward '{ type filter hook forward priority 0; policy accept; }'
-    nft add rule $NFT_TABLE forward ct state established flow add @ft counter 2>/dev/null || \
-        msg_dim "  Flowtable offload rule skipped (not supported)"
+    if $flowtable_ok; then
+        nft add rule $NFT_TABLE forward ct state established flow add @ft counter 2>/dev/null || \
+            msg_dim "  Flowtable offload rule skipped"
+    fi
     nft add rule $NFT_TABLE forward ct state established,related accept
 
     # Input chain (for realm traffic counters)
     nft add chain $NFT_TABLE input '{ type filter hook input priority filter; policy accept; }'
 
-    msg_ok "nftables table created with flowtable"
+    if $flowtable_ok; then
+        msg_ok "nftables table created with flowtable acceleration"
+    else
+        msg_ok "nftables table created (without flowtable)"
+    fi
 }
 
 # nft_add_rule <lport> <target> <tport> <ip_ver> <proto>
@@ -357,10 +584,13 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v4_target" ]]; then
-                nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport"
-                nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade
-                msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
-                ((added++))
+                if nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
+                   nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1; then
+                    msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
+                    ((added++)) || true
+                else
+                    msg_err "Failed to add IPv4 $p rule :$lport -> $v4_target:$tport"
+                fi
             elif [[ "$ip_ver" == "4" ]]; then
                 msg_warn "Target $target has no IPv4 address, skipping IPv4 $p rule"
             fi
@@ -376,10 +606,13 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v6_target" ]]; then
-                nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport"
-                nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade
-                msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
-                ((added++))
+                if nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
+                   nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1; then
+                    msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
+                    ((added++)) || true
+                else
+                    msg_err "Failed to add IPv6 $p rule :$lport -> [$v6_target]:$tport"
+                fi
             elif [[ "$ip_ver" == "6" ]]; then
                 msg_warn "Target $target has no IPv6 address, skipping IPv6 $p rule"
             fi
@@ -413,7 +646,7 @@ nft_delete_port() {
         local handles
         handles=$(nft -a list chain $NFT_TABLE "$chain" 2>/dev/null | grep -E "dport $port\b" | grep -oE 'handle [0-9]+' | awk '{print $2}')
         for h in $handles; do
-            nft delete rule $NFT_TABLE "$chain" handle "$h" 2>/dev/null && ((deleted++))
+            nft delete rule $NFT_TABLE "$chain" handle "$h" 2>/dev/null && ((deleted++)) || true
         done
     done
 
@@ -1197,23 +1430,23 @@ cmd_import() {
         case "$method" in
             nftables|nft)
                 if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" 2>/dev/null; then
-                    ((imported++))
+                    ((imported++)) || true
                 else
                     msg_warn "Failed to import nft rule :$lport -> $target:$tport"
-                    ((failed++))
+                    ((failed++)) || true
                 fi
                 ;;
             realm)
                 if realm_add_endpoint "$lport" "$target" "$tport" "$ipver" "$comment" 2>/dev/null; then
-                    ((imported++))
+                    ((imported++)) || true
                 else
                     msg_warn "Failed to import realm rule :$lport -> $target:$tport"
-                    ((failed++))
+                    ((failed++)) || true
                 fi
                 ;;
             *)
                 msg_warn "Unknown method '$method' for rule :$lport, skipping"
-                ((failed++))
+                ((failed++)) || true
                 ;;
         esac
     done < <(jq -c '.forward_rules[]' "$filepath")
@@ -1243,6 +1476,9 @@ Commands:
   (none/add)  Add forwarding rules (default)
   del         Delete forwarding rules
   list        List all forwarding rules
+  start       Start forwarding (nft / realm / all)
+  stop        Stop forwarding (nft / realm / all)
+  restart     Restart forwarding (nft / realm / all)
   stats       Traffic statistics
   export      Export config to JSON
   import      Import config from JSON
@@ -1251,11 +1487,15 @@ Commands:
   optimize    Run kernel optimization only
   help        Show this help
 
-Add rules:
+Add rules (new syntax):
+  pfwd -m nft|realm -t <target> [options] <ports>
+
+Add rules (legacy syntax):
   pfwd -m nft|realm [options] local_port:target:target_port[,...]
 
 Options:
   -m, --method <nft|realm>   Forwarding method (required)
+  -t, --target <addr>        Target IP or domain (enables new syntax)
   -4                         IPv4 only
   -6                         IPv6 only
   -46                        Dual-stack (default)
@@ -1265,16 +1505,33 @@ Options:
   -c, --comment <text>       Comment (realm only)
   -q, --quiet                Quiet mode
 
+Port formats (with -t):
+  Single port:    80
+  Multiple ports: 80,443
+  Port range:     8080-8090
+  Port mapping:   33389:3389
+  Range mapping:  8080-8090:3080-3090
+  Mixed:          80,443,8080-8090,33389:3389
+
 Backup/Import/Export:
   pfwd export [filepath]
   pfwd import <filepath> [-m nft|realm]
   pfwd import --url <URL> [-m nft|realm]
 
-Examples:
-  pfwd -m nft -4 --both 3489:1.2.3.4:3489
-  pfwd -m realm -46 3489:example.com:3489,8080:example.com:8080
-  pfwd del -m nft 3489
-  pfwd del -m realm 3489
+Examples (new syntax):
+  pfwd -m nft -t 1.2.3.4 80,443,8080-8090
+  pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
+  pfwd -m realm -t example.com 80,443 -c "web"
+  pfwd -m nft -t 1.2.3.4 33389:3389
+
+Examples (legacy syntax):
+  pfwd -m nft -4 --both 10280:1.2.3.4:10280
+  pfwd -m nft 8080-8090:1.2.3.4:3080-3090
+  pfwd -m realm -46 10280:example.com:10280,10281:example.com:10281
+
+Other:
+  pfwd del -m nft 10280
+  pfwd del -m realm 10280
   pfwd list
   pfwd stats
   pfwd export ~/backup.json
@@ -1284,23 +1541,31 @@ EOF
 
 # cmd_add - add forwarding rules from CLI
 cmd_add() {
-    local method="" ip_ver="46" proto="tcp" comment="" rules_str=""
+    local method="" ip_ver="46" proto="tcp" comment="" target="" rules_str=""
+    local -a positional_args=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -m|--method) method="$2"; shift 2 ;;
-            -4)          ip_ver="4"; shift ;;
-            -6)          ip_ver="6"; shift ;;
-            -46)         ip_ver="46"; shift ;;
-            --tcp)       proto="tcp"; shift ;;
-            --udp)       proto="udp"; shift ;;
-            --both)      proto="both"; shift ;;
+            -m|--method)  method="$2"; shift 2 ;;
+            -t|--target)  target="$2"; shift 2 ;;
+            -4)           ip_ver="4"; shift ;;
+            -6)           ip_ver="6"; shift ;;
+            -46)          ip_ver="46"; shift ;;
+            --tcp)        proto="tcp"; shift ;;
+            --udp)        proto="udp"; shift ;;
+            --both)       proto="both"; shift ;;
             -c|--comment) comment="$2"; shift 2 ;;
-            -q|--quiet)  QUIET=true; shift ;;
-            -*)          msg_err "Unknown option: $1"; show_help; return 1 ;;
-            *)           rules_str="$1"; shift ;;
+            -q|--quiet)   QUIET=true; shift ;;
+            -*)           msg_err "Unknown option: $1"; show_help; return 1 ;;
+            *)            positional_args+=("$1"); shift ;;
         esac
     done
+
+    # Merge positional args: "80 443 8080-8090" -> "80,443,8080-8090"
+    if (( ${#positional_args[@]} > 0 )); then
+        local IFS=','
+        rules_str="${positional_args[*]}"
+    fi
 
     if [[ -z "$method" ]]; then
         msg_err "Method is required. Use -m nft or -m realm"
@@ -1309,33 +1574,87 @@ cmd_add() {
 
     if [[ -z "$rules_str" ]]; then
         msg_err "No rules specified"
-        msg_err "Format: local_port:target:target_port"
+        msg_err "Format: local_port:target:target_port  or  -t <target> <ports>"
         return 1
     fi
 
     # Ensure kernel forwarding is on
     optimize_kernel 2>/dev/null || true
 
-    # Process comma-separated rules
-    IFS=',' read -ra rules_arr <<< "$rules_str"
-    for rule in "${rules_arr[@]}"; do
-        if ! parse_rule "$rule"; then
-            continue
-        fi
+    local added=0 failed=0
 
-        case "$method" in
-            nft|nftables)
-                nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"
-                ;;
-            realm)
-                realm_add_endpoint "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$comment"
-                ;;
-            *)
-                msg_err "Unknown method: $method (use nft or realm)"
-                return 1
-                ;;
-        esac
-    done
+    if [[ -n "$target" ]]; then
+        # New syntax: -t <target> <port_spec>
+        if ! validate_target "$target"; then
+            msg_err "Invalid target: $target"
+            return 1
+        fi
+        if ! expand_port_spec "$rules_str" "$target"; then
+            return 1
+        fi
+        for expanded in "${EXPANDED_RULES[@]}"; do
+            if ! parse_rule "$expanded"; then
+                ((failed++)) || true; continue
+            fi
+            case "$method" in
+                nft|nftables)
+                    if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                        ((added++)) || true
+                    else
+                        ((failed++)) || true
+                    fi
+                    ;;
+                realm)
+                    if realm_add_endpoint "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$comment"; then
+                        ((added++)) || true
+                    else
+                        ((failed++)) || true
+                    fi
+                    ;;
+                *)
+                    msg_err "Unknown method: $method (use nft or realm)"
+                    return 1
+                    ;;
+            esac
+        done
+    else
+        # Legacy syntax: lport:target:tport[,...]
+        IFS=',' read -ra rules_arr <<< "$rules_str"
+        for rule in "${rules_arr[@]}"; do
+            if ! expand_rules "$rule"; then
+                ((failed++)) || true; continue
+            fi
+            for expanded in "${EXPANDED_RULES[@]}"; do
+                if ! parse_rule "$expanded"; then
+                    ((failed++)) || true; continue
+                fi
+                case "$method" in
+                    nft|nftables)
+                        if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                            ((added++)) || true
+                        else
+                            ((failed++)) || true
+                        fi
+                        ;;
+                    realm)
+                        if realm_add_endpoint "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$comment"; then
+                            ((added++)) || true
+                        else
+                            ((failed++)) || true
+                        fi
+                        ;;
+                    *)
+                        msg_err "Unknown method: $method (use nft or realm)"
+                        return 1
+                        ;;
+                esac
+            done
+        done
+    fi
+
+    if (( added > 0 || failed > 0 )); then
+        msg_info "Result: $added added, $failed failed"
+    fi
 }
 
 # cmd_delete - delete forwarding rules
@@ -1393,6 +1712,84 @@ cmd_list() {
     realm_list_endpoints
 }
 
+# cmd_stop - stop forwarding without removing config
+cmd_stop() {
+    local target="${1:-all}"
+    case "$target" in
+        nft|nftables)
+            if nft list table $NFT_TABLE >/dev/null 2>&1; then
+                nft_setup_persistence
+                nft delete table $NFT_TABLE 2>/dev/null || true
+                msg_ok "nftables forwarding stopped (config saved)"
+            else
+                msg_warn "nftables forwarding is not running"
+            fi
+            ;;
+        realm)
+            if systemctl is-active realm-forward >/dev/null 2>&1; then
+                systemctl stop realm-forward 2>/dev/null || true
+                msg_ok "realm forwarding stopped"
+            else
+                msg_warn "realm forwarding is not running"
+            fi
+            ;;
+        all)
+            cmd_stop nft
+            cmd_stop realm
+            ;;
+        *)
+            msg_err "Specify what to stop: nft, realm, or all"
+            return 1
+            ;;
+    esac
+}
+
+# cmd_start - start forwarding from saved config
+cmd_start() {
+    local target="${1:-all}"
+    case "$target" in
+        nft|nftables)
+            if nft list table $NFT_TABLE >/dev/null 2>&1; then
+                msg_warn "nftables forwarding is already running"
+                return 0
+            fi
+            if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
+                nft -f "$NFT_CONFIG" 2>/dev/null
+                if nft list table $NFT_TABLE >/dev/null 2>&1; then
+                    local _restored_count
+                    _restored_count=$(nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -c 'dnat') || _restored_count=0
+                    msg_ok "nftables forwarding started ($_restored_count rules restored)"
+                else
+                    msg_err "Failed to restore nftables rules"
+                    return 1
+                fi
+            else
+                msg_warn "No saved nftables config found"
+            fi
+            ;;
+        realm)
+            if systemctl is-active realm-forward >/dev/null 2>&1; then
+                msg_warn "realm forwarding is already running"
+                return 0
+            fi
+            if [[ -f "$REALM_SERVICE" && -f "$REALM_CONFIG" ]]; then
+                systemctl start realm-forward 2>/dev/null || true
+                msg_ok "realm forwarding started"
+            else
+                msg_warn "No realm service configured"
+            fi
+            ;;
+        all)
+            cmd_start nft
+            cmd_start realm
+            ;;
+        *)
+            msg_err "Specify what to start: nft, realm, or all"
+            return 1
+            ;;
+    esac
+}
+
 # cmd_uninstall - uninstall components
 cmd_uninstall() {
     local target="${1:-}"
@@ -1414,6 +1811,7 @@ cmd_uninstall() {
                 sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
                 sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
             fi
+            remove_shortcut
             rm -rf "$DATA_DIR"
             msg_ok "All pfwd components removed"
             ;;
@@ -1444,12 +1842,30 @@ parse_cli_args() {
             # Flags before -m, treat as add
             cmd_add "$@"
             ;;
+        -t|--target)
+            # Target flag, treat as add
+            cmd_add "$@"
+            ;;
         del|delete)
             shift
             cmd_delete "$@"
             ;;
         list|ls)
             cmd_list
+            ;;
+        start)
+            shift
+            cmd_start "${1:-all}"
+            ;;
+        stop)
+            shift
+            cmd_stop "${1:-all}"
+            ;;
+        restart)
+            shift
+            local rt="${1:-all}"
+            cmd_stop "$rt"
+            cmd_start "$rt"
             ;;
         stats|traffic)
             show_traffic_stats
@@ -1509,37 +1925,101 @@ parse_cli_args() {
 #  Section 10: Interactive Menu
 #===============================================================================
 
+show_header() {
+    clear
+
+    # Count rules
+    local nft_count=0
+    if nft list chain $NFT_TABLE prerouting >/dev/null 2>&1; then
+        nft_count=$(nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -c 'dnat') || nft_count=0
+    fi
+    local realm_count=0
+    if [[ -f "$REALM_CONFIG" ]]; then
+        realm_count=$(grep -c '^\[\[endpoints\]\]' "$REALM_CONFIG" 2>/dev/null) || realm_count=0
+    fi
+    local rule_count=$((nft_count + realm_count))
+
+    # Check running status
+    local status_text
+    if [[ $nft_count -gt 0 ]] || systemctl is-active realm-forward >/dev/null 2>&1; then
+        status_text="${GREEN}Running${NC}"
+    else
+        status_text="${RED}Stopped${NC}"
+    fi
+
+    # Detect network
+    local has_v4=false has_v6=false net_info
+    if ip -4 addr show scope global 2>/dev/null | grep -q inet; then
+        has_v4=true
+    fi
+    if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        has_v6=true
+    fi
+    if $has_v4 && $has_v6; then
+        net_info="${GREEN}IPv4+IPv6${NC}"
+    elif $has_v4; then
+        net_info="${GREEN}IPv4${NC}"
+    elif $has_v6; then
+        net_info="${CYAN}IPv6 only${NC}"
+    else
+        net_info="${RED}No public IP${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}================================================${NC}"
+    echo -e "     ${BOLD}pfwd${NC} - Port Forwarding Tool  ${DIM}v$VERSION${NC}"
+    echo -e "${CYAN}------------------------------------------------${NC}"
+    echo -e "  Status: ${status_text}    Rules: ${CYAN}${rule_count}${NC}    Network: ${net_info}"
+    echo -e "${CYAN}================================================${NC}"
+    echo ""
+}
+
 interactive_menu() {
     while true; do
-        clear
-        echo ""
-        echo -e "${CYAN}========================================${NC}"
-        echo -e "   ${BOLD}pfwd${NC} - Port Forwarding Tool  ${DIM}v$VERSION${NC}"
-        echo -e "${CYAN}========================================${NC}"
-        echo ""
+        show_header
+
+        # Determine forwarding status for menu item 4
+        local _nft_running=false _realm_running=false
+        nft list table $NFT_TABLE >/dev/null 2>&1 && _nft_running=true
+        systemctl is-active realm-forward >/dev/null 2>&1 && _realm_running=true
+        local _fwd_label
+        if $_nft_running || $_realm_running; then
+            _fwd_label="Stop forwarding"
+        else
+            _fwd_label="Start forwarding"
+        fi
+
         echo -e "  ${BOLD}1)${NC} Add forwarding rules"
         echo -e "  ${BOLD}2)${NC} View forwarding rules"
         echo -e "  ${BOLD}3)${NC} Delete forwarding rules"
-        echo -e "  ${BOLD}4)${NC} Traffic statistics"
-        echo -e "  ${BOLD}5)${NC} Import/Export config"
-        echo -e "  ${BOLD}6)${NC} Install/Update realm"
-        echo -e "  ${BOLD}7)${NC} Kernel optimization"
-        echo -e "  ${BOLD}8)${NC} Uninstall"
+        echo -e "  ${BOLD}4)${NC} ${_fwd_label}"
+        echo -e "  ${BOLD}5)${NC} Traffic statistics"
+        echo -e "  ${BOLD}6)${NC} Import/Export config"
+        echo -e "  ${BOLD}7)${NC} Install/Update realm"
+        echo -e "  ${BOLD}8)${NC} Kernel optimization"
+        echo -e "  ${BOLD}9)${NC} Uninstall"
         echo -e "  ${BOLD}0)${NC} Exit"
         echo ""
-        read -rp "Select [0-8]: " choice
+        read -rp "Select [0-9]: " choice
 
         case "$choice" in
-            1) menu_add_rule ;;
-            2) cmd_list; echo ""; read -rp "Press Enter to continue..." ;;
-            3) menu_delete_rule ;;
-            4) show_traffic_stats; echo ""; read -rp "Press Enter to continue..." ;;
-            5) menu_export_import ;;
-            6) realm_install; echo ""; read -rp "Press Enter to continue..." ;;
-            7) optimize_kernel; echo ""; read -rp "Press Enter to continue..." ;;
-            8) menu_uninstall ;;
+            1) menu_add_rule || true ;;
+            2) cmd_list; wait_for_enter ;;
+            3) menu_delete_rule || true ;;
+            4)
+                if $_nft_running || $_realm_running; then
+                    menu_stop_forward || true
+                else
+                    menu_start_forward || true
+                fi
+                ;;
+            5) show_traffic_stats; wait_for_enter ;;
+            6) menu_export_import || true ;;
+            7) realm_install; wait_for_enter ;;
+            8) optimize_kernel; wait_for_enter ;;
+            9) menu_uninstall || true ;;
             0) echo "Bye."; exit 0 ;;
-            *) msg_warn "Invalid choice" ;;
+            *) msg_warn "Invalid choice"; sleep 1.5 ;;
         esac
     done
 }
@@ -1548,27 +2028,30 @@ interactive_menu() {
 menu_add_rule() {
     echo ""
     echo -e "${BOLD}Add Forwarding Rule${NC}"
-    echo -e "${DIM}$(printf '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
 
-    # Method selection
+    # 1. Method selection
     echo ""
     echo "  1) nftables  (kernel-level, fast path with flowtable)"
     echo "  2) realm     (userspace, supports domain targets)"
+    echo "  0) Back"
     echo ""
-    read -rp "Method [1-2]: " method_choice
+    read -rp "Method [0-2]: " method_choice
 
     local method
     case "$method_choice" in
         1) method="nft" ;;
         2) method="realm" ;;
-        *) msg_err "Invalid choice"; return ;;
+        0) return ;;
+        *) msg_err "Invalid choice"; wait_for_enter; return ;;
     esac
 
-    # IP version
+    # 2. IP version
     echo ""
     echo "  1) IPv4 only"
     echo "  2) IPv6 only"
     echo "  3) Dual-stack (default)"
+    echo "  0) Back"
     echo ""
     read -rp "IP version [3]: " ipver_choice
     ipver_choice=${ipver_choice:-3}
@@ -1578,16 +2061,18 @@ menu_add_rule() {
         1) ip_ver="4" ;;
         2) ip_ver="6" ;;
         3) ip_ver="46" ;;
+        0) return ;;
         *) ip_ver="46" ;;
     esac
 
-    # Protocol (nftables only)
+    # 3. Protocol (nftables only)
     local proto="tcp"
     if [[ "$method" == "nft" ]]; then
         echo ""
         echo "  1) TCP only (default)"
         echo "  2) UDP only"
         echo "  3) TCP + UDP"
+        echo "  0) Back"
         echo ""
         read -rp "Protocol [1]: " proto_choice
         proto_choice=${proto_choice:-1}
@@ -1596,62 +2081,127 @@ menu_add_rule() {
             1) proto="tcp" ;;
             2) proto="udp" ;;
             3) proto="both" ;;
+            0) return ;;
             *) proto="tcp" ;;
         esac
     fi
 
-    # Rules input
+    # 4. Target IP/domain
     echo ""
-    echo -e "Enter forwarding rules (format: ${CYAN}local_port:target:target_port${NC})"
-    echo -e "Multiple rules separated by comma"
-    echo -e "Example: ${DIM}3489:1.2.3.4:3489,8080:1.2.3.4:8080${NC}"
+    echo -e "Enter target IP address or domain (empty to cancel):"
+    echo -e "  ${DIM}IPv4: 1.2.3.4${NC}"
+    echo -e "  ${DIM}IPv6: 2001:db8::1${NC}"
+    echo -e "  ${DIM}Domain: example.com${NC}"
     echo ""
-    read -rp "Rules: " rules_str
+    local target=""
+    read -rp "Target: " target
+    if [[ -z "$target" ]]; then
+        msg_info "Cancelled"
+        return
+    fi
+    if ! validate_target "$target"; then
+        msg_err "Invalid target: $target"
+        wait_for_enter
+        return
+    fi
+    local target_type
+    target_type=$(detect_ip_type "$target")
+    case "$target_type" in
+        ipv4)   msg_dim "  Valid IPv4 address" ;;
+        ipv6)   msg_dim "  Valid IPv6 address" ;;
+        domain) msg_dim "  Valid domain name" ;;
+    esac
 
-    if [[ -z "$rules_str" ]]; then
-        msg_err "No rules entered"
-        read -rp "Press Enter to continue..."
+    # 5. Port config (simplified input)
+    echo ""
+    echo -e "Enter port(s) to forward (empty to cancel):"
+    echo -e "  ${DIM}Single port:    80${NC}"
+    echo -e "  ${DIM}Multiple ports: 80,443${NC}"
+    echo -e "  ${DIM}Port range:     8080-8090${NC}"
+    echo -e "  ${DIM}Port mapping:   33389:3389${NC}"
+    echo -e "  ${DIM}Range mapping:  8080-8090:3080-3090${NC}"
+    echo -e "  ${DIM}Mixed:          80,443,8080-8090,33389:3389${NC}"
+    echo ""
+    local port_spec=""
+    read -rp "Port(s): " port_spec
+
+    if [[ -z "$port_spec" ]]; then
+        msg_info "Cancelled"
         return
     fi
 
-    # Comment (realm only)
+    # 6. Comment (realm only)
     local comment=""
     if [[ "$method" == "realm" ]]; then
         echo ""
         read -rp "Comment (optional): " comment
     fi
 
+    # 7. Confirmation summary
+    echo ""
+    echo -e "${BOLD}=== Confirmation ===${NC}"
+    echo -e "  Method:   ${CYAN}${method}${NC}"
+    echo -e "  IP ver:   ${CYAN}${ip_ver}${NC}"
+    [[ "$method" == "nft" ]] && echo -e "  Protocol: ${CYAN}${proto}${NC}"
+    echo -e "  Target:   ${CYAN}${target}${NC}"
+    echo -e "  Ports:    ${CYAN}${port_spec}${NC}"
+    [[ -n "$comment" ]] && echo -e "  Comment:  ${CYAN}${comment}${NC}"
+    echo ""
+    read -rp "Proceed? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        msg_info "Cancelled"
+        return
+    fi
+
+    # 8. Expand and add rules
     echo ""
     msg_info "Processing rules..."
 
     # Ensure kernel optimization
     optimize_kernel 2>/dev/null || true
 
-    IFS=',' read -ra rules_arr <<< "$rules_str"
-    for rule in "${rules_arr[@]}"; do
-        if ! parse_rule "$rule"; then
-            continue
+    if ! expand_port_spec "$port_spec" "$target"; then
+        msg_err "Failed to expand port spec"
+        wait_for_enter
+        return
+    fi
+
+    local added=0 failed=0
+    for expanded in "${EXPANDED_RULES[@]}"; do
+        if ! parse_rule "$expanded"; then
+            ((failed++)) || true; continue
         fi
 
         case "$method" in
             nft)
-                nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"
+                if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                    ((added++)) || true
+                else
+                    ((failed++)) || true
+                fi
                 ;;
             realm)
-                realm_add_endpoint "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$comment"
+                if realm_add_endpoint "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$comment"; then
+                    ((added++)) || true
+                else
+                    ((failed++)) || true
+                fi
                 ;;
         esac
     done
 
+    # 9. Summary
     echo ""
-    read -rp "Press Enter to continue..."
+    msg_info "Result: $added rules added, $failed failed"
+    wait_for_enter
 }
 
 # menu_delete_rule - interactive rule deletion
 menu_delete_rule() {
     echo ""
     echo -e "${BOLD}Delete Forwarding Rule${NC}"
-    echo -e "${DIM}$(printf '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
 
     # Show current rules first
     cmd_list
@@ -1660,23 +2210,24 @@ menu_delete_rule() {
     # Method selection
     echo "  1) nftables"
     echo "  2) realm"
+    echo "  0) Back"
     echo ""
-    read -rp "Method [1-2]: " method_choice
+    read -rp "Method [0-2]: " method_choice
 
     local method
     case "$method_choice" in
         1) method="nft" ;;
         2) method="realm" ;;
-        *) msg_err "Invalid choice"; return ;;
+        0) return ;;
+        *) msg_err "Invalid choice"; wait_for_enter; return ;;
     esac
 
     echo ""
-    echo "Enter port(s) to delete (comma-separated)"
+    echo "Enter port(s) to delete (comma-separated, empty to cancel)"
     read -rp "Port(s): " ports_str
 
     if [[ -z "$ports_str" ]]; then
-        msg_err "No ports entered"
-        read -rp "Press Enter to continue..."
+        msg_info "Cancelled"
         return
     fi
 
@@ -1694,22 +2245,22 @@ menu_delete_rule() {
         esac
     done
 
-    echo ""
-    read -rp "Press Enter to continue..."
+    wait_for_enter
 }
 
 # menu_export_import - interactive import/export
 menu_export_import() {
     echo ""
     echo -e "${BOLD}Import / Export Configuration${NC}"
-    echo -e "${DIM}$(printf '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
     echo ""
     echo "  1) Export to JSON file"
     echo "  2) Import from JSON file"
     echo "  3) Import from URL"
     echo "  4) List backup files"
+    echo "  0) Back"
     echo ""
-    read -rp "Choice [1-4]: " ie_choice
+    read -rp "Choice [0-4]: " ie_choice
 
     case "$ie_choice" in
         1)
@@ -1725,8 +2276,7 @@ menu_export_import() {
             echo ""
             read -rp "JSON file path: " ipath
             if [[ -z "$ipath" ]]; then
-                msg_err "No path specified"
-                read -rp "Press Enter to continue..."
+                msg_info "Cancelled"
                 return
             fi
             echo ""
@@ -1741,8 +2291,7 @@ menu_export_import() {
             echo ""
             read -rp "URL: " iurl
             if [[ -z "$iurl" ]]; then
-                msg_err "No URL specified"
-                read -rp "Press Enter to continue..."
+                msg_info "Cancelled"
                 return
             fi
             echo ""
@@ -1758,26 +2307,71 @@ menu_export_import() {
                 msg_dim "  No backup files found in $DATA_DIR"
             fi
             ;;
+        0) return ;;
         *)
             msg_warn "Invalid choice"
             ;;
     esac
 
+    wait_for_enter
+}
+
+# menu_stop_forward - interactive stop forwarding
+menu_stop_forward() {
     echo ""
-    read -rp "Press Enter to continue..."
+    echo -e "${BOLD}Stop Forwarding${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo ""
+    echo "  1) Stop nftables only"
+    echo "  2) Stop realm only"
+    echo "  3) Stop all"
+    echo "  0) Back"
+    echo ""
+    read -rp "Choice [0-3]: " schoice
+    case "$schoice" in
+        1) cmd_stop nft ;;
+        2) cmd_stop realm ;;
+        3) cmd_stop all ;;
+        0) return ;;
+        *) msg_warn "Invalid choice" ;;
+    esac
+    wait_for_enter
+}
+
+# menu_start_forward - interactive start forwarding
+menu_start_forward() {
+    echo ""
+    echo -e "${BOLD}Start Forwarding${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo ""
+    echo "  1) Start nftables only"
+    echo "  2) Start realm only"
+    echo "  3) Start all"
+    echo "  0) Back"
+    echo ""
+    read -rp "Choice [0-3]: " schoice
+    case "$schoice" in
+        1) cmd_start nft ;;
+        2) cmd_start realm ;;
+        3) cmd_start all ;;
+        0) return ;;
+        *) msg_warn "Invalid choice" ;;
+    esac
+    wait_for_enter
 }
 
 # menu_uninstall - interactive uninstall
 menu_uninstall() {
     echo ""
     echo -e "${BOLD}Uninstall${NC}"
-    echo -e "${DIM}$(printf '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
     echo ""
     echo "  1) Uninstall nftables rules only"
     echo "  2) Uninstall realm only"
     echo "  3) Uninstall everything"
+    echo "  0) Back"
     echo ""
-    read -rp "Choice [1-3]: " uchoice
+    read -rp "Choice [0-3]: " uchoice
 
     case "$uchoice" in
         1) cmd_uninstall nft ;;
@@ -1787,11 +2381,11 @@ menu_uninstall() {
             read -rp "Are you sure? This will remove ALL forwarding rules. [y/N]: " confirm
             [[ "$confirm" =~ ^[Yy]$ ]] && cmd_uninstall all || msg_info "Cancelled"
             ;;
+        0) return ;;
         *) msg_warn "Invalid choice" ;;
     esac
 
-    echo ""
-    read -rp "Press Enter to continue..."
+    wait_for_enter
 }
 
 #===============================================================================
@@ -1799,4 +2393,5 @@ menu_uninstall() {
 #===============================================================================
 
 require_root "$@"
+ensure_shortcut
 parse_cli_args "$@"

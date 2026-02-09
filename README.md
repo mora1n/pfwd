@@ -6,12 +6,14 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **realm forwarding** for domain-based targets and userspace proxying
+- **Flexible port syntax** — single ports, ranges, mappings, mixed formats
 - **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
 - **CLI + Interactive menu** interface
 - **Traffic statistics** via nftables counters
 - **Backup/Import/Export** in JSON format
 - **Boot persistence** via systemd services
 - **Enhanced kernel optimization** (BBR, TCP tuning, conntrack, flowtable)
+- **Flowtable diagnostics** — kernel version detection, automatic module loading, actionable fix suggestions
 
 ## Quick Start
 
@@ -25,9 +27,13 @@ cp pfwd.sh /usr/local/bin/pfwd
 # Interactive mode
 pfwd
 
-# CLI examples
-pfwd -m nft -4 --both 3489:1.2.3.4:3489
-pfwd -m realm -46 8080:example.com:8080
+# CLI examples (new syntax with -t)
+pfwd -m nft -t 1.2.3.4 80,443,8080-8090
+pfwd -m realm -t example.com 80,443 -c "web"
+
+# CLI examples (legacy syntax)
+pfwd -m nft -4 --both 10280:1.2.3.4:10280
+pfwd -m realm -46 10280:example.com:10280
 ```
 
 ## Usage
@@ -39,6 +45,9 @@ Commands:
   (none/add)  Add forwarding rules (default)
   del         Delete forwarding rules
   list        List all forwarding rules
+  start       Start forwarding (nft / realm / all)
+  stop        Stop forwarding (nft / realm / all)
+  restart     Restart forwarding (nft / realm / all)
   stats       Traffic statistics
   export      Export config to JSON
   import      Import config from JSON
@@ -50,6 +59,14 @@ Commands:
 
 ### Add Rules
 
+**New syntax** (recommended):
+
+```bash
+pfwd -m nft|realm -t <target> [options] <ports>
+```
+
+**Legacy syntax**:
+
 ```bash
 pfwd -m nft|realm [options] local_port:target:target_port[,...]
 ```
@@ -57,6 +74,7 @@ pfwd -m nft|realm [options] local_port:target:target_port[,...]
 | Option | Description |
 |--------|-------------|
 | `-m, --method` | `nft` or `realm` (required) |
+| `-t, --target` | Target IP or domain (enables new syntax) |
 | `-4` | IPv4 only |
 | `-6` | IPv6 only |
 | `-46` | Dual-stack (default) |
@@ -66,21 +84,49 @@ pfwd -m nft|realm [options] local_port:target:target_port[,...]
 | `-c, --comment` | Comment (realm only) |
 | `-q, --quiet` | Quiet mode |
 
+### Port Formats (with `-t`)
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Single port | `80` | Forward port 80 |
+| Multiple ports | `80,443` | Forward ports 80 and 443 |
+| Port range | `8080-8090` | Forward ports 8080 through 8090 |
+| Port mapping | `33389:3389` | Forward local 33389 to remote 3389 |
+| Range mapping | `8080-8090:3080-3090` | Map local range to remote range |
+| Mixed | `80,443,8080-8090,33389:3389` | Combine any formats |
+
 ### Examples
 
 ```bash
-# nftables: IPv4 TCP+UDP forwarding
-pfwd -m nft -4 --both 3489:1.2.3.4:3489
+# New syntax: nftables with port range
+pfwd -m nft -t 1.2.3.4 10280-10281
 
-# nftables: dual-stack TCP
-pfwd -m nft -46 443:backend.example.com:443
+# New syntax: nftables with mixed ports, IPv4 only, TCP+UDP
+pfwd -m nft -t 1.2.3.4 -4 --both 80,443,8080-8090
 
-# realm: multiple endpoints
-pfwd -m realm -46 3489:ix.cnix.taphip.com:3489,8080:ix.cnix.taphip.com:8080
+# New syntax: realm with domain target
+pfwd -m realm -t example.com 80,443 -c "web"
+
+# New syntax: port mapping (local 33389 -> remote 3389)
+pfwd -m nft -t 1.2.3.4 33389:3389
+
+# Legacy syntax: nftables IPv4 TCP+UDP forwarding
+pfwd -m nft -4 --both 10280:1.2.3.4:10280
+
+# Legacy syntax: realm multiple endpoints
+pfwd -m realm -46 10280:example.com:10280,10281:example.com:10281
+
+# Legacy syntax: port range
+pfwd -m nft 8080-8090:1.2.3.4:3080-3090
 
 # Delete rules
-pfwd del -m nft 3489
-pfwd del -m realm 3489,8080
+pfwd del -m nft 10280
+pfwd del -m realm 10280,10281
+
+# Start/Stop/Restart
+pfwd stop nft
+pfwd start all
+pfwd restart realm
 
 # List all rules
 pfwd list
@@ -99,6 +145,12 @@ pfwd import --url https://example.com/backup.json
 ### nftables (with flowtable)
 
 Kernel-level DNAT forwarding with flowtable fast path acceleration. Established connections are offloaded to the ingress hook, bypassing the entire netfilter stack for near-zero CPU overhead.
+
+Flowtable requires Linux kernel >= 4.16 and the `nf_flow_table` module. pfwd will automatically:
+- Detect kernel version and skip flowtable on older kernels
+- Attempt to load the `nf_flow_table` module via `modprobe`
+- Provide actionable suggestions if the module is unavailable (e.g. `apt install linux-modules-extra-$(uname -r)`)
+- Fall back gracefully to standard forwarding if flowtable is not available
 
 Best for: IP-based targets, maximum performance.
 
@@ -147,17 +199,17 @@ Install realm: `pfwd install`
   "forward_rules": [
     {
       "type": "nftables",
-      "local_port": "3489",
+      "local_port": "10280",
       "target_ip": "1.2.3.4",
-      "target_port": "3489",
+      "target_port": "10280",
       "protocol": "tcp",
       "ip_ver": "4"
     },
     {
       "type": "realm",
-      "local_port": "8080",
+      "local_port": "10281",
       "target_ip": "ix.cnix.taphip.com",
-      "target_port": "8080",
+      "target_port": "10281",
       "ip_ver": "46",
       "comment": "taphip-cnix"
     }
@@ -169,6 +221,7 @@ Install realm: `pfwd install`
 
 - Linux with root access
 - nftables (for nft method)
+- Linux kernel >= 4.16 (for flowtable acceleration; older kernels fall back to standard forwarding)
 - jq (auto-installed for import/export)
 - curl or wget (for realm installation and URL imports)
 
