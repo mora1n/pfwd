@@ -344,7 +344,7 @@ get_local_ip() {
 
 # get_all_nics - get all up network interfaces except lo
 get_all_nics() {
-    ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$' | tr '\n' ',' | sed 's/,$//'
+    ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -v '^lo$' | tr '\n' ',' | sed 's/,$//'
 }
 
 # ensure_shortcut - install/update pfwd to /usr/local/bin on first run
@@ -515,10 +515,12 @@ nft_ensure_table() {
         fi
 
         # Try to create flowtable
-        if nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>/dev/null; then
+        local ft_err
+        if ft_err=$(nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>&1); then
             flowtable_ok=true
         else
             msg_warn "Flowtable creation failed, continuing without fast path"
+            msg_dim "  devices=($nics) error: $ft_err"
         fi
     fi
 
