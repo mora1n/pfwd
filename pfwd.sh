@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.3.2"
+readonly VERSION="1.4.0"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -103,6 +103,51 @@ validate_port_range() {
         (( spec >= 1 && spec <= 65535 ))
     else
         return 1
+    fi
+}
+
+# expand_port_range <port_spec> -> echo space-separated port list
+# Expands port ranges for deletion: "80" -> "80", "8080-8090" -> "8080 8081 ... 8090"
+expand_port_range() {
+    local spec="$1"
+
+    # Check if it's a port range
+    if [[ "$spec" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local start="${BASH_REMATCH[1]}"
+        local end="${BASH_REMATCH[2]}"
+
+        # Validate port validity
+        if ! validate_port "$start" || ! validate_port "$end"; then
+            msg_err "Invalid port range: $spec"
+            return 1
+        fi
+
+        # Validate range order
+        if (( start > end )); then
+            msg_err "Invalid port range: start ($start) > end ($end)"
+            return 1
+        fi
+
+        # Validate range size (prevent accidental operations)
+        local range_size=$((end - start + 1))
+        if (( range_size > 100 )); then
+            msg_err "Port range too large: $range_size ports (max 100)"
+            return 1
+        fi
+
+        # Expand range
+        local ports=()
+        for ((p=start; p<=end; p++)); do
+            ports+=("$p")
+        done
+        echo "${ports[@]}"
+    else
+        # Single port
+        if validate_port "$spec"; then
+            echo "$spec"
+        else
+            return 1
+        fi
     fi
 }
 
@@ -458,6 +503,20 @@ $marker_end
 EOF
 
     sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+
+    # Verify IP forwarding is actually enabled
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+        msg_warn "sysctl failed to enable IPv4 forwarding, trying direct write..."
+        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+        if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+            msg_err "Cannot enable IPv4 forwarding — port forwarding will not work"
+        fi
+    fi
+    if [[ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]]; then
+        msg_warn "sysctl failed to enable IPv6 forwarding, trying direct write..."
+        echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+    fi
+
     msg_ok "Kernel optimizations applied"
     msg_dim "  IP forwarding: enabled"
     msg_dim "  BBR congestion control: enabled"
@@ -549,6 +608,36 @@ nft_ensure_table() {
     else
         msg_ok "nftables table created (without flowtable)"
     fi
+
+    ensure_forward_accept
+}
+
+# ensure_forward_accept - add FORWARD ACCEPT rules if system firewall drops forwarded traffic
+ensure_forward_accept() {
+    # Check iptables FORWARD chain
+    if command -v iptables >/dev/null 2>&1; then
+        local policy
+        policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+        if [[ "$policy" == "DROP" ]]; then
+            iptables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                iptables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT
+            iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            msg_info "Added iptables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+        fi
+    fi
+    # Check ip6tables FORWARD chain
+    if command -v ip6tables >/dev/null 2>&1; then
+        local policy6
+        policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+        if [[ "$policy6" == "DROP" ]]; then
+            ip6tables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT
+            ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            msg_info "Added ip6tables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+        fi
+    fi
 }
 
 # nft_rule_exists <lport> <proto> <ip_ver> -> 0=exists, 1=not found
@@ -619,6 +708,15 @@ nft_add_rule() {
                     ((added++)) || true
                 else
                     msg_err "Failed to add IPv4 $p rule :$lport -> $v4_target:$tport"
+                    # Rollback: remove prerouting rule if it was added but postrouting failed
+                    local rb_handle
+                    rb_handle=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                        { grep -E "ip protocol $p.*dport $lport.*dnat ip to $v4_target:$tport" || true; } | \
+                        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
+                    if [[ -n "$rb_handle" ]]; then
+                        nft delete rule $NFT_TABLE prerouting handle "$rb_handle" 2>/dev/null
+                        msg_dim "  Rolled back prerouting rule (handle $rb_handle)"
+                    fi
                 fi
             elif [[ "$ip_ver" == "4" ]]; then
                 msg_warn "Target $target has no IPv4 address, skipping IPv4 $p rule"
@@ -645,6 +743,15 @@ nft_add_rule() {
                     ((added++)) || true
                 else
                     msg_err "Failed to add IPv6 $p rule :$lport -> [$v6_target]:$tport"
+                    # Rollback: remove prerouting rule if it was added but postrouting failed
+                    local rb_handle6
+                    rb_handle6=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                        { grep -E "ip6 nexthdr $p.*dport $lport.*dnat ip6 to \[$v6_target\]:$tport" || true; } | \
+                        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
+                    if [[ -n "$rb_handle6" ]]; then
+                        nft delete rule $NFT_TABLE prerouting handle "$rb_handle6" 2>/dev/null
+                        msg_dim "  Rolled back prerouting rule (handle $rb_handle6)"
+                    fi
                 fi
             elif [[ "$ip_ver" == "6" ]]; then
                 msg_warn "Target $target has no IPv6 address, skipping IPv6 $p rule"
@@ -665,6 +772,7 @@ nft_add_rule() {
 # nft_delete_port <port> - delete all rules matching this local port
 nft_delete_port() {
     local port="$1"
+    local proto="${2:-both}"  # Default: delete all protocols
     ensure_nft || return 1
 
     if ! nft list table $NFT_TABLE >/dev/null 2>&1; then
@@ -674,18 +782,92 @@ nft_delete_port() {
 
     local deleted=0
 
-    # Delete from all chains
-    for chain in prerouting postrouting input; do
-        local handles
-        handles=$(nft -a list chain $NFT_TABLE "$chain" 2>/dev/null | { grep -E "dport $port\b" || true; } | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
-        for h in $handles; do
-            nft delete rule $NFT_TABLE "$chain" handle "$h" 2>/dev/null && ((deleted++)) || true
-        done
+    # Step 1: Find prerouting DNAT rules matching dport $port (with protocol filter)
+    local prerouting_lines
+    case "$proto" in
+        tcp)
+            prerouting_lines=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                { grep -E "(ip protocol tcp|ip6 nexthdr tcp).*dport $port\b" || true; })
+            ;;
+        udp)
+            prerouting_lines=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                { grep -E "(ip protocol udp|ip6 nexthdr udp).*dport $port\b" || true; })
+            ;;
+        both)
+            prerouting_lines=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                { grep -E "dport $port\b" || true; })
+            ;;
+        *)
+            msg_err "Invalid protocol: $proto"
+            return 1
+            ;;
+    esac
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        # Extract handle from prerouting rule
+        local handle=""
+        if [[ "$line" =~ handle\ ([0-9]+) ]]; then
+            handle="${BASH_REMATCH[1]}"
+        fi
+        [[ -z "$handle" ]] && continue
+
+        # Extract DNAT target address and port for postrouting matching
+        local dnat_addr="" dnat_port=""
+        # IPv4: dnat ip to 1.2.3.4:3389
+        if [[ "$line" =~ dnat\ ip\ to\ ([0-9.]+):([0-9]+) ]]; then
+            dnat_addr="${BASH_REMATCH[1]}"
+            dnat_port="${BASH_REMATCH[2]}"
+        # IPv6: dnat ip6 to [::1]:3389
+        elif [[ "$line" =~ dnat\ ip6\ to\ \[([^\]]+)\]:([0-9]+) ]]; then
+            dnat_addr="${BASH_REMATCH[1]}"
+            dnat_port="${BASH_REMATCH[2]}"
+        fi
+
+        # Delete the prerouting rule
+        nft delete rule $NFT_TABLE prerouting handle "$handle" 2>/dev/null && ((deleted++)) || true
+
+        # Step 2: Delete matching postrouting masquerade rule using extracted target info
+        if [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
+            local post_handles
+            post_handles=$(nft -a list chain $NFT_TABLE postrouting 2>/dev/null | \
+                { grep -E "daddr $dnat_addr.*dport $dnat_port" || true; } | \
+                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+            for h in $post_handles; do
+                nft delete rule $NFT_TABLE postrouting handle "$h" 2>/dev/null && ((deleted++)) || true
+            done
+        fi
+    done <<< "$prerouting_lines"
+
+    # Step 3: Delete input chain rules matching dport $port (with protocol filter)
+    local input_handles
+    case "$proto" in
+        tcp)
+            input_handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                { grep -E "(ip protocol tcp|ip6 nexthdr tcp).*dport $port\b" || true; } | \
+                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+            ;;
+        udp)
+            input_handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                { grep -E "(ip protocol udp|ip6 nexthdr udp).*dport $port\b" || true; } | \
+                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+            ;;
+        both)
+            input_handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                { grep -E "dport $port\b" || true; } | \
+                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+            ;;
+    esac
+    for h in $input_handles; do
+        nft delete rule $NFT_TABLE input handle "$h" 2>/dev/null && ((deleted++)) || true
     done
 
     if (( deleted > 0 )); then
         nft_save
-        msg_ok "Deleted $deleted nftables rule(s) for port $port"
+        local proto_msg=""
+        [[ "$proto" != "both" ]] && proto_msg=" ($proto)"
+        msg_ok "Deleted $deleted nftables rule(s) for port $port$proto_msg"
     else
         msg_warn "No nftables rules found for port $port"
     fi
@@ -815,7 +997,7 @@ RESTORE_EOF
     cat > "$NFT_RESTORE_SERVICE" << EOF
 [Unit]
 Description=pfwd nftables rules restore
-After=network-online.target nftables.service
+After=network-online.target nftables.service systemd-sysctl.service
 Wants=network-online.target
 
 [Service]
@@ -1019,19 +1201,20 @@ realm_add_endpoint() {
 # realm_delete_endpoint <port> - remove endpoint by local port
 realm_delete_endpoint() {
     local port="$1"
+    local proto="${2:-both}"  # Default: delete all protocols
 
     if [[ ! -f "$REALM_CONFIG" ]]; then
         msg_warn "No realm config found"
         return 0
     fi
 
-    # Use awk to remove the endpoint block matching this port
+    # Use awk to remove the endpoint block matching this port (and protocol if specified)
     # An endpoint block = optional comment line + [[endpoints]] + listen + remote
     # We detect blocks by "listen = ..." containing the port
     local tmp_file
     tmp_file=$(mktemp)
 
-    awk -v port="$port" '
+    awk -v port="$port" -v proto="$proto" '
     BEGIN { skip=0; buf=""; comment="" }
     {
         # Track comment lines before [[endpoints]]
@@ -1071,17 +1254,35 @@ realm_delete_endpoint() {
 
     mv "$tmp_file" "$REALM_CONFIG"
 
-    # Also remove traffic counter rules from nft
+    # Also remove traffic counter rules from nft (with protocol filter)
     if nft list table $NFT_TABLE >/dev/null 2>&1; then
         local handles
-        handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | { grep -E "dport $port\b" || true; } | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+        case "$proto" in
+            tcp)
+                handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                    { grep -E "(ip protocol tcp|ip6 nexthdr tcp).*dport $port\b" || true; } | \
+                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+                ;;
+            udp)
+                handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                    { grep -E "(ip protocol udp|ip6 nexthdr udp).*dport $port\b" || true; } | \
+                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+                ;;
+            both)
+                handles=$(nft -a list chain $NFT_TABLE input 2>/dev/null | \
+                    { grep -E "dport $port\b" || true; } | \
+                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+                ;;
+        esac
         for h in $handles; do
             nft delete rule $NFT_TABLE input handle "$h" 2>/dev/null
         done
     fi
 
     realm_restart_service
-    msg_ok "realm endpoint deleted for port $port"
+    local proto_msg=""
+    [[ "$proto" != "both" ]] && proto_msg=" ($proto)"
+    msg_ok "realm endpoint deleted for port $port$proto_msg"
 }
 
 # realm_list_endpoints - display realm endpoints
@@ -1573,11 +1774,32 @@ Examples (legacy syntax):
 
 Other:
   pfwd del -m nft 3389
+  pfwd del -m nft --tcp 8080
+  pfwd del -m nft --udp 8080
+  pfwd del -m nft 8080-8088
+  pfwd del -m nft 80,443,8080-8082
   pfwd del -m realm 3389
   pfwd list
   pfwd stats
   pfwd export ~/backup.json
   pfwd import ~/backup.json -m nft
+
+Delete options:
+  pfwd del -m <method> [--tcp|--udp|--both] <port|port-range|port1,port2,...>
+      Delete forwarding rule(s)
+
+      Options:
+        -m, --method <nft|realm>  Forwarding method
+        --tcp                     Delete only TCP rules
+        --udp                     Delete only UDP rules
+        --both                    Delete both TCP and UDP rules (default)
+
+      Examples:
+        pfwd del -m nft 3389                    # Delete all rules for port 3389
+        pfwd del -m nft --tcp 8080             # Delete only TCP rule for 8080
+        pfwd del -m nft --udp 8080             # Delete only UDP rule for 8080
+        pfwd del -m nft 8080-8088             # Delete ports 8080 and 8088
+        pfwd del -m nft 80,443,8080-8082        # Delete multiple ports and ranges
 EOF
 }
 
@@ -1701,11 +1923,14 @@ cmd_add() {
 
 # cmd_delete - delete forwarding rules
 cmd_delete() {
-    local method="" ports_str=""
+    local method="" ports_str="" proto="both"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -m|--method) method="$2"; shift 2 ;;
+            --tcp)       proto="tcp"; shift ;;
+            --udp)       proto="udp"; shift ;;
+            --both)      proto="both"; shift ;;
             -q|--quiet)  QUIET=true; shift ;;
             -*)          msg_err "Unknown option: $1"; return 1 ;;
             *)           ports_str="$1"; shift ;;
@@ -1722,19 +1947,34 @@ cmd_delete() {
         return 1
     fi
 
-    IFS=',' read -ra ports_arr <<< "$ports_str"
-    for port in "${ports_arr[@]}"; do
-        if ! validate_port "$port"; then
-            msg_err "Invalid port: $port"
+    # Parse port list (comma-separated, with range support)
+    IFS=',' read -ra port_specs <<< "$ports_str"
+    local all_ports=()
+
+    for spec in "${port_specs[@]}"; do
+        spec="${spec//[[:space:]]/}"  # Remove whitespace
+        [[ -z "$spec" ]] && continue
+        # Expand port range
+        local expanded
+        if ! expanded=$(expand_port_range "$spec"); then
             continue
         fi
+        all_ports+=($expanded)
+    done
 
+    if (( ${#all_ports[@]} == 0 )); then
+        msg_err "No valid ports found"
+        return 1
+    fi
+
+    # Delete ports
+    for port in "${all_ports[@]}"; do
         case "$method" in
             nft|nftables)
-                nft_delete_port "$port"
+                nft_delete_port "$port" "$proto"
                 ;;
             realm)
-                realm_delete_endpoint "$port"
+                realm_delete_endpoint "$port" "$proto"
                 ;;
             *)
                 msg_err "Unknown method: $method"
@@ -2265,8 +2505,30 @@ menu_delete_rule() {
         *) msg_err "Invalid choice"; wait_for_enter; return ;;
     esac
 
+    # Protocol selection (nftables only)
+    local proto="both"
+    if [[ "$method" == "nft" ]]; then
+        echo ""
+        echo "  1) TCP only"
+        echo "  2) UDP only"
+        echo "  3) Both TCP and UDP (default)"
+        echo "  0) Back"
+        echo ""
+        read -rp "Protocol [3]: " proto_choice
+        proto_choice=${proto_choice:-3}
+
+        case "$proto_choice" in
+            1) proto="tcp" ;;
+            2) proto="udp" ;;
+            3) proto="both" ;;
+            0) return ;;
+            *) proto="both" ;;
+        esac
+    fi
+
     echo ""
-    echo "Enter port(s) to delete (comma-separated, empty to cancel)"
+    echo "Enter port(s) to delete (comma-separated, ranges supported, empty to cancel)"
+    echo -e "  ${DIM}Examples: 80  or  80,443  or  8080-8090  or  80,8080-8090${NC}"
     read -rp "Port(s): " ports_str
 
     if [[ -z "$ports_str" ]]; then
@@ -2274,17 +2536,26 @@ menu_delete_rule() {
         return
     fi
 
-    IFS=',' read -ra ports_arr <<< "$ports_str"
-    for port in "${ports_arr[@]}"; do
-        port="${port//[[:space:]]/}"
-        if ! validate_port "$port"; then
-            msg_err "Invalid port: $port"
+    # Parse port list (comma-separated, with range support)
+    IFS=',' read -ra port_specs <<< "$ports_str"
+    local all_ports=()
+
+    for spec in "${port_specs[@]}"; do
+        spec="${spec//[[:space:]]/}"  # Remove whitespace
+        [[ -z "$spec" ]] && continue
+        # Expand port range
+        local expanded
+        if ! expanded=$(expand_port_range "$spec"); then
             continue
         fi
+        all_ports+=($expanded)
+    done
 
+    # Delete ports
+    for port in "${all_ports[@]}"; do
         case "$method" in
-            nft)   nft_delete_port "$port" ;;
-            realm) realm_delete_endpoint "$port" ;;
+            nft)   nft_delete_port "$port" "$proto" ;;
+            realm) realm_delete_endpoint "$port" "$proto" ;;
         esac
     done
 
