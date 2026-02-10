@@ -249,7 +249,7 @@ detect_local_network() {
     LOCAL_IPV6_TYPE=""
 
     # Detect IPv4
-    LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+    LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1) || true
     if [ -n "$LOCAL_IPV4" ]; then
         LOCAL_HAS_IPV4=true
         # Private address detection: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 (CGNAT)
@@ -264,7 +264,7 @@ detect_local_network() {
     fi
 
     # Detect IPv6
-    LOCAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+    LOCAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1) || true
     if [ -n "$LOCAL_IPV6" ]; then
         LOCAL_HAS_IPV6=true
         # Private address detection: fc00::/7 ULA, fe80::/10 link-local
