@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.2"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -2495,7 +2495,7 @@ parse_cli_args() {
 #===============================================================================
 
 show_header() {
-    clear
+    clear 2>/dev/null || true
 
     # Count rules (cache nft output to avoid duplicate calls)
     local nft_count=0
