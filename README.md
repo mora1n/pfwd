@@ -6,6 +6,11 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **realm forwarding** for domain-based targets and userspace proxying
+- **Smart download system** with GitHub mirror support for improved reliability (especially in China)
+- **Port availability check** to prevent conflicts before adding rules
+- **Network environment detection** showing IPv4/IPv6 status and public/private classification
+- **Enhanced input prompts** with clear examples and formatting
+- **Dual backup system** for nftables rules (main config + timestamped backups)
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
 - **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
 - **CLI + Interactive menu** interface
@@ -175,6 +180,9 @@ Install realm: `pfwd install`
 | Feature | Description |
 |---------|-------------|
 | **Flowtable fast path** | Established connections offloaded to ingress, bypassing netfilter |
+| **Smart download** | Multiple GitHub mirrors with automatic fallback for reliable downloads |
+| **Port conflict prevention** | Pre-flight checks to avoid configuration errors |
+| **Network awareness** | Auto-detects IPv4/IPv6, public/private networks for better UX |
 | **BBR congestion control** | Optimized for throughput |
 | **TCP fast open** | Reduced connection latency |
 | **Conntrack tuning** | 1M max connections, optimized timeouts |
@@ -187,6 +195,7 @@ Install realm: `pfwd install`
 |------|---------|
 | `/etc/modules-load.d/nf_flow_table.conf` | nf_flow_table module auto-persistence |
 | `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
+| `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5 kept) |
 | `/etc/realm/config.toml` | realm configuration |
 | `/etc/systemd/system/realm-forward.service` | realm systemd service |
 | `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore |

@@ -49,6 +49,16 @@ readonly NC='\033[0m'
 # Quiet mode flag
 QUIET=false
 
+# GitHub mirrors for smart download (China acceleration)
+GITHUB_MIRRORS=(
+    "https://ghproxy.com/"
+    "https://mirror.ghproxy.com/"
+    "https://gh.ddlc.top/"
+    "https://github.moeyy.xyz/"
+    "https://gh-proxy.com/"
+    ""  # Direct connection (last resort)
+)
+
 #===============================================================================
 #  Section 2: Utility Functions
 #===============================================================================
@@ -70,6 +80,263 @@ msg_dim()   { $QUIET || echo -e "${DIM}$*${NC}"; }
 wait_for_enter() {
     echo ""
     read -rp "Press Enter to return to main menu..."
+}
+
+# smart_download <url> <output_path> [timeout] - Smart download with GitHub mirror support
+# Auto-detects GitHub URLs and tries multiple mirror sources to improve download success rate
+smart_download() {
+    local original_url="$1"
+    local output_path="$2"
+    local timeout=${3:-15}
+
+    # Detect if it's a GitHub URL
+    local is_github=false
+    [[ "$original_url" =~ github\.com|githubusercontent\.com|github\.io ]] && is_github=true
+
+    # Non-GitHub URL: direct download
+    if [ "$is_github" = false ]; then
+        if command -v wget >/dev/null 2>&1; then
+            wget -q --timeout="$timeout" -O "$output_path" "$original_url" 2>/dev/null && return 0
+        fi
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL --connect-timeout "$timeout" --max-time 60 -o "$output_path" "$original_url" 2>/dev/null && return 0
+        fi
+        return 1
+    fi
+
+    # GitHub URL - try multiple mirror sources
+    for mirror in "${GITHUB_MIRRORS[@]}"; do
+        local download_url
+        local try_timeout
+        if [ -z "$mirror" ]; then
+            download_url="$original_url"
+            try_timeout=8
+        else
+            download_url="${mirror}${original_url}"
+            try_timeout="$timeout"
+        fi
+
+        msg_dim "  Trying: ${download_url}"
+        rm -f "$output_path" 2>/dev/null
+
+        # wget preferred
+        if command -v wget >/dev/null 2>&1; then
+            if wget --timeout="$try_timeout" --tries=1 -q -O "$output_path" "$download_url" 2>/dev/null; then
+                if [ -f "$output_path" ] && [ -s "$output_path" ]; then
+                    local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
+                    if [ "$fsize" -gt 1024 ]; then
+                        [ -n "$mirror" ] && msg_ok "Downloaded via mirror successfully"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+
+        # wget 失败，尝试 curl
+        rm -f "$output_path" 2>/dev/null
+        if command -v curl >/dev/null 2>&1; then
+            if timeout $((try_timeout + 10)) curl -sL --connect-timeout "$try_timeout" -o "$output_path" "$download_url" 2>/dev/null; then
+                if [ -f "$output_path" ] && [ -s "$output_path" ]; then
+                    local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
+                    if [ "$fsize" -gt 1024 ]; then
+                        [ -n "$mirror" ] && msg_ok "Downloaded via mirror successfully"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+
+        msg_dim "  Failed, trying next..."
+    done
+
+    rm -f "$output_path" 2>/dev/null
+    msg_err "All download sources failed"
+    return 1
+}
+
+# smart_api_get <url> [timeout] - Smart API request
+# For GitHub API requests with automatic timeout and error handling
+smart_api_get() {
+    local original_url="$1"
+    local timeout=${2:-10}
+    local result=""
+
+    # wget preferred
+    if command -v wget >/dev/null 2>&1; then
+        result=$(wget --timeout="$timeout" --tries=2 -qO- "$original_url" 2>/dev/null)
+        if [ -n "$result" ] && [[ "$result" != *"rate limit"* ]] && [[ "$result" == *"tag_name"* || "$result" == *"{"* ]]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+
+    # curl fallback
+    if command -v curl >/dev/null 2>&1; then
+        result=$(curl -s --connect-timeout "$timeout" --max-time $((timeout + 5)) "$original_url" 2>/dev/null)
+        if [ -n "$result" ] && [[ "$result" != *"rate limit"* ]]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+
+    echo "$result"
+    return 1
+}
+
+# check_port_in_use <port> [proto] - Check if port is in use
+# proto: tcp/udp/both (default: tcp)
+# Returns: 0=not in use, 1=in use
+check_port_in_use() {
+    local port=$1
+    local proto=${2:-tcp}
+
+    # Check TCP port
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        if command -v ss >/dev/null 2>&1; then
+            if ss -tuln 2>/dev/null | grep -q ":$port "; then
+                msg_warn "Port $port (TCP) is already in use"
+                # Try to show process info
+                if command -v ss >/dev/null 2>&1; then
+                    local process_info=$(ss -tlnp 2>/dev/null | grep ":$port " | head -1)
+                    if [[ -n "$process_info" ]]; then
+                        msg_dim "  Process: $process_info"
+                    fi
+                fi
+                read -rp "Continue adding rule anyway? [y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+            fi
+        elif command -v netstat >/dev/null 2>&1; then
+            if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+                msg_warn "Port $port (TCP) is already in use"
+                read -rp "Continue adding rule anyway? [y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+            fi
+        fi
+    fi
+
+    # Check UDP port
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        if command -v ss >/dev/null 2>&1; then
+            if ss -uln 2>/dev/null | grep -q ":$port "; then
+                msg_warn "Port $port (UDP) is already in use"
+                local process_info=$(ss -ulnp 2>/dev/null | grep ":$port " | head -1)
+                if [[ -n "$process_info" ]]; then
+                    msg_dim "  Process: $process_info"
+                fi
+                read -rp "Continue adding rule anyway? [y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+            fi
+        elif command -v netstat >/dev/null 2>&1; then
+            if netstat -uln 2>/dev/null | grep -q ":$port "; then
+                msg_warn "Port $port (UDP) is already in use"
+                read -rp "Continue adding rule anyway? [y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# detect_local_network - Detect local network environment
+# Sets global variables: LOCAL_HAS_IPV4, LOCAL_HAS_IPV6, LOCAL_IPV4, LOCAL_IPV6, LOCAL_IPV4_TYPE, LOCAL_IPV6_TYPE
+detect_local_network() {
+    LOCAL_HAS_IPV4=false
+    LOCAL_HAS_IPV6=false
+    LOCAL_IPV4=""
+    LOCAL_IPV6=""
+    LOCAL_IPV4_TYPE=""
+    LOCAL_IPV6_TYPE=""
+
+    # Detect IPv4
+    LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+    if [ -n "$LOCAL_IPV4" ]; then
+        LOCAL_HAS_IPV4=true
+        # Private address detection: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 (CGNAT)
+        if [[ "$LOCAL_IPV4" =~ ^10\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^192\.168\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]]; then
+            LOCAL_IPV4_TYPE="private"
+        else
+            LOCAL_IPV4_TYPE="public"
+        fi
+    fi
+
+    # Detect IPv6
+    LOCAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+    if [ -n "$LOCAL_IPV6" ]; then
+        LOCAL_HAS_IPV6=true
+        # Private address detection: fc00::/7 ULA, fe80::/10 link-local
+        if [[ "$LOCAL_IPV6" =~ ^[fF][cCdD] ]] || [[ "$LOCAL_IPV6" =~ ^[fF][eE][89aAbB] ]]; then
+            LOCAL_IPV6_TYPE="private"
+        else
+            LOCAL_IPV6_TYPE="public"
+        fi
+    fi
+}
+
+# detect_script_path - Detect script path
+# Sets global variable: SCRIPT_PATH
+detect_script_path() {
+    # If $0 is an executable regular file, use it directly
+    if [[ -f "$0" && -x "$0" && ! "$0" =~ ^/dev/fd/ && ! "$0" =~ ^/proc/ ]]; then
+        SCRIPT_PATH="$0"
+        return 0
+    fi
+
+    # Check if shortcut command exists
+    if [[ -x "$SHORTCUT_LINK" ]]; then
+        SCRIPT_PATH="$SHORTCUT_LINK"
+        return 0
+    fi
+
+    # Check other possible installation paths
+    for path in "$INSTALLED_SCRIPT" "/usr/bin/pfwd" "/usr/bin/pfwd.sh"; do
+        if [[ -x "$path" ]]; then
+            SCRIPT_PATH="$path"
+            return 0
+        fi
+    done
+
+    # Running via process substitution, cannot exec $0 directly
+    if [[ "$0" =~ ^/dev/fd/ || "$0" =~ ^/proc/ ]]; then
+        SCRIPT_PATH=""
+        USE_LOOP_MENU=true
+        return 1
+    fi
+
+    SCRIPT_PATH=""
+    return 1
+}
+
+# ensure_script_installed - Ensure script is installed locally
+# Called once at script start to support exec restart
+ensure_script_installed() {
+    detect_script_path
+
+    # If script is already installed, no action needed
+    if [[ -n "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]]; then
+        return 0
+    fi
+
+    # Running via process substitution, set flag to use loop menu
+    SCRIPT_PATH=""
+    USE_LOOP_MENU=true
+    return 1
+}
+
+# return_to_main_menu - Return to main menu
+# Alternative to exec $0, solves exec $0 failure when running via bash <(curl ...)
+return_to_main_menu() {
+    # If valid script path exists, use exec to restart
+    if [[ -n "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]]; then
+        exec "$SCRIPT_PATH"
+    fi
+
+    # No valid path, set flag to continue main loop
+    RETURN_TO_MENU=true
+    return 0
 }
 
 # detect_ip_type <address> -> "ipv4" | "ipv6" | "domain" | "unknown"
@@ -660,6 +927,12 @@ nft_add_rule() {
 
     nft_ensure_table || return 1
 
+    # Check port availability
+    if ! check_port_in_use "$lport" "$proto"; then
+        msg_info "Cancelled"
+        return 1
+    fi
+
     local target_type
     target_type=$(detect_ip_type "$target")
 
@@ -942,7 +1215,17 @@ nft_get_traffic() {
 nft_save() {
     mkdir -p "$(dirname "$NFT_CONFIG")"
     nft list table $NFT_TABLE > "$NFT_CONFIG" 2>/dev/null || true
-    msg_dim "  Rules saved to $NFT_CONFIG"
+
+    # Dual backup: main config + backup directory
+    local backup_dir="/root/.pfwd_backup"
+    mkdir -p "$backup_dir"
+    if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
+        cp "$NFT_CONFIG" "$backup_dir/nftables_$(date +%Y%m%d_%H%M%S).nft" 2>/dev/null || true
+        # Keep last 5 backups
+        ls -t "$backup_dir"/nftables_*.nft 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+    fi
+
+    msg_dim "  Rules saved to $NFT_CONFIG (backup: $backup_dir)"
 }
 
 # nft_flush_all - delete entire table and config files
@@ -1043,10 +1326,12 @@ realm_install() {
     local api_url="https://api.github.com/repos/zhboner/realm/releases/latest"
     local download_url=""
 
-    if command -v curl >/dev/null 2>&1; then
-        download_url=$(curl -s "$api_url" 2>/dev/null | awk -v arch="$realm_arch" '/browser_download_url/ && $0 ~ arch && !/\.sha256/ { gsub(/.*"(https:)/, "https:"); gsub(/".*/, ""); print; exit }' || true)
-    elif command -v wget >/dev/null 2>&1; then
-        download_url=$(wget -qO- "$api_url" 2>/dev/null | awk -v arch="$realm_arch" '/browser_download_url/ && $0 ~ arch && !/\.sha256/ { gsub(/.*"(https:)/, "https:"); gsub(/".*/, ""); print; exit }' || true)
+    msg_dim "  Fetching latest version info..."
+    local api_result
+    api_result=$(smart_api_get "$api_url" 10)
+
+    if [[ -n "$api_result" ]]; then
+        download_url=$(echo "$api_result" | awk -v arch="$realm_arch" '/browser_download_url/ && $0 ~ arch && !/\.sha256/ { gsub(/.*"(https:)/, "https:"); gsub(/".*/, ""); print; exit }' || true)
     fi
 
     if [[ -z "$download_url" ]]; then
@@ -1059,15 +1344,11 @@ realm_install() {
     local tmp_file
     tmp_file=$(mktemp)
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -sL -o "$tmp_file" "$download_url"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$tmp_file" "$download_url"
-    fi
-
-    if [[ ! -s "$tmp_file" ]]; then
+    # Use smart download function
+    if ! smart_download "$download_url" "$tmp_file" 15; then
         rm -f "$tmp_file"
         msg_err "Download failed"
+        msg_err "Try manual install from: https://github.com/zhboner/realm/releases"
         return 1
     fi
 
@@ -1159,6 +1440,12 @@ realm_add_endpoint() {
     fi
 
     realm_ensure_config
+
+    # Check port availability (realm supports TCP+UDP, check both)
+    if ! check_port_in_use "$lport" "both"; then
+        msg_info "Cancelled"
+        return 1
+    fi
 
     # Check for duplicate realm endpoint — replace if exists
     if [[ -f "$REALM_CONFIG" ]] && grep -q "listen = \".*:${lport}\"" "$REALM_CONFIG" 2>/dev/null; then
@@ -2231,19 +2518,28 @@ show_header() {
     fi
 
     # Detect network
-    local has_v4=false has_v6=false net_info
-    if ip -4 addr show scope global 2>/dev/null | grep -q inet; then
-        has_v4=true
-    fi
-    if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
-        has_v6=true
-    fi
-    if $has_v4 && $has_v6; then
-        net_info="${GREEN}IPv4+IPv6${NC}"
-    elif $has_v4; then
-        net_info="${GREEN}IPv4${NC}"
-    elif $has_v6; then
-        net_info="${CYAN}IPv6 only${NC}"
+    detect_local_network
+    local net_info=""
+    if $LOCAL_HAS_IPV4 && $LOCAL_HAS_IPV6; then
+        local v4_label="${GREEN}IPv4${NC}"
+        local v6_label="${GREEN}IPv6${NC}"
+        [[ "$LOCAL_IPV4_TYPE" == "private" ]] && v4_label="${YELLOW}IPv4(private)${NC}"
+        [[ "$LOCAL_IPV6_TYPE" == "private" ]] && v6_label="${YELLOW}IPv6(private)${NC}"
+        [[ "$LOCAL_IPV4_TYPE" == "public" ]] && v4_label="${GREEN}IPv4(public)${NC}"
+        [[ "$LOCAL_IPV6_TYPE" == "public" ]] && v6_label="${GREEN}IPv6(public)${NC}"
+        net_info="${v4_label} + ${v6_label}"
+    elif $LOCAL_HAS_IPV4; then
+        if [[ "$LOCAL_IPV4_TYPE" == "private" ]]; then
+            net_info="${YELLOW}IPv4(private)${NC}"
+        else
+            net_info="${GREEN}IPv4(public)${NC}"
+        fi
+    elif $LOCAL_HAS_IPV6; then
+        if [[ "$LOCAL_IPV6_TYPE" == "private" ]]; then
+            net_info="${YELLOW}IPv6(private)${NC}"
+        else
+            net_info="${CYAN}IPv6(public)${NC}"
+        fi
     else
         net_info="${RED}No public IP${NC}"
     fi
@@ -2371,10 +2667,10 @@ menu_add_rule() {
 
     # 4. Target IP/domain
     echo ""
-    echo -e "Enter target IP address or domain (empty to cancel):"
-    echo -e "  ${DIM}IPv4: 1.2.3.4${NC}"
-    echo -e "  ${DIM}IPv6: 2001:db8::1${NC}"
-    echo -e "  ${DIM}Domain: example.com${NC}"
+    echo -e "${BOLD}Enter target IP address or domain (empty to cancel):${NC}"
+    echo -e "  ${DIM}IPv4:   ${BOLD}1.2.3.4${NC}"
+    echo -e "  ${DIM}IPv6:   ${BOLD}2001:db8::1${NC}"
+    echo -e "  ${DIM}Domain: ${BOLD}example.com${NC}"
     echo ""
     local target=""
     read -rp "Target: " target
@@ -2397,13 +2693,13 @@ menu_add_rule() {
 
     # 5. Port config (simplified input)
     echo ""
-    echo -e "Enter port(s) to forward (empty to cancel):"
-    echo -e "  ${DIM}Single port:    80${NC}"
-    echo -e "  ${DIM}Multiple ports: 80,443${NC}"
-    echo -e "  ${DIM}Port range:     8080-8090${NC}"
-    echo -e "  ${DIM}Port mapping:   33389:3389${NC}"
-    echo -e "  ${DIM}Range mapping:  8080-8090:3080-3090${NC}"
-    echo -e "  ${DIM}Mixed:          80,443,8080-8090,33389:3389${NC}"
+    echo -e "${BOLD}Enter port(s) to forward (empty to cancel):${NC}"
+    echo -e "  ${DIM}Single:        ${BOLD}80${NC}"
+    echo -e "  ${DIM}Multiple:      ${BOLD}80,443${NC}"
+    echo -e "  ${DIM}Range:         ${BOLD}8080-8090${NC}"
+    echo -e "  ${DIM}Mapping:       ${BOLD}33389:3389${NC}"
+    echo -e "  ${DIM}Range mapping: ${BOLD}8080-8090:3080-3090${NC}"
+    echo -e "  ${DIM}Mixed:         ${BOLD}80,443,8080-8090,33389:3389${NC}"
     echo ""
     local port_spec=""
     read -rp "Port(s): " port_spec
@@ -2706,6 +3002,12 @@ menu_uninstall() {
 #  Section 11: Main Entry
 #===============================================================================
 
+# Initialize script path detection
+SCRIPT_PATH=""
+USE_LOOP_MENU=false
+RETURN_TO_MENU=false
+
 require_root "$@"
 ensure_shortcut
+ensure_script_installed
 parse_cli_args "$@"
