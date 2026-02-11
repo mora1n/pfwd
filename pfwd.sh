@@ -919,11 +919,12 @@ nft_rule_exists() {
     nft list chain $NFT_TABLE prerouting 2>/dev/null | grep -q "$ip_match.*dport $lport.*dnat"
 }
 
-# nft_add_rule <lport> <target> <tport> <ip_ver> <proto>
+# nft_add_rule <lport> <target> <tport> <ip_ver> <proto> <comment>
 # ip_ver: 4, 6, or 46
 # proto: tcp, udp, or both
+# comment: optional comment for the rule
 nft_add_rule() {
-    local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}"
+    local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}" comment="${6:-}"
 
     nft_ensure_table || return 1
 
@@ -975,8 +976,20 @@ nft_add_rule() {
                     msg_info "Replacing existing IPv4 $p rule for port $lport"
                     nft_delete_port "$lport"
                 fi
-                if nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
-                   nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1; then
+
+                # Add rules with optional comment
+                local nft_result=0
+                if [[ -n "$comment" ]]; then
+                    nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" comment '"'"$comment"'"' 2>&1 && \
+                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
+                    nft_result=$?
+                else
+                    nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
+                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1
+                    nft_result=$?
+                fi
+
+                if (( nft_result == 0 )); then
                     msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
                     ((added++)) || true
                 else
@@ -1010,8 +1023,20 @@ nft_add_rule() {
                     msg_info "Replacing existing IPv6 $p rule for port $lport"
                     nft_delete_port "$lport"
                 fi
-                if nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
-                   nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1; then
+
+                # Add rules with optional comment
+                local nft_result6=0
+                if [[ -n "$comment" ]]; then
+                    nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" comment '"'"$comment"'"' 2>&1 && \
+                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
+                    nft_result6=$?
+                else
+                    nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
+                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1
+                    nft_result6=$?
+                fi
+
+                if (( nft_result6 == 0 )); then
                     msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
                     ((added++)) || true
                 else
@@ -1164,10 +1189,12 @@ nft_list_rules() {
     fi
 
     echo -e "${CYAN}nftables forwarding rules:${NC}"
-    printf "  ${BOLD}%-8s %-6s %-6s %-30s %s${NC}\n" "L.Port" "Proto" "IPver" "Target" "Traffic"
+    printf "  ${BOLD}%-8s %-6s %-6s %-30s %-20s %s${NC}\n" "L.Port" "Proto" "IPver" "Target" "Comment" "Traffic"
 
+    # Collect all rules into a sortable format
+    local rule_data=""
     while IFS= read -r line; do
-        local lport="" target="" proto="" ipver="" bytes=""
+        local lport="" target="" proto="" ipver="" bytes="" comment=""
 
         # Extract protocol
         if [[ "$line" =~ "ip protocol tcp" ]]; then
@@ -1197,10 +1224,28 @@ nft_list_rules() {
             bytes="${BASH_REMATCH[1]}"
         fi
 
-        local traffic
-        traffic=$(format_bytes "${bytes:-0}")
-        printf "  %-8s %-6s %-6s %-30s %s\n" ":$lport" "$proto" "IPv$ipver" "$target" "$traffic"
+        # Extract comment
+        if [[ "$line" =~ comment\ \"([^\"]+)\" ]]; then
+            comment="${BASH_REMATCH[1]}"
+        fi
+
+        # Add to rule_data: proto|port|ipver|target|comment|bytes
+        if [[ -n "$lport" && -n "$proto" ]]; then
+            rule_data+="${proto}|${lport}|${ipver}|${target}|${comment}|${bytes:-0}"$'\n'
+        fi
     done <<< "$rules"
+
+    # Sort by protocol (tcp first) and then by port number
+    local sorted_rules
+    sorted_rules=$(echo "$rule_data" | sort -t'|' -k1,1 -k2,2n)
+
+    # Display sorted rules
+    while IFS='|' read -r proto lport ipver target comment bytes; do
+        [[ -z "$lport" ]] && continue
+        local traffic
+        traffic=$(format_bytes "$bytes")
+        printf "  %-8s %-6s %-6s %-30s %-20s %s\n" ":$lport" "$proto" "IPv$ipver" "$target" "${comment:--}" "$traffic"
+    done <<< "$sorted_rules"
 }
 
 # nft_get_traffic <port> - get traffic bytes for a port
@@ -1616,6 +1661,8 @@ realm_list_endpoints() {
     echo -e "  Service: $svc_status"
     printf "  ${BOLD}%-25s %-30s %-15s %s${NC}\n" "Listen" "Remote" "Comment" "Traffic"
 
+    # Collect endpoints with port numbers for sorting
+    local endpoint_data=""
     while IFS='|' read -r listen remote comment; do
         # Extract port from listen address
         local lport
@@ -1625,11 +1672,22 @@ realm_list_endpoints() {
         if nft list table $NFT_TABLE >/dev/null 2>&1; then
             traffic_bytes=$(nft list chain $NFT_TABLE input 2>/dev/null | { grep -E "dport $lport\b.*counter" || true; } | grep -oE 'bytes [0-9]+' | awk '{sum+=$2} END{print sum+0}')
         fi
-        local traffic
-        traffic=$(format_bytes "${traffic_bytes:-0}")
 
-        printf "  %-25s %-30s %-15s %s\n" "$listen" "$remote" "${comment:--}" "$traffic"
+        # Add to endpoint_data: port|listen|remote|comment|traffic_bytes
+        endpoint_data+="${lport}|${listen}|${remote}|${comment}|${traffic_bytes:-0}"$'\n'
     done <<< "$endpoints"
+
+    # Sort by port number
+    local sorted_endpoints
+    sorted_endpoints=$(echo "$endpoint_data" | sort -t'|' -k1,1n)
+
+    # Display sorted endpoints
+    while IFS='|' read -r lport listen remote comment traffic_bytes; do
+        [[ -z "$lport" ]] && continue
+        local traffic
+        traffic=$(format_bytes "$traffic_bytes")
+        printf "  %-25s %-30s %-15s %s\n" "$listen" "$remote" "${comment:--}" "$traffic"
+    done <<< "$sorted_endpoints"
 }
 
 # realm_restart_service - restart realm service
@@ -1781,7 +1839,7 @@ cmd_export() {
 
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            local lport="" target="" tport="" proto="" ipver=""
+            local lport="" target="" tport="" proto="" ipver="" comment=""
 
             if [[ "$line" =~ "ip protocol tcp" ]]; then proto="tcp"; ipver="4"
             elif [[ "$line" =~ "ip protocol udp" ]]; then proto="udp"; ipver="4"
@@ -1799,6 +1857,11 @@ cmd_export() {
                 tport="${BASH_REMATCH[2]}"
             fi
 
+            # Extract comment
+            if [[ "$line" =~ comment\ \"([^\"]+)\" ]]; then
+                comment="${BASH_REMATCH[1]}"
+            fi
+
             if [[ -n "$lport" && -n "$target" && -n "$tport" ]]; then
                 export_data=$(echo "$export_data" | jq \
                     --arg type "nftables" \
@@ -1807,13 +1870,15 @@ cmd_export() {
                     --arg target_port "$tport" \
                     --arg protocol "$proto" \
                     --arg ip_ver "$ipver" \
+                    --arg comment "$comment" \
                     '.forward_rules += [{
                         type: $type,
                         local_port: $local_port,
                         target_ip: $target_ip,
                         target_port: $target_port,
                         protocol: $protocol,
-                        ip_ver: $ip_ver
+                        ip_ver: $ip_ver,
+                        comment: $comment
                     }]')
             fi
         done <<< "$nft_rules"
@@ -1959,7 +2024,7 @@ cmd_import() {
 
         case "$method" in
             nftables|nft)
-                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto"; then
+                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" "$comment"; then
                     ((imported++)) || true
                 else
                     msg_warn "Failed to import nft rule :$lport -> $target:$tport"
@@ -2032,7 +2097,7 @@ Options:
   --tcp                      TCP only (default)
   --udp                      UDP only
   --both                     TCP + UDP
-  -c, --comment <text>       Comment (realm only)
+  -c, --comment <text>       Add comment to rule
   -q, --quiet                Quiet mode
 
 Port formats (with -t):
@@ -2149,7 +2214,7 @@ cmd_add() {
             fi
             case "$method" in
                 nft|nftables)
-                    if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                    if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
                         ((added++)) || true
                     else
                         ((failed++)) || true
@@ -2181,7 +2246,7 @@ cmd_add() {
                 fi
                 case "$method" in
                     nft|nftables)
-                        if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                        if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
                             ((added++)) || true
                         else
                             ((failed++)) || true
@@ -2709,12 +2774,10 @@ menu_add_rule() {
         return
     fi
 
-    # 6. Comment (realm only)
+    # 6. Comment (both nft and realm)
     local comment=""
-    if [[ "$method" == "realm" ]]; then
-        echo ""
-        read -rp "Comment (optional): " comment
-    fi
+    echo ""
+    read -rp "Comment (optional): " comment
 
     # 7. Confirmation summary
     echo ""
@@ -2754,7 +2817,7 @@ menu_add_rule() {
 
         case "$method" in
             nft)
-                if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto"; then
+                if nft_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
                     ((added++)) || true
                 else
                     ((failed++)) || true
