@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.4.2"
+readonly VERSION="1.5.1"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -1749,6 +1749,8 @@ show_traffic_stats() {
             echo -e "\n${CYAN}nftables forwarding:${NC}"
             printf "  ${BOLD}%-8s %-6s %-6s %-25s %s${NC}\n" "L.Port" "Proto" "IPver" "Target" "Traffic"
 
+            # Collect rules for sorting
+            local rule_data=""
             while IFS= read -r line; do
                 local lport="" target="" proto="" ipver="" bytes=""
 
@@ -1766,10 +1768,22 @@ show_traffic_stats() {
 
                 [[ "$line" =~ bytes\ ([0-9]+) ]] && bytes="${BASH_REMATCH[1]}"
 
-                local traffic
-                traffic=$(format_bytes "${bytes:-0}")
-                printf "  %-8s %-6s %-6s %-25s %s\n" ":$lport" "$proto" "IPv$ipver" "$target" "$traffic"
+                if [[ -n "$lport" && -n "$proto" ]]; then
+                    rule_data+="${proto}|${lport}|${ipver}|${target}|${bytes:-0}"$'\n'
+                fi
             done <<< "$nft_rules"
+
+            # Sort by protocol and port number
+            local sorted_rules
+            sorted_rules=$(echo "$rule_data" | sort -t'|' -k1,1 -k2,2n)
+
+            # Display sorted rules
+            while IFS='|' read -r proto lport ipver target bytes; do
+                [[ -z "$lport" ]] && continue
+                local traffic
+                traffic=$(format_bytes "$bytes")
+                printf "  %-8s %-6s %-6s %-25s %s\n" ":$lport" "$proto" "IPv$ipver" "$target" "$traffic"
+            done <<< "$sorted_rules"
         fi
     fi
 
@@ -1783,6 +1797,8 @@ show_traffic_stats() {
             echo -e "\n${CYAN}realm traffic:${NC}"
             printf "  ${BOLD}%-8s %-6s %s${NC}\n" "L.Port" "Proto" "Traffic"
 
+            # Collect rules for sorting
+            local realm_data=""
             while IFS= read -r line; do
                 local lport="" proto="" bytes=""
 
@@ -1793,10 +1809,22 @@ show_traffic_stats() {
                 [[ "$line" =~ dport\ ([0-9]+) ]] && lport="${BASH_REMATCH[1]}"
                 [[ "$line" =~ bytes\ ([0-9]+) ]] && bytes="${BASH_REMATCH[1]}"
 
-                local traffic
-                traffic=$(format_bytes "${bytes:-0}")
-                printf "  %-8s %-6s %s\n" ":$lport" "$proto" "$traffic"
+                if [[ -n "$lport" && -n "$proto" ]]; then
+                    realm_data+="${proto}|${lport}|${bytes:-0}"$'\n'
+                fi
             done <<< "$input_rules"
+
+            # Sort by protocol and port number
+            local sorted_realm
+            sorted_realm=$(echo "$realm_data" | sort -t'|' -k1,1 -k2,2n)
+
+            # Display sorted rules
+            while IFS='|' read -r proto lport bytes; do
+                [[ -z "$lport" ]] && continue
+                local traffic
+                traffic=$(format_bytes "$bytes")
+                printf "  %-8s %-6s %s\n" ":$lport" "$proto" "$traffic"
+            done <<< "$sorted_realm"
         fi
     fi
 
