@@ -1091,6 +1091,7 @@ _batch_finalize() {
 
 # _parse_delete_input <input_str> <total_rules> - parse delete input with prefix support
 # Supports: #N (rule number), pN (port number), N (auto-detect)
+# Ranges:   #N-#M / #N-M (rule range), pN-pM / pN-M (port range), N-M (port range)
 # Sets: delete_rule_numbers array, delete_port_numbers array
 # Returns: 0 on success, 1 on ambiguity error
 _parse_delete_input() {
@@ -1104,9 +1105,65 @@ _parse_delete_input() {
         item="${item//[[:space:]]/}"
         [[ -z "$item" ]] && continue
 
-        # Check for prefix
-        if [[ "$item" =~ ^#([0-9]+)$ ]]; then
-            # Rule number with # prefix
+        # 1. Rule number range: #N-#M or #N-M
+        if [[ "$item" =~ ^#([0-9]+)-#?([0-9]+)$ ]]; then
+            local rstart="${BASH_REMATCH[1]}" rend="${BASH_REMATCH[2]}"
+            if (( rstart > rend )); then
+                msg_err "Invalid range: #$rstart-#$rend (start > end)"
+                return 1
+            fi
+            if (( rstart < 1 || rend > total_rules )); then
+                msg_err "Rule range #$rstart-#$rend out of bounds (1-$total_rules)"
+                return 1
+            fi
+            if (( rend - rstart + 1 > MAX_PORT_RANGE )); then
+                msg_err "Range too large: $((rend - rstart + 1)) items (max $MAX_PORT_RANGE)"
+                return 1
+            fi
+            for (( r=rstart; r<=rend; r++ )); do
+                delete_rule_numbers+=("$r")
+            done
+
+        # 2. Port range with p prefix: pN-pM or pN-M
+        elif [[ "$item" =~ ^p([0-9]+)-p?([0-9]+)$ ]]; then
+            local pstart="${BASH_REMATCH[1]}" pend="${BASH_REMATCH[2]}"
+            if (( pstart > pend )); then
+                msg_err "Invalid range: p$pstart-p$pend (start > end)"
+                return 1
+            fi
+            if ! validate_port "$pstart" || ! validate_port "$pend"; then
+                msg_err "Port out of range in p$pstart-p$pend (valid: 1-65535)"
+                return 1
+            fi
+            if (( pend - pstart + 1 > MAX_PORT_RANGE )); then
+                msg_err "Port range too large: $((pend - pstart + 1)) ports (max $MAX_PORT_RANGE)"
+                return 1
+            fi
+            for (( p=pstart; p<=pend; p++ )); do
+                delete_port_numbers+=("$p")
+            done
+
+        # 3. Pure numeric range: N-M → port range
+        elif [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local nstart="${BASH_REMATCH[1]}" nend="${BASH_REMATCH[2]}"
+            if (( nstart > nend )); then
+                msg_err "Invalid range: $nstart-$nend (start > end)"
+                return 1
+            fi
+            if ! validate_port "$nstart" || ! validate_port "$nend"; then
+                msg_err "Port out of range in $nstart-$nend (valid: 1-65535)"
+                return 1
+            fi
+            if (( nend - nstart + 1 > MAX_PORT_RANGE )); then
+                msg_err "Port range too large: $((nend - nstart + 1)) ports (max $MAX_PORT_RANGE)"
+                return 1
+            fi
+            for (( p=nstart; p<=nend; p++ )); do
+                delete_port_numbers+=("$p")
+            done
+
+        # 4. Single rule number: #N
+        elif [[ "$item" =~ ^#([0-9]+)$ ]]; then
             local rnum="${BASH_REMATCH[1]}"
             if (( rnum < 1 || rnum > total_rules )); then
                 msg_err "Rule number #$rnum out of range (1-$total_rules)"
@@ -1114,23 +1171,21 @@ _parse_delete_input() {
             fi
             delete_rule_numbers+=("$rnum")
 
+        # 5. Single port with p prefix: pN
         elif [[ "$item" =~ ^p([0-9]+)$ ]]; then
-            # Port number with p prefix
             local port="${BASH_REMATCH[1]}"
             delete_port_numbers+=("$port")
 
+        # 6. Plain number: ambiguity check
         elif [[ "$item" =~ ^[0-9]+$ ]]; then
-            # No prefix - check for ambiguity
             local num="$item"
             if (( num >= 1 && num <= total_rules )); then
-                # Ambiguous: could be rule number or port number
                 msg_err "Input '$num' is ambiguous (could be rule number or port number)"
                 echo -e "${DIM}  Use prefix to specify:${NC}"
                 echo -e "${DIM}    #$num  - delete rule number $num${NC}"
                 echo -e "${DIM}    p$num  - delete port number $num${NC}"
                 return 1
             else
-                # Unambiguous - treat as port number
                 delete_port_numbers+=("$num")
             fi
 
@@ -1663,7 +1718,7 @@ _parse_nft_prerouting_rules() {
         # Extract DNAT target using index() (mawk-compatible, no bracket regex)
         if (match($0, /dnat ip6 to /)) {
             # IPv6: "dnat ip6 to [addr]:port"
-            rest = substr($0, RSTART + 15)  # skip "dnat ip6 to ["
+            rest = substr($0, RSTART + 13)  # skip "dnat ip6 to ["
             p = index(rest, "]:")
             if (p > 0) {
                 target = substr(rest, 1, p - 1)
@@ -1741,7 +1796,7 @@ _parse_nft_bidirectional_traffic() {
         }
         # dnat target (mawk-compatible: avoid bracket regex)
         if (match($0, /dnat ip6 to /)) {
-            rest = substr($0, RSTART + 15)
+            rest = substr($0, RSTART + 13)
             p = index(rest, "]:")
             if (p > 0) {
                 target = substr(rest, 1, p - 1)
@@ -1752,7 +1807,7 @@ _parse_nft_bidirectional_traffic() {
             rest = substr($0, RSTART + 11)
             if (match(rest, /[^ ]+/)) {
                 s = substr(rest, RSTART, RLENGTH)
-                n = split(s, p, ":"); target = p[1]; tport = p[n]
+                n = split(s, da, ":"); target = da[1]; tport = da[n]
             }
         }
         # bytes
@@ -1762,8 +1817,8 @@ _parse_nft_bidirectional_traffic() {
         # comment
         if (match($0, /comment "/)) {
             rest = substr($0, RSTART + 9)
-            p = index(rest, "\"")
-            if (p > 1) comment = substr(rest, 1, p - 1)
+            ci = index(rest, "\"")
+            if (ci > 1) comment = substr(rest, 1, ci - 1)
         }
 
         if (lport != "" && proto != "") {
@@ -1799,7 +1854,7 @@ _parse_nft_bidirectional_traffic() {
             ib = in_bytes[key]
             ob = (key in out_bytes) ? out_bytes[key] : "0"
             total = ib + ob
-            printf "%s|%s|%s|%d|%d|%d\n", key, info[key], ib, ob, total
+            printf "%s|%s|%d|%d|%d\n", key, info[key], ib, ob, total
         }
     }
     '
@@ -2418,7 +2473,7 @@ show_traffic_stats() {
             has_rules=true
             echo -e "\n${CYAN}nftables forwarding:${NC}"
             echo -e "  ${DIM}┌────────┬──────┬──────┬─────────────────────────┬────────────┬────────────┬────────────┐${NC}"
-            printf "  ${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-25s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}\n" " L.Port" " Proto" " IPvr" " Target" " Inbound ↓" " Outbound ↑" " Total"
+            printf "  ${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-25s${NC}${DIM}│${NC}${BOLD}%-14s${NC}${DIM}│${NC}${BOLD}%-14s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}\n" " L.Port" " Proto" " IPvr" " Target" " Inbound ↓" " Outbound ↑" " Total"
             echo -e "  ${DIM}├────────┼──────┼──────┼─────────────────────────┼────────────┼────────────┼────────────┤${NC}"
 
             # Sort by protocol and port number
@@ -3704,8 +3759,8 @@ menu_delete_rule() {
     local proto="both"
 
     echo "Enter rule number(s) or port number(s) to delete (empty to cancel)"
-    echo -e "  ${DIM}Format: #1 (rule), p80 (port), or 80 (port if unambiguous)${NC}"
-    echo -e "  ${DIM}Examples: #1,#3  or  p80,p443  or  80,443  or  #1,p80${NC}"
+    echo -e "  ${DIM}Format: #1 (rule), #1-#5 (range), p80 (port), 80-90 (port range)${NC}"
+    echo -e "  ${DIM}Examples: #1-#5  or  p8000-8010  or  #1,p80,90-99${NC}"
     read -rp "Selection: " input_str
 
     if [[ -z "$input_str" ]]; then
@@ -3720,26 +3775,39 @@ menu_delete_rule() {
         return
     fi
 
+    # Determine if any nft rules are involved (need protocol selection)
+    local has_nft=false
+
+    if (( ${#delete_rule_numbers[@]} > 0 )); then
+        for rnum in "${delete_rule_numbers[@]}"; do
+            local ri=$((rnum - 1))
+            if [[ "${rule_methods[$ri]}" == "nft" ]]; then
+                has_nft=true
+                break
+            fi
+        done
+    fi
+
+    # Ask protocol upfront if any nft deletion is needed
+    if [[ "$has_nft" == true ]] || (( ${#delete_port_numbers[@]} > 0 )); then
+        echo ""
+        echo "  1) TCP only"
+        echo "  2) UDP only"
+        echo "  3) Both TCP and UDP (default)"
+        echo ""
+        read -rp "Protocol [3]: " proto_choice
+        proto_choice=${proto_choice:-3}
+        case "$proto_choice" in
+            1) proto="tcp" ;; 2) proto="udp" ;; *) proto="both" ;;
+        esac
+    fi
+
     # Process rule numbers
     if (( ${#delete_rule_numbers[@]} > 0 )); then
         for rnum in "${delete_rule_numbers[@]}"; do
             local ri=$((rnum - 1))
             local method="${rule_methods[$ri]}"
             local port="${rule_ports[$ri]}"
-
-            # Ask protocol for nft if not already asked
-            if [[ "$method" == "nft" && "$proto" == "both" ]]; then
-                echo ""
-                echo "  1) TCP only"
-                echo "  2) UDP only"
-                echo "  3) Both TCP and UDP (default)"
-                echo ""
-                read -rp "Protocol [3]: " proto_choice
-                proto_choice=${proto_choice:-3}
-                case "$proto_choice" in
-                    1) proto="tcp" ;; 2) proto="udp" ;; *) proto="both" ;;
-                esac
-            fi
 
             case "$method" in
                 nft)   nft_delete_port "$port" "$proto" ;;
@@ -3761,16 +3829,6 @@ menu_delete_rule() {
         case "$method_choice" in
             1) method="nft" ;; 2) method="realm" ;; *) method="nft" ;;
         esac
-
-        if [[ "$method" == "nft" ]]; then
-            echo ""
-            echo "  1) TCP only  2) UDP only  3) Both (default)"
-            read -rp "Protocol [3]: " proto_choice
-            proto_choice=${proto_choice:-3}
-            case "$proto_choice" in
-                1) proto="tcp" ;; 2) proto="udp" ;; *) proto="both" ;;
-            esac
-        fi
 
         for port in "${delete_port_numbers[@]}"; do
             case "$method" in
