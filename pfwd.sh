@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.1"
+readonly VERSION="1.6.2"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -3360,8 +3360,11 @@ menu_add_rule() {
         if ! parse_rule "$expanded"; then
             ((failed++)) || true; continue
         fi
-        _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" && \
-            ((added++)) || ((failed++)) || true
+        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
+            ((added++)) || true
+        else
+            ((failed++)) || true
+        fi
     done
 
     # Batch finalize: save/persist/restart once
