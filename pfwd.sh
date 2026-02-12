@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.2"
+readonly VERSION="1.6.3"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -59,6 +59,18 @@ for _arg in "$@"; do
     esac
 done
 unset _arg
+
+# Magic number constants
+readonly MAX_PORT_RANGE=100        # max ports in a single range expansion
+readonly MAX_BULK_PORTS=500        # max ports in paired range expansion
+readonly NET_CACHE_TTL=30          # network detection cache TTL (seconds)
+readonly MIN_DOWNLOAD_SIZE=1024    # minimum valid download size (bytes)
+
+# Pre-generated separator lines (avoid subshell printf calls)
+readonly SEP_EQ="============================================================"
+readonly SEP_DASH="------------------------------------------------------------"
+readonly SEP_EQ_40="========================================"
+readonly SEP_DASH_40="----------------------------------------"
 
 # Quiet mode flag
 QUIET=false
@@ -126,6 +138,21 @@ msg_warn()  { $QUIET || echo -e "${YELLOW}[WARN]${NC} $*"; }
 msg_err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 msg_dim()   { $QUIET || echo -e "${DIM}$*${NC}"; }
 
+# show_progress <current> <total> [label] - display progress bar
+show_progress() {
+    local current="$1" total="$2" label="${3:-Progress}"
+    local pct=0
+    (( total > 0 )) && pct=$(( current * 100 / total ))
+    local filled=$(( pct / 5 ))       # 20 chars wide
+    local empty=$(( 20 - filled ))
+    local bar=""
+    local i
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "\r  %s: [%s] %d%% (%d/%d)" "$label" "$bar" "$pct" "$current" "$total"
+    (( current == total )) && echo ""
+}
+
 wait_for_enter() {
     echo ""
     read -rp "Press Enter to return to main menu..."
@@ -173,7 +200,7 @@ smart_download() {
             if wget --timeout="$try_timeout" --tries=1 -q -O "$output_path" "$download_url" 2>/dev/null; then
                 if [ -f "$output_path" ] && [ -s "$output_path" ]; then
                     local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
-                    if [ "$fsize" -gt 1024 ]; then
+                    if [ "$fsize" -gt $MIN_DOWNLOAD_SIZE ]; then
                         [ -n "$mirror" ] && msg_ok "Downloaded via mirror successfully"
                         return 0
                     fi
@@ -187,7 +214,7 @@ smart_download() {
             if timeout $((try_timeout + 10)) curl -sL --connect-timeout "$try_timeout" -o "$output_path" "$download_url" 2>/dev/null; then
                 if [ -f "$output_path" ] && [ -s "$output_path" ]; then
                     local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
-                    if [ "$fsize" -gt 1024 ]; then
+                    if [ "$fsize" -gt $MIN_DOWNLOAD_SIZE ]; then
                         [ -n "$mirror" ] && msg_ok "Downloaded via mirror successfully"
                         return 0
                     fi
@@ -293,7 +320,7 @@ detect_local_network() {
     # 30-second TTL cache
     local now
     now=$(date +%s)
-    if (( now - _NET_CACHE_TIME < 30 )) && [[ -n "${LOCAL_IPV4:-}${LOCAL_IPV6:-}" ]]; then
+    if (( now - _NET_CACHE_TIME < NET_CACHE_TTL )) && [[ -n "${LOCAL_IPV4:-}${LOCAL_IPV6:-}" ]]; then
         return 0
     fi
     _NET_CACHE_TIME=$now
@@ -454,8 +481,8 @@ expand_port_range() {
 
         # Validate range size (prevent accidental operations)
         local range_size=$((end - start + 1))
-        if (( range_size > 100 )); then
-            msg_err "Port range too large: $range_size ports (max 100)"
+        if (( range_size > MAX_PORT_RANGE )); then
+            msg_err "Port range too large: $range_size ports (max $MAX_PORT_RANGE)"
             return 1
         fi
 
@@ -545,8 +572,8 @@ _expand_range_pair() {
         msg_err "Port range length mismatch: $lrange ($lcount ports) vs $trange ($tcount ports)"
         return 1
     fi
-    if (( lcount > 500 )); then
-        msg_err "Port range too large: $lcount ports (max 500)"
+    if (( lcount > MAX_BULK_PORTS )); then
+        msg_err "Port range too large: $lcount ports (max $MAX_BULK_PORTS)"
         return 1
     fi
 
@@ -882,6 +909,13 @@ _extract_nft_proto_ipver() {
     elif [[ "$line" =~ "ip protocol udp" ]]; then _PROTO=udp _IPVER=4
     elif [[ "$line" =~ "ip6 nexthdr tcp" ]]; then _PROTO=tcp _IPVER=6
     elif [[ "$line" =~ "ip6 nexthdr udp" ]]; then _PROTO=udp _IPVER=6
+    # postrouting masquerade 格式 fallback
+    else
+        [[ "$line" =~ "tcp dport" ]] && _PROTO=tcp
+        [[ "$line" =~ "udp dport" ]] && _PROTO=udp
+        if [[ "$line" =~ "ip daddr" ]]; then _IPVER=4
+        elif [[ "$line" =~ "ip6 daddr" ]]; then _IPVER=6
+        fi
     fi
 }
 
@@ -897,6 +931,50 @@ _extract_nft_dnat_target() {
         _TARGET="${full%:*}"; _TPORT="${full##*:}"
     elif [[ "$line" =~ dnat\ ip6\ to\ ([^\ ]+) ]]; then
         _TARGET="${BASH_REMATCH[1]}"; _TPORT=""
+    fi
+}
+
+# _ensure_forward_counters - auto-migrate: add forward chain counter rules for existing rules
+_ensure_forward_counters() {
+    _nft_table_exists || return 0
+
+    local pre_output
+    pre_output=$(_nft_cached_chain prerouting | grep "dnat" || true)
+    [[ -z "$pre_output" ]] && return 0
+
+    local fwd_output
+    fwd_output=$(nft list chain $NFT_TABLE forward 2>/dev/null || true)
+
+    local added=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        _extract_nft_proto_ipver "$line"
+        local proto="$_PROTO" ipver="$_IPVER"
+        [[ -z "$proto" ]] && continue
+
+        local lport=""
+        [[ "$line" =~ dport\ ([0-9]+) ]] && lport="${BASH_REMATCH[1]}"
+        [[ -z "$lport" ]] && continue
+
+        # Already has forward counter
+        echo "$fwd_output" | grep -q "pfwd_ret:${lport}:${ipver}:${proto}" && continue
+
+        _extract_nft_dnat_target "$line"
+        local target="$_TARGET" tport="$_TPORT"
+        [[ -z "$target" || -z "$tport" ]] && continue
+
+        local ip_family="ip"
+        [[ "$ipver" == "6" ]] && ip_family="ip6"
+
+        nft insert rule $NFT_TABLE forward $ip_family daddr "$target" "$proto" dport "$tport" counter comment '"pfwd_fwd:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
+        nft insert rule $NFT_TABLE forward $ip_family saddr "$target" "$proto" sport "$tport" counter comment '"pfwd_ret:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
+        ((added++)) || true
+    done <<< "$pre_output"
+
+    if (( added > 0 )); then
+        _nft_invalidate_cache
+        nft_save 2>/dev/null || true
     fi
 }
 
@@ -1192,6 +1270,70 @@ nft_rule_exists() {
     _nft_cached_chain prerouting | grep -q "$ip_match.*dport $lport.*dnat"
 }
 
+# _nft_add_single_rule <ip_family> <proto> <lport> <target> <tport> <comment>
+# Unified helper for adding a single nft rule (IPv4 or IPv6).
+# In batch mode, appends to $_NFT_BATCH_FILE instead of executing directly.
+_nft_add_single_rule() {
+    local ip_family="$1" proto="$2" lport="$3" target="$4" tport="$5" comment="${6:-}"
+    local ipver="4" ip_match="ip protocol" dnat_keyword="ip" dnat_target="$target:$tport"
+    if [[ "$ip_family" == "ip6" ]]; then
+        ipver="6"
+        ip_match="ip6 nexthdr"
+        dnat_keyword="ip6"
+        dnat_target="[$target]:$tport"
+    fi
+
+    if nft_rule_exists "$lport" "$proto" "$ipver"; then
+        msg_info "Replacing existing IPv$ipver $proto rule for port $lport"
+        nft_delete_port "$lport"
+    fi
+
+    local nft_result=0
+    if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
+        # Append to batch file for atomic commit
+        if [[ -n "$comment" ]]; then
+            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$comment\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE postrouting $ip_family daddr $target $proto dport $tport counter masquerade comment \"$comment\"" >> "$_NFT_BATCH_FILE"
+        else
+            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE postrouting $ip_family daddr $target $proto dport $tport counter masquerade" >> "$_NFT_BATCH_FILE"
+        fi
+        echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport counter comment \"pfwd_fwd:${lport}:${ipver}:${proto}\"" >> "$_NFT_BATCH_FILE"
+        echo "insert rule $NFT_TABLE forward $ip_family saddr $target $proto sport $tport counter comment \"pfwd_ret:${lport}:${ipver}:${proto}\"" >> "$_NFT_BATCH_FILE"
+    else
+        # Direct execution
+        if [[ -n "$comment" ]]; then
+            nft add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" comment '"'"$comment"'"' 2>&1 && \
+            nft add rule $NFT_TABLE postrouting $ip_family daddr "$target" "$proto" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
+            nft_result=$?
+        else
+            nft add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" 2>&1 && \
+            nft add rule $NFT_TABLE postrouting $ip_family daddr "$target" "$proto" dport "$tport" counter masquerade 2>&1
+            nft_result=$?
+        fi
+
+        if (( nft_result == 0 )); then
+            nft insert rule $NFT_TABLE forward $ip_family daddr "$target" "$proto" dport "$tport" counter comment '"pfwd_fwd:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
+            nft insert rule $NFT_TABLE forward $ip_family saddr "$target" "$proto" sport "$tport" counter comment '"pfwd_ret:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
+        else
+            msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
+            # Rollback: remove prerouting rule if it was added but postrouting failed
+            local rb_handle
+            rb_handle=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
+                { grep -E "$ip_match $proto.*dport $lport.*dnat $dnat_keyword to .*$target.*$tport" || true; } | \
+                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
+            if [[ -n "$rb_handle" ]]; then
+                nft delete rule $NFT_TABLE prerouting handle "$rb_handle" 2>/dev/null
+                msg_dim "  Rolled back prerouting rule (handle $rb_handle)"
+            fi
+            return 1
+        fi
+    fi
+
+    msg_dim "  Added IPv$ipver $proto :$lport -> $dnat_target"
+    return 0
+}
+
 # nft_add_rule <lport> <target> <tport> <ip_ver> <proto> <comment>
 # ip_ver: 4, 6, or 46
 # proto: tcp, udp, or both
@@ -1200,6 +1342,11 @@ nft_add_rule() {
     local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}" comment="${6:-}"
 
     nft_ensure_table || return 1
+
+    # Initialize batch file if in batch mode and not yet created
+    if $_BATCH_MODE && [[ -z "$_NFT_BATCH_FILE" ]]; then
+        _NFT_BATCH_FILE=$(mktemp)
+    fi
 
     # Check port availability
     if ! check_port_in_use "$lport" "$proto"; then
@@ -1245,37 +1392,8 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v4_target" ]]; then
-                if nft_rule_exists "$lport" "$p" "4"; then
-                    msg_info "Replacing existing IPv4 $p rule for port $lport"
-                    nft_delete_port "$lport"
-                fi
-
-                # Add rules with optional comment
-                local nft_result=0
-                if [[ -n "$comment" ]]; then
-                    nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" comment '"'"$comment"'"' 2>&1 && \
-                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
-                    nft_result=$?
-                else
-                    nft add rule $NFT_TABLE prerouting ip protocol "$p" "$p" dport "$lport" counter dnat ip to "$v4_target:$tport" 2>&1 && \
-                    nft add rule $NFT_TABLE postrouting ip daddr "$v4_target" "$p" dport "$tport" counter masquerade 2>&1
-                    nft_result=$?
-                fi
-
-                if (( nft_result == 0 )); then
-                    msg_dim "  Added IPv4 $p :$lport -> $v4_target:$tport"
+                if _nft_add_single_rule "ip" "$p" "$lport" "$v4_target" "$tport" "$comment"; then
                     ((added++)) || true
-                else
-                    msg_err "Failed to add IPv4 $p rule :$lport -> $v4_target:$tport"
-                    # Rollback: remove prerouting rule if it was added but postrouting failed
-                    local rb_handle
-                    rb_handle=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
-                        { grep -E "ip protocol $p.*dport $lport.*dnat ip to $v4_target:$tport" || true; } | \
-                        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
-                    if [[ -n "$rb_handle" ]]; then
-                        nft delete rule $NFT_TABLE prerouting handle "$rb_handle" 2>/dev/null
-                        msg_dim "  Rolled back prerouting rule (handle $rb_handle)"
-                    fi
                 fi
             elif [[ "$ip_ver" == "4" ]]; then
                 msg_warn "Target $target has no IPv4 address, skipping IPv4 $p rule"
@@ -1292,37 +1410,8 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v6_target" ]]; then
-                if nft_rule_exists "$lport" "$p" "6"; then
-                    msg_info "Replacing existing IPv6 $p rule for port $lport"
-                    nft_delete_port "$lport"
-                fi
-
-                # Add rules with optional comment
-                local nft_result6=0
-                if [[ -n "$comment" ]]; then
-                    nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" comment '"'"$comment"'"' 2>&1 && \
-                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
-                    nft_result6=$?
-                else
-                    nft add rule $NFT_TABLE prerouting ip6 nexthdr "$p" "$p" dport "$lport" counter dnat ip6 to "[$v6_target]:$tport" 2>&1 && \
-                    nft add rule $NFT_TABLE postrouting ip6 daddr "$v6_target" "$p" dport "$tport" counter masquerade 2>&1
-                    nft_result6=$?
-                fi
-
-                if (( nft_result6 == 0 )); then
-                    msg_dim "  Added IPv6 $p :$lport -> [$v6_target]:$tport"
+                if _nft_add_single_rule "ip6" "$p" "$lport" "$v6_target" "$tport" "$comment"; then
                     ((added++)) || true
-                else
-                    msg_err "Failed to add IPv6 $p rule :$lport -> [$v6_target]:$tport"
-                    # Rollback: remove prerouting rule if it was added but postrouting failed
-                    local rb_handle6
-                    rb_handle6=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null | \
-                        { grep -E "ip6 nexthdr $p.*dport $lport.*dnat ip6 to \[$v6_target\]:$tport" || true; } | \
-                        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
-                    if [[ -n "$rb_handle6" ]]; then
-                        nft delete rule $NFT_TABLE prerouting handle "$rb_handle6" 2>/dev/null
-                        msg_dim "  Rolled back prerouting rule (handle $rb_handle6)"
-                    fi
                 fi
             elif [[ "$ip_ver" == "6" ]]; then
                 msg_warn "Target $target has no IPv6 address, skipping IPv6 $p rule"
@@ -1421,6 +1510,15 @@ nft_delete_port() {
         nft delete rule $NFT_TABLE input handle "$h" 2>/dev/null && ((deleted++)) || true
     done
 
+    # Step 4: Delete forward chain counter rules (pfwd_fwd/pfwd_ret)
+    local fwd_handles
+    fwd_handles=$(nft -a list chain $NFT_TABLE forward 2>/dev/null | \
+        { grep -E "pfwd_(fwd|ret):${port}:" || true; } | \
+        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+    for h in $fwd_handles; do
+        nft delete rule $NFT_TABLE forward handle "$h" 2>/dev/null && ((deleted++)) || true
+    done
+
     if (( deleted > 0 )); then
         _nft_invalidate_cache
         nft_save
@@ -1445,10 +1543,11 @@ nft_delete_ports_batch() {
     fi
 
     # Fetch all chain data once with handles
-    local pre_data post_data input_data
+    local pre_data post_data input_data fwd_data
     pre_data=$(nft -a list chain $NFT_TABLE prerouting 2>/dev/null || true)
     post_data=$(nft -a list chain $NFT_TABLE postrouting 2>/dev/null || true)
     input_data=$(nft -a list chain $NFT_TABLE input 2>/dev/null || true)
+    fwd_data=$(nft -a list chain $NFT_TABLE forward 2>/dev/null || true)
 
     local total_deleted=0
 
@@ -1502,6 +1601,16 @@ nft_delete_ports_batch() {
             }
         done <<< "$input_lines"
 
+        # Delete forward chain counter rules (pfwd_fwd/pfwd_ret)
+        local fwd_lines
+        fwd_lines=$(echo "$fwd_data" | { grep -E "pfwd_(fwd|ret):${port}:" || true; })
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ handle\ ([0-9]+) ]] && {
+                nft delete rule $NFT_TABLE forward handle "${BASH_REMATCH[1]}" 2>/dev/null && ((deleted++)) || true
+            }
+        done <<< "$fwd_lines"
+
         if (( deleted > 0 )); then
             local proto_msg=""
             [[ "$proto" != "both" ]] && proto_msg=" ($proto)"
@@ -1528,31 +1637,50 @@ _parse_nft_prerouting_rules() {
     fi
     [[ -z "$nft_output" ]] && return 0
 
-    while IFS= read -r line; do
-        local lport=""
+    echo "$nft_output" | awk '
+    /dnat/ {
+        proto=""; ipver=""; lport=""; target=""; tport=""; comment=""; bytes="0"
 
         # Extract protocol and IP version
-        _extract_nft_proto_ipver "$line"
-        local proto="$_PROTO" ipver="$_IPVER"
+        if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
+        else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
+        else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
+        else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
+        else {
+            if (match($0, /tcp dport/)) proto="tcp"
+            if (match($0, /udp dport/)) proto="udp"
+            if (match($0, /ip daddr/))  ipver="4"
+            if (match($0, /ip6 daddr/)) ipver="6"
+        }
 
         # Extract local port
-        [[ "$line" =~ dport\ ([0-9]+) ]] && lport="${BASH_REMATCH[1]}"
+        if (match($0, /dport ([0-9]+)/, m)) lport=m[1]
 
-        # Extract target and target port
-        _extract_nft_dnat_target "$line"
-        local target="$_TARGET" tport="$_TPORT"
+        # Extract DNAT target
+        if (match($0, /dnat ip to ([0-9.]+):([0-9]+)/, m)) {
+            target=m[1]; tport=m[2]
+        } else if (match($0, /dnat ip6 to \[([^\]]+)\]:([0-9]+)/, m)) {
+            target=m[1]; tport=m[2]
+        } else if (match($0, /dnat ip to ([^ ]+)/, m)) {
+            split(m[1], parts, ":")
+            target=parts[1]; tport=parts[2]
+        }
 
-        # Extract traffic bytes and comment
-        _extract_nft_bytes "$line"
-        _extract_nft_comment "$line"
+        # Extract bytes
+        if (match($0, /bytes ([0-9]+)/, m)) bytes=m[1]
 
-        if [[ -n "$lport" && -n "$proto" ]]; then
-            echo "${proto}|${lport}|${ipver}|${target}${tport:+:$tport}|${tport}|${_COMMENT}|${_BYTES}"
-        fi
-    done <<< "$nft_output"
+        # Extract comment
+        if (match($0, /comment "([^"]+)"/, m)) comment=m[1]
+
+        if (lport != "" && proto != "") {
+            t = target (tport != "" ? ":" tport : "")
+            printf "%s|%s|%s|%s|%s|%s|%s\n", proto, lport, ipver, t, tport, comment, bytes
+        }
+    }
+    '
 }
 
-# _parse_nft_bidirectional_traffic - parse both prerouting and postrouting for traffic stats
+# _parse_nft_bidirectional_traffic - parse prerouting + forward chain for traffic stats
 # Output: proto|lport|ipver|target|tport|comment|in_bytes|out_bytes|total_bytes
 _parse_nft_bidirectional_traffic() {
     # Get prerouting rules (inbound traffic)
@@ -1560,68 +1688,61 @@ _parse_nft_bidirectional_traffic() {
     prerouting_output=$(_nft_cached_chain prerouting | grep "dnat" || true)
     [[ -z "$prerouting_output" ]] && return 0
 
-    # Get postrouting rules (outbound traffic)
-    local postrouting_output
-    postrouting_output=$(_nft_cached_chain postrouting | grep "snat" || true)
+    # Get forward chain return counters (outbound traffic)
+    local forward_ret_output
+    forward_ret_output=$(_nft_cached_chain forward | grep "pfwd_ret:" || true)
 
-    # Parse prerouting rules and store in associative array
-    declare -A in_traffic out_traffic rule_info
-    # Reverse index: proto|tport|ipver -> key (for O(1) postrouting matching)
-    declare -A tport_to_key
+    # Use awk to combine prerouting (inbound) with forward return (outbound) data
+    {
+        echo "===PREROUTING==="
+        echo "$prerouting_output"
+        echo "===FORWARD_RET==="
+        echo "$forward_ret_output"
+    } | awk '
+    /^===PREROUTING===/ { section="pre"; next }
+    /^===FORWARD_RET===/ { section="fwd"; next }
 
-    while IFS= read -r line; do
-        local lport=""
+    section == "pre" && /dnat/ {
+        proto=""; ipver=""; lport=""; target=""; tport=""; comment=""; bytes="0"
 
-        _extract_nft_proto_ipver "$line"
-        local proto="$_PROTO" ipver="$_IPVER"
+        if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
+        else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
+        else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
+        else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
 
-        [[ "$line" =~ dport\ ([0-9]+) ]] && lport="${BASH_REMATCH[1]}"
+        if (match($0, /dport ([0-9]+)/, m)) lport=m[1]
+        if (match($0, /dnat ip to ([0-9.]+):([0-9]+)/, m)) { target=m[1]; tport=m[2] }
+        else if (match($0, /dnat ip6 to \[([^\]]+)\]:([0-9]+)/, m)) { target=m[1]; tport=m[2] }
+        if (match($0, /bytes ([0-9]+)/, m)) bytes=m[1]
+        if (match($0, /comment "([^"]+)"/, m)) comment=m[1]
 
-        _extract_nft_dnat_target "$line"
-        local target="$_TARGET" tport="$_TPORT"
+        if (lport != "" && proto != "") {
+            key = proto "|" lport "|" ipver
+            in_bytes[key] = bytes
+            info[key] = target (tport != "" ? ":" tport : "") "|" tport "|" comment
+        }
+    }
 
-        _extract_nft_bytes "$line"
-        _extract_nft_comment "$line"
+    section == "fwd" && /pfwd_ret:/ {
+        if (match($0, /pfwd_ret:([0-9]+):([46]):([a-z]+)/, m)) {
+            key = m[3] "|" m[1] "|" m[2]
+            if (key in in_bytes) {
+                ob = "0"
+                if (match($0, /bytes ([0-9]+)/, bm)) ob = bm[1]
+                out_bytes[key] = ob
+            }
+        }
+    }
 
-        if [[ -n "$lport" && -n "$proto" ]]; then
-            local key="${proto}|${lport}|${ipver}"
-            in_traffic[$key]="$_BYTES"
-            rule_info[$key]="${target}${tport:+:$tport}|${tport}|${_COMMENT}"
-            [[ -n "$tport" ]] && tport_to_key["${proto}|${tport}|${ipver}"]="$key"
-        fi
-    done <<< "$prerouting_output"
-
-    # Parse postrouting rules for outbound traffic (O(1) lookup via tport_to_key)
-    if [[ -n "$postrouting_output" ]]; then
-        while IFS= read -r line; do
-            local sport=""
-
-            _extract_nft_proto_ipver "$line"
-            local proto="$_PROTO" ipver="$_IPVER"
-
-            [[ "$line" =~ sport\ ([0-9]+) ]] && sport="${BASH_REMATCH[1]}"
-
-            _extract_nft_bytes "$line"
-
-            if [[ -n "$sport" && -n "$proto" ]]; then
-                local lookup_key="${proto}|${sport}|${ipver}"
-                local matched_key="${tport_to_key[$lookup_key]:-}"
-                if [[ -n "$matched_key" ]]; then
-                    out_traffic[$matched_key]="$_BYTES"
-                fi
-            fi
-        done <<< "$postrouting_output"
-    fi
-
-    # Output combined results
-    for key in "${!in_traffic[@]}"; do
-        IFS='|' read -r proto lport ipver <<< "$key"
-        IFS='|' read -r target tport comment <<< "${rule_info[$key]}"
-        local in_bytes="${in_traffic[$key]}"
-        local out_bytes="${out_traffic[$key]:-0}"
-        local total_bytes=$((in_bytes + out_bytes))
-        echo "${proto}|${lport}|${ipver}|${target}|${tport}|${comment}|${in_bytes}|${out_bytes}|${total_bytes}"
-    done
+    END {
+        for (key in in_bytes) {
+            ib = in_bytes[key]
+            ob = (key in out_bytes) ? out_bytes[key] : "0"
+            total = ib + ob
+            printf "%s|%s|%s|%d|%d|%d\n", key, info[key], ib, ob, total
+        }
+    }
+    '
 }
 
 # nft_list_rules - display all forwarding rules in a table
@@ -1643,7 +1764,9 @@ nft_list_rules() {
     fi
 
     echo -e "${CYAN}nftables forwarding rules:${NC}"
-    printf "  ${BOLD}%-4s %-8s %-6s %-6s %-30s %-20s %s${NC}\n" "#" "L.Port" "Proto" "IPver" "Target" "Comment" "Traffic"
+    echo -e "  ${DIM}┌────┬────────┬──────┬──────┬──────────────────────────────┬────────────────────┬──────────┐${NC}"
+    printf "  ${DIM}│${NC}${BOLD}%-4s${NC}${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-30s${NC}${DIM}│${NC}${BOLD}%-20s${NC}${DIM}│${NC}${BOLD}%-10s${NC}${DIM}│${NC}\n" " # " " L.Port" " Proto" " IPvr" " Target" " Comment" " Traffic"
+    echo -e "  ${DIM}├────┼────────┼──────┼──────┼──────────────────────────────┼────────────────────┼──────────┤${NC}"
 
     # Sort by protocol (tcp first) and then by port number
     local sorted_rules
@@ -1671,9 +1794,14 @@ nft_list_rules() {
             elif (( bytes > 1048576 )); then traffic_color="$GREEN"
             fi
         fi
-        printf "  %-4s %-8s ${proto_color}%-6s${NC} ${ipver_color}%-6s${NC} %-30s %-20s ${traffic_color}%s${NC}\n" \
-            "$idx" ":$lport" "$proto" "IPv$ipver" "$target" "${comment:--}" "$traffic"
+        # Truncate target/comment to fit column widths (29/19 visible chars + 1 leading space)
+        local disp_target=" $target" disp_comment=" ${comment:--}"
+        (( ${#disp_target} > 30 )) && disp_target="${disp_target:0:28}.."
+        (( ${#disp_comment} > 20 )) && disp_comment="${disp_comment:0:18}.."
+        printf "  ${DIM}│${NC}%-4s${DIM}│${NC}%-8s${DIM}│${NC}${proto_color}%-6s${NC}${DIM}│${NC}${ipver_color}%-6s${NC}${DIM}│${NC}%-30s${DIM}│${NC}%-20s${DIM}│${NC}${traffic_color}%-10s${NC}${DIM}│${NC}\n" \
+            " $idx" " :$lport" " $proto" " v$ipver" "$disp_target" "$disp_comment" " $traffic"
     done <<< "$sorted_rules"
+    echo -e "  ${DIM}└────┴────────┴──────┴──────┴──────────────────────────────┴────────────────────┴──────────┘${NC}"
 }
 
 # nft_get_traffic <port> - get traffic bytes for a port
@@ -1835,7 +1963,11 @@ realm_install() {
     if file "$tmp_file" 2>/dev/null | grep -qi "gzip\|tar"; then
         local tmp_dir
         tmp_dir=$(mktemp -d)
-        tar -xzf "$tmp_file" -C "$tmp_dir" 2>/dev/null
+        if ! tar -xzf "$tmp_file" -C "$tmp_dir" 2>/dev/null; then
+            msg_err "Failed to extract realm archive"
+            rm -rf "$tmp_dir" "$tmp_file"
+            return 1
+        fi
         local realm_extracted
         realm_extracted=$(find "$tmp_dir" -name "realm" -type f | head -1)
         if [[ -n "$realm_extracted" ]]; then
@@ -2203,19 +2335,22 @@ realm_setup_traffic_counter() {
 
 show_traffic_stats() {
     echo -e "${BOLD}Traffic Statistics${NC}"
-    echo -e "${DIM}$(printf '=%.0s' {1..60})${NC}"
+    echo -e "${DIM}$SEP_EQ${NC}"
 
     local has_rules=false
 
     # nftables bidirectional traffic
     if _nft_table_exists; then
+        _ensure_forward_counters
         local parsed_nft
         parsed_nft=$(_parse_nft_bidirectional_traffic)
 
         if [[ -n "$parsed_nft" ]]; then
             has_rules=true
             echo -e "\n${CYAN}nftables forwarding:${NC}"
-            printf "  ${BOLD}%-8s %-6s %-6s %-25s %-12s %-12s %s${NC}\n" "L.Port" "Proto" "IPver" "Target" "Inbound↓" "Outbound↑" "Total"
+            echo -e "  ${DIM}┌────────┬──────┬──────┬─────────────────────────┬────────────┬────────────┬────────────┐${NC}"
+            printf "  ${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-25s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}\n" " L.Port" " Proto" " IPvr" " Target" " Inbound ↓" " Outbound ↑" " Total"
+            echo -e "  ${DIM}├────────┼──────┼──────┼─────────────────────────┼────────────┼────────────┼────────────┤${NC}"
 
             # Sort by protocol and port number
             local sorted_rules
@@ -2228,8 +2363,9 @@ show_traffic_stats() {
                 in_traffic=$(format_bytes "$in_bytes")
                 out_traffic=$(format_bytes "$out_bytes")
                 total_traffic=$(format_bytes "$total_bytes")
-                printf "  %-8s %-6s %-6s %-25s %-12s %-12s %s\n" ":$lport" "$proto" "IPv$ipver" "$target" "$in_traffic" "$out_traffic" "$total_traffic"
+                printf "  ${DIM}│${NC}%-8s${DIM}│${NC}%-6s${DIM}│${NC}%-6s${DIM}│${NC}%-25s${DIM}│${NC}%-12s${DIM}│${NC}%-12s${DIM}│${NC}%-12s${DIM}│${NC}\n" " :$lport" " $proto" " v$ipver" " $target" " $in_traffic" " $out_traffic" " $total_traffic"
             done <<< "$sorted_rules"
+            echo -e "  ${DIM}└────────┴──────┴──────┴─────────────────────────┴────────────┴────────────┴────────────┘${NC}"
         fi
     fi
 
@@ -2241,7 +2377,9 @@ show_traffic_stats() {
         if [[ -n "$input_rules" ]]; then
             has_rules=true
             echo -e "\n${CYAN}realm traffic:${NC}"
-            printf "  ${BOLD}%-8s %-6s %s${NC}\n" "L.Port" "Proto" "Traffic"
+            echo -e "  ${DIM}┌────────┬──────┬────────────┐${NC}"
+            printf "  ${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-12s${NC}${DIM}│${NC}\n" " L.Port" " Proto" " Traffic"
+            echo -e "  ${DIM}├────────┼──────┼────────────┤${NC}"
 
             # Collect rules for sorting
             local realm_data=""
@@ -2269,8 +2407,9 @@ show_traffic_stats() {
                 [[ -z "$lport" ]] && continue
                 local traffic
                 traffic=$(format_bytes "$bytes")
-                printf "  %-8s %-6s %s\n" ":$lport" "$proto" "$traffic"
+                printf "  ${DIM}│${NC}%-8s${DIM}│${NC}%-6s${DIM}│${NC}%-12s${DIM}│${NC}\n" " :$lport" " $proto" " $traffic"
             done <<< "$sorted_realm"
+            echo -e "  ${DIM}└────────┴──────┴────────────┘${NC}"
         fi
     fi
 
@@ -2282,12 +2421,14 @@ show_traffic_stats() {
 # show_traffic_rate - sample traffic twice and show bytes/s
 show_traffic_rate() {
     echo -e "${BOLD}Traffic Rate (sampling 2s...)${NC}"
-    echo -e "${DIM}$(printf '=%.0s' {1..60})${NC}"
+    echo -e "${DIM}$SEP_EQ${NC}"
 
     if ! _nft_table_exists; then
         msg_dim "  No nftables forwarding rules"
         return 0
     fi
+
+    _ensure_forward_counters
 
     # First sample
     _nft_invalidate_cache
@@ -2345,12 +2486,59 @@ cmd_export() {
     ensure_jq || return 1
     mkdir -p "$(dirname "$filepath")"
 
-    local export_data
-    export_data=$(jq -n \
+    # Build nft rules JSON array with awk (single pass, no per-rule jq calls)
+    local nft_json="[]"
+    if _nft_table_exists; then
+        local parsed_nft
+        parsed_nft=$(_parse_nft_prerouting_rules)
+        if [[ -n "$parsed_nft" ]]; then
+            nft_json=$(echo "$parsed_nft" | awk -F'|' '
+            BEGIN { printf "[" ; first=1 }
+            {
+                proto=$1; lport=$2; ipver=$3; target=$4; tport=$5; comment=$6
+                # Strip port from target if embedded
+                sub(/:[0-9]+$/, "", target)
+                # Handle IPv6 bracket format
+                gsub(/^\[|\]$/, "", target)
+                if (!first) printf ","
+                first=0
+                # Escape double quotes in comment
+                gsub(/"/, "\\\"", comment)
+                printf "{\"type\":\"nftables\",\"local_port\":\"%s\",\"target_ip\":\"%s\",\"target_port\":\"%s\",\"protocol\":\"%s\",\"ip_ver\":\"%s\",\"comment\":\"%s\"}", lport, target, tport, proto, ipver, comment
+            }
+            END { printf "]" }
+            ')
+        fi
+    fi
+
+    # Build realm rules JSON array with awk (single pass)
+    local realm_json="[]"
+    if [[ -f "$REALM_CONFIG" ]]; then
+        local realm_data
+        realm_data=$(_parse_realm_endpoints)
+        if [[ -n "$realm_data" ]]; then
+            realm_json=$(echo "$realm_data" | awk -F'|' '
+            BEGIN { printf "[" ; first=1 }
+            {
+                lport=$1; target=$2; tport=$3; ipver=$4; comment=$7
+                if (!first) printf ","
+                first=0
+                gsub(/"/, "\\\"", comment)
+                printf "{\"type\":\"realm\",\"local_port\":\"%s\",\"target_ip\":\"%s\",\"target_port\":\"%s\",\"ip_ver\":\"%s\",\"comment\":\"%s\"}", lport, target, tport, ipver, comment
+            }
+            END { printf "]" }
+            ')
+        fi
+    fi
+
+    # Single jq call to build complete export JSON
+    jq -n \
         --arg version "$VERSION" \
         --arg tool "pfwd" \
         --arg export_time "$(date '+%Y-%m-%dT%H:%M:%S')" \
         --arg source_ip "$(get_local_ip)" \
+        --argjson nft "$nft_json" \
+        --argjson realm "$realm_json" \
         '{
             export_info: {
                 version: $version,
@@ -2358,72 +2546,13 @@ cmd_export() {
                 export_time: $export_time,
                 source_ip: $source_ip
             },
-            forward_rules: []
-        }')
+            forward_rules: ($nft + $realm)
+        }' > "$filepath"
 
-    # Collect nftables rules
-    if _nft_table_exists; then
-        local parsed_nft
-        parsed_nft=$(_parse_nft_prerouting_rules)
-
-        while IFS='|' read -r proto lport ipver target tport comment bytes; do
-            [[ -z "$lport" || -z "$target" || -z "$tport" ]] && continue
-            # Strip port from target if embedded (e.g. 1.2.3.4:80 -> 1.2.3.4)
-            local target_ip="$target"
-            target_ip="${target_ip%:*}"
-            # Handle IPv6 bracket format [addr]:port
-            target_ip="${target_ip#\[}"
-            target_ip="${target_ip%\]}"
-            export_data=$(echo "$export_data" | jq \
-                --arg type "nftables" \
-                --arg local_port "$lport" \
-                --arg target_ip "$target_ip" \
-                --arg target_port "$tport" \
-                --arg protocol "$proto" \
-                --arg ip_ver "$ipver" \
-                --arg comment "$comment" \
-                '.forward_rules += [{
-                    type: $type,
-                    local_port: $local_port,
-                    target_ip: $target_ip,
-                    target_port: $target_port,
-                    protocol: $protocol,
-                    ip_ver: $ip_ver,
-                    comment: $comment
-                }]')
-        done <<< "$parsed_nft"
-    fi
-
-    # Collect realm endpoints
-    if [[ -f "$REALM_CONFIG" ]]; then
-        local realm_data
-        realm_data=$(_parse_realm_endpoints)
-
-        while IFS='|' read -r lport target tport ipver listen remote comment; do
-            [[ -z "$lport" ]] && continue
-            export_data=$(echo "$export_data" | jq \
-                --arg type "realm" \
-                --arg local_port "$lport" \
-                --arg target_ip "$target" \
-                --arg target_port "$tport" \
-                --arg ip_ver "$ipver" \
-                --arg comment "$comment" \
-                '.forward_rules += [{
-                    type: $type,
-                    local_port: $local_port,
-                    target_ip: $target_ip,
-                    target_port: $target_port,
-                    ip_ver: $ip_ver,
-                    comment: $comment
-                }]')
-        done <<< "$realm_data"
-    fi
-
-    echo "$export_data" | jq '.' > "$filepath"
     msg_ok "Exported to: $filepath"
 
     local count
-    count=$(echo "$export_data" | jq '.forward_rules | length')
+    count=$(jq '.forward_rules | length' "$filepath")
     msg_info "Total rules exported: $count"
 
     # Show SCP hint
@@ -2532,8 +2661,8 @@ cmd_import() {
 #===============================================================================
 
 show_help() {
-    cat << 'EOF'
-pfwd - Port Forwarding Tool v1.6.0
+    cat << EOF
+pfwd - Port Forwarding Tool v$VERSION
 
 Usage: pfwd [command] [options] [rules...]
 
@@ -2767,7 +2896,7 @@ cmd_list() {
         esac
     done
     echo -e "${BOLD}Forwarding Rules${NC}"
-    echo -e "${DIM}$(printf '=%.0s' {1..60})${NC}"
+    echo -e "${DIM}$SEP_EQ${NC}"
     [[ -n "$filter" ]] && echo -e "  ${DIM}Filter: $filter${NC}"
     echo ""
     nft_list_rules "$filter"
@@ -2779,7 +2908,7 @@ cmd_list() {
 # cmd_status - show running status and rule counts
 cmd_status() {
     echo -e "${BOLD}pfwd Status${NC}"
-    echo -e "${DIM}$(printf '=%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_EQ_40${NC}"
 
     # nftables status
     local nft_status nft_count=0
@@ -3105,47 +3234,108 @@ show_header() {
     fi
     local rule_count=$((nft_count + realm_count))
 
-    # Check running status
-    local status_text
-    if [[ $nft_count -gt 0 ]] || systemctl is-active realm-forward >/dev/null 2>&1; then
-        status_text="${GREEN}Running${NC}"
+    # Check running status (colored + plain text)
+    local status_text status_plain
+    if [[ $nft_count -gt 0 ]] || pgrep -x realm >/dev/null 2>&1; then
+        status_text="${GREEN}Running${NC}"; status_plain="Running"
     else
-        status_text="${RED}Stopped${NC}"
+        status_text="${RED}Stopped${NC}"; status_plain="Stopped"
     fi
 
-    # Detect network
+    # Detect network (colored + plain text)
     detect_local_network
-    local net_info=""
+    local net_info="" net_plain=""
     if $LOCAL_HAS_IPV4 && $LOCAL_HAS_IPV6; then
-        local v4_label="${GREEN}IPv4${NC}"
-        local v6_label="${GREEN}IPv6${NC}"
-        [[ "$LOCAL_IPV4_TYPE" == "private" ]] && v4_label="${YELLOW}IPv4(private)${NC}"
-        [[ "$LOCAL_IPV6_TYPE" == "private" ]] && v6_label="${YELLOW}IPv6(private)${NC}"
-        [[ "$LOCAL_IPV4_TYPE" == "public" ]] && v4_label="${GREEN}IPv4(public)${NC}"
-        [[ "$LOCAL_IPV6_TYPE" == "public" ]] && v6_label="${GREEN}IPv6(public)${NC}"
-        net_info="${v4_label} + ${v6_label}"
+        local v4_label="${GREEN}IPv4${NC}" v4_plain="IPv4"
+        local v6_label="${GREEN}IPv6${NC}" v6_plain="IPv6"
+        if [[ "$LOCAL_IPV4_TYPE" == "private" ]]; then
+            v4_label="${YELLOW}IPv4(NAT)${NC}"; v4_plain="IPv4(NAT)"
+        elif [[ "$LOCAL_IPV4_TYPE" == "public" ]]; then
+            v4_label="${GREEN}IPv4${NC}"; v4_plain="IPv4"
+        fi
+        if [[ "$LOCAL_IPV6_TYPE" == "private" ]]; then
+            v6_label="${YELLOW}IPv6(ULA)${NC}"; v6_plain="IPv6(ULA)"
+        elif [[ "$LOCAL_IPV6_TYPE" == "public" ]]; then
+            v6_label="${GREEN}IPv6${NC}"; v6_plain="IPv6"
+        fi
+        net_info="${v4_label}+${v6_label}"; net_plain="${v4_plain}+${v6_plain}"
     elif $LOCAL_HAS_IPV4; then
         if [[ "$LOCAL_IPV4_TYPE" == "private" ]]; then
-            net_info="${YELLOW}IPv4(private)${NC}"
+            net_info="${YELLOW}IPv4(NAT)${NC}"; net_plain="IPv4(NAT)"
         else
-            net_info="${GREEN}IPv4(public)${NC}"
+            net_info="${GREEN}IPv4${NC}"; net_plain="IPv4"
         fi
     elif $LOCAL_HAS_IPV6; then
         if [[ "$LOCAL_IPV6_TYPE" == "private" ]]; then
-            net_info="${YELLOW}IPv6(private)${NC}"
+            net_info="${YELLOW}IPv6(ULA)${NC}"; net_plain="IPv6(ULA)"
         else
-            net_info="${CYAN}IPv6(public)${NC}"
+            net_info="${CYAN}IPv6${NC}"; net_plain="IPv6"
         fi
     else
-        net_info="${RED}No public IP${NC}"
+        net_info="${RED}No IP${NC}"; net_plain="No IP"
     fi
 
+    # ── Compute dynamic box inner width ──
+    # Title line plain text: "  pfwd - Port Forwarding Tool  v1.6.2  "
+    local title_l_plain="  pfwd - Port Forwarding Tool"
+    local title_r_plain="v$VERSION  "
+    local title_min_gap=2
+    local title_plain_len=$(( ${#title_l_plain} + title_min_gap + ${#title_r_plain} ))
+
+    # Status line segments (plain text, no ANSI)
+    local seg1="Status: ${status_plain}"
+    local seg2="Rules: ${rule_count}"
+    local seg3="Net: ${net_plain}"
+    # Visible: "  seg1 │ seg2 │ seg3  "
+    local status_plain_len=$(( 2 + ${#seg1} + 3 + ${#seg2} + 3 + ${#seg3} + 2 ))
+    # separators " │ " = 3 visible chars each
+
+    # Inner width = max of title and status, clamped to [48, terminal_width - 2]
+    local inner_w=$title_plain_len
+    (( status_plain_len > inner_w )) && inner_w=$status_plain_len
+    (( inner_w < 48 )) && inner_w=48
+    local term_w
+    term_w=$(tput cols 2>/dev/null || echo 80)
+    (( inner_w > term_w - 2 )) && inner_w=$((term_w - 2))
+
+    # If status line would still be too wide, truncate net_plain/net_info
+    if (( status_plain_len > inner_w )); then
+        local max_net=$(( inner_w - 2 - ${#seg1} - 3 - ${#seg2} - 3 - 5 - 2 ))
+        # 5 = "Net: " prefix, 2 = trailing spaces
+        if (( max_net < 3 )); then max_net=3; fi
+        net_plain="${net_plain:0:$max_net}"
+        # Rebuild net_info: strip colors, just use plain truncated
+        net_info="${net_plain}"
+        seg3="Net: ${net_plain}"
+        status_plain_len=$(( 2 + ${#seg1} + 3 + ${#seg2} + 3 + ${#seg3} + 2 ))
+    fi
+
+    # Generate border strings using printf (no subshell)
+    local border_eq border_dash
+    printf -v border_eq '%*s' "$inner_w" ''
+    border_eq=${border_eq// /═}
+    printf -v border_dash '%*s' "$inner_w" ''
+    border_dash=${border_dash// /─}
+
+    # Title line: left-align name, right-align version, fill gap with spaces
+    local title_gap=$(( inner_w - ${#title_l_plain} - ${#title_r_plain} ))
+    (( title_gap < 1 )) && title_gap=1
+    local title_gap_str
+    printf -v title_gap_str '%*s' "$title_gap" ''
+
+    # Status line: right-pad to reach inner_w
+    # visible content = "  " + seg1 + " │ " + seg2 + " │ " + seg3 + "  "
+    local status_right_pad=$(( inner_w - status_plain_len ))
+    (( status_right_pad < 0 )) && status_right_pad=0
+    local status_pad_str
+    printf -v status_pad_str '%*s' "$status_right_pad" ''
+
     echo ""
-    echo -e "${CYAN}================================================${NC}"
-    echo -e "     ${BOLD}pfwd${NC} - Port Forwarding Tool  ${DIM}v$VERSION${NC}"
-    echo -e "${CYAN}------------------------------------------------${NC}"
-    echo -e "  Status: ${status_text}    Rules: ${CYAN}${rule_count}${NC}    Network: ${net_info}"
-    echo -e "${CYAN}================================================${NC}"
+    echo -e "${CYAN}╔${border_eq}╗${NC}"
+    echo -e "${CYAN}║${NC}${title_l_plain}${title_gap_str}${DIM}${title_r_plain}${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}╟${border_dash}╢${NC}"
+    echo -e "${CYAN}║${NC}  Status: ${status_text} ${CYAN}│${NC} Rules: ${CYAN}${rule_count}${NC} ${CYAN}│${NC} Net: ${net_info}  ${status_pad_str}${CYAN}║${NC}"
+    echo -e "${CYAN}╚${border_eq}╝${NC}"
     echo ""
 }
 
@@ -3156,7 +3346,7 @@ interactive_menu() {
         # Determine forwarding status for menu item 4
         local _nft_running=false _realm_running=false
         _nft_table_exists && _nft_running=true
-        systemctl is-active realm-forward >/dev/null 2>&1 && _realm_running=true
+        pgrep -x realm >/dev/null 2>&1 && _realm_running=true
         local _fwd_label
         if $_nft_running || $_realm_running; then
             _fwd_label="${RED}Stop forwarding${NC}"
@@ -3164,14 +3354,21 @@ interactive_menu() {
             _fwd_label="${GREEN}Start forwarding${NC}"
         fi
 
+        echo -e "  ${DIM}── Rule Management ──${NC}"
         echo -e "  ${CYAN}1)${NC} Add forwarding rules"
         echo -e "  ${CYAN}2)${NC} View forwarding rules"
         echo -e "  ${CYAN}3)${NC} Delete forwarding rules"
+        echo ""
+        echo -e "  ${DIM}── Service Control ──${NC}"
         echo -e "  ${CYAN}4)${NC} ${_fwd_label}"
         echo -e "  ${CYAN}5)${NC} Traffic statistics"
+        echo ""
+        echo -e "  ${DIM}── Configuration ──${NC}"
         echo -e "  ${CYAN}6)${NC} Import/Export config"
         echo -e "  ${CYAN}7)${NC} Install/Update realm"
         echo -e "  ${CYAN}8)${NC} Kernel optimization"
+        echo ""
+        echo -e "  ${DIM}── System ──${NC}"
         echo -e "  ${CYAN}9)${NC} ${RED}Uninstall${NC}"
         echo -e "  ${CYAN}0)${NC} ${DIM}Exit${NC}"
         echo ""
@@ -3216,7 +3413,7 @@ interactive_menu() {
 menu_add_rule() {
     echo ""
     echo -e "${BOLD}Add Forwarding Rule${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
 
     # 1. Method selection
     echo ""
@@ -3356,7 +3553,11 @@ menu_add_rule() {
     # Enable batch mode: skip per-rule save/restart
     _BATCH_MODE=true
     local added=0 failed=0
+    local total_rules=${#EXPANDED_RULES[@]}
+    local progress_idx=0
     for expanded in "${EXPANDED_RULES[@]}"; do
+        ((progress_idx++)) || true
+        (( total_rules > 3 )) && show_progress "$progress_idx" "$total_rules" "Adding"
         if ! parse_rule "$expanded"; then
             ((failed++)) || true; continue
         fi
@@ -3381,7 +3582,7 @@ menu_add_rule() {
 menu_delete_rule() {
     echo ""
     echo -e "${BOLD}Delete Forwarding Rule${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
 
     # Collect all rules into a numbered list
     local -a rule_methods=() rule_ports=() rule_labels=()
@@ -3516,7 +3717,7 @@ menu_delete_rule() {
 menu_export_import() {
     echo ""
     echo -e "${BOLD}Import / Export Configuration${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
     echo ""
     echo "  1) Export to JSON file"
     echo "  2) Import from JSON file"
@@ -3584,7 +3785,7 @@ menu_export_import() {
 menu_stop_forward() {
     echo ""
     echo -e "${BOLD}Stop Forwarding${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
     echo ""
     echo "  1) Stop nftables only"
     echo "  2) Stop realm only"
@@ -3606,7 +3807,7 @@ menu_stop_forward() {
 menu_start_forward() {
     echo ""
     echo -e "${BOLD}Start Forwarding${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
     echo ""
     echo "  1) Start nftables only"
     echo "  2) Start realm only"
@@ -3628,7 +3829,7 @@ menu_start_forward() {
 menu_uninstall() {
     echo ""
     echo -e "${BOLD}Uninstall${NC}"
-    echo -e "${DIM}$(printf -- '-%.0s' {1..40})${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
     echo ""
     echo "  1) Uninstall nftables rules only"
     echo "  2) Uninstall realm only"
