@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.3"
+readonly VERSION="1.6.4"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -96,7 +96,7 @@ _nft_cached_chain() {
     local chain="$1" data
     data=$(_nft_cached_table)
     [[ -z "$data" ]] && return 1
-    echo "$data" | awk -v c="$chain" '$0 ~ "chain "c" \\{",/^\t\}/'
+    echo "$data" | awk -v c="$chain" '$0 ~ "chain "c" [{]",/^\t[}]/'
 }
 
 _nft_invalidate_cache() { _NFT_CACHE="" _NFT_CACHE_TIME=0; }
@@ -997,7 +997,7 @@ _sort_parsed_rules() { sort -t'|' -k1,1 -k2,2n; }
 _nft_traffic_from_chain() {
     local data="$1" port="$2"
     echo "$data" | awk -v p="$port" '
-        $0 ~ "dport "p"\\b" && /counter/ {
+        $0 ~ "dport "p"( |$)" && /counter/ {
             for(i=1;i<=NF;i++) if($i=="bytes") { sum+=$(i+1) }
         }
         END { print sum+0 }
@@ -1653,24 +1653,49 @@ _parse_nft_prerouting_rules() {
             if (match($0, /ip6 daddr/)) ipver="6"
         }
 
-        # Extract local port
-        if (match($0, /dport ([0-9]+)/, m)) lport=m[1]
-
-        # Extract DNAT target
-        if (match($0, /dnat ip to ([0-9.]+):([0-9]+)/, m)) {
-            target=m[1]; tport=m[2]
-        } else if (match($0, /dnat ip6 to \[([^\]]+)\]:([0-9]+)/, m)) {
-            target=m[1]; tport=m[2]
-        } else if (match($0, /dnat ip to ([^ ]+)/, m)) {
-            split(m[1], parts, ":")
-            target=parts[1]; tport=parts[2]
+        # Extract local port: "dport NNN"
+        if (match($0, /dport [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/dport /, "", s)
+            lport = s
         }
 
-        # Extract bytes
-        if (match($0, /bytes ([0-9]+)/, m)) bytes=m[1]
+        # Extract DNAT target using index() (mawk-compatible, no bracket regex)
+        if (match($0, /dnat ip6 to /)) {
+            # IPv6: "dnat ip6 to [addr]:port"
+            rest = substr($0, RSTART + 15)  # skip "dnat ip6 to ["
+            p = index(rest, "]:")
+            if (p > 0) {
+                target = substr(rest, 1, p - 1)
+                rest2 = substr(rest, p + 2)
+                # Extract port (digits before space or end)
+                match(rest2, /[0-9]+/)
+                tport = substr(rest2, RSTART, RLENGTH)
+            }
+        } else if (match($0, /dnat ip to /)) {
+            # IPv4: "dnat ip to 1.2.3.4:5678"
+            rest = substr($0, RSTART + 11)
+            # Get until space or end of string
+            if (match(rest, /[^ ]+/)) {
+                s = substr(rest, RSTART, RLENGTH)
+                n = split(s, parts, ":")
+                target = parts[1]; tport = parts[n]
+            }
+        }
 
-        # Extract comment
-        if (match($0, /comment "([^"]+)"/, m)) comment=m[1]
+        # Extract bytes: "bytes NNN"
+        if (match($0, /bytes [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/bytes /, "", s)
+            bytes = s
+        }
+
+        # Extract comment: comment "text"
+        if (match($0, /comment "/)) {
+            rest = substr($0, RSTART + 9)
+            p = index(rest, "\"")
+            if (p > 1) comment = substr(rest, 1, p - 1)
+        }
 
         if (lport != "" && proto != "") {
             t = target (tport != "" ? ":" tport : "")
@@ -1710,11 +1735,36 @@ _parse_nft_bidirectional_traffic() {
         else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
         else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
 
-        if (match($0, /dport ([0-9]+)/, m)) lport=m[1]
-        if (match($0, /dnat ip to ([0-9.]+):([0-9]+)/, m)) { target=m[1]; tport=m[2] }
-        else if (match($0, /dnat ip6 to \[([^\]]+)\]:([0-9]+)/, m)) { target=m[1]; tport=m[2] }
-        if (match($0, /bytes ([0-9]+)/, m)) bytes=m[1]
-        if (match($0, /comment "([^"]+)"/, m)) comment=m[1]
+        # dport
+        if (match($0, /dport [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/dport /, "", s); lport = s
+        }
+        # dnat target (mawk-compatible: avoid bracket regex)
+        if (match($0, /dnat ip6 to /)) {
+            rest = substr($0, RSTART + 15)
+            p = index(rest, "]:")
+            if (p > 0) {
+                target = substr(rest, 1, p - 1)
+                rest2 = substr(rest, p + 2)
+                match(rest2, /[0-9]+/); tport = substr(rest2, RSTART, RLENGTH)
+            }
+        } else if (match($0, /dnat ip to /)) {
+            rest = substr($0, RSTART + 11)
+            if (match(rest, /[^ ]+/)) {
+                s = substr(rest, RSTART, RLENGTH)
+                n = split(s, p, ":"); target = p[1]; tport = p[n]
+            }
+        }
+        # bytes
+        if (match($0, /bytes [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/bytes /, "", s); bytes = s
+        }
+        # comment
+        if (match($0, /comment "/)) {
+            rest = substr($0, RSTART + 9)
+            p = index(rest, "\"")
+            if (p > 1) comment = substr(rest, 1, p - 1)
+        }
 
         if (lport != "" && proto != "") {
             key = proto "|" lport "|" ipver
@@ -1724,12 +1774,22 @@ _parse_nft_bidirectional_traffic() {
     }
 
     section == "fwd" && /pfwd_ret:/ {
-        if (match($0, /pfwd_ret:([0-9]+):([46]):([a-z]+)/, m)) {
-            key = m[3] "|" m[1] "|" m[2]
-            if (key in in_bytes) {
-                ob = "0"
-                if (match($0, /bytes ([0-9]+)/, bm)) ob = bm[1]
-                out_bytes[key] = ob
+        # Extract pfwd_ret:<lport>:<ipver>:<proto> using POSIX match+substr
+        if (match($0, /pfwd_ret:[0-9]+:[46]:[a-z]+/)) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/pfwd_ret:/, "", s)
+            n = split(s, rp, ":")
+            if (n >= 3) {
+                key = rp[3] "|" rp[1] "|" rp[2]
+                if (key in in_bytes) {
+                    ob = "0"
+                    if (match($0, /bytes [0-9]+/)) {
+                        bs = substr($0, RSTART, RLENGTH)
+                        sub(/bytes /, "", bs)
+                        ob = bs
+                    }
+                    out_bytes[key] = ob
+                }
             }
         }
     }
@@ -2179,28 +2239,37 @@ _parse_realm_endpoints() {
     /^# / { comment=$0; sub(/^# /, "", comment); next }
     /^\[\[endpoints\]\]/ { listen=""; remote=""; next }
     /^listen/ {
-        match($0, /"([^"]+)"/, m)
-        if (RSTART) listen=m[1]
+        # Extract value between quotes: listen = "..."
+        if (match($0, /"[^"]+"/)) {
+            listen = substr($0, RSTART+1, RLENGTH-2)
+        }
         next
     }
     /^remote/ {
-        match($0, /"([^"]+)"/, m)
-        if (RSTART) remote=m[1]
+        # Extract value between quotes: remote = "..."
+        if (match($0, /"[^"]+"/)) {
+            remote = substr($0, RSTART+1, RLENGTH-2)
+        }
         if (listen != "" && remote != "") {
             # Determine ip_ver from listen address
             ip_ver="46"
             if (listen ~ /^0\.0\.0\.0:/) ip_ver="4"
-            if (listen ~ /^\[::]:/) ip_ver="46"
+            if (substr(listen, 1, 4) == "[::]:") ip_ver="46"
             # Extract port from listen
             split(listen, la, ":")
             lport = la[length(la)]
             # Extract target and port from remote
-            if (remote ~ /^\[/) {
-                # IPv6 remote [addr]:port
-                match(remote, /\[([^\]]+)\]:([0-9]+)/, rm)
-                if (RSTART) {
-                    printf "%s|%s|%s|%s|%s|%s|%s\n", lport, rm[1], rm[2], ip_ver, listen, remote, comment
+            if (substr(remote, 1, 1) == "[") {
+                # IPv6 remote [addr]:port - use index to split on "]:"
+                tmp = substr(remote, 2)
+                idx = index(tmp, "]:")
+                if (idx > 0) {
+                    rtarget = substr(tmp, 1, idx - 1)
+                    rtport = substr(tmp, idx + 2)
+                } else {
+                    rtarget = tmp; rtport = ""
                 }
+                printf "%s|%s|%s|%s|%s|%s|%s\n", lport, rtarget, rtport, ip_ver, listen, remote, comment
             } else {
                 # IPv4/domain remote addr:port
                 n = split(remote, ra, ":")
@@ -2499,7 +2568,8 @@ cmd_export() {
                 # Strip port from target if embedded
                 sub(/:[0-9]+$/, "", target)
                 # Handle IPv6 bracket format
-                gsub(/^\[|\]$/, "", target)
+                if (substr(target, 1, 1) == "[") target = substr(target, 2)
+                sub(/]$/, "", target)
                 if (!first) printf ","
                 first=0
                 # Escape double quotes in comment
