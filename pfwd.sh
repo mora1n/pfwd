@@ -3716,7 +3716,7 @@ menu_delete_rule() {
     # Collect nft rules
     if _nft_table_exists; then
         local nft_parsed
-        nft_parsed=$(_parse_nft_prerouting_rules)
+        nft_parsed=$(_parse_nft_prerouting_rules | _sort_parsed_rules)
         if [[ -n "$nft_parsed" ]]; then
             while IFS='|' read -r proto lport ipver target tport comment bytes; do
                 [[ -z "$lport" ]] && continue
