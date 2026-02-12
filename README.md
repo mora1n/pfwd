@@ -6,14 +6,16 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **realm forwarding** for domain-based targets and userspace proxying
+- **Batch mode** — bulk add rules with a single save/restart cycle (100 rules → ~3 I/O ops instead of ~300)
 - **Smart download system** with GitHub mirror support for improved reliability (especially in China)
 - **Port availability check** to prevent conflicts before adding rules
-- **Network environment detection** showing IPv4/IPv6 status and public/private classification
+- **Network environment detection** showing IPv4/IPv6 status and public/private classification (30s cache)
 - **Enhanced input prompts** with clear examples and formatting
 - **Dual backup system** for nftables rules (main config + timestamped backups)
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
 - **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
 - **CLI + Interactive menu** interface
+- **Numbered delete menu** — select rules by number for quick deletion in interactive mode
 - **Traffic statistics** via nftables counters
 - **Backup/Import/Export** in JSON format
 - **Boot persistence** via systemd services
@@ -22,6 +24,7 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **Port mapping auto-replace** — re-adding a rule for an existing local port automatically replaces the old target instead of skipping
 - **Virtual NIC filtering** — flowtable setup automatically excludes virtual interfaces (veth, docker, virbr, etc.)
 - **Auto-persist nf_flow_table** — automatically writes `/etc/modules-load.d/nf_flow_table.conf` after loading the module
+- **`--no-color` mode** — disable colored output for scripting or piped usage
 
 ## Quick Start
 
@@ -53,6 +56,7 @@ Commands:
   (none/add)  Add forwarding rules (default)
   del         Delete forwarding rules
   list        List all forwarding rules
+  status      Show running status and rule counts
   start       Start forwarding (nft / realm / all)
   stop        Stop forwarding (nft / realm / all)
   restart     Restart forwarding (nft / realm / all)
@@ -89,8 +93,9 @@ pfwd -m nft|realm [options] local_port:target:target_port[,...]
 | `--tcp` | TCP only (default) |
 | `--udp` | UDP only |
 | `--both` | TCP + UDP |
-| `-c, --comment` | Comment (realm only) |
+| `-c, --comment` | Comment |
 | `-q, --quiet` | Quiet mode |
+| `--no-color` | Disable colored output |
 
 ### Port Formats (with `-t`)
 
@@ -142,6 +147,9 @@ pfwd restart realm
 # List all rules
 pfwd list
 
+# Quick status overview
+pfwd status
+
 # Traffic stats
 pfwd stats
 
@@ -180,6 +188,10 @@ Install realm: `pfwd install`
 | Feature | Description |
 |---------|-------------|
 | **Flowtable fast path** | Established connections offloaded to ingress, bypassing netfilter |
+| **Batch mode** | Bulk add defers save/restart to end; 100 rules: ~300 I/O → ~3 |
+| **Single nft query** | realm list pre-fetches nft data once instead of per-endpoint |
+| **Kernel opt caching** | `ensure_kernel_optimized` skips rewrite if already configured |
+| **Network detection cache** | 30-second TTL avoids repeated `ip addr` calls in interactive mode |
 | **Smart download** | Multiple GitHub mirrors with automatic fallback for reliable downloads |
 | **Port conflict prevention** | Pre-flight checks to avoid configuration errors |
 | **Network awareness** | Auto-detects IPv4/IPv6, public/private networks for better UX |
@@ -209,7 +221,7 @@ Install realm: `pfwd install`
 ```json
 {
   "export_info": {
-    "version": "1.0.0",
+    "version": "1.5.1",
     "tool": "pfwd",
     "export_time": "2026-01-01T00:00:00",
     "source_ip": "1.2.3.4"
