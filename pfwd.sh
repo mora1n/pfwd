@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -36,15 +36,15 @@ readonly SHORTCUT_LINK="$INSTALL_DIR/pfwd"
 # nftables names
 readonly NFT_TABLE="inet port_forward"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Colors (use $'...' so escape chars are real, works with echo -e and read -rp)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
 
 # disable_colors - strip all color codes
 disable_colors() {
@@ -598,60 +598,6 @@ expand_port_spec() {
         msg_err "No valid port specs found"
         return 1
     fi
-}
-
-# _expand_triple_range <lspec> <target> <tspec> -> populates EXPANDED_RULES
-# Expand ranges in legacy triple format: lspec:target:tspec
-_expand_triple_range() {
-    local lspec="$1" target="$2" tspec="$3"
-    EXPANDED_RULES=()
-    _expand_range_pair "$lspec" "$tspec" "$target"
-}
-
-# expand_rules <rule> -> populates EXPANDED_RULES
-# Compatibility layer for old triple format with range support
-# Detects ranges in lport:target:tport format, falls back to parse_rule for plain triples
-expand_rules() {
-    local rule="$1"
-    EXPANDED_RULES=()
-
-    # IPv6 bracket format: lspec:[ipv6]:tspec
-    if [[ "$rule" =~ ^([0-9-]+):\[([^\]]+)\]:([0-9-]+)$ ]]; then
-        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}" tspec="${BASH_REMATCH[3]}"
-        if [[ "$lspec" == *-* || "$tspec" == *-* ]]; then
-            _expand_triple_range "$lspec" "$target" "$tspec"
-            return $?
-        fi
-        # No range, single rule
-        EXPANDED_RULES=("$rule")
-        return 0
-    fi
-
-    # Standard format: lspec:target:tspec (target may contain dots/colons for domain/ipv4)
-    if [[ "$rule" =~ ^([0-9-]+):(.+):([0-9-]+)$ ]]; then
-        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}" tspec="${BASH_REMATCH[3]}"
-        if [[ "$lspec" == *-* || "$tspec" == *-* ]]; then
-            _expand_triple_range "$lspec" "$target" "$tspec"
-            return $?
-        fi
-        # No range, single rule
-        EXPANDED_RULES=("$rule")
-        return 0
-    fi
-
-    # lspec:target (no target port, same port as local) - with range support
-    if [[ "$rule" =~ ^([0-9-]+):(.+)$ ]]; then
-        local lspec="${BASH_REMATCH[1]}" target="${BASH_REMATCH[2]}"
-        # Only if target looks like an address (not a port)
-        if validate_target "$target" && [[ "$lspec" == *-* ]]; then
-            _expand_triple_range "$lspec" "$target" "$lspec"
-            return $?
-        fi
-    fi
-
-    # No range detected, return as-is for parse_rule
-    EXPANDED_RULES=("$rule")
-    return 0
 }
 
 # format_bytes <bytes> -> human readable string
@@ -2612,15 +2558,12 @@ Shortcut syntax (auto nft):
   pfwd <port> <target> <tport>  pfwd 8080 1.2.3.4 80
   pfwd <ports> <target>         pfwd 80,443 1.2.3.4
 
-Add rules (new syntax):
+Add rules:
   pfwd -m nft|realm -t <target> [options] <ports>
-
-Add rules (legacy syntax):
-  pfwd -m nft|realm [options] local_port:target:target_port[,...]
 
 Options:
   -m, --method <nft|realm>   Forwarding method (required)
-  -t, --target <addr>        Target IP or domain (enables new syntax)
+  -t, --target <addr>        Target IP or domain (required)
   -4                         IPv4 only
   -6                         IPv6 only
   -46                        Dual-stack (default)
@@ -2632,7 +2575,7 @@ Options:
   --no-color                 Disable colored output
   --no-clear                 Don't clear screen in interactive menu
 
-Port formats (with -t):
+Port formats:
   Single port:    80
   Multiple ports: 80,443
   Port range:     8080-8090
@@ -2643,7 +2586,6 @@ Port formats (with -t):
 List/Filter:
   pfwd list                  List all rules (with numbering + colors)
   pfwd list -f <pattern>     Filter rules by regex pattern
-  pfwd list --filter 9000    Show only rules matching "9000"
 
 Traffic:
   pfwd stats                 Show traffic statistics
@@ -2660,27 +2602,15 @@ Backup/Import/Export:
   pfwd import <filepath> [-m nft|realm]
   pfwd import --url <URL> [-m nft|realm]
 
-Examples (shortcut):
+Examples:
   pfwd 8080 1.2.3.4
-  pfwd 8080 1.2.3.4 80
   pfwd 80,443 1.2.3.4
-
-Examples (new syntax):
+  pfwd 8080 1.2.3.4 80
   pfwd -m nft -t 1.2.3.4 80,443,8080-8090
   pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
   pfwd -m realm -t example.com 80,443 -c "web"
   pfwd -m nft -t 1.2.3.4 33389:3389
-
-Examples (legacy syntax):
-  pfwd -m nft -4 --both 3389:1.2.3.4:3389
-  pfwd -m nft 8080-8090:1.2.3.4:3080-3090
-  pfwd -m realm -46 3389:example.com:3389,10281:example.com:10281
-
-Other:
   pfwd del -m nft 3389
-  pfwd del -m nft --tcp 8080
-  pfwd del -m nft --udp 8080
-  pfwd del -m nft 8080-8088
   pfwd del -m nft 80,443,8080-8082
   pfwd del -m realm 3389
   pfwd list
@@ -2724,8 +2654,13 @@ cmd_add() {
     fi
 
     if [[ -z "$rules_str" ]]; then
-        msg_err "No rules specified"
-        msg_err "Format: local_port:target:target_port  or  -t <target> <ports>"
+        msg_err "No ports specified"
+        msg_err "Usage: pfwd -m nft -t <target> <ports>"
+        return 1
+    fi
+
+    if [[ -z "$target" ]]; then
+        msg_err "Target is required. Use -t <ip|domain>"
         return 1
     fi
 
@@ -2737,40 +2672,25 @@ cmd_add() {
     # Enable batch mode: skip per-rule save/restart
     _BATCH_MODE=true
 
-    if [[ -n "$target" ]]; then
-        # New syntax: -t <target> <port_spec>
-        if ! validate_target "$target"; then
-            msg_err "Invalid target: $target"
-            _BATCH_MODE=false
-            return 1
-        fi
-        if ! expand_port_spec "$rules_str" "$target"; then
-            _BATCH_MODE=false
-            return 1
-        fi
-        for expanded in "${EXPANDED_RULES[@]}"; do
-            if ! parse_rule "$expanded"; then
-                ((failed++)) || true; continue
-            fi
-            _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" && \
-                ((added++)) || ((failed++)) || true
-        done
-    else
-        # Legacy syntax: lport:target:tport[,...]
-        IFS=',' read -ra rules_arr <<< "$rules_str"
-        for rule in "${rules_arr[@]}"; do
-            if ! expand_rules "$rule"; then
-                ((failed++)) || true; continue
-            fi
-            for expanded in "${EXPANDED_RULES[@]}"; do
-                if ! parse_rule "$expanded"; then
-                    ((failed++)) || true; continue
-                fi
-                _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" && \
-                    ((added++)) || ((failed++)) || true
-            done
-        done
+    if ! validate_target "$target"; then
+        msg_err "Invalid target: $target"
+        _BATCH_MODE=false
+        return 1
     fi
+    if ! expand_port_spec "$rules_str" "$target"; then
+        _BATCH_MODE=false
+        return 1
+    fi
+    for expanded in "${EXPANDED_RULES[@]}"; do
+        if ! parse_rule "$expanded"; then
+            ((failed++)) || true; continue
+        fi
+        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
+            ((added++)) || true
+        else
+            ((failed++)) || true
+        fi
+    done
 
     # Batch finalize: save/persist/restart once
     _BATCH_MODE=false

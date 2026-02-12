@@ -6,25 +6,19 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **realm forwarding** for domain-based targets and userspace proxying
-- **Batch mode** — bulk add rules with a single save/restart cycle (100 rules → ~3 I/O ops instead of ~300)
-- **Smart download system** with GitHub mirror support for improved reliability (especially in China)
-- **Port availability check** to prevent conflicts before adding rules
-- **Network environment detection** showing IPv4/IPv6 status and public/private classification (30s cache)
-- **Enhanced input prompts** with clear examples and formatting
-- **Dual backup system** for nftables rules (main config + timestamped backups)
+- **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
+- **Batch mode** — bulk add/delete with single save/restart cycle
+- **nft output caching** — TTL-based cache eliminates redundant `nft list` calls
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
 - **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
-- **CLI + Interactive menu** interface
-- **Numbered delete menu** — select rules by number for quick deletion in interactive mode
-- **Traffic statistics** via nftables counters
+- **CLI + Interactive menu** with numbered rules and color coding
+- **Rule filtering** — `pfwd list -f <pattern>` for regex search
+- **Traffic statistics** with optional live rate display (`pfwd stats --rate`)
+- **Kernel optimization profiles** — balanced / gaming / lowmem
 - **Backup/Import/Export** in JSON format
 - **Boot persistence** via systemd services
-- **Enhanced kernel optimization** (BBR, TCP tuning, conntrack, flowtable)
-- **Flowtable diagnostics** — kernel version detection, automatic module loading, actionable fix suggestions
-- **Port mapping auto-replace** — re-adding a rule for an existing local port automatically replaces the old target instead of skipping
-- **Virtual NIC filtering** — flowtable setup automatically excludes virtual interfaces (veth, docker, virbr, etc.)
-- **Auto-persist nf_flow_table** — automatically writes `/etc/modules-load.d/nf_flow_table.conf` after loading the module
-- **`--no-color` mode** — disable colored output for scripting or piped usage
+- **Smart download** with GitHub mirror support
+- **`--no-color` / `--no-clear`** modes for scripting
 
 ## Quick Start
 
@@ -32,19 +26,16 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 # Install
 curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd && chmod +x /usr/local/bin/pfwd
 
-# Or just copy the script
-cp pfwd.sh /usr/local/bin/pfwd
-
 # Interactive mode
 pfwd
 
-# CLI examples (new syntax with -t)
+# Shortcut (auto nft)
+pfwd 8080 1.2.3.4
+pfwd 80,443 1.2.3.4
+
+# Full syntax
 pfwd -m nft -t 1.2.3.4 80,443,8080-8090
 pfwd -m realm -t example.com 80,443 -c "web"
-
-# CLI examples (legacy syntax)
-pfwd -m nft -4 --both 3389:1.2.3.4:3389
-pfwd -m realm -46 3389:example.com:3389
 ```
 
 ## Usage
@@ -57,47 +48,37 @@ Commands:
   del         Delete forwarding rules
   list        List all forwarding rules
   status      Show running status and rule counts
-  start       Start forwarding (nft / realm / all)
-  stop        Stop forwarding (nft / realm / all)
-  restart     Restart forwarding (nft / realm / all)
+  start/stop/restart  Control forwarding (nft / realm / all)
   stats       Traffic statistics
   export      Export config to JSON
   import      Import config from JSON
   install     Install realm binary
   uninstall   Uninstall (realm / nftables / all)
-  optimize    Run kernel optimization only
+  optimize    Kernel optimization [balanced|gaming|lowmem]
   help        Show help
 ```
 
 ### Add Rules
 
-**New syntax** (recommended):
-
 ```bash
 pfwd -m nft|realm -t <target> [options] <ports>
-```
 
-**Legacy syntax**:
-
-```bash
-pfwd -m nft|realm [options] local_port:target:target_port[,...]
+# Or shortcut (defaults to nft):
+pfwd <ports> <target> [target_port]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `-m, --method` | `nft` or `realm` (required) |
-| `-t, --target` | Target IP or domain (enables new syntax) |
-| `-4` | IPv4 only |
-| `-6` | IPv6 only |
-| `-46` | Dual-stack (default) |
-| `--tcp` | TCP only (default) |
-| `--udp` | UDP only |
-| `--both` | TCP + UDP |
+| `-t, --target` | Target IP or domain (required) |
+| `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
+| `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
 | `-c, --comment` | Comment |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
+| `--no-clear` | Don't clear screen in interactive menu |
 
-### Port Formats (with `-t`)
+### Port Formats
 
 | Format | Example | Description |
 |--------|---------|-------------|
@@ -111,47 +92,36 @@ pfwd -m nft|realm [options] local_port:target:target_port[,...]
 ### Examples
 
 ```bash
-# New syntax: nftables with port range
-pfwd -m nft -t 1.2.3.4 3389-8090
+# Shortcut
+pfwd 8080 1.2.3.4
+pfwd 80,443 1.2.3.4
+pfwd 8080 1.2.3.4 80          # local 8080 -> remote 80
 
-# New syntax: nftables with mixed ports, IPv4 only, TCP+UDP
-pfwd -m nft -t 1.2.3.4 -4 --both 80,443,8080-8090
-
-# New syntax: realm with domain target
-pfwd -m realm -t example.com 80,443 -c "web"
-
-# New syntax: port mapping (local 33389 -> remote 3389)
+# nftables
+pfwd -m nft -t 1.2.3.4 80,443,8080-8090
+pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
 pfwd -m nft -t 1.2.3.4 33389:3389
 
-# Replace existing rule: change port 3389's target from old to new
-pfwd -m nft -t 5.6.7.8 3389:3389
+# realm (domain targets)
+pfwd -m realm -t example.com 80,443 -c "web"
 
-# Legacy syntax: nftables IPv4 TCP+UDP forwarding
-pfwd -m nft -4 --both 3389:1.2.3.4:3389
-
-# Legacy syntax: realm multiple endpoints
-pfwd -m realm -46 3389:example.com:3389,8090:example.com:8090
-
-# Legacy syntax: port range
-pfwd -m nft 8080-8090:1.2.3.4:3080-3090
-
-# Delete rules
+# Delete
 pfwd del -m nft 3389
-pfwd del -m realm 3389,8090
+pfwd del -m nft 80,443,8080-8082
+pfwd del -m realm 3389
 
-# Start/Stop/Restart
-pfwd stop nft
-pfwd start all
-pfwd restart realm
-
-# List all rules
+# List / Filter
 pfwd list
+pfwd list -f 8080
 
-# Quick status overview
-pfwd status
-
-# Traffic stats
+# Traffic
 pfwd stats
+pfwd stats --rate
+
+# Kernel optimization
+pfwd optimize              # balanced (default)
+pfwd optimize gaming       # low latency
+pfwd optimize lowmem       # for small VPS
 
 # Export/Import
 pfwd export ~/backup.json
@@ -163,95 +133,49 @@ pfwd import --url https://example.com/backup.json
 
 ### nftables (with flowtable)
 
-Kernel-level DNAT forwarding with flowtable fast path acceleration. Established connections are offloaded to the ingress hook, bypassing the entire netfilter stack for near-zero CPU overhead.
+Kernel-level DNAT forwarding with flowtable fast path acceleration. Established connections are offloaded to the ingress hook, bypassing the entire netfilter stack.
 
-Flowtable requires Linux kernel >= 4.16 and the `nf_flow_table` module. pfwd will automatically:
-- Detect kernel version and skip flowtable on older kernels
-- Attempt to load the `nf_flow_table` module via `modprobe`
-- Persist the module to `/etc/modules-load.d/nf_flow_table.conf` for boot survival (idempotent)
-- Provide actionable suggestions if the module is unavailable (e.g. `apt install linux-modules-extra-$(uname -r)`)
-- Fall back gracefully to standard forwarding if flowtable is not available
-- Automatically replace existing rules when re-adding the same local port with a different target
+Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loads, and persists the module, falling back gracefully if unavailable.
 
 Best for: IP-based targets, maximum performance.
 
 ### realm
 
-Userspace proxy written in Rust. Supports domain-based targets natively. Re-adding an existing listen port automatically replaces the old endpoint.
+Userspace proxy written in Rust. Supports domain-based targets natively.
 
 Best for: Domain targets, environments where kernel-level forwarding is not suitable.
 
-Install realm: `pfwd install`
+Install: `pfwd install`
 
 ## Performance
 
 | Feature | Description |
 |---------|-------------|
-| **Flowtable fast path** | Established connections offloaded to ingress, bypassing netfilter |
-| **Batch mode** | Bulk add defers save/restart to end; 100 rules: ~300 I/O → ~3 |
-| **Single nft query** | realm list pre-fetches nft data once instead of per-endpoint |
-| **Kernel opt caching** | `ensure_kernel_optimized` skips rewrite if already configured |
-| **Network detection cache** | 30-second TTL avoids repeated `ip addr` calls in interactive mode |
-| **Smart download** | Multiple GitHub mirrors with automatic fallback for reliable downloads |
-| **Port conflict prevention** | Pre-flight checks to avoid configuration errors |
-| **Network awareness** | Auto-detects IPv4/IPv6, public/private networks for better UX |
-| **BBR congestion control** | Optimized for throughput |
-| **TCP fast open** | Reduced connection latency |
-| **Conntrack tuning** | 1M max connections, optimized timeouts |
-| **Buffer optimization** | 256MB TCP buffers |
-| **MTU probing** | Auto MTU discovery to avoid fragmentation |
+| Flowtable fast path | Established connections offloaded to ingress |
+| nft output cache | TTL-based cache avoids redundant nft list calls |
+| Batch mode | Bulk add/delete defers save/restart to end |
+| Batch delete | Single chain fetch for multi-port deletion |
+| O(1) traffic matching | Hash-based postrouting lookup (replaces O(n²) loop) |
+| Pure-bash format_bytes | No awk fork for human-readable byte formatting |
+| BBR + TCP tuning | Optimized congestion control and buffers |
 
 ## File Locations
 
 | File | Purpose |
 |------|---------|
-| `/etc/modules-load.d/nf_flow_table.conf` | nf_flow_table module auto-persistence |
 | `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
-| `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5 kept) |
+| `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5) |
 | `/etc/realm/config.toml` | realm configuration |
 | `/etc/systemd/system/realm-forward.service` | realm systemd service |
 | `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore |
-| `/var/lib/pfwd/restore-nft.sh` | nftables restore script |
-| `/var/lib/pfwd/backup_*.json` | backup files |
-| `/usr/local/bin/realm` | realm binary |
 | `/etc/sysctl.d/99-pfwd.conf` | kernel optimizations |
-
-## JSON Backup Format
-
-```json
-{
-  "export_info": {
-    "version": "1.5.1",
-    "tool": "pfwd",
-    "export_time": "2026-01-01T00:00:00",
-    "source_ip": "1.2.3.4"
-  },
-  "forward_rules": [
-    {
-      "type": "nftables",
-      "local_port": "3389",
-      "target_ip": "1.2.3.4",
-      "target_port": "3389",
-      "protocol": "tcp",
-      "ip_ver": "4"
-    },
-    {
-      "type": "realm",
-      "local_port": "3389",
-      "target_ip": "example.com",
-      "target_port": "3389",
-      "ip_ver": "46",
-      "comment": "example"
-    }
-  ]
-}
-```
+| `/var/lib/pfwd/` | backup files and restore scripts |
 
 ## Requirements
 
 - Linux with root access
 - nftables (for nft method)
-- Linux kernel >= 4.16 (for flowtable acceleration; older kernels fall back to standard forwarding)
+- Linux kernel >= 4.16 (for flowtable; older kernels fall back to standard forwarding)
 - jq (auto-installed for import/export)
 - curl or wget (for realm installation and URL imports)
 
