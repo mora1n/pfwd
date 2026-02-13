@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.4"
+readonly VERSION="1.6.7"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -27,6 +27,7 @@ readonly REALM_CONFIG_DIR="/etc/realm"
 readonly REALM_CONFIG="$REALM_CONFIG_DIR/config.toml"
 readonly REALM_SERVICE="/etc/systemd/system/realm-forward.service"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-pfwd.conf"
+readonly TRAFFIC_DATA="$DATA_DIR/traffic_stats.dat"
 
 # Install paths
 readonly INSTALL_DIR="/usr/local/bin"
@@ -765,6 +766,7 @@ optimize_kernel() {
     # Profile-specific values
     local buf_max conntrack_max conntrack_tcp_est udp_timeout udp_stream_timeout
     local tcp_rmem tcp_wmem backlog somaxconn file_max
+    local ft_tcp_timeout ft_udp_timeout conntrack_buckets gro_normal_batch
 
     case "$profile" in
         gaming)
@@ -778,6 +780,10 @@ optimize_kernel() {
             backlog=50000
             somaxconn=32768
             file_max=3407872
+            ft_tcp_timeout=300
+            ft_udp_timeout=120
+            conntrack_buckets=131072
+            gro_normal_batch=8
             ;;
         lowmem)
             buf_max=16777216         # 16MB
@@ -790,6 +796,10 @@ optimize_kernel() {
             backlog=10000
             somaxconn=4096
             file_max=1048576
+            ft_tcp_timeout=60
+            ft_udp_timeout=15
+            conntrack_buckets=32768
+            gro_normal_batch=4
             ;;
         balanced|*)
             buf_max=268435456        # 256MB
@@ -802,6 +812,10 @@ optimize_kernel() {
             backlog=100000
             somaxconn=65535
             file_max=6815744
+            ft_tcp_timeout=120
+            ft_udp_timeout=30
+            conntrack_buckets=262144
+            gro_normal_batch=8
             ;;
     esac
 
@@ -859,6 +873,16 @@ net.netfilter.nf_conntrack_tcp_timeout_established = $conntrack_tcp_est
 net.netfilter.nf_conntrack_tcp_loose = 1
 net.netfilter.nf_conntrack_udp_timeout = $udp_timeout
 net.netfilter.nf_conntrack_udp_timeout_stream = $udp_stream_timeout
+net.netfilter.nf_conntrack_acct = 1
+net.netfilter.nf_conntrack_helper = 0
+net.netfilter.nf_conntrack_buckets = $conntrack_buckets
+
+# Flowtable Timeout
+net.netfilter.nf_flowtable_tcp_timeout = $ft_tcp_timeout
+net.netfilter.nf_flowtable_udp_timeout = $ft_udp_timeout
+
+# GRO Optimization
+net.core.gro_normal_batch = $gro_normal_batch
 
 # DNAT Optimization
 net.ipv4.conf.all.rp_filter = 0
@@ -894,7 +918,9 @@ EOF
     msg_dim "  IP forwarding: enabled"
     msg_dim "  BBR congestion control: enabled"
     msg_dim "  TCP fast open: enabled"
-    msg_dim "  Conntrack max: $conntrack_max"
+    msg_dim "  Conntrack max: $conntrack_max (buckets: $conntrack_buckets)"
+    msg_dim "  Conntrack accounting: enabled"
+    msg_dim "  Flowtable timeout: tcp=${ft_tcp_timeout}s udp=${ft_udp_timeout}s"
     msg_dim "  Flowtable acceleration: via nftables"
 }
 
@@ -1251,10 +1277,17 @@ nft_ensure_table() {
             fi
         fi
 
-        # Try to create flowtable
+        # Try to create flowtable (three-level fallback)
         local ft_err
-        if ft_err=$(nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>&1); then
+        if ft_err=$(nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; flags offload; counter; }" 2>&1); then
             flowtable_ok=true
+            msg_dim "  Flowtable: hardware offload + counter enabled"
+        elif ft_err=$(nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; counter; }" 2>&1); then
+            flowtable_ok=true
+            msg_dim "  Flowtable: counter enabled (no hardware offload)"
+        elif ft_err=$(nft add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }" 2>&1); then
+            flowtable_ok=true
+            msg_dim "  Flowtable: basic mode (kernel < 5.7, no counter)"
         else
             msg_warn "Flowtable creation failed, continuing without fast path"
             msg_dim "  devices=($nics) error: $ft_err"
@@ -1498,6 +1531,9 @@ nft_delete_port() {
         return 0
     fi
 
+    # Save traffic data before deleting rules
+    _traffic_accumulate_and_clear "$port" "$proto"
+
     local deleted=0
 
     # Step 1: Find prerouting DNAT rules matching dport $port (with protocol filter)
@@ -1596,6 +1632,11 @@ nft_delete_ports_batch() {
         msg_warn "No nftables forwarding table found"
         return 0
     fi
+
+    # Save traffic data for all ports before deleting
+    for port in "${_ports_ref[@]}"; do
+        _traffic_accumulate_and_clear "$port" "$proto"
+    done
 
     # Fetch all chain data once with handles
     local pre_data post_data input_data fwd_data
@@ -1878,6 +1919,10 @@ nft_list_rules() {
         return 0
     fi
 
+    # Load saved traffic data for merging
+    declare -A _SAVED_IN _SAVED_OUT
+    _traffic_load
+
     echo -e "${CYAN}nftables forwarding rules:${NC}"
     echo -e "  ${DIM}┌────┬────────┬──────┬──────┬──────────────────────────────┬────────────────────┬──────────┐${NC}"
     printf "  ${DIM}│${NC}${BOLD}%-4s${NC}${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-30s${NC}${DIM}│${NC}${BOLD}%-20s${NC}${DIM}│${NC}${BOLD}%-10s${NC}${DIM}│${NC}\n" " # " " L.Port" " Proto" " IPvr" " Target" " Comment" " Traffic"
@@ -1897,6 +1942,10 @@ nft_list_rules() {
             [[ ! "$line_text" =~ $filter ]] && continue
         fi
         ((idx++)) || true
+        # Merge with saved traffic data
+        local key="${proto}|${lport}|${ipver}"
+        local saved_total=$(( ${_SAVED_IN[$key]:-0} + ${_SAVED_OUT[$key]:-0} ))
+        bytes=$(( bytes + saved_total ))
         local traffic
         traffic=$(format_bytes "$bytes")
         # Color coding: proto (tcp=green, udp=yellow), ipver (4=cyan, 6=blue)
@@ -1949,6 +1998,8 @@ nft_save() {
 
 # nft_flush_all - delete entire table and config files
 nft_flush_all() {
+    # Save all traffic data before flushing
+    _traffic_save
     nft delete table $NFT_TABLE 2>/dev/null || true
     rm -f "$NFT_CONFIG"
     rm -f "$NFT_RESTORE_SCRIPT"
@@ -2457,17 +2508,139 @@ realm_setup_traffic_counter() {
 #  Section 6: Traffic Statistics
 #===============================================================================
 
+# --- Traffic Persistence ---
+# Format: proto|lport|ipver|saved_in|saved_out (one line per rule)
+
+# _traffic_save - save current nft counter values + accumulated data to disk
+_traffic_save() {
+    _nft_table_exists || return 0
+    mkdir -p "$DATA_DIR"
+
+    # Read existing saved data into associative arrays
+    declare -A saved_in saved_out
+    if [[ -f "$TRAFFIC_DATA" ]]; then
+        while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
+            [[ -z "$s_lport" ]] && continue
+            local skey="${s_proto}|${s_lport}|${s_ipver}"
+            saved_in[$skey]="${s_in:-0}"
+            saved_out[$skey]="${s_out:-0}"
+        done < "$TRAFFIC_DATA"
+    fi
+
+    # Read current nft counter values (bidirectional)
+    _ensure_forward_counters
+    local parsed
+    parsed=$(_parse_nft_bidirectional_traffic)
+
+    if [[ -n "$parsed" ]]; then
+        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+            [[ -z "$lport" ]] && continue
+            local key="${proto}|${lport}|${ipver}"
+            local prev_in="${saved_in[$key]:-0}"
+            local prev_out="${saved_out[$key]:-0}"
+            saved_in[$key]=$(( prev_in + in_bytes ))
+            saved_out[$key]=$(( prev_out + out_bytes ))
+        done <<< "$parsed"
+    fi
+
+    # Write merged data
+    local tmp_file="${TRAFFIC_DATA}.tmp"
+    : > "$tmp_file"
+    for key in "${!saved_in[@]}"; do
+        echo "${key}|${saved_in[$key]}|${saved_out[$key]}" >> "$tmp_file"
+    done
+    mv -f "$tmp_file" "$TRAFFIC_DATA"
+}
+
+# _traffic_load - read saved traffic data into caller's associative arrays
+# Sets: _SAVED_IN[key] and _SAVED_OUT[key] (caller must declare)
+_traffic_load() {
+    [[ -f "$TRAFFIC_DATA" ]] || return 0
+    while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
+        [[ -z "$s_lport" ]] && continue
+        local key="${s_proto}|${s_lport}|${s_ipver}"
+        _SAVED_IN[$key]="${s_in:-0}"
+        _SAVED_OUT[$key]="${s_out:-0}"
+    done < "$TRAFFIC_DATA"
+}
+
+# _traffic_merge - merge current nft counters with saved data
+# Output: same format as _parse_nft_bidirectional_traffic but with accumulated totals
+_traffic_merge() {
+    declare -A _SAVED_IN _SAVED_OUT
+    _traffic_load
+
+    local parsed
+    parsed=$(_parse_nft_bidirectional_traffic)
+    [[ -z "$parsed" ]] && return 0
+
+    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+        [[ -z "$lport" ]] && continue
+        local key="${proto}|${lport}|${ipver}"
+        local merged_in=$(( in_bytes + ${_SAVED_IN[$key]:-0} ))
+        local merged_out=$(( out_bytes + ${_SAVED_OUT[$key]:-0} ))
+        local merged_total=$(( merged_in + merged_out ))
+        echo "${proto}|${lport}|${ipver}|${target}:${tport}|${tport}|${comment}|${merged_in}|${merged_out}|${merged_total}"
+    done <<< "$parsed"
+}
+
+# _traffic_accumulate_and_clear - accumulate current counters into saved data before rule deletion
+# Args: [port] [proto] - if given, only accumulate for matching rules; otherwise accumulate all
+_traffic_accumulate_and_clear() {
+    _nft_table_exists || return 0
+    local filter_port="${1:-}" filter_proto="${2:-}"
+
+    mkdir -p "$DATA_DIR"
+
+    # Read existing saved data
+    declare -A saved_in saved_out
+    if [[ -f "$TRAFFIC_DATA" ]]; then
+        while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
+            [[ -z "$s_lport" ]] && continue
+            local skey="${s_proto}|${s_lport}|${s_ipver}"
+            saved_in[$skey]="${s_in:-0}"
+            saved_out[$skey]="${s_out:-0}"
+        done < "$TRAFFIC_DATA"
+    fi
+
+    # Read current nft counter values
+    local parsed
+    parsed=$(_parse_nft_bidirectional_traffic)
+
+    if [[ -n "$parsed" ]]; then
+        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+            [[ -z "$lport" ]] && continue
+            # Apply filter if specified
+            if [[ -n "$filter_port" && "$lport" != "$filter_port" ]]; then continue; fi
+            if [[ -n "$filter_proto" && "$filter_proto" != "both" && "$proto" != "$filter_proto" ]]; then continue; fi
+            local key="${proto}|${lport}|${ipver}"
+            local prev_in="${saved_in[$key]:-0}"
+            local prev_out="${saved_out[$key]:-0}"
+            saved_in[$key]=$(( prev_in + in_bytes ))
+            saved_out[$key]=$(( prev_out + out_bytes ))
+        done <<< "$parsed"
+    fi
+
+    # Write back
+    local tmp_file="${TRAFFIC_DATA}.tmp"
+    : > "$tmp_file"
+    for key in "${!saved_in[@]}"; do
+        echo "${key}|${saved_in[$key]}|${saved_out[$key]}" >> "$tmp_file"
+    done
+    mv -f "$tmp_file" "$TRAFFIC_DATA"
+}
+
 show_traffic_stats() {
     echo -e "${BOLD}Traffic Statistics${NC}"
     echo -e "${DIM}$SEP_EQ${NC}"
 
     local has_rules=false
 
-    # nftables bidirectional traffic
+    # nftables bidirectional traffic (merged with persisted data)
     if _nft_table_exists; then
         _ensure_forward_counters
         local parsed_nft
-        parsed_nft=$(_parse_nft_bidirectional_traffic)
+        parsed_nft=$(_traffic_merge)
 
         if [[ -n "$parsed_nft" ]]; then
             has_rules=true
@@ -3528,7 +3701,7 @@ interactive_menu() {
                 wait_for_enter
                 ;;
             9) menu_uninstall || true ;;
-            0) echo "Bye."; exit 0 ;;
+            0) _traffic_save 2>/dev/null; echo "Bye."; exit 0 ;;
             *) msg_warn "Invalid choice"; sleep 1.5 ;;
         esac
     done
