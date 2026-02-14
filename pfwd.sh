@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.7"
+readonly VERSION="1.6.8"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -28,6 +28,9 @@ readonly REALM_CONFIG="$REALM_CONFIG_DIR/config.toml"
 readonly REALM_SERVICE="/etc/systemd/system/realm-forward.service"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-pfwd.conf"
 readonly TRAFFIC_DATA="$DATA_DIR/traffic_stats.dat"
+readonly TRAFFIC_COLLECTOR="$DATA_DIR/traffic-collector.sh"
+readonly TRAFFIC_SAVE_SERVICE="/etc/systemd/system/pfwd-traffic-save.service"
+readonly TRAFFIC_SAVE_TIMER="/etc/systemd/system/pfwd-traffic-save.timer"
 
 # Install paths
 readonly INSTALL_DIR="/usr/local/bin"
@@ -1531,9 +1534,6 @@ nft_delete_port() {
         return 0
     fi
 
-    # Save traffic data before deleting rules
-    _traffic_accumulate_and_clear "$port" "$proto"
-
     local deleted=0
 
     # Step 1: Find prerouting DNAT rules matching dport $port (with protocol filter)
@@ -1632,11 +1632,6 @@ nft_delete_ports_batch() {
         msg_warn "No nftables forwarding table found"
         return 0
     fi
-
-    # Save traffic data for all ports before deleting
-    for port in "${_ports_ref[@]}"; do
-        _traffic_accumulate_and_clear "$port" "$proto"
-    done
 
     # Fetch all chain data once with handles
     local pre_data post_data input_data fwd_data
@@ -1912,16 +1907,17 @@ nft_list_rules() {
     fi
 
     local parsed
-    parsed=$(_parse_nft_prerouting_rules)
+    parsed=$(_traffic_read_merged)
+
+    # Fallback to prerouting-only if no merged data (e.g. no dat file yet)
+    if [[ -z "$parsed" ]]; then
+        parsed=$(_parse_nft_prerouting_rules)
+    fi
 
     if [[ -z "$parsed" ]]; then
         msg_dim "  No nftables forwarding rules"
         return 0
     fi
-
-    # Load saved traffic data for merging
-    declare -A _SAVED_IN _SAVED_OUT
-    _traffic_load
 
     echo -e "${CYAN}nftables forwarding rules:${NC}"
     echo -e "  ${DIM}┌────┬────────┬──────┬──────┬──────────────────────────────┬────────────────────┬──────────┐${NC}"
@@ -1932,9 +1928,9 @@ nft_list_rules() {
     local sorted_rules
     sorted_rules=$(echo "$parsed" | _sort_parsed_rules)
 
-    # Display sorted rules: proto|lport|ipver|target|tport|comment|bytes
+    # Display sorted rules (supports both 7-field and 9-field formats)
     local idx=0
-    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+    while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9; do
         [[ -z "$lport" ]] && continue
         # Apply filter if specified
         if [[ -n "$filter" ]]; then
@@ -1942,10 +1938,8 @@ nft_list_rules() {
             [[ ! "$line_text" =~ $filter ]] && continue
         fi
         ((idx++)) || true
-        # Merge with saved traffic data
-        local key="${proto}|${lport}|${ipver}"
-        local saved_total=$(( ${_SAVED_IN[$key]:-0} + ${_SAVED_OUT[$key]:-0} ))
-        bytes=$(( bytes + saved_total ))
+        # Use total_bytes (f9) if 9-field format, otherwise f7 is bytes
+        local bytes="${f9:-$f7}"
         local traffic
         traffic=$(format_bytes "$bytes")
         # Color coding: proto (tcp=green, udp=yellow), ipver (4=cyan, 6=blue)
@@ -1998,16 +1992,19 @@ nft_save() {
 
 # nft_flush_all - delete entire table and config files
 nft_flush_all() {
-    # Save all traffic data before flushing
-    _traffic_save
     nft delete table $NFT_TABLE 2>/dev/null || true
     rm -f "$NFT_CONFIG"
     rm -f "$NFT_RESTORE_SCRIPT"
     if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
         systemctl disable pfwd-nft-restore 2>/dev/null || true
         rm -f "$NFT_RESTORE_SERVICE"
-        systemctl daemon-reload 2>/dev/null || true
     fi
+    # Clean up traffic collector timer/service/script/data
+    systemctl stop pfwd-traffic-save.timer 2>/dev/null || true
+    systemctl disable pfwd-traffic-save.timer 2>/dev/null || true
+    rm -f "$TRAFFIC_SAVE_SERVICE" "$TRAFFIC_SAVE_TIMER"
+    rm -f "$TRAFFIC_COLLECTOR" "$TRAFFIC_DATA"
+    systemctl daemon-reload 2>/dev/null || true
     msg_ok "nftables rules and persistence removed"
     _nft_invalidate_cache
 }
@@ -2049,7 +2046,7 @@ fi
 RESTORE_EOF
     chmod +x "$NFT_RESTORE_SCRIPT"
 
-    # Create systemd service
+    # Create systemd service (with ExecStop to save traffic on shutdown)
     cat > "$NFT_RESTORE_SERVICE" << EOF
 [Unit]
 Description=pfwd nftables rules restore
@@ -2059,14 +2056,160 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=$NFT_RESTORE_SCRIPT
+ExecStop=$TRAFFIC_COLLECTOR
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # Create traffic collector script
+    cat > "$TRAFFIC_COLLECTOR" << 'COLLECTOR_EOF'
+#!/bin/bash
+# pfwd traffic data collector - runs independently via systemd timer
+# Reads nft counters, computes deltas, writes accumulated data to disk
+set -euo pipefail
+
+NFT_TABLE="inet port_forward"
+TRAFFIC_DATA="/var/lib/pfwd/traffic_stats.dat"
+
+# Check if nft table exists
+nft list table $NFT_TABLE >/dev/null 2>&1 || exit 0
+
+# Parse prerouting (inbound) + forward return (outbound) counters via awk
+current_data=$(
+    {
+        echo "===PREROUTING==="
+        nft list chain $NFT_TABLE prerouting 2>/dev/null | grep "dnat" || true
+        echo "===FORWARD_RET==="
+        nft list chain $NFT_TABLE forward 2>/dev/null | grep "pfwd_ret:" || true
+    } | awk '
+    /^===PREROUTING===/ { section="pre"; next }
+    /^===FORWARD_RET===/ { section="fwd"; next }
+
+    section == "pre" && /dnat/ {
+        proto=""; ipver=""; lport=""; bytes="0"
+        if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
+        else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
+        else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
+        else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
+        if (match($0, /dport [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/dport /, "", s); lport = s
+        }
+        if (match($0, /bytes [0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/bytes /, "", s); bytes = s
+        }
+        if (lport != "" && proto != "") {
+            key = proto "|" lport "|" ipver
+            in_bytes[key] = bytes
+        }
+    }
+
+    section == "fwd" && /pfwd_ret:/ {
+        if (match($0, /pfwd_ret:[0-9]+:[46]:[a-z]+/)) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/pfwd_ret:/, "", s)
+            n = split(s, rp, ":")
+            if (n >= 3) {
+                key = rp[3] "|" rp[1] "|" rp[2]
+                if (key in in_bytes) {
+                    ob = "0"
+                    if (match($0, /bytes [0-9]+/)) {
+                        bs = substr($0, RSTART, RLENGTH)
+                        sub(/bytes /, "", bs)
+                        ob = bs
+                    }
+                    out_bytes[key] = ob
+                }
+            }
+        }
+    }
+
+    END {
+        for (key in in_bytes) {
+            ib = in_bytes[key]
+            ob = (key in out_bytes) ? out_bytes[key] : "0"
+            print key "|" ib "|" ob
+        }
+    }
+    '
+)
+
+# Read existing saved data into associative arrays
+declare -A acc_in acc_out snap_in snap_out
+if [[ -f "$TRAFFIC_DATA" ]]; then
+    while IFS='|' read -r s_proto s_lport s_ipver s_acc_in s_acc_out s_snap_in s_snap_out; do
+        [[ -z "$s_lport" ]] && continue
+        local_key="${s_proto}|${s_lport}|${s_ipver}"
+        acc_in[$local_key]="${s_acc_in:-0}"
+        acc_out[$local_key]="${s_acc_out:-0}"
+        snap_in[$local_key]="${s_snap_in:-0}"
+        snap_out[$local_key]="${s_snap_out:-0}"
+    done < "$TRAFFIC_DATA"
+fi
+
+# Compute deltas and update accumulated values
+if [[ -n "$current_data" ]]; then
+    while IFS='|' read -r proto lport ipver cur_in cur_out; do
+        [[ -z "$lport" ]] && continue
+        key="${proto}|${lport}|${ipver}"
+        prev_snap_in="${snap_in[$key]:-0}"
+        prev_snap_out="${snap_out[$key]:-0}"
+        # Delta calculation: handle counter reset (rule rebuilt)
+        if (( cur_in >= prev_snap_in )); then
+            delta_in=$(( cur_in - prev_snap_in ))
+        else
+            delta_in=$cur_in
+        fi
+        if (( cur_out >= prev_snap_out )); then
+            delta_out=$(( cur_out - prev_snap_out ))
+        else
+            delta_out=$cur_out
+        fi
+        acc_in[$key]=$(( ${acc_in[$key]:-0} + delta_in ))
+        acc_out[$key]=$(( ${acc_out[$key]:-0} + delta_out ))
+        snap_in[$key]=$cur_in
+        snap_out[$key]=$cur_out
+    done <<< "$current_data"
+fi
+
+# Write updated data atomically
+tmp_file="${TRAFFIC_DATA}.tmp"
+: > "$tmp_file"
+for key in "${!acc_in[@]}"; do
+    echo "${key}|${acc_in[$key]}|${acc_out[$key]}|${snap_in[$key]}|${snap_out[$key]}" >> "$tmp_file"
+done
+mv -f "$tmp_file" "$TRAFFIC_DATA"
+COLLECTOR_EOF
+    chmod +x "$TRAFFIC_COLLECTOR"
+
+    # Create traffic save timer
+    cat > "$TRAFFIC_SAVE_SERVICE" << EOF
+[Unit]
+Description=pfwd traffic data collector
+After=pfwd-nft-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=$TRAFFIC_COLLECTOR
+EOF
+
+    cat > "$TRAFFIC_SAVE_TIMER" << 'EOF'
+[Unit]
+Description=Periodically save pfwd traffic statistics
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
     systemctl daemon-reload 2>/dev/null
     systemctl enable pfwd-nft-restore >/dev/null 2>&1 || true
+    systemctl enable --now pfwd-traffic-save.timer >/dev/null 2>&1 || true
 }
 
 #===============================================================================
@@ -2508,126 +2651,49 @@ realm_setup_traffic_counter() {
 #  Section 6: Traffic Statistics
 #===============================================================================
 
-# --- Traffic Persistence ---
-# Format: proto|lport|ipver|saved_in|saved_out (one line per rule)
-
-# _traffic_save - save current nft counter values + accumulated data to disk
-_traffic_save() {
-    _nft_table_exists || return 0
-    mkdir -p "$DATA_DIR"
-
-    # Read existing saved data into associative arrays
-    declare -A saved_in saved_out
-    if [[ -f "$TRAFFIC_DATA" ]]; then
-        while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
-            [[ -z "$s_lport" ]] && continue
-            local skey="${s_proto}|${s_lport}|${s_ipver}"
-            saved_in[$skey]="${s_in:-0}"
-            saved_out[$skey]="${s_out:-0}"
-        done < "$TRAFFIC_DATA"
-    fi
-
-    # Read current nft counter values (bidirectional)
+# _traffic_read_merged - read-only merge of saved data + live nft counters
+# Output: same format as _parse_nft_bidirectional_traffic
+_traffic_read_merged() {
     _ensure_forward_counters
-    local parsed
-    parsed=$(_parse_nft_bidirectional_traffic)
-
-    if [[ -n "$parsed" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
-            [[ -z "$lport" ]] && continue
-            local key="${proto}|${lport}|${ipver}"
-            local prev_in="${saved_in[$key]:-0}"
-            local prev_out="${saved_out[$key]:-0}"
-            saved_in[$key]=$(( prev_in + in_bytes ))
-            saved_out[$key]=$(( prev_out + out_bytes ))
-        done <<< "$parsed"
-    fi
-
-    # Write merged data
-    local tmp_file="${TRAFFIC_DATA}.tmp"
-    : > "$tmp_file"
-    for key in "${!saved_in[@]}"; do
-        echo "${key}|${saved_in[$key]}|${saved_out[$key]}" >> "$tmp_file"
-    done
-    mv -f "$tmp_file" "$TRAFFIC_DATA"
-}
-
-# _traffic_load - read saved traffic data into caller's associative arrays
-# Sets: _SAVED_IN[key] and _SAVED_OUT[key] (caller must declare)
-_traffic_load() {
-    [[ -f "$TRAFFIC_DATA" ]] || return 0
-    while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
-        [[ -z "$s_lport" ]] && continue
-        local key="${s_proto}|${s_lport}|${s_ipver}"
-        _SAVED_IN[$key]="${s_in:-0}"
-        _SAVED_OUT[$key]="${s_out:-0}"
-    done < "$TRAFFIC_DATA"
-}
-
-# _traffic_merge - merge current nft counters with saved data
-# Output: same format as _parse_nft_bidirectional_traffic but with accumulated totals
-_traffic_merge() {
-    declare -A _SAVED_IN _SAVED_OUT
-    _traffic_load
-
     local parsed
     parsed=$(_parse_nft_bidirectional_traffic)
     [[ -z "$parsed" ]] && return 0
 
-    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
-        [[ -z "$lport" ]] && continue
-        local key="${proto}|${lport}|${ipver}"
-        local merged_in=$(( in_bytes + ${_SAVED_IN[$key]:-0} ))
-        local merged_out=$(( out_bytes + ${_SAVED_OUT[$key]:-0} ))
-        local merged_total=$(( merged_in + merged_out ))
-        echo "${proto}|${lport}|${ipver}|${target}:${tport}|${tport}|${comment}|${merged_in}|${merged_out}|${merged_total}"
-    done <<< "$parsed"
-}
-
-# _traffic_accumulate_and_clear - accumulate current counters into saved data before rule deletion
-# Args: [port] [proto] - if given, only accumulate for matching rules; otherwise accumulate all
-_traffic_accumulate_and_clear() {
-    _nft_table_exists || return 0
-    local filter_port="${1:-}" filter_proto="${2:-}"
-
-    mkdir -p "$DATA_DIR"
-
-    # Read existing saved data
-    declare -A saved_in saved_out
+    # Load saved accumulated + snapshot data
+    declare -A acc_in acc_out snap_in snap_out
     if [[ -f "$TRAFFIC_DATA" ]]; then
-        while IFS='|' read -r s_proto s_lport s_ipver s_in s_out; do
+        while IFS='|' read -r s_proto s_lport s_ipver s_acc_in s_acc_out s_snap_in s_snap_out; do
             [[ -z "$s_lport" ]] && continue
-            local skey="${s_proto}|${s_lport}|${s_ipver}"
-            saved_in[$skey]="${s_in:-0}"
-            saved_out[$skey]="${s_out:-0}"
+            local key="${s_proto}|${s_lport}|${s_ipver}"
+            acc_in[$key]="${s_acc_in:-0}"
+            acc_out[$key]="${s_acc_out:-0}"
+            snap_in[$key]="${s_snap_in:-0}"
+            snap_out[$key]="${s_snap_out:-0}"
         done < "$TRAFFIC_DATA"
     fi
 
-    # Read current nft counter values
-    local parsed
-    parsed=$(_parse_nft_bidirectional_traffic)
-
-    if [[ -n "$parsed" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
-            [[ -z "$lport" ]] && continue
-            # Apply filter if specified
-            if [[ -n "$filter_port" && "$lport" != "$filter_port" ]]; then continue; fi
-            if [[ -n "$filter_proto" && "$filter_proto" != "both" && "$proto" != "$filter_proto" ]]; then continue; fi
-            local key="${proto}|${lport}|${ipver}"
-            local prev_in="${saved_in[$key]:-0}"
-            local prev_out="${saved_out[$key]:-0}"
-            saved_in[$key]=$(( prev_in + in_bytes ))
-            saved_out[$key]=$(( prev_out + out_bytes ))
-        done <<< "$parsed"
-    fi
-
-    # Write back
-    local tmp_file="${TRAFFIC_DATA}.tmp"
-    : > "$tmp_file"
-    for key in "${!saved_in[@]}"; do
-        echo "${key}|${saved_in[$key]}|${saved_out[$key]}" >> "$tmp_file"
-    done
-    mv -f "$tmp_file" "$TRAFFIC_DATA"
+    # Merge: accumulated + (current - snapshot) for each rule
+    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+        [[ -z "$lport" ]] && continue
+        local key="${proto}|${lport}|${ipver}"
+        local prev_snap_in="${snap_in[$key]:-0}"
+        local prev_snap_out="${snap_out[$key]:-0}"
+        local delta_in delta_out
+        if (( in_bytes >= prev_snap_in )); then
+            delta_in=$(( in_bytes - prev_snap_in ))
+        else
+            delta_in=$in_bytes
+        fi
+        if (( out_bytes >= prev_snap_out )); then
+            delta_out=$(( out_bytes - prev_snap_out ))
+        else
+            delta_out=$out_bytes
+        fi
+        local merged_in=$(( ${acc_in[$key]:-0} + delta_in ))
+        local merged_out=$(( ${acc_out[$key]:-0} + delta_out ))
+        local merged_total=$(( merged_in + merged_out ))
+        echo "${proto}|${lport}|${ipver}|${target}|${tport}|${comment}|${merged_in}|${merged_out}|${merged_total}"
+    done <<< "$parsed"
 }
 
 show_traffic_stats() {
@@ -2638,9 +2704,8 @@ show_traffic_stats() {
 
     # nftables bidirectional traffic (merged with persisted data)
     if _nft_table_exists; then
-        _ensure_forward_counters
         local parsed_nft
-        parsed_nft=$(_traffic_merge)
+        parsed_nft=$(_traffic_read_merged)
 
         if [[ -n "$parsed_nft" ]]; then
             has_rules=true
@@ -3701,7 +3766,7 @@ interactive_menu() {
                 wait_for_enter
                 ;;
             9) menu_uninstall || true ;;
-            0) _traffic_save 2>/dev/null; echo "Bye."; exit 0 ;;
+            0) echo "Bye."; exit 0 ;;
             *) msg_warn "Invalid choice"; sleep 1.5 ;;
         esac
     done
