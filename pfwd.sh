@@ -1111,6 +1111,8 @@ _batch_finalize() {
             fi
             nft_save
             nft_setup_persistence
+            ensure_forward_accept
+            ufw_reload_if_enabled
             ;;
         realm)
             realm_restart_service
@@ -1322,7 +1324,7 @@ nft_ensure_table() {
     ensure_forward_accept
 }
 
-# ensure_forward_accept - add FORWARD ACCEPT rules if system firewall drops forwarded traffic
+# ensure_forward_accept - add FORWARD/INPUT ACCEPT rules if system firewall drops traffic
 ensure_forward_accept() {
     # Check iptables FORWARD chain
     if command -v iptables >/dev/null 2>&1; then
@@ -1335,6 +1337,15 @@ ensure_forward_accept() {
                 iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
             msg_info "Added iptables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
         fi
+
+        # Check iptables INPUT chain
+        local input_policy
+        input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+        if [[ "$input_policy" == "DROP" ]]; then
+            iptables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                iptables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT
+            msg_info "Added iptables INPUT ACCEPT rule for DNAT traffic"
+        fi
     fi
     # Check ip6tables FORWARD chain
     if command -v ip6tables >/dev/null 2>&1; then
@@ -1346,6 +1357,15 @@ ensure_forward_accept() {
             ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
                 ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
             msg_info "Added ip6tables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+        fi
+
+        # Check ip6tables INPUT chain
+        local input_policy6
+        input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+        if [[ "$input_policy6" == "DROP" ]]; then
+            ip6tables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                ip6tables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT
+            msg_info "Added ip6tables INPUT ACCEPT rule for DNAT traffic"
         fi
     fi
 }
@@ -1614,6 +1634,7 @@ nft_delete_port() {
     if (( deleted > 0 )); then
         _nft_invalidate_cache
         nft_save
+        ufw_reload_if_enabled
         local proto_msg=""
         [[ "$proto" != "both" ]] && proto_msg=" ($proto)"
         msg_ok "Deleted $deleted nftables rule(s) for port $port$proto_msg"
@@ -1716,6 +1737,7 @@ nft_delete_ports_batch() {
     if (( total_deleted > 0 )); then
         _nft_invalidate_cache
         nft_save
+        ufw_reload_if_enabled
     fi
 }
 
@@ -1989,6 +2011,26 @@ nft_save() {
 
     msg_dim "  Rules saved to $NFT_CONFIG (backup: $backup_dir)"
     _nft_invalidate_cache
+}
+
+# ufw_reload_if_enabled - reload ufw if it's enabled to apply nftables changes
+ufw_reload_if_enabled() {
+    # Check if ufw is installed
+    if ! command -v ufw >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Check if ufw is enabled
+    local ufw_status
+    ufw_status=$(ufw status 2>/dev/null | head -1)
+    if [[ "$ufw_status" =~ "Status: active" ]]; then
+        msg_dim "  Reloading ufw to apply nftables changes..."
+        if ufw reload >/dev/null 2>&1; then
+            msg_dim "  ufw reloaded successfully"
+        else
+            msg_warn "Failed to reload ufw, you may need to reload it manually"
+        fi
+    fi
 }
 
 # nft_flush_all - delete entire table and config files
