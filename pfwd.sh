@@ -1310,7 +1310,8 @@ nft_ensure_table() {
     nft add rule $NFT_TABLE forward ct state established,related accept
 
     # Input chain (for realm traffic counters)
-    nft add chain $NFT_TABLE input '{ type filter hook input priority filter; policy accept; }'
+    nft add chain $NFT_TABLE input '{ type filter hook input priority filter - 10; policy accept; }'
+    nft add rule $NFT_TABLE input ct status dnat accept comment "Allow DNAT traffic before iptables"
 
     if $flowtable_ok; then
         msg_ok "nftables table created with flowtable acceleration"
