@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.3"
+readonly VERSION="1.7.4"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -752,6 +752,23 @@ ensure_ip_forwarding() {
     if [[ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]]; then
         echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
         sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    fi
+}
+
+# ensure_route_localnet - enable route_localnet for DNAT to 127.0.0.0/8
+# Required when forwarding to loopback (127.x.x.x) targets
+ensure_route_localnet() {
+    local current
+    current=$(sysctl -n net.ipv4.conf.all.route_localnet 2>/dev/null || echo 0)
+    [[ "$current" == "1" ]] && return 0
+
+    sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+    msg_info "Enabled route_localnet (required for DNAT to loopback)"
+
+    mkdir -p "$(dirname "$SYSCTL_CONF")"
+    if ! grep -q 'route_localnet' "$SYSCTL_CONF" 2>/dev/null; then
+        echo "net.ipv4.conf.all.route_localnet = 1" >> "$SYSCTL_CONF"
+        msg_dim "  Persisted to $SYSCTL_CONF"
     fi
 }
 
@@ -1512,6 +1529,12 @@ nft_add_rule() {
         both) protos=(tcp udp) ;;
         *)    msg_err "Invalid protocol: $proto"; return 1 ;;
     esac
+
+    # Enable route_localnet if forwarding to loopback
+    local _effective_target="${resolved_v4:-$target}"
+    if [[ "$_effective_target" =~ ^127\. ]]; then
+        ensure_route_localnet
+    fi
 
     local added=0
 
