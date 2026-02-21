@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.6.8"
+readonly VERSION="1.7.3"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -742,14 +742,17 @@ remove_shortcut() {
 
 # ensure_kernel_optimized - skip optimize_kernel if already configured
 # Checks ip_forward and sysctl file; only runs full optimization if needed
-ensure_kernel_optimized() {
-    local fwd_ok=false sysctl_ok=false
-    [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] && fwd_ok=true
-    [[ -f "$SYSCTL_CONF" ]] && grep -q "pfwd-managed-start" "$SYSCTL_CONF" 2>/dev/null && sysctl_ok=true
-    if $fwd_ok && $sysctl_ok; then
-        return 0
+ensure_ip_forwarding() {
+    # Only enable IP forwarding (required for port forwarding); full kernel
+    # optimization must be triggered explicitly via: pfwd optimize [profile]
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     fi
-    optimize_kernel
+    if [[ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]]; then
+        echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    fi
 }
 
 optimize_kernel() {
@@ -770,6 +773,7 @@ optimize_kernel() {
     local buf_max conntrack_max conntrack_tcp_est udp_timeout udp_stream_timeout
     local tcp_rmem tcp_wmem backlog somaxconn file_max
     local ft_tcp_timeout ft_udp_timeout conntrack_buckets gro_normal_batch
+    local max_syn_backlog max_tw_buckets
 
     case "$profile" in
         gaming)
@@ -787,6 +791,8 @@ optimize_kernel() {
             ft_udp_timeout=120
             conntrack_buckets=131072
             gro_normal_batch=8
+            max_syn_backlog=16384
+            max_tw_buckets=262144
             ;;
         lowmem)
             buf_max=16777216         # 16MB
@@ -803,6 +809,8 @@ optimize_kernel() {
             ft_udp_timeout=15
             conntrack_buckets=32768
             gro_normal_batch=4
+            max_syn_backlog=4096
+            max_tw_buckets=65536
             ;;
         balanced|*)
             buf_max=268435456        # 256MB
@@ -819,6 +827,8 @@ optimize_kernel() {
             ft_udp_timeout=30
             conntrack_buckets=262144
             gro_normal_batch=8
+            max_syn_backlog=32768
+            max_tw_buckets=524288
             ;;
     esac
 
@@ -843,20 +853,18 @@ net.ipv4.tcp_congestion_control = bbr
 
 # TCP Optimization
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_early_retrans = 1
+net.ipv4.tcp_early_retrans = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
 net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_rfc1337 = 0
-net.ipv4.tcp_ecn = 0
-net.ipv4.tcp_frto = 0
+net.ipv4.tcp_rfc1337 = 0                    # 防止 TIME-WAIT 暗杀攻击（0=防护，1=严格 RFC1337）
+net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_frto = 2
 
 # UDP Optimization
 net.ipv4.udp_rmem_min = 8192
@@ -899,8 +907,22 @@ net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
 
+# SYN 防护与连接管理
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_syn_backlog = $max_syn_backlog
+net.ipv4.tcp_max_tw_buckets = $max_tw_buckets
+
 $marker_end
 EOF
+
+    # tcp_adv_win_scale obsolete since kernel 6.6; skip on newer kernels
+    local kver_num
+    kver_num=$(uname -r | awk -F'[.-]' '{printf "%d%03d", $1, $2}')
+    if (( kver_num < 6006 )); then
+        echo "net.ipv4.tcp_adv_win_scale = 1" >> "$SYSCTL_CONF"
+    fi
 
     sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
 
@@ -3199,8 +3221,8 @@ cmd_add() {
         return 1
     fi
 
-    # Ensure kernel forwarding is on (fast path: skip if already configured)
-    ensure_kernel_optimized 2>/dev/null || true
+    # Ensure IP forwarding is on (full optimization: use 'pfwd optimize [profile]')
+    ensure_ip_forwarding 2>/dev/null || true
 
     local added=0 failed=0
 
@@ -3947,8 +3969,8 @@ menu_add_rule() {
     echo ""
     msg_info "Processing rules..."
 
-    # Ensure kernel optimization (fast path: skip if already configured)
-    ensure_kernel_optimized 2>/dev/null || true
+    # Ensure IP forwarding is on (full optimization: use 'pfwd optimize [profile]')
+    ensure_ip_forwarding 2>/dev/null || true
 
     if ! expand_port_spec "$port_spec" "$target"; then
         msg_err "Failed to expand port spec"
