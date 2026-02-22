@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.5"
+readonly VERSION="1.7.6"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -788,7 +788,7 @@ optimize_kernel() {
 
     # Profile-specific values
     local buf_max conntrack_max conntrack_tcp_est udp_timeout udp_stream_timeout
-    local tcp_rmem tcp_wmem backlog somaxconn file_max
+    local tcp_rmem tcp_wmem tcp_mem backlog somaxconn file_max
     local ft_tcp_timeout ft_udp_timeout conntrack_buckets gro_normal_batch
     local max_syn_backlog max_tw_buckets
 
@@ -801,6 +801,7 @@ optimize_kernel() {
             udp_stream_timeout=300
             tcp_rmem="4096 131072 134217728"
             tcp_wmem="4096 131072 134217728"
+            tcp_mem="65536 98304 131072"
             backlog=50000
             somaxconn=32768
             file_max=3407872
@@ -819,6 +820,7 @@ optimize_kernel() {
             udp_stream_timeout=120
             tcp_rmem="4096 65536 16777216"
             tcp_wmem="4096 65536 16777216"
+            tcp_mem="16384 24576 32768"
             backlog=10000
             somaxconn=4096
             file_max=1048576
@@ -830,22 +832,23 @@ optimize_kernel() {
             max_tw_buckets=65536
             ;;
         balanced|*)
-            buf_max=268435456        # 256MB
+            buf_max=33554432         # 32MB
             conntrack_max=1048576
             conntrack_tcp_est=7200
             udp_timeout=60
             udp_stream_timeout=180
-            tcp_rmem="8192 262144 268435456"
-            tcp_wmem="8192 262144 268435456"
-            backlog=100000
-            somaxconn=65535
+            tcp_rmem="4096 131072 33554432"
+            tcp_wmem="4096 131072 33554432"
+            tcp_mem="32768 49152 65536"
+            backlog=4096
+            somaxconn=4096
             file_max=6815744
             ft_tcp_timeout=120
             ft_udp_timeout=30
             conntrack_buckets=262144
             gro_normal_batch=8
-            max_syn_backlog=32768
-            max_tw_buckets=524288
+            max_syn_backlog=4096
+            max_tw_buckets=262144
             ;;
     esac
 
@@ -890,6 +893,7 @@ net.ipv4.udp_wmem_min = 8192
 # Buffers
 net.core.rmem_max = $buf_max
 net.core.wmem_max = $buf_max
+net.ipv4.tcp_mem = $tcp_mem
 net.ipv4.tcp_rmem = $tcp_rmem
 net.ipv4.tcp_wmem = $tcp_wmem
 net.core.netdev_max_backlog = $backlog
