@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.4"
+readonly VERSION="1.7.5"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -1150,8 +1150,8 @@ _batch_finalize() {
             fi
             nft_save
             nft_setup_persistence
-            ensure_forward_accept
             ufw_reload_if_enabled
+            ensure_forward_accept
             ;;
         realm)
             realm_restart_service
@@ -2072,6 +2072,8 @@ ufw_reload_if_enabled() {
         msg_dim "  Reloading ufw to apply nftables changes..."
         if ufw reload >/dev/null 2>&1; then
             msg_dim "  ufw reloaded successfully"
+            # Re-add iptables ACCEPT rules after UFW reload (may have been flushed)
+            ensure_forward_accept
         else
             msg_warn "Failed to reload ufw, you may need to reload it manually"
         fi
@@ -2120,11 +2122,47 @@ log "Restoring nftables rules..."
 echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
 echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
 
+# Enable route_localnet (required for DNAT to 127.x.x.x)
+echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet 2>/dev/null
+
 NFT_CONFIG="/etc/nftables.d/port_forward.nft"
 if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
     nft delete table inet port_forward 2>/dev/null
     if nft -f "$NFT_CONFIG" 2>/dev/null; then
         log "Rules restored from $NFT_CONFIG"
+        # Re-add iptables FORWARD/INPUT ACCEPT rules if UFW/iptables has DROP policy
+        if command -v iptables >/dev/null 2>&1; then
+            policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+            if [[ "$policy" == "DROP" ]]; then
+                iptables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                    iptables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
+                iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                    iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+                log "Added iptables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+            fi
+            input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+            if [[ "$input_policy" == "DROP" ]]; then
+                iptables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                    iptables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
+                log "Added iptables INPUT ACCEPT rule for DNAT traffic"
+            fi
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+            if [[ "$policy6" == "DROP" ]]; then
+                ip6tables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                    ip6tables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
+                ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                    ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+                log "Added ip6tables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+            fi
+            input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+            if [[ "$input_policy6" == "DROP" ]]; then
+                ip6tables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
+                    ip6tables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
+                log "Added ip6tables INPUT ACCEPT rule for DNAT traffic"
+            fi
+        fi
     else
         log "Failed to restore rules from $NFT_CONFIG"
     fi
@@ -2138,7 +2176,7 @@ RESTORE_EOF
     cat > "$NFT_RESTORE_SERVICE" << EOF
 [Unit]
 Description=pfwd nftables rules restore
-After=network-online.target nftables.service systemd-sysctl.service
+After=network-online.target nftables.service systemd-sysctl.service ufw.service
 Wants=network-online.target
 
 [Service]
