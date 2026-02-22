@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.6"
+readonly VERSION="1.7.7"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -968,6 +968,27 @@ EOF
     msg_dim "  Conntrack accounting: enabled"
     msg_dim "  Flowtable timeout: tcp=${ft_tcp_timeout}s udp=${ft_udp_timeout}s"
     msg_dim "  Flowtable acceleration: via nftables"
+}
+
+# reset_kernel_optimization - remove pfwd-managed sysctl block and reload
+reset_kernel_optimization() {
+    if [[ ! -f "$SYSCTL_CONF" ]]; then
+        msg_warn "No kernel optimization config found ($SYSCTL_CONF)"
+        return 0
+    fi
+
+    local marker_start="# pfwd-managed-start"
+    local marker_end="# pfwd-managed-end"
+
+    if ! grep -q "$marker_start" "$SYSCTL_CONF" 2>/dev/null; then
+        msg_warn "No pfwd-managed optimization block found in $SYSCTL_CONF"
+        return 0
+    fi
+
+    sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+    msg_ok "Kernel optimization removed (pfwd-managed block deleted)"
+    msg_dim "  Note: some live kernel parameters may remain until reboot"
 }
 
 #===============================================================================
@@ -3677,7 +3698,10 @@ parse_cli_args() {
             ;;
         optimize)
             shift
-            optimize_kernel "${1:-balanced}"
+            case "${1:-balanced}" in
+                reset|undo) reset_kernel_optimization ;;
+                *) optimize_kernel "${1:-balanced}" ;;
+            esac
             ;;
         help|--help|-h)
             show_help
@@ -3886,14 +3910,17 @@ interactive_menu() {
                 echo -e "  ${CYAN}1)${NC} balanced  (default, high bandwidth)"
                 echo -e "  ${CYAN}2)${NC} gaming    (low latency, longer UDP timeout)"
                 echo -e "  ${CYAN}3)${NC} lowmem    (for 512MB-1GB VPS)"
+                echo -e "  ${CYAN}4)${NC} ${YELLOW}Reset${NC}     (undo optimization, remove pfwd config)"
+                echo -e "  ${CYAN}0)${NC} ${DIM}Back${NC}"
                 echo ""
-                read -rp "Select profile [1-3, default=1]: " _kp
+                read -rp "Select [0-4, default=1]: " _kp
                 case "$_kp" in
-                    2) optimize_kernel gaming ;;
-                    3) optimize_kernel lowmem ;;
-                    *) optimize_kernel balanced ;;
+                    0) continue ;;
+                    2) optimize_kernel gaming; wait_for_enter ;;
+                    3) optimize_kernel lowmem; wait_for_enter ;;
+                    4) reset_kernel_optimization; wait_for_enter ;;
+                    *) optimize_kernel balanced; wait_for_enter ;;
                 esac
-                wait_for_enter
                 ;;
             9) menu_uninstall || true ;;
             0) echo "Bye."; exit 0 ;;
