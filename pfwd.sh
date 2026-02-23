@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.7"
+readonly VERSION="1.7.8"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -843,7 +843,7 @@ optimize_kernel() {
             backlog=4096
             somaxconn=4096
             file_max=6815744
-            ft_tcp_timeout=120
+            ft_tcp_timeout=300
             ft_udp_timeout=30
             conntrack_buckets=262144
             gro_normal_batch=8
@@ -947,6 +947,11 @@ EOF
 
     sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
 
+    # Cap BQL limit_max to prevent bufferbloat
+    # flowtable fast path bypasses fq_codel; without this cap the NIC TX ring
+    # buffer can grow to the kernel default (~1.75GB), causing latency spikes
+    apply_bql_limits
+
     # Verify IP forwarding is actually enabled
     if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
         msg_warn "sysctl failed to enable IPv4 forwarding, trying direct write..."
@@ -968,6 +973,7 @@ EOF
     msg_dim "  Conntrack accounting: enabled"
     msg_dim "  Flowtable timeout: tcp=${ft_tcp_timeout}s udp=${ft_udp_timeout}s"
     msg_dim "  Flowtable acceleration: via nftables"
+    msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
 }
 
 # reset_kernel_optimization - remove pfwd-managed sysctl block and reload
@@ -989,6 +995,22 @@ reset_kernel_optimization() {
     sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
     msg_ok "Kernel optimization removed (pfwd-managed block deleted)"
     msg_dim "  Note: some live kernel parameters may remain until reboot"
+}
+
+# apply_bql_limits - cap NIC TX byte queue limits to prevent bufferbloat
+# flowtable fast path bypasses fq_codel AQM; without this cap the NIC TX ring
+# buffer can grow to the kernel default (~1.75GB on some NICs), causing latency
+# spikes under load (100ms idle → 300ms+ under traffic).
+# 64KB cap: at 1Gbps drains in ~0.5ms; at 100Mbps ~5ms — acceptable for relay.
+apply_bql_limits() {
+    local limit="${1:-65536}"  # Default: 64KB
+    local count=0
+    for f in /sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max; do
+        [[ -f "$f" ]] || continue
+        echo "$limit" > "$f" 2>/dev/null && ((count++)) || true
+    done
+    [[ $count -gt 0 ]] && msg_dim "  BQL limit_max: ${count} TX queue(s) capped at ${limit} bytes"
+    return 0
 }
 
 #===============================================================================
@@ -2149,6 +2171,12 @@ echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
 
 # Enable route_localnet (required for DNAT to 127.x.x.x)
 echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet 2>/dev/null
+
+# Cap BQL limit_max to prevent bufferbloat (flowtable bypasses fq_codel AQM)
+for _bql_f in /sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max; do
+    [[ -f "$_bql_f" ]] && echo 65536 > "$_bql_f" 2>/dev/null || true
+done
+log "BQL limit_max capped at 65536 bytes on all TX queues"
 
 NFT_CONFIG="/etc/nftables.d/port_forward.nft"
 if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
