@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.7.8"
+readonly VERSION="1.7.9"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -734,6 +734,35 @@ ensure_shortcut() {
 remove_shortcut() {
     rm -f "$SHORTCUT_LINK" "$INSTALLED_SCRIPT"
     msg_ok "pfwd shortcut removed"
+}
+
+# ensure_bbr_enabled - auto-enable BBR for optimal performance
+ensure_bbr_enabled() {
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+
+    if [[ "$current_cc" != "bbr" ]]; then
+        msg_info "Enabling BBR congestion control for optimal performance..."
+
+        # Check if BBR module is available
+        if ! lsmod | grep -q tcp_bbr; then
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
+
+        # Temporarily enable BBR
+        sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+        # Verify if successful
+        current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+        if [[ "$current_cc" == "bbr" ]]; then
+            msg_ok "BBR enabled (runtime only)"
+            msg_dim "  Run 'pfwd optimize' to persist BBR across reboots"
+        else
+            msg_warn "Failed to enable BBR (kernel may not support it)"
+            msg_dim "  Realm will still work, but performance may be suboptimal"
+        fi
+    fi
 }
 
 #===============================================================================
@@ -2485,6 +2514,9 @@ realm_install() {
 
     # Setup service
     realm_setup_service
+
+    # Auto-enable BBR for optimal performance
+    ensure_bbr_enabled
 }
 
 # realm_setup_service - create systemd service file
@@ -2524,6 +2556,8 @@ output = "/var/log/realm.log"
 [network]
 no_tcp = false
 use_udp = true
+tcp_timeout = 300      # TCP connection timeout (seconds), suitable for long connections
+udp_timeout = 60       # UDP timeout (seconds), balance performance and resources
 EOF
         msg_dim "  Created initial realm config"
     fi
@@ -2539,6 +2573,13 @@ realm_add_endpoint() {
     fi
 
     realm_ensure_config
+
+    # Auto-enable BBR when adding first realm endpoint
+    local endpoint_count
+    endpoint_count=$(grep -c "^\[\[endpoints\]\]" "$REALM_CONFIG" 2>/dev/null || echo 0)
+    if (( endpoint_count == 0 )); then
+        ensure_bbr_enabled
+    fi
 
     # Check port availability (realm supports TCP+UDP, check both)
     if ! check_port_in_use "$lport" "both"; then
@@ -2738,6 +2779,27 @@ realm_list_endpoints() {
         svc_status="${RED}stopped${NC}"
     fi
     echo -e "  Service: $svc_status"
+
+    # Show BBR status
+    local bbr_status
+    bbr_status=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$bbr_status" == "bbr" ]]; then
+        echo -e "  BBR: ${GREEN}enabled${NC}"
+    else
+        echo -e "  BBR: ${YELLOW}disabled${NC} (run 'pfwd optimize' to enable)"
+    fi
+
+    # Show LimitNOFILE status
+    if systemctl is-active realm-forward >/dev/null 2>&1; then
+        local nofile_limit
+        nofile_limit=$(systemctl show realm-forward -p LimitNOFILE --value 2>/dev/null || echo "unknown")
+        if [[ "$nofile_limit" == "1048576" ]]; then
+            echo -e "  Max connections: ${GREEN}${nofile_limit}${NC}"
+        else
+            echo -e "  Max connections: ${YELLOW}${nofile_limit}${NC}"
+        fi
+    fi
+
     printf "  ${BOLD}%-4s %-25s %-30s %-15s %s${NC}\n" "#" "Listen" "Remote" "Comment" "Traffic"
 
     # Pre-fetch nft input chain data ONCE (instead of per-endpoint)
