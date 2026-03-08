@@ -179,10 +179,53 @@ _realm_network_value() {
     ' "$REALM_CONFIG" 2>/dev/null
 }
 
+_pfwd_rule_tag() {
+    local lport="$1" ipver="$2" proto="$3"
+    printf 'pfwd:%s:%s:%s' "$lport" "$ipver" "$proto"
+}
+
+_pfwd_postrouting_handles_by_tag() {
+    local tag="$1"
+    nft -a list chain $NFT_TABLE postrouting 2>/dev/null | \
+        { grep -F "comment \"$tag\"" || true; } | \
+        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+}
+
+_pfwd_forward_handles_by_tag() {
+    local tag="$1"
+    nft -a list chain $NFT_TABLE forward 2>/dev/null | \
+        { grep -F "comment \"$tag" || true; } | \
+        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+}
+
+_nft_rule_option_summary() {
+    local snat_mode="${1:-}" snat_source="${2:-}" mss_mode="${3:-}" mss_value="${4:-}"
+    local parts=()
+    if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
+        parts+=("snat:${snat_source}")
+    fi
+    case "$mss_mode" in
+        clamp) parts+=("mss:clamp") ;;
+        set)
+            if [[ -n "$mss_value" ]]; then
+                parts+=("mss:${mss_value}")
+            else
+                parts+=("mss:set")
+            fi
+            ;;
+    esac
+    if (( ${#parts[@]} == 0 )); then
+        echo "-"
+    else
+        local IFS=','
+        echo "${parts[*]}"
+    fi
+}
+
 _pfwd_collect_state() {
-    PFWD_NFT_RULES=$(_parse_nft_prerouting_rules)
+    PFWD_NFT_RULES=$(_parse_nft_export_rules)
     PFWD_REALM_ENDPOINTS=$(_parse_realm_endpoints)
-    PFWD_NFT_COUNT=$(_nft_count_rules "$PFWD_NFT_RULES")
+    PFWD_NFT_COUNT=$(_nft_count_rules "$(_parse_nft_prerouting_rules)")
     PFWD_REALM_COUNT=$(_realm_count_endpoints "$PFWD_REALM_ENDPOINTS")
     PFWD_NFT_RUNNING=false
     PFWD_REALM_RUNNING=false
@@ -194,7 +237,7 @@ _pfwd_collect_state() {
     [[ "$current_cc" == "bbr" ]] && PFWD_BBR_ENABLED=true || PFWD_BBR_ENABLED=false
 
     PFWD_LOOPBACK_DNAT=false
-    if [[ -n "$PFWD_NFT_RULES" ]] && grep -Eq '(^|\|)(127\.[0-9.]+:[0-9]+|::1:[0-9]+)(\||$)' <<< "$PFWD_NFT_RULES"; then
+    if [[ -n "$PFWD_NFT_RULES" ]] && awk -F'|' '$4 ~ /^127\./ || $4 == "::1" { found=1 } END { exit(found ? 0 : 1) }' <<< "$PFWD_NFT_RULES"; then
         PFWD_LOOPBACK_DNAT=true
     fi
 
@@ -666,6 +709,12 @@ validate_target() {
     local t
     t=$(detect_ip_type "$target")
     [[ "$t" != "unknown" ]]
+}
+
+# validate_mss_value <value> -> 0=valid, 1=invalid
+validate_mss_value() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 536 && value <= 65535 ))
 }
 
 # parse_rule <rule_str> -> sets RULE_LPORT, RULE_TARGET, RULE_TPORT
@@ -1447,13 +1496,14 @@ _nft_handles_by_port() {
     echo "$lines" | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
 }
 
-# _dispatch_add_rule <method> <lport> <target> <tport> <ip_ver> <proto> <comment>
+# _dispatch_add_rule <method> <lport> <target> <tport> <ip_ver> <proto> <comment> [mss_mode] [mss_value] [snat_mode] [snat_source]
 # Unified add rule dispatcher for nft/realm
 _dispatch_add_rule() {
     local method="$1" lport="$2" target="$3" tport="$4" ip_ver="$5" proto="$6" comment="$7"
+    local mss_mode="${8:-}" mss_value="${9:-}" snat_mode="${10:-}" snat_source="${11:-}"
     case "$method" in
         nft|nftables)
-            nft_add_rule "$lport" "$target" "$tport" "$ip_ver" "$proto" "$comment"
+            nft_add_rule "$lport" "$target" "$tport" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
             ;;
         realm)
             realm_add_endpoint "$lport" "$target" "$tport" "$ip_ver" "$comment"
@@ -1784,6 +1834,7 @@ nft_rule_exists() {
 # In batch mode, appends to $_NFT_BATCH_FILE instead of executing directly.
 _nft_add_single_rule() {
     local ip_family="$1" proto="$2" lport="$3" target="$4" tport="$5" comment="${6:-}"
+    local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}"
     local ipver="4" ip_match="ip protocol" dnat_keyword="ip" dnat_target="$target:$tport"
     if [[ "$ip_family" == "ip6" ]]; then
         ipver="6"
@@ -1798,32 +1849,52 @@ _nft_add_single_rule() {
     fi
 
     local nft_result=0
+    local postrouting_action="masquerade"
+    local rule_tag
+    rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto")
+    if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
+        postrouting_action="snat to $snat_source"
+    fi
     if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
         # Append to batch file for atomic commit
         if [[ -n "$comment" ]]; then
             echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$comment\"" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE postrouting $ip_family daddr $target $proto dport $tport counter masquerade comment \"$comment\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr $target $proto dport $tport counter $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
         else
             echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE postrouting $ip_family daddr $target $proto dport $tport counter masquerade" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr $target $proto dport $tport counter $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
         fi
         echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport counter comment \"pfwd_fwd:${lport}:${ipver}:${proto}\"" >> "$_NFT_BATCH_FILE"
         echo "insert rule $NFT_TABLE forward $ip_family saddr $target $proto sport $tport counter comment \"pfwd_ret:${lport}:${ipver}:${proto}\"" >> "$_NFT_BATCH_FILE"
+        if [[ "$proto" == "tcp" ]]; then
+            if [[ "$mss_mode" == "clamp" ]]; then
+                echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set rt mtu comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
+            elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
+                echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set $mss_value comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
+            fi
+        fi
     else
         # Direct execution
         if [[ -n "$comment" ]]; then
             nft add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" comment '"'"$comment"'"' 2>&1 && \
-            nft add rule $NFT_TABLE postrouting $ip_family daddr "$target" "$proto" dport "$tport" counter masquerade comment '"'"$comment"'"' 2>&1
+            nft add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" counter $postrouting_action comment '"'"$rule_tag"'"' 2>&1
             nft_result=$?
         else
             nft add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" 2>&1 && \
-            nft add rule $NFT_TABLE postrouting $ip_family daddr "$target" "$proto" dport "$tport" counter masquerade 2>&1
+            nft add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" counter $postrouting_action comment '"'"$rule_tag"'"' 2>&1
             nft_result=$?
         fi
 
         if (( nft_result == 0 )); then
             nft insert rule $NFT_TABLE forward $ip_family daddr "$target" "$proto" dport "$tport" counter comment '"pfwd_fwd:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
             nft insert rule $NFT_TABLE forward $ip_family saddr "$target" "$proto" sport "$tport" counter comment '"pfwd_ret:'$lport':'$ipver':'$proto'"' 2>/dev/null || true
+            if [[ "$proto" == "tcp" ]]; then
+                if [[ "$mss_mode" == "clamp" ]]; then
+                    nft insert rule $NFT_TABLE forward $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment '"'"${rule_tag}:mss"'"' 2>/dev/null || true
+                elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
+                    nft insert rule $NFT_TABLE forward $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set "$mss_value" comment '"'"${rule_tag}:mss"'"' 2>/dev/null || true
+                fi
+            fi
         else
             msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
             # Rollback: remove prerouting rule if it was added but postrouting failed
@@ -1847,8 +1918,13 @@ _nft_add_single_rule() {
 # ip_ver: 4, 6, or 46
 # proto: tcp, udp, or both
 # comment: optional comment for the rule
+# mss_mode: empty, clamp, or set
+# mss_value: MSS value when mss_mode=set
+# snat_mode: masquerade (default) or snat
+# snat_source: source IP when snat_mode=snat
 nft_add_rule() {
     local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}" comment="${6:-}"
+    local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}"
 
     nft_ensure_table || return 1
 
@@ -1907,7 +1983,7 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v4_target" ]]; then
-                if _nft_add_single_rule "ip" "$p" "$lport" "$v4_target" "$tport" "$comment"; then
+                if _nft_add_single_rule "ip" "$p" "$lport" "$v4_target" "$tport" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"; then
                     ((added++)) || true
                 fi
             elif [[ "$ip_ver" == "4" ]]; then
@@ -1925,7 +2001,7 @@ nft_add_rule() {
             fi
 
             if [[ -n "$v6_target" ]]; then
-                if _nft_add_single_rule "ip6" "$p" "$lport" "$v6_target" "$tport" "$comment"; then
+                if _nft_add_single_rule "ip6" "$p" "$lport" "$v6_target" "$tport" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"; then
                     ((added++)) || true
                 fi
             elif [[ "$ip_ver" == "6" ]]; then
@@ -1991,7 +2067,7 @@ nft_delete_port() {
         [[ -z "$handle" ]] && continue
 
         # Extract DNAT target address and port for postrouting matching
-        local dnat_addr="" dnat_port=""
+        local dnat_addr="" dnat_port="" rule_tag=""
         # IPv4: dnat ip to 1.2.3.4:3389
         if [[ "$line" =~ dnat\ ip\ to\ ([0-9.]+):([0-9]+) ]]; then
             dnat_addr="${BASH_REMATCH[1]}"
@@ -2001,18 +2077,37 @@ nft_delete_port() {
             dnat_addr="${BASH_REMATCH[1]}"
             dnat_port="${BASH_REMATCH[2]}"
         fi
+        _extract_nft_proto_ipver "$line"
+        if [[ -n "$_PROTO" && -n "$_IPVER" ]]; then
+            rule_tag=$(_pfwd_rule_tag "$port" "$_IPVER" "$_PROTO")
+        fi
 
         # Delete the prerouting rule
         nft delete rule $NFT_TABLE prerouting handle "$handle" 2>/dev/null && ((deleted++)) || true
 
-        # Step 2: Delete matching postrouting masquerade rule using extracted target info
-        if [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
+        # Step 2: Delete matching postrouting SNAT/masquerade rule using managed tag when available
+        if [[ -n "$rule_tag" ]]; then
+            local tagged_post_handles
+            tagged_post_handles=$(_pfwd_postrouting_handles_by_tag "$rule_tag")
+            for h in $tagged_post_handles; do
+                nft delete rule $NFT_TABLE postrouting handle "$h" 2>/dev/null && ((deleted++)) || true
+            done
+        elif [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
             local post_handles
             post_handles=$(nft -a list chain $NFT_TABLE postrouting 2>/dev/null | \
                 { grep -E "daddr $dnat_addr.*dport $dnat_port" || true; } | \
                 awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
             for h in $post_handles; do
                 nft delete rule $NFT_TABLE postrouting handle "$h" 2>/dev/null && ((deleted++)) || true
+            done
+        fi
+
+        # Step 2b: Delete managed forward helper rules (including optional MSS rule)
+        if [[ -n "$rule_tag" ]]; then
+            local helper_handles
+            helper_handles=$(_pfwd_forward_handles_by_tag "$rule_tag")
+            for h in $helper_handles; do
+                nft delete rule $NFT_TABLE forward handle "$h" 2>/dev/null && ((deleted++)) || true
             done
         fi
     done <<< "$prerouting_lines"
@@ -2084,16 +2179,34 @@ nft_delete_ports_batch() {
             [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
             [[ -z "$handle" ]] && continue
 
-            local dnat_addr="" dnat_port=""
+            local dnat_addr="" dnat_port="" rule_tag=""
             if [[ "$line" =~ dnat\ ip\ to\ ([0-9.]+):([0-9]+) ]]; then
                 dnat_addr="${BASH_REMATCH[1]}"; dnat_port="${BASH_REMATCH[2]}"
             elif [[ "$line" =~ dnat\ ip6\ to\ \[([^\]]+)\]:([0-9]+) ]]; then
                 dnat_addr="${BASH_REMATCH[1]}"; dnat_port="${BASH_REMATCH[2]}"
             fi
+            _extract_nft_proto_ipver "$line"
+            if [[ -n "$_PROTO" && -n "$_IPVER" ]]; then
+                rule_tag=$(_pfwd_rule_tag "$port" "$_IPVER" "$_PROTO")
+            fi
 
             nft delete rule $NFT_TABLE prerouting handle "$handle" 2>/dev/null && ((deleted++)) || true
 
-            if [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
+            if [[ -n "$rule_tag" ]]; then
+                local post_handles
+                post_handles=$(echo "$post_data" | { grep -F "comment \"$rule_tag\"" || true; } | \
+                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+                for h in $post_handles; do
+                    nft delete rule $NFT_TABLE postrouting handle "$h" 2>/dev/null && ((deleted++)) || true
+                done
+
+                local helper_handles
+                helper_handles=$(echo "$fwd_data" | { grep -F "comment \"$rule_tag" || true; } | \
+                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
+                for h in $helper_handles; do
+                    nft delete rule $NFT_TABLE forward handle "$h" 2>/dev/null && ((deleted++)) || true
+                done
+            elif [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
                 local post_handles
                 post_handles=$(echo "$post_data" | { grep -E "daddr $dnat_addr.*dport $dnat_port" || true; } | \
                     awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
@@ -2218,6 +2331,47 @@ _parse_nft_prerouting_rules() {
         }
     }
     '
+}
+
+# _parse_nft_export_rules - parse nft rules plus optional pfwd MSS/SNAT metadata
+# Output: proto|lport|ipver|target|tport|comment|snat_mode|snat_source|mss_mode|mss_value
+_parse_nft_export_rules() {
+    local parsed
+    parsed=$(_parse_nft_prerouting_rules)
+    [[ -z "$parsed" ]] && return 0
+
+    local post_data forward_data
+    post_data=$(_nft_cached_chain postrouting || true)
+    forward_data=$(_nft_cached_chain forward || true)
+
+    local proto lport ipver target tport comment bytes
+    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+        [[ -z "$lport" ]] && continue
+
+        local tag snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
+        local post_line="" mss_line=""
+        tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto")
+
+        post_line=$(printf '%s\n' "$post_data" | grep -F "comment \"$tag\"" | head -1 || true)
+        if [[ -n "$post_line" && "$post_line" =~ snat\ to\ ([^[:space:]]+) ]]; then
+            snat_mode="snat"
+            snat_source="${BASH_REMATCH[1]}"
+        fi
+
+        mss_line=$(printf '%s\n' "$forward_data" | grep -F "comment \"${tag}:mss\"" | head -1 || true)
+        if [[ -n "$mss_line" ]]; then
+            if [[ "$mss_line" =~ tcp\ option\ maxseg\ size\ set\ rt\ mtu ]]; then
+                mss_mode="clamp"
+            elif [[ "$mss_line" =~ tcp\ option\ maxseg\ size\ set\ ([0-9]+) ]]; then
+                mss_mode="set"
+                mss_value="${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
+            "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
+    done <<< "$parsed"
 }
 
 # _parse_nft_bidirectional_traffic - parse prerouting + forward chain for traffic stats
@@ -2349,26 +2503,36 @@ nft_list_rules() {
     fi
 
     echo -e "${CYAN}nftables forwarding rules:${NC}"
-    echo -e "  ${DIM}┌────┬────────┬──────┬──────┬──────────────────────────────┬────────────────────┬──────────┐${NC}"
-    printf "  ${DIM}│${NC}${BOLD}%-4s${NC}${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-30s${NC}${DIM}│${NC}${BOLD}%-20s${NC}${DIM}│${NC}${BOLD}%-10s${NC}${DIM}│${NC}\n" " # " " L.Port" " Proto" " IPvr" " Target" " Comment" " Traffic"
-    echo -e "  ${DIM}├────┼────────┼──────┼──────┼──────────────────────────────┼────────────────────┼──────────┤${NC}"
+    echo -e "  ${DIM}┌────┬────────┬──────┬──────┬──────────────────────────────┬──────────────────┬────────────────────┬──────────┐${NC}"
+    printf "  ${DIM}│${NC}${BOLD}%-4s${NC}${DIM}│${NC}${BOLD}%-8s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-6s${NC}${DIM}│${NC}${BOLD}%-30s${NC}${DIM}│${NC}${BOLD}%-18s${NC}${DIM}│${NC}${BOLD}%-20s${NC}${DIM}│${NC}${BOLD}%-10s${NC}${DIM}│${NC}\n" " # " " L.Port" " Proto" " IPvr" " Target" " Options" " Comment" " Traffic"
+    echo -e "  ${DIM}├────┼────────┼──────┼──────┼──────────────────────────────┼──────────────────┼────────────────────┼──────────┤${NC}"
 
     # Sort by protocol (tcp first) and then by port number
     local sorted_rules
     sorted_rules=$(echo "$parsed" | _sort_parsed_rules)
 
-    # Display sorted rules (supports both 7-field and 9-field formats)
+    # Display sorted rules (supports both 10-field export format and older traffic-only formats)
     local idx=0
-    while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9; do
+    while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9 f10; do
         [[ -z "$lport" ]] && continue
+        local snat_mode="masquerade" snat_source="" mss_mode="" mss_value="" bytes="0"
+        if [[ -n "$f10" || "$f7" == "masquerade" || "$f7" == "snat" || "$f9" == "clamp" || "$f9" == "set" ]]; then
+            snat_mode="$f7"
+            snat_source="$f8"
+            mss_mode="$f9"
+            mss_value="$f10"
+            bytes=$(nft_get_traffic "$lport")
+        else
+            bytes="${f9:-$f7}"
+        fi
         # Apply filter if specified
         if [[ -n "$filter" ]]; then
-            local line_text=":$lport $proto IPv$ipver ${target}:${tport} ${comment:--}"
+            local opts_text
+            opts_text=$(_nft_rule_option_summary "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
+            local line_text=":$lport $proto IPv$ipver ${target}:${tport} ${comment:--} ${opts_text}"
             [[ ! "$line_text" =~ $filter ]] && continue
         fi
         ((idx++)) || true
-        # Use total_bytes (f9) if 9-field format, otherwise f7 is bytes
-        local bytes="${f9:-$f7}"
         local traffic
         traffic=$(format_bytes "$bytes")
         # Color coding: proto (tcp=green, udp=yellow), ipver (4=cyan, 6=blue)
@@ -2382,14 +2546,17 @@ nft_list_rules() {
             fi
         fi
         local target_display="$target:$tport"
-        # Truncate target/comment to fit column widths (29/19 visible chars + 1 leading space)
-        local disp_target=" ${target_display}" disp_comment=" ${comment:--}"
+        local option_display
+        option_display=$(_nft_rule_option_summary "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
+        # Truncate target/options/comment to fit column widths
+        local disp_target=" ${target_display}" disp_opts=" ${option_display}" disp_comment=" ${comment:--}"
         (( ${#disp_target} > 30 )) && disp_target="${disp_target:0:28}.."
+        (( ${#disp_opts} > 18 )) && disp_opts="${disp_opts:0:16}.."
         (( ${#disp_comment} > 20 )) && disp_comment="${disp_comment:0:18}.."
-        printf "  ${DIM}│${NC}%-4s${DIM}│${NC}%-8s${DIM}│${NC}${proto_color}%-6s${NC}${DIM}│${NC}${ipver_color}%-6s${NC}${DIM}│${NC}%-30s${DIM}│${NC}%-20s${DIM}│${NC}${traffic_color}%-10s${NC}${DIM}│${NC}\n" \
-            " $idx" " :$lport" " $proto" " v$ipver" "$disp_target" "$disp_comment" " $traffic"
+        printf "  ${DIM}│${NC}%-4s${DIM}│${NC}%-8s${DIM}│${NC}${proto_color}%-6s${NC}${DIM}│${NC}${ipver_color}%-6s${NC}${DIM}│${NC}%-30s${DIM}│${NC}%-18s${DIM}│${NC}%-20s${DIM}│${NC}${traffic_color}%-10s${NC}${DIM}│${NC}\n" \
+            " $idx" " :$lport" " $proto" " v$ipver" "$disp_target" "$disp_opts" "$disp_comment" " $traffic"
     done <<< "$sorted_rules"
-    echo -e "  ${DIM}└────┴────────┴──────┴──────┴──────────────────────────────┴────────────────────┴──────────┘${NC}"
+    echo -e "  ${DIM}└────┴────────┴──────┴──────┴──────────────────────────────┴──────────────────┴────────────────────┴──────────┘${NC}"
 }
 
 # nft_get_traffic <port> - get traffic bytes for a port
@@ -3573,16 +3740,16 @@ cmd_export() {
     ensure_jq || return 1
     mkdir -p "$(dirname "$filepath")"
 
-    # Build nft rules JSON array with awk (single pass, no per-rule jq calls)
+    # Build nft rules JSON array with awk (single pass, includes optional MSS/SNAT fields)
     local nft_json="[]"
     if _nft_table_exists; then
         local parsed_nft
-        parsed_nft=$(_parse_nft_prerouting_rules)
+        parsed_nft=$(_parse_nft_export_rules)
         if [[ -n "$parsed_nft" ]]; then
             nft_json=$(echo "$parsed_nft" | awk -F'|' '
             BEGIN { printf "[" ; first=1 }
             {
-                proto=$1; lport=$2; ipver=$3; target=$4; tport=$5; comment=$6
+                proto=$1; lport=$2; ipver=$3; target=$4; tport=$5; comment=$6; snat_mode=$7; snat_source=$8; mss_mode=$9; mss_value=$10
                 # Strip port from target if embedded
                 sub(/:[0-9]+$/, "", target)
                 # Handle IPv6 bracket format
@@ -3590,9 +3757,21 @@ cmd_export() {
                 sub(/]$/, "", target)
                 if (!first) printf ","
                 first=0
-                # Escape double quotes in comment
+                # Escape double quotes in strings
                 gsub(/"/, "\\\"", comment)
-                printf "{\"type\":\"nftables\",\"local_port\":\"%s\",\"target_ip\":\"%s\",\"target_port\":\"%s\",\"protocol\":\"%s\",\"ip_ver\":\"%s\",\"comment\":\"%s\"}", lport, target, tport, proto, ipver, comment
+                gsub(/"/, "\\\"", target)
+                gsub(/"/, "\\\"", snat_source)
+                printf "{\"type\":\"nftables\",\"local_port\":\"%s\",\"target_ip\":\"%s\",\"target_port\":\"%s\",\"protocol\":\"%s\",\"ip_ver\":\"%s\",\"comment\":\"%s\"", lport, target, tport, proto, ipver, comment
+                if (snat_mode == "snat") {
+                    printf ",\"snat_mode\":\"snat\",\"snat_source\":\"%s\"", snat_source
+                }
+                if (mss_mode != "") {
+                    printf ",\"mss_mode\":\"%s\"", mss_mode
+                    if (mss_mode == "set" && mss_value != "") {
+                        printf ",\"mss_value\":\"%s\"", mss_value
+                    }
+                }
+                printf "}"
             }
             END { printf "]" }
             ')
@@ -3697,11 +3876,11 @@ cmd_import() {
     local nft_batch_count=0 realm_batch_count=0
 
     _BATCH_MODE=true
-    while IFS='|' read -r method lport target tport proto ipver comment; do
+    while IFS='|' read -r method lport target tport proto ipver comment mss_mode mss_value snat_mode snat_source; do
         [[ -z "$method" ]] && continue
         case "$method" in
             nft|nftables)
-                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" "$comment"; then
+                if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"; then
                     ((imported++)) || true
                     ((nft_batch_count++)) || true
                 else
@@ -3733,7 +3912,11 @@ cmd_import() {
                 (.target_port | tostring),
                 (.protocol // "tcp" | tostring),
                 (.ip_ver // "46" | tostring),
-                (.comment // "" | tostring)
+                (.comment // "" | tostring),
+                (.mss_mode // "" | tostring),
+                (.mss_value // "" | tostring),
+                (.snat_mode // "" | tostring),
+                (.snat_source // "" | tostring)
             ] | @tsv
         ' "$filepath"
     )
@@ -3805,6 +3988,7 @@ Delete syntax:
 
 Traffic / diagnosis:
   pfwd list
+  pfwd list -f mss
   pfwd status
   pfwd stats
   pfwd stats --rate
@@ -3813,6 +3997,17 @@ Import / export:
   pfwd export [filepath]
   pfwd import <filepath> [-m nft|realm]
   pfwd import --url <URL> [-m nft|realm]
+  Export/import preserves nft MSS and fixed-SNAT fields.
+
+New examples:
+  pfwd -m nft -t 10.0.0.2 --mss-clamp 443
+  pfwd -m nft -t 10.0.0.2 --mss 1360 8443:443
+  pfwd -m nft -t 10.0.0.2 --snat-source 192.168.1.2 9443:443
+  pfwd -m nft -t 10.0.0.2 --snat-source 192.168.1.2 --mss 1360 9443:443
+  pfwd list -f snat
+  pfwd export /tmp/pfwd-backup.json
+  pfwd import /tmp/pfwd-backup.json
+  Interactive add/delete/list/status also show MSS/SNAT options.
 
 Common scenarios:
   pfwd 8080 1.2.3.4
@@ -3838,6 +4033,10 @@ Options:
   --tcp                      TCP only (default)
   --udp                      UDP only
   --both                     TCP + UDP
+  --mss-clamp                nft only: clamp TCP MSS to PMTU on forwarded SYN packets
+  --mss <value>              nft only: set a fixed TCP MSS value (e.g. 1360/1452)
+  --snat-source <addr>       nft only: use fixed SNAT source instead of masquerade
+  --masquerade               nft only: force default masquerade mode
   -c, --comment <text>       Add comment to rule
   -q, --quiet                Quiet mode
   --no-color                 Disable colored output
@@ -3848,6 +4047,7 @@ EOF
 # cmd_add - add forwarding rules from CLI
 cmd_add() {
     local method="" ip_ver="46" proto="tcp" comment="" target="" rules_str=""
+    local mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
     local -a positional_args=()
 
     while [[ $# -gt 0 ]]; do
@@ -3860,6 +4060,10 @@ cmd_add() {
             --tcp)        proto="tcp"; shift ;;
             --udp)        proto="udp"; shift ;;
             --both)       proto="both"; shift ;;
+            --mss-clamp)  mss_mode="clamp"; mss_value=""; shift ;;
+            --mss)        mss_mode="set"; mss_value="$2"; shift 2 ;;
+            --snat-source) snat_mode="snat"; snat_source="$2"; shift 2 ;;
+            --masquerade) snat_mode="masquerade"; snat_source=""; shift ;;
             -c|--comment) comment="$2"; shift 2 ;;
             -q|--quiet)   QUIET=true; shift ;;
             -*)           msg_err "Unknown option: $1"; show_help; return 1 ;;
@@ -3889,6 +4093,29 @@ cmd_add() {
         return 1
     fi
 
+    if [[ -n "$mss_mode" && "$method" != "nft" ]]; then
+        msg_err "MSS options are only supported with -m nft"
+        return 1
+    fi
+    if [[ "$mss_mode" == "set" ]]; then
+        if ! validate_mss_value "$mss_value"; then
+            msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
+            return 1
+        fi
+    fi
+    if [[ "$snat_mode" == "snat" ]]; then
+        if [[ "$method" != "nft" ]]; then
+            msg_err "Fixed SNAT source is only supported with -m nft"
+            return 1
+        fi
+        local snat_type
+        snat_type=$(detect_ip_type "$snat_source")
+        if [[ "$snat_type" != "ipv4" && "$snat_type" != "ipv6" ]]; then
+            msg_err "Invalid SNAT source address: $snat_source"
+            return 1
+        fi
+    fi
+
     # Ensure IP forwarding is on (full optimization: use 'pfwd optimize [profile]')
     ensure_ip_forwarding 2>/dev/null || true
 
@@ -3910,7 +4137,7 @@ cmd_add() {
         if ! parse_rule "$expanded"; then
             ((failed++)) || true; continue
         fi
-        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
+        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"; then
             ((added++)) || true
         else
             ((failed++)) || true
@@ -4019,6 +4246,17 @@ cmd_status() {
     $PFWD_REALM_RUNNING && realm_status="${GREEN}running${NC}" || realm_status="${RED}stopped${NC}"
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
     echo -e "  realm:     $realm_status  ($PFWD_REALM_COUNT endpoints)"
+    if [[ -n "$PFWD_NFT_RULES" ]]; then
+        local nft_mss_count=0 nft_snat_count=0
+        while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+            [[ -z "$lport" ]] && continue
+            [[ "$snat_mode" == "snat" ]] && ((nft_snat_count++)) || true
+            [[ -n "$mss_mode" ]] && ((nft_mss_count++)) || true
+        done <<< "$PFWD_NFT_RULES"
+        if (( nft_mss_count > 0 || nft_snat_count > 0 )); then
+            echo -e "  nft opts:  mss=${CYAN}${nft_mss_count}${NC}, fixed-snat=${CYAN}${nft_snat_count}${NC}"
+        fi
+    fi
 
     # realm binary
     if realm_is_installed; then
@@ -4537,6 +4775,7 @@ interactive_menu() {
 
 # menu_add_rule - interactive rule addition
 menu_add_rule() {
+    local mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
     echo ""
     echo -e "${BOLD}Add Forwarding Rule${NC}"
     echo -e "${DIM}$SEP_DASH_40${NC}"
@@ -4646,6 +4885,69 @@ menu_add_rule() {
     echo ""
     read -rp "Comment (optional): " comment
 
+    # 7. Optional nft advanced settings
+    if [[ "$method" == "nft" ]]; then
+        echo ""
+        echo -e "${BOLD}Optional nft advanced settings:${NC}"
+        echo "  SNAT mode:"
+        echo "    1) Masquerade (default)"
+        echo "    2) Fixed source SNAT"
+        echo "    0) Back"
+        echo ""
+        local snat_choice
+        read -rp "SNAT mode [1]: " snat_choice
+        snat_choice=${snat_choice:-1}
+        case "$snat_choice" in
+            1) snat_mode="masquerade"; snat_source="" ;;
+            2)
+                snat_mode="snat"
+                read -rp "SNAT source address: " snat_source
+                if [[ -z "$snat_source" ]]; then
+                    msg_err "SNAT source address is required"
+                    wait_for_enter
+                    return
+                fi
+                local snat_type
+                snat_type=$(detect_ip_type "$snat_source")
+                if [[ "$snat_type" != "ipv4" && "$snat_type" != "ipv6" ]]; then
+                    msg_err "Invalid SNAT source address: $snat_source"
+                    wait_for_enter
+                    return
+                fi
+                ;;
+            0) return ;;
+            *) snat_mode="masquerade"; snat_source="" ;;
+        esac
+
+        if [[ "$proto" != "udp" ]]; then
+            echo ""
+            echo "  TCP MSS handling:"
+            echo "    1) Off (default)"
+            echo "    2) Clamp to PMTU"
+            echo "    3) Fixed MSS value"
+            echo "    0) Back"
+            echo ""
+            local mss_choice
+            read -rp "MSS mode [1]: " mss_choice
+            mss_choice=${mss_choice:-1}
+            case "$mss_choice" in
+                1) mss_mode=""; mss_value="" ;;
+                2) mss_mode="clamp"; mss_value="" ;;
+                3)
+                    mss_mode="set"
+                    read -rp "MSS value: " mss_value
+                    if ! validate_mss_value "$mss_value"; then
+                        msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
+                        wait_for_enter
+                        return
+                    fi
+                    ;;
+                0) return ;;
+                *) mss_mode=""; mss_value="" ;;
+            esac
+        fi
+    fi
+
     if ! expand_port_spec "$port_spec" "$target"; then
         msg_err "Failed to expand port spec"
         wait_for_enter
@@ -4660,6 +4962,20 @@ menu_add_rule() {
     echo -e "  Target:   ${CYAN}${target}${NC}"
     echo -e "  Raw spec: ${CYAN}${port_spec}${NC}"
     [[ -n "$comment" ]] && echo -e "  Comment:  ${CYAN}${comment}${NC}"
+    if [[ "$method" == "nft" ]]; then
+        if [[ "$snat_mode" == "snat" ]]; then
+            echo -e "  SNAT:     ${CYAN}fixed ${snat_source}${NC}"
+        else
+            echo -e "  SNAT:     ${CYAN}masquerade${NC}"
+        fi
+        if [[ -n "$mss_mode" ]]; then
+            if [[ "$mss_mode" == "clamp" ]]; then
+                echo -e "  MSS:      ${CYAN}clamp to PMTU${NC}"
+            else
+                echo -e "  MSS:      ${CYAN}fixed ${mss_value}${NC}"
+            fi
+        fi
+    fi
     echo -e "  Expanded:"
     local preview_count=0
     for expanded in "${EXPANDED_RULES[@]}"; do
@@ -4700,7 +5016,7 @@ menu_add_rule() {
         if ! parse_rule "$expanded"; then
             ((failed++)) || true; continue
         fi
-        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment"; then
+        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"; then
             ((added++)) || true
         else
             ((failed++)) || true
@@ -4722,10 +5038,8 @@ menu_delete_rule() {
     echo -e "${DIM}$SEP_DASH_40${NC}"
 
     local nft_parsed="" realm_parsed=""
-    local traffic_merged=""
     if _nft_table_exists; then
-        traffic_merged=$(_traffic_read_merged)
-        nft_parsed="${traffic_merged:-$(_parse_nft_prerouting_rules)}"
+        nft_parsed=$(_parse_nft_export_rules)
     fi
     realm_parsed=$(_parse_realm_endpoints)
 
@@ -4733,13 +5047,15 @@ menu_delete_rule() {
     local idx=0
 
     if [[ -n "$nft_parsed" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9; do
+        while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
             [[ -z "$lport" ]] && continue
             ((idx++)) || true
             rule_methods+=("nft")
             rule_ports+=("$lport")
-            local traffic="${f9:-$f7}"
-            rule_labels+=("$(printf "[nft] :%s %s IPv%s -> %s:%s (%s)" "$lport" "$proto" "$ipver" "$target" "$tport" "$(format_bytes "${traffic:-0}")")")
+            local option_label traffic_label
+            option_label=$(_nft_rule_option_summary "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
+            traffic_label=$(format_bytes "$(nft_get_traffic "$lport")")
+            rule_labels+=("$(printf "[nft] :%s %s IPv%s -> %s:%s [opts:%s] (%s)" "$lport" "$proto" "$ipver" "$target" "$tport" "$option_label" "$traffic_label")")
         done <<< "$(echo "$nft_parsed" | _sort_parsed_rules)"
     fi
 
