@@ -8,6 +8,7 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **realm forwarding** for domain-based targets and userspace proxying
 - **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
 - **Safe conflict handling** — duplicate nft port/protocol/IP-family rules are rejected unless you pass `--replace`
+- **Atomic nft persistence** — saved nft config is written via temp file + atomic replace
 - **Batch mode** — bulk add/delete with single save/restart cycle
 - **nft output caching** — TTL-based cache eliminates redundant `nft list` calls
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
@@ -50,6 +51,7 @@ Commands:
   del         Delete forwarding rules
   list        List all forwarding rules
   status      Show running status and rule counts
+  doctor      Run forwarding diagnostics
   start/stop/restart  Control forwarding (nft / realm / all)
   stats       Traffic statistics
   export      Export config to JSON
@@ -120,6 +122,7 @@ pfwd list
 pfwd list -f 8080
 
 # Traffic
+pfwd doctor
 pfwd stats
 pfwd stats --rate
 

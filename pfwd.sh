@@ -15,11 +15,12 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.8.2"
+readonly VERSION="1.8.3"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
 readonly NFT_CONFIG="/etc/nftables.d/port_forward.nft"
+readonly NFT_BACKUP_DIR="/root/.pfwd_backup"
 readonly NFT_RESTORE_SCRIPT="$DATA_DIR/restore-nft.sh"
 readonly NFT_RESTORE_SERVICE="/etc/systemd/system/pfwd-nft-restore.service"
 readonly REALM_BIN="/usr/local/bin/realm"
@@ -41,6 +42,9 @@ readonly SHORTCUT_LINK="$INSTALL_DIR/pfwd"
 
 # nftables names
 readonly NFT_TABLE="inet port_forward"
+readonly IPTABLES_FWD_DNAT_COMMENT="pfwd-managed forward dnat"
+readonly IPTABLES_FWD_EST_COMMENT="pfwd-managed forward established"
+readonly IPTABLES_INPUT_DNAT_COMMENT="pfwd-managed input dnat"
 
 # Colors (use $'...' so escape chars are real, works with echo -e and read -rp)
 RED=$'\033[0;31m'
@@ -292,6 +296,29 @@ _pfwd_collect_state() {
         PFWD_REALM_TCP_KEEPALIVE=$(_realm_network_value tcp_keepalive)
         PFWD_REALM_TCP_KEEPALIVE_PROBE=$(_realm_network_value tcp_keepalive_probe)
     fi
+}
+
+_mktemp_in_dir() {
+    local target="$1" dir
+    dir=$(dirname "$target")
+    mkdir -p "$dir" 2>/dev/null || true
+    mktemp "$dir/.pfwd.XXXXXX"
+}
+
+_atomic_replace_file() {
+    local tmp_file="$1" target="$2" mode="${3:-}"
+    [[ -f "$tmp_file" ]] || return 1
+    if [[ -n "$mode" ]]; then
+        chmod "$mode" "$tmp_file" 2>/dev/null || true
+    fi
+    mv -f "$tmp_file" "$target"
+}
+
+_backup_nft_config() {
+    [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]] || return 0
+    mkdir -p "$NFT_BACKUP_DIR"
+    cp "$NFT_CONFIG" "$NFT_BACKUP_DIR/nftables_$(date +%Y%m%d_%H%M%S).nft" 2>/dev/null || true
+    ls -t "$NFT_BACKUP_DIR"/nftables_*.nft 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
 }
 
 # nft batch file for atomic operations (Phase 2)
@@ -1555,6 +1582,15 @@ _expand_port_list() {
     done
 }
 
+sync_managed_firewall_state() {
+    local parsed="${1:-}"
+    if [[ -z "$parsed" ]]; then
+        parsed=$(_parse_nft_prerouting_rules)
+    fi
+    sync_managed_iptables_accept_rules "$parsed"
+    ufw_sync_loopback_dnat_rules
+}
+
 # _batch_finalize <method> - finalize after batch add (save/persist/restart once)
 _batch_finalize() {
     local method="$1"
@@ -1572,16 +1608,16 @@ _batch_finalize() {
                 _NFT_BATCH_FILE=""
                 _nft_invalidate_cache
             fi
-            if $_DIRTY_UFW_SYNC; then
-                ufw_sync_loopback_dnat_rules
-            fi
             if $_DIRTY_NFT; then
+                sync_managed_firewall_state
                 nft_save "auto"
                 nft_setup_persistence
-                ensure_forward_accept
+            elif $_DIRTY_UFW_SYNC; then
+                ufw_sync_loopback_dnat_rules
             fi
             if $_DIRTY_UFW_RELOAD; then
                 ufw_reload_if_enabled
+                sync_managed_iptables_accept_rules
             fi
             ;;
         realm)
@@ -1794,50 +1830,72 @@ nft_ensure_table() {
     ensure_forward_accept
 }
 
-# ensure_forward_accept - add FORWARD/INPUT ACCEPT rules if system firewall drops traffic
+_iptables_rule_present() {
+    local bin="$1"; shift
+    "$bin" -C "$@" >/dev/null 2>&1
+}
+
+_iptables_rule_ensure() {
+    local bin="$1"; shift
+    if ! _iptables_rule_present "$bin" "$@"; then
+        "$bin" -I "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+_iptables_rule_delete_all() {
+    local bin="$1"; shift
+    while _iptables_rule_present "$bin" "$@"; do
+        "$bin" -D "$@" >/dev/null 2>&1 || break
+    done
+}
+
+_sync_managed_iptables_family() {
+    local bin="$1" family="$2" parsed="${3:-}"
+    command -v "$bin" >/dev/null 2>&1 || return 0
+
+    local need_forward=false need_input=false
+    local proto lport ipver target tport comment bytes
+    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+        [[ -z "$lport" ]] && continue
+        [[ "$ipver" == "$family" ]] || continue
+        need_forward=true
+        if [[ "$target" =~ ^127\. || "$target" == "::1" ]]; then
+            need_input=true
+        fi
+    done <<< "$parsed"
+
+    local forward_policy input_policy
+    forward_policy=$("$bin" -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+    input_policy=$("$bin" -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+
+    if [[ "$forward_policy" == "DROP" && "$need_forward" == true ]]; then
+        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT
+        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT
+    else
+        _iptables_rule_delete_all "$bin" FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT
+        _iptables_rule_delete_all "$bin" FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT
+    fi
+
+    if [[ "$input_policy" == "DROP" && "$need_input" == true ]]; then
+        _iptables_rule_ensure "$bin" INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT
+    else
+        _iptables_rule_delete_all "$bin" INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT
+    fi
+}
+
+sync_managed_iptables_accept_rules() {
+    local parsed="${1:-}"
+    if [[ -z "$parsed" ]]; then
+        parsed=$(_parse_nft_prerouting_rules)
+    fi
+
+    _sync_managed_iptables_family iptables 4 "$parsed"
+    _sync_managed_iptables_family ip6tables 6 "$parsed"
+}
+
+# ensure_forward_accept - keep managed iptables ACCEPT rules in sync with current nft state
 ensure_forward_accept() {
-    # Check iptables FORWARD chain
-    if command -v iptables >/dev/null 2>&1; then
-        local policy
-        policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
-        if [[ "$policy" == "DROP" ]]; then
-            iptables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                iptables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT
-            iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-                iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            msg_info "Added iptables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
-        fi
-
-        # Check iptables INPUT chain
-        local input_policy
-        input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
-        if [[ "$input_policy" == "DROP" ]]; then
-            iptables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                iptables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT
-            msg_info "Added iptables INPUT ACCEPT rule for DNAT traffic"
-        fi
-    fi
-    # Check ip6tables FORWARD chain
-    if command -v ip6tables >/dev/null 2>&1; then
-        local policy6
-        policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
-        if [[ "$policy6" == "DROP" ]]; then
-            ip6tables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                ip6tables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT
-            ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-                ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            msg_info "Added ip6tables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
-        fi
-
-        # Check ip6tables INPUT chain
-        local input_policy6
-        input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
-        if [[ "$input_policy6" == "DROP" ]]; then
-            ip6tables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                ip6tables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT
-            msg_info "Added ip6tables INPUT ACCEPT rule for DNAT traffic"
-        fi
-    fi
+    sync_managed_iptables_accept_rules
 }
 
 # nft_rule_exists <lport> <proto> <ip_ver> -> 0=exists, 1=not found
@@ -2713,19 +2771,29 @@ nft_get_traffic() {
 nft_save() {
     local mode="${1:-auto}"
     mkdir -p "$(dirname "$NFT_CONFIG")"
-    nft list table $NFT_TABLE > "$NFT_CONFIG" 2>/dev/null || true
+    local tmp_file
+    tmp_file=$(_mktemp_in_dir "$NFT_CONFIG") || return 1
 
-    # Dual backup: main config + backup directory
-    local backup_dir="/root/.pfwd_backup"
-    mkdir -p "$backup_dir"
-    if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
-        if [[ "$mode" == "backup" || "$mode" == "explicit" || $_NFT_BACKUP_NEEDED == true ]]; then
-            cp "$NFT_CONFIG" "$backup_dir/nftables_$(date +%Y%m%d_%H%M%S).nft" 2>/dev/null || true
-            # Keep last 5 backups
-            ls -t "$backup_dir"/nftables_*.nft 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
-            _NFT_BACKUP_NEEDED=false
-        fi
+    if [[ "$mode" == "backup" || "$mode" == "explicit" || $_NFT_BACKUP_NEEDED == true ]]; then
+        _backup_nft_config
     fi
+
+    if ! nft list table $NFT_TABLE > "$tmp_file" 2>/dev/null; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        msg_warn "Failed to export nftables rules to $NFT_CONFIG"
+        return 1
+    fi
+    if [[ ! -s "$tmp_file" ]]; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        msg_warn "Exported nftables rules were empty; keeping existing $NFT_CONFIG"
+        return 1
+    fi
+    if ! _atomic_replace_file "$tmp_file" "$NFT_CONFIG" 0644; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        msg_warn "Failed to atomically replace $NFT_CONFIG"
+        return 1
+    fi
+    _NFT_BACKUP_NEEDED=false
 
     msg_dim "  Rules saved to $NFT_CONFIG"
     _DIRTY_NFT=false
@@ -2763,6 +2831,10 @@ ufw_reload_if_enabled() {
 # nft_flush_all - delete entire table and config files
 nft_flush_all() {
     nft delete table $NFT_TABLE 2>/dev/null || true
+    _nft_invalidate_cache
+    sync_managed_iptables_accept_rules ""
+    ufw_sync_loopback_dnat_rules
+    ufw_reload_if_enabled
     rm -f "$NFT_CONFIG"
     rm -f "$NFT_RESTORE_SCRIPT"
     if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
@@ -2776,7 +2848,6 @@ nft_flush_all() {
     rm -f "$TRAFFIC_COLLECTOR" "$TRAFFIC_DATA"
     systemctl daemon-reload 2>/dev/null || true
     msg_ok "nftables rules and persistence removed"
-    _nft_invalidate_cache
 }
 
 # nft_setup_persistence - create restore script + systemd service
@@ -2786,11 +2857,13 @@ nft_setup_persistence() {
 
     # nft_save already exports rules to NFT_CONFIG, only re-export if file missing
     if [[ ! -f "$NFT_CONFIG" || ! -s "$NFT_CONFIG" ]]; then
-        nft list table $NFT_TABLE > "$NFT_CONFIG" 2>/dev/null || true
+        nft_save "auto" >/dev/null 2>&1 || true
     fi
 
     # Create restore script
-    cat > "$NFT_RESTORE_SCRIPT" << 'RESTORE_EOF'
+    local restore_tmp service_tmp collector_tmp timer_tmp
+    restore_tmp=$(_mktemp_in_dir "$NFT_RESTORE_SCRIPT") || return 1
+    cat > "$restore_tmp" << 'RESTORE_EOF'
 #!/bin/bash
 # pfwd nftables restore script
 LOG="/var/log/pfwd-restore.log"
@@ -2913,37 +2986,81 @@ if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
     nft delete table inet port_forward 2>/dev/null
     if nft -f "$NFT_CONFIG" 2>/dev/null; then
         log "Rules restored from $NFT_CONFIG"
-        # Re-add iptables FORWARD/INPUT ACCEPT rules if UFW/iptables has DROP policy
+        # Re-sync managed iptables ACCEPT rules only when current nft rules need them.
         if command -v iptables >/dev/null 2>&1; then
+            has_v4=false
+            has_loopback_v4=false
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                if [[ "$line" =~ "ip protocol tcp" || "$line" =~ "ip protocol udp" ]]; then
+                    has_v4=true
+                fi
+                if [[ "$line" =~ dnat\ ip\ to\ (127\.[0-9.]+):([0-9]+) ]]; then
+                    has_loopback_v4=true
+                fi
+            done < <(nft list chain inet port_forward prerouting 2>/dev/null | grep 'dnat' || true)
             policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
-            if [[ "$policy" == "DROP" ]]; then
-                iptables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                    iptables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
-                iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-                    iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-                log "Added iptables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+            if [[ "$policy" == "DROP" && "$has_v4" == true ]]; then
+                iptables -C FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT 2>/dev/null || \
+                    iptables -I FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT 2>/dev/null
+                iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT 2>/dev/null || \
+                    iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT 2>/dev/null
+                log "Synced managed iptables FORWARD ACCEPT rules"
+            else
+                while iptables -C FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT >/dev/null 2>&1; do
+                    iptables -D FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT >/dev/null 2>&1 || break
+                done
+                while iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT >/dev/null 2>&1; do
+                    iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT >/dev/null 2>&1 || break
+                done
             fi
             input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
-            if [[ "$input_policy" == "DROP" ]]; then
-                iptables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                    iptables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
-                log "Added iptables INPUT ACCEPT rule for DNAT traffic"
+            if [[ "$input_policy" == "DROP" && "$has_loopback_v4" == true ]]; then
+                iptables -C INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT 2>/dev/null || \
+                    iptables -I INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT 2>/dev/null
+                log "Synced managed iptables INPUT ACCEPT rule"
+            else
+                while iptables -C INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT >/dev/null 2>&1; do
+                    iptables -D INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT >/dev/null 2>&1 || break
+                done
             fi
         fi
         if command -v ip6tables >/dev/null 2>&1; then
+            has_v6=false
+            has_loopback_v6=false
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                if [[ "$line" =~ "ip6 nexthdr tcp" || "$line" =~ "ip6 nexthdr udp" ]]; then
+                    has_v6=true
+                fi
+                if [[ "$line" =~ dnat\ ip6\ to\ \[(::1)\]:([0-9]+) ]]; then
+                    has_loopback_v6=true
+                fi
+            done < <(nft list chain inet port_forward prerouting 2>/dev/null | grep 'dnat' || true)
             policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
-            if [[ "$policy6" == "DROP" ]]; then
-                ip6tables -C FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                    ip6tables -I FORWARD -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
-                ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-                    ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-                log "Added ip6tables FORWARD ACCEPT rules (DNAT + ESTABLISHED)"
+            if [[ "$policy6" == "DROP" && "$has_v6" == true ]]; then
+                ip6tables -C FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT 2>/dev/null || \
+                    ip6tables -I FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT 2>/dev/null
+                ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT 2>/dev/null || \
+                    ip6tables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT 2>/dev/null
+                log "Synced managed ip6tables FORWARD ACCEPT rules"
+            else
+                while ip6tables -C FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT >/dev/null 2>&1; do
+                    ip6tables -D FORWARD -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed forward dnat" -j ACCEPT >/dev/null 2>&1 || break
+                done
+                while ip6tables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT >/dev/null 2>&1; do
+                    ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "pfwd-managed forward established" -j ACCEPT >/dev/null 2>&1 || break
+                done
             fi
             input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
-            if [[ "$input_policy6" == "DROP" ]]; then
-                ip6tables -C INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || \
-                    ip6tables -I INPUT -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null
-                log "Added ip6tables INPUT ACCEPT rule for DNAT traffic"
+            if [[ "$input_policy6" == "DROP" && "$has_loopback_v6" == true ]]; then
+                ip6tables -C INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT 2>/dev/null || \
+                    ip6tables -I INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT 2>/dev/null
+                log "Synced managed ip6tables INPUT ACCEPT rule"
+            else
+                while ip6tables -C INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT >/dev/null 2>&1; do
+                    ip6tables -D INPUT -m conntrack --ctstate DNAT -m comment --comment "pfwd-managed input dnat" -j ACCEPT >/dev/null 2>&1 || break
+                done
             fi
         fi
     else
@@ -2953,10 +3070,11 @@ else
     log "No rules file found at $NFT_CONFIG"
 fi
 RESTORE_EOF
-    chmod +x "$NFT_RESTORE_SCRIPT"
+    _atomic_replace_file "$restore_tmp" "$NFT_RESTORE_SCRIPT" 0755
 
     # Create systemd service (with ExecStop to save traffic on shutdown)
-    cat > "$NFT_RESTORE_SERVICE" << EOF
+    service_tmp=$(_mktemp_in_dir "$NFT_RESTORE_SERVICE") || return 1
+    cat > "$service_tmp" << EOF
 [Unit]
 Description=pfwd nftables rules restore
 After=network-online.target nftables.service systemd-sysctl.service ufw.service
@@ -2971,9 +3089,11 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    _atomic_replace_file "$service_tmp" "$NFT_RESTORE_SERVICE" 0644
 
     # Create traffic collector script
-    cat > "$TRAFFIC_COLLECTOR" << 'COLLECTOR_EOF'
+    collector_tmp=$(_mktemp_in_dir "$TRAFFIC_COLLECTOR") || return 1
+    cat > "$collector_tmp" << 'COLLECTOR_EOF'
 #!/bin/bash
 # pfwd traffic data collector - runs independently via systemd timer
 # Reads nft counters, computes deltas, writes accumulated data to disk
@@ -3111,10 +3231,11 @@ for key in "${!acc_in[@]}"; do
 done
 mv -f "$tmp_file" "$TRAFFIC_DATA"
 COLLECTOR_EOF
-    chmod +x "$TRAFFIC_COLLECTOR"
+    _atomic_replace_file "$collector_tmp" "$TRAFFIC_COLLECTOR" 0755
 
     # Create traffic save timer
-    cat > "$TRAFFIC_SAVE_SERVICE" << EOF
+    service_tmp=$(_mktemp_in_dir "$TRAFFIC_SAVE_SERVICE") || return 1
+    cat > "$service_tmp" << EOF
 [Unit]
 Description=pfwd traffic data collector
 After=pfwd-nft-restore.service
@@ -3123,8 +3244,10 @@ After=pfwd-nft-restore.service
 Type=oneshot
 ExecStart=$TRAFFIC_COLLECTOR
 EOF
+    _atomic_replace_file "$service_tmp" "$TRAFFIC_SAVE_SERVICE" 0644
 
-    cat > "$TRAFFIC_SAVE_TIMER" << 'EOF'
+    timer_tmp=$(_mktemp_in_dir "$TRAFFIC_SAVE_TIMER") || return 1
+    cat > "$timer_tmp" << 'EOF'
 [Unit]
 Description=Periodically save pfwd traffic statistics
 
@@ -3136,6 +3259,7 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
+    _atomic_replace_file "$timer_tmp" "$TRAFFIC_SAVE_TIMER" 0644
 
     systemctl daemon-reload 2>/dev/null
     systemctl enable pfwd-nft-restore >/dev/null 2>&1 || true
@@ -4091,6 +4215,7 @@ Commands:
   del         Delete forwarding rules
   list        List all forwarding rules
   status      Show running status and rule counts
+  doctor      Run forwarding diagnostics
   start       Start forwarding (nft / realm / all)
   stop        Stop forwarding (nft / realm / all)
   restart     Restart forwarding (nft / realm / all)
@@ -4131,6 +4256,7 @@ Traffic / diagnosis:
   pfwd list
   pfwd list -f mss
   pfwd status
+  pfwd doctor
   pfwd stats
   pfwd stats --rate
 
@@ -4156,6 +4282,7 @@ Common scenarios:
   pfwd -m nft -t 1.2.3.4 --both 80,443
   pfwd -m nft -t 127.0.0.1 33389:3389
   pfwd -m realm -t example.com 443 -c "tls relay"
+  pfwd doctor
   pfwd import backup.json
   pfwd optimize balanced
 
@@ -4380,6 +4507,155 @@ cmd_list() {
     nft_list_rules "$filter" "$(_traffic_read_merged)"
     echo ""
     realm_list_endpoints "$filter" "$PFWD_REALM_ENDPOINTS"
+}
+
+# _nft_saved_rule_count - count persisted prerouting DNAT rules in NFT_CONFIG
+_nft_saved_rule_count() {
+    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
+    awk '/dnat ip to / || /dnat ip6 to / { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
+}
+
+_doctor_print_check() {
+    local level="$1" title="$2" detail="${3:-}"
+    local color="$GREEN"
+    case "$level" in
+        WARN) color="$YELLOW" ;;
+        ERROR) color="$RED" ;;
+    esac
+    if [[ -n "$detail" ]]; then
+        echo -e "  ${color}[${level}]${NC} ${title} ${DIM}- ${detail}${NC}"
+    else
+        echo -e "  ${color}[${level}]${NC} ${title}"
+    fi
+}
+
+cmd_doctor() {
+    _pfwd_collect_state
+    echo -e "${BOLD}pfwd Doctor${NC}"
+    echo -e "${DIM}$SEP_EQ${NC}"
+
+    local running_rules="$PFWD_NFT_COUNT"
+    local saved_rules saved_valid=false
+    saved_rules=$(_nft_saved_rule_count)
+
+    if command -v nft >/dev/null 2>&1; then
+        _doctor_print_check OK "nft command available"
+    else
+        _doctor_print_check ERROR "nft command missing" "install nftables before using nft forwarding"
+    fi
+
+    if _nft_table_exists; then
+        _doctor_print_check OK "nft table loaded" "$running_rules rule(s) active"
+        local chain
+        for chain in prerouting postrouting forward input; do
+            if _nft_cached_chain "$chain" >/dev/null; then
+                _doctor_print_check OK "chain ${chain} present"
+            else
+                _doctor_print_check ERROR "chain ${chain} missing" "runtime table is incomplete"
+            fi
+        done
+    elif (( saved_rules > 0 )); then
+        _doctor_print_check WARN "saved nft config exists but table is not loaded" "run 'pfwd start nft' or 'pfwd restart nft'"
+    else
+        _doctor_print_check WARN "no active nft forwarding table"
+    fi
+
+    if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
+        if command -v nft >/dev/null 2>&1 && nft -c -f "$NFT_CONFIG" >/dev/null 2>&1; then
+            saved_valid=true
+            _doctor_print_check OK "persisted nft config is valid" "$saved_rules rule(s) saved"
+        else
+            _doctor_print_check ERROR "persisted nft config failed validation" "$NFT_CONFIG"
+        fi
+    else
+        _doctor_print_check WARN "persisted nft config missing" "$NFT_CONFIG"
+    fi
+
+    if (( saved_rules > 0 && running_rules == 0 )); then
+        _doctor_print_check WARN "rules are saved but not running" "use 'pfwd start nft'"
+    elif (( running_rules > 0 && saved_rules == 0 )); then
+        _doctor_print_check WARN "rules are running but not saved" "use 'pfwd restart nft' or modify rules to trigger save"
+    elif (( running_rules != saved_rules )); then
+        _doctor_print_check WARN "saved/runtime rule counts differ" "saved=${saved_rules}, running=${running_rules}"
+    fi
+
+    local fwd4 fwd6
+    fwd4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+    fwd6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
+    [[ "$fwd4" == "1" ]] && _doctor_print_check OK "IPv4 forwarding enabled" || _doctor_print_check ERROR "IPv4 forwarding disabled" "run 'pfwd optimize balanced' or enable net.ipv4.ip_forward=1"
+    [[ "$fwd6" == "1" ]] && _doctor_print_check OK "IPv6 forwarding enabled" || _doctor_print_check WARN "IPv6 forwarding disabled"
+
+    if $PFWD_LOOPBACK_DNAT; then
+        local route_all route_default
+        route_all=$(sysctl -n net.ipv4.conf.all.route_localnet 2>/dev/null || echo 0)
+        route_default=$(sysctl -n net.ipv4.conf.default.route_localnet 2>/dev/null || echo 0)
+        if [[ "$route_all" == "1" && "$route_default" == "1" ]]; then
+            _doctor_print_check OK "route_localnet enabled for loopback DNAT"
+        else
+            _doctor_print_check ERROR "route_localnet missing for loopback DNAT" "run 'pfwd optimize balanced' or re-add the loopback rule"
+        fi
+
+        if command -v ufw >/dev/null 2>&1; then
+            case "$PFWD_UFW_LOOPBACK_STATE" in
+                ok) _doctor_print_check OK "UFW loopback DNAT exceptions synced" ;;
+                missing) _doctor_print_check ERROR "UFW loopback DNAT exceptions missing" "reload pfwd rules or run 'ufw reload'" ;;
+                disabled) _doctor_print_check WARN "UFW disabled; loopback exception sync not needed" ;;
+                *) _doctor_print_check WARN "UFW loopback state: $PFWD_UFW_LOOPBACK_STATE" ;;
+            esac
+        fi
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        local fwd_policy input_policy
+        fwd_policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+        input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+        if [[ "$fwd_policy" == "DROP" ]]; then
+            if _iptables_rule_present iptables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+               _iptables_rule_present iptables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                _doctor_print_check OK "iptables FORWARD managed exceptions present"
+            else
+                _doctor_print_check ERROR "iptables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft' or reload UFW"
+            fi
+        else
+            _doctor_print_check OK "iptables FORWARD policy is ${fwd_policy:-unset}"
+        fi
+        if [[ "$input_policy" == "DROP" && $PFWD_LOOPBACK_DNAT == true ]]; then
+            if _iptables_rule_present iptables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
+                _doctor_print_check OK "iptables INPUT managed exception present for loopback DNAT"
+            else
+                _doctor_print_check ERROR "iptables INPUT loopback DNAT exception missing" "run 'pfwd restart nft' or reload UFW"
+            fi
+        fi
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        local fwd_policy6 input_policy6
+        fwd_policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
+        input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
+        if [[ "$fwd_policy6" == "DROP" ]]; then
+            if _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+               _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                _doctor_print_check OK "ip6tables FORWARD managed exceptions present"
+            else
+                _doctor_print_check ERROR "ip6tables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft'"
+            fi
+        else
+            _doctor_print_check OK "ip6tables FORWARD policy is ${fwd_policy6:-unset}"
+        fi
+        if [[ "$input_policy6" == "DROP" && $PFWD_LOOPBACK_DNAT == true ]]; then
+            if _iptables_rule_present ip6tables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
+                _doctor_print_check OK "ip6tables INPUT managed exception present for loopback DNAT"
+            else
+                _doctor_print_check ERROR "ip6tables INPUT loopback DNAT exception missing" "run 'pfwd restart nft'"
+            fi
+        fi
+    fi
+
+    if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
+        _doctor_print_check OK "boot restore service present" "$NFT_RESTORE_SERVICE"
+    else
+        _doctor_print_check WARN "boot restore service missing" "rules may not survive reboot"
+    fi
 }
 
 # cmd_stop - stop forwarding without removing config
@@ -4650,6 +4926,9 @@ parse_cli_args() {
         status)
             cmd_status
             ;;
+        doctor|diagnose)
+            cmd_doctor
+            ;;
         export)
             shift
             cmd_export "${1:-}"
@@ -4875,6 +5154,7 @@ interactive_menu() {
         echo -e "  ${CYAN}4)${NC} ${_fwd_label}"
         echo -e "  ${CYAN}5)${NC} Traffic statistics"
         echo -e "  ${CYAN}s)${NC} Status overview"
+        echo -e "  ${CYAN}d)${NC} Doctor / diagnostics"
         echo ""
         echo -e "  ${DIM}── Configuration ──${NC}"
         echo -e "  ${CYAN}6)${NC} Import/Export config"
@@ -4886,7 +5166,7 @@ interactive_menu() {
         echo -e "  ${CYAN}9)${NC} ${RED}Uninstall${NC}"
         echo -e "  ${CYAN}0)${NC} ${DIM}Exit${NC}"
         echo ""
-        read -rp "${CYAN}Select [0-9/s/h]:${NC} " choice
+        read -rp "${CYAN}Select [0-9/s/d/h]:${NC} " choice
 
         case "$choice" in
             1) menu_add_rule || true ;;
@@ -4901,6 +5181,7 @@ interactive_menu() {
                 ;;
             5) show_traffic_stats; wait_for_enter ;;
             s|S) cmd_status; wait_for_enter ;;
+            d|D) cmd_doctor; wait_for_enter ;;
             6) menu_export_import || true ;;
             7) realm_install; wait_for_enter ;;
             8)
