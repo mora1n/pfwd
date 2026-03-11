@@ -7,6 +7,7 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **realm forwarding** for domain-based targets and userspace proxying
 - **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
+- **Safe conflict handling** — duplicate nft port/protocol/IP-family rules are rejected unless you pass `--replace`
 - **Batch mode** — bulk add/delete with single save/restart cycle
 - **nft output caching** — TTL-based cache eliminates redundant `nft list` calls
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
@@ -32,6 +33,7 @@ pfwd
 # Shortcut (auto nft)
 pfwd 8080 1.2.3.4
 pfwd 80,443 1.2.3.4
+pfwd 8080 1.2.3.4 --replace
 
 # Full syntax
 pfwd -m nft -t 1.2.3.4 80,443,8080-8090
@@ -73,6 +75,7 @@ pfwd <ports> <target> [target_port]
 | `-t, --target` | Target IP or domain (required) |
 | `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
 | `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
+| `--replace` | nft only: replace an existing rule for the same local port/protocol/IP family |
 | `-c, --comment` | Comment |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
@@ -96,11 +99,13 @@ pfwd <ports> <target> [target_port]
 pfwd 8080 1.2.3.4
 pfwd 80,443 1.2.3.4
 pfwd 8080 1.2.3.4 80          # local 8080 -> remote 80
+pfwd 8080 1.2.3.4 --replace   # replace an existing nft rule explicitly
 
 # nftables
 pfwd -m nft -t 1.2.3.4 80,443,8080-8090
 pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
 pfwd -m nft -t 1.2.3.4 33389:3389
+pfwd -m nft -t 2.2.2.2 --replace 33389:3389
 
 # realm (domain targets)
 pfwd -m realm -t example.com 80,443 -c "web"
