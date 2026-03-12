@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.8.4"
+readonly VERSION="1.8.5"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -4751,21 +4751,41 @@ cmd_doctor() {
         fi
     fi
 
+    # 检查是否有 IPv4/IPv6 转发规则
+    local parsed_rules has_ipv4_rules=false has_ipv6_rules=false has_loopback_rules=false
+    parsed_rules=$(_parse_nft_prerouting_rules)
+    if [[ -n "$parsed_rules" ]]; then
+        while IFS='|' read -r proto lport ipver target tport comment bytes; do
+            [[ -z "$lport" ]] && continue
+            if [[ "$ipver" == "4" ]]; then
+                has_ipv4_rules=true
+                [[ "$target" =~ ^127\. ]] && has_loopback_rules=true
+            elif [[ "$ipver" == "6" ]]; then
+                has_ipv6_rules=true
+                [[ "$target" == "::1" ]] && has_loopback_rules=true
+            fi
+        done <<< "$parsed_rules"
+    fi
+
     if command -v iptables >/dev/null 2>&1; then
         local fwd_policy input_policy
         fwd_policy=$(iptables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
         input_policy=$(iptables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
         if [[ "$fwd_policy" == "DROP" ]]; then
-            if _iptables_rule_present iptables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
-               _iptables_rule_present iptables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
-                _doctor_print_check OK "iptables FORWARD managed exceptions present"
+            if [[ "$has_ipv4_rules" == true ]]; then
+                if _iptables_rule_present iptables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+                   _iptables_rule_present iptables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                    _doctor_print_check OK "iptables FORWARD managed exceptions present"
+                else
+                    _doctor_print_check ERROR "iptables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft' or reload UFW"
+                fi
             else
-                _doctor_print_check ERROR "iptables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft' or reload UFW"
+                _doctor_print_check OK "iptables FORWARD policy is DROP (no IPv4 rules, no exceptions needed)"
             fi
         else
             _doctor_print_check OK "iptables FORWARD policy is ${fwd_policy:-unset}"
         fi
-        if [[ "$input_policy" == "DROP" && $PFWD_LOOPBACK_DNAT == true ]]; then
+        if [[ "$input_policy" == "DROP" && $PFWD_LOOPBACK_DNAT == true && "$has_loopback_rules" == true ]]; then
             if _iptables_rule_present iptables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
                 _doctor_print_check OK "iptables INPUT managed exception present for loopback DNAT"
             else
@@ -4779,16 +4799,20 @@ cmd_doctor() {
         fwd_policy6=$(ip6tables -S FORWARD 2>/dev/null | awk '/-P FORWARD/{print $3}')
         input_policy6=$(ip6tables -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
         if [[ "$fwd_policy6" == "DROP" ]]; then
-            if _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
-               _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
-                _doctor_print_check OK "ip6tables FORWARD managed exceptions present"
+            if [[ "$has_ipv6_rules" == true ]]; then
+                if _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+                   _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                    _doctor_print_check OK "ip6tables FORWARD managed exceptions present"
+                else
+                    _doctor_print_check ERROR "ip6tables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft'"
+                fi
             else
-                _doctor_print_check ERROR "ip6tables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft'"
+                _doctor_print_check OK "ip6tables FORWARD policy is DROP (no IPv6 rules, no exceptions needed)"
             fi
         else
             _doctor_print_check OK "ip6tables FORWARD policy is ${fwd_policy6:-unset}"
         fi
-        if [[ "$input_policy6" == "DROP" && $PFWD_LOOPBACK_DNAT == true ]]; then
+        if [[ "$input_policy6" == "DROP" && $PFWD_LOOPBACK_DNAT == true && "$has_loopback_rules" == true ]]; then
             if _iptables_rule_present ip6tables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
                 _doctor_print_check OK "ip6tables INPUT managed exception present for loopback DNAT"
             else
@@ -4919,6 +4943,8 @@ cmd_start() {
                     local _restored_count
                     _restored_count=$(_nft_cached_chain prerouting | grep -c 'dnat') || _restored_count=0
                     msg_ok "nftables forwarding started ($_restored_count rules restored)"
+                    # 同步 iptables/ip6tables FORWARD 规则
+                    ensure_forward_accept
                 else
                     msg_err "Failed to restore nftables rules"
                     return 1
