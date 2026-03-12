@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants & Colors
 #===============================================================================
 
-readonly VERSION="1.8.3"
+readonly VERSION="1.8.4"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -672,15 +672,65 @@ return_to_main_menu() {
 # detect_ip_type <address> -> "ipv4" | "ipv6" | "domain" | "unknown"
 detect_ip_type() {
     local addr="$1"
-    if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "ipv4"
-    elif [[ "$addr" =~ : ]]; then
-        echo "ipv6"
-    elif [[ "$addr" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$ ]]; then
-        echo "domain"
-    else
-        echo "unknown"
+
+    # IPv4 验证：检查格式和数值范围
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}"
+        local o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+        if (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )); then
+            echo "ipv4"
+            return 0
+        fi
     fi
+
+    # IPv6 验证：使用更严格的正则表达式
+    if [[ "$addr" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || \
+       [[ "$addr" =~ ^::([0-9a-fA-F]{0,4}:){0,6}[0-9a-fA-F]{0,4}$ ]] || \
+       [[ "$addr" =~ ^([0-9a-fA-F]{0,4}:){1,6}:$ ]]; then
+        echo "ipv6"
+        return 0
+    fi
+
+    # 域名验证
+    if [[ "$addr" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$ ]]; then
+        echo "domain"
+        return 0
+    fi
+
+    echo "unknown"
+    return 1
+}
+
+# validate_target_reachable <target> - 验证目标地址是否可达
+validate_target_reachable() {
+    local target="$1"
+    local target_type
+    target_type=$(detect_ip_type "$target")
+
+    case "$target_type" in
+        ipv4|ipv6)
+            # 使用 ping 测试连通性（可选，用户可通过 --skip-ping 跳过）
+            if [[ "${SKIP_PING_CHECK:-false}" != "true" ]]; then
+                if ! ping -c 1 -W 2 "$target" >/dev/null 2>&1; then
+                    msg_warn "Target $target is not reachable (ping failed)"
+                    read -rp "Continue anyway? [y/N]: " confirm
+                    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+                fi
+            fi
+            ;;
+        domain)
+            # 验证域名可以解析
+            if ! getent ahosts "$target" >/dev/null 2>&1; then
+                msg_err "Cannot resolve domain: $target"
+                return 1
+            fi
+            ;;
+        *)
+            msg_err "Invalid target address: $target"
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 # validate_port <port> -> 0=valid, 1=invalid
@@ -1060,6 +1110,12 @@ _rewrite_ufw_file() {
     local file="$1" anchor="$2" marker_start="$3" marker_end="$4" block="$5"
     [[ -f "$file" ]] || return 0
 
+    # 验证锚点是否存在
+    if ! grep -qF "$anchor" "$file" 2>/dev/null; then
+        msg_warn "UFW anchor '$anchor' not found in $file"
+        msg_warn "Rules will be appended to the end of the file"
+    fi
+
     local tmp_file block_file
     tmp_file=$(mktemp)
     block_file=$(mktemp)
@@ -1127,6 +1183,9 @@ _rewrite_ufw_file() {
 ufw_sync_loopback_dnat_rules() {
     command -v ufw >/dev/null 2>&1 || return 0
     [[ -f "$UFW_BEFORE_RULES" ]] || return 0
+
+    # 强制刷新 nftables 缓存，确保获取最新规则
+    _nft_invalidate_cache
 
     local marker_start="# pfwd-managed loopback dnat start"
     local marker_end="# pfwd-managed loopback dnat end"
@@ -2817,15 +2876,49 @@ ufw_reload_if_enabled() {
     ufw_status=$(ufw status 2>/dev/null | head -1)
     if [[ "$ufw_status" =~ "Status: active" ]]; then
         msg_dim "  Reloading ufw to apply nftables changes..."
+
+        # 先验证规则文件语法
+        if [[ -f "$UFW_BEFORE_RULES" ]]; then
+            if ! iptables-restore --test < "$UFW_BEFORE_RULES" >/dev/null 2>&1; then
+                msg_err "UFW before.rules syntax error detected"
+                msg_err "Please check $UFW_BEFORE_RULES manually"
+                _DIRTY_UFW_RELOAD=false
+                return 1
+            fi
+        fi
+
         if ufw reload >/dev/null 2>&1; then
             msg_dim "  ufw reloaded successfully"
             # Re-add iptables ACCEPT rules after UFW reload (may have been flushed)
             ensure_forward_accept
         else
-            msg_warn "Failed to reload ufw, you may need to reload it manually"
+            msg_err "Failed to reload ufw"
+            msg_err "Your firewall rules may be inconsistent"
+            msg_err "Run 'ufw reload' manually to fix"
+            _DIRTY_UFW_RELOAD=false
+            return 1
         fi
     fi
     _DIRTY_UFW_RELOAD=false
+}
+
+# fix_ufw_loopback_rules - 手动修复 UFW loopback DNAT 规则
+fix_ufw_loopback_rules() {
+    msg_info "Fixing UFW loopback DNAT rules..."
+
+    # 强制刷新缓存
+    _nft_invalidate_cache
+
+    # 执行同步
+    ufw_sync_loopback_dnat_rules
+
+    # 重新加载 UFW
+    if ufw_reload_if_enabled; then
+        msg_ok "UFW loopback DNAT rules fixed"
+    else
+        msg_err "Failed to fix UFW rules"
+        return 1
+    fi
 }
 
 # nft_flush_all - delete entire table and config files
@@ -4216,6 +4309,8 @@ Commands:
   list        List all forwarding rules
   status      Show running status and rule counts
   doctor      Run forwarding diagnostics
+  verify      Verify forwarding rules validity
+  fix-ufw     Fix UFW loopback DNAT rules
   start       Start forwarding (nft / realm / all)
   stop        Stop forwarding (nft / realm / all)
   restart     Restart forwarding (nft / realm / all)
@@ -4526,6 +4621,57 @@ _doctor_print_check() {
         echo -e "  ${color}[${level}]${NC} ${title} ${DIM}- ${detail}${NC}"
     else
         echo -e "  ${color}[${level}]${NC} ${title}"
+    fi
+}
+
+# verify_forwarding_rules - 验证转发规则的有效性
+verify_forwarding_rules() {
+    msg_info "Verifying forwarding rules..."
+
+    local parsed_rules
+    parsed_rules=$(_parse_nft_prerouting_rules)
+
+    local errors=0
+    local warnings=0
+
+    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+        [[ -z "$lport" ]] && continue
+
+        # 验证目标地址格式
+        local target_type
+        target_type=$(detect_ip_type "$target")
+        if [[ "$target_type" == "unknown" ]]; then
+            msg_err "Rule #$lport: Invalid target address '$target'"
+            ((errors++))
+            continue
+        fi
+
+        # 验证目标可达性（仅警告）
+        if [[ "$target_type" == "ipv4" || "$target_type" == "ipv6" ]]; then
+            if ! ping -c 1 -W 2 "$target" >/dev/null 2>&1; then
+                msg_warn "Rule #$lport: Target $target:$tport is not reachable"
+                ((warnings++))
+            fi
+        fi
+
+        # 验证端口范围
+        if ! validate_port "$lport" || ! validate_port "$tport"; then
+            msg_err "Rule #$lport: Invalid port number"
+            ((errors++))
+        fi
+
+    done <<< "$parsed_rules"
+
+    echo ""
+    if (( errors > 0 )); then
+        msg_err "Found $errors error(s) in forwarding rules"
+        return 1
+    elif (( warnings > 0 )); then
+        msg_warn "Found $warnings warning(s) in forwarding rules"
+        return 0
+    else
+        msg_ok "All forwarding rules are valid"
+        return 0
     fi
 }
 
@@ -4928,6 +5074,12 @@ parse_cli_args() {
             ;;
         doctor|diagnose)
             cmd_doctor
+            ;;
+        verify)
+            verify_forwarding_rules
+            ;;
+        fix-ufw)
+            fix_ufw_loopback_rules
             ;;
         export)
             shift
