@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.1"
+readonly VERSION="1.9.2"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -3138,9 +3138,11 @@ _parse_nft_export_rules() {
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
 
         post_line=$(printf '%s\n' "$post_data" | grep -F "comment \"$tag\"" | head -1 || true)
-        if [[ -n "$post_line" && "$post_line" =~ snat\ to\ ([^[:space:]]+) ]]; then
+        if [[ -n "$post_line" && "$post_line" =~ snat([[:space:]]+ip6?|[[:space:]]+ip)?[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
             snat_mode="snat"
-            snat_source="${BASH_REMATCH[1]}"
+            snat_source="${BASH_REMATCH[2]}"
+            snat_source="${snat_source#[}"
+            snat_source="${snat_source%]}"
         fi
 
         mss_line=$(printf '%s\n' "$forward_data" | grep -F "comment \"${tag}:mss\"" | head -1 || true)
@@ -3298,6 +3300,7 @@ nft_list_rules() {
 
     # Display sorted rules (supports both 10-field export format and older traffic-only formats)
     local idx=0
+    local -a detail_lines=()
     while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9 f10; do
         [[ -z "$lport" ]] && continue
         local snat_mode="masquerade" snat_source="" mss_mode="" mss_value="" bytes="0"
@@ -3340,8 +3343,19 @@ nft_list_rules() {
         (( ${#disp_comment} > 20 )) && disp_comment="${disp_comment:0:18}.."
         printf "  ${DIM}│${NC}%-4s${DIM}│${NC}%-8s${DIM}│${NC}${proto_color}%-6s${NC}${DIM}│${NC}${ipver_color}%-6s${NC}${DIM}│${NC}%-30s${DIM}│${NC}%-18s${DIM}│${NC}%-20s${DIM}│${NC}${traffic_color}%-10s${NC}${DIM}│${NC}\n" \
             " $idx" " :$lport" " $proto" " v$ipver" "$disp_target" "$disp_opts" "$disp_comment" " $traffic"
+        if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
+            detail_lines+=("#$idx fixed-snat: $snat_source")
+        fi
     done <<< "$sorted_rules"
     echo -e "  ${DIM}└────┴────────┴──────┴──────┴──────────────────────────────┴──────────────────┴────────────────────┴──────────┘${NC}"
+    if (( ${#detail_lines[@]} > 0 )); then
+        echo ""
+        echo -e "${DIM}Fixed SNAT details:${NC}"
+        local detail_line
+        for detail_line in "${detail_lines[@]}"; do
+            echo -e "  ${DIM}${detail_line}${NC}"
+        done
+    fi
 }
 
 # nft_get_traffic <port> - get traffic bytes for a port
