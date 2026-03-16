@@ -1,11 +1,10 @@
 # pfwd - Port Forwarding Tool
 
-A streamlined port forwarding management tool supporting **nftables** (with flowtable fast path acceleration) and **realm** (userspace Rust proxy).
+A streamlined port forwarding management tool focused on **nftables** with flowtable fast path acceleration.
 
 ## Features
 
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
-- **realm forwarding** for domain-based targets and userspace proxying
 - **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
 - **Safe conflict handling** — duplicate nft port/protocol/IP-family rules are rejected unless you pass `--replace`
 - **Atomic nft persistence** — saved nft config is written via temp file + atomic replace
@@ -16,16 +15,18 @@ A streamlined port forwarding management tool supporting **nftables** (with flow
 - **CLI + Interactive menu** with numbered rules and color coding
 - **Rule filtering** — `pfwd list -f <pattern>` for regex search
 - **Traffic statistics** with optional live rate display (`pfwd stats --rate`)
+- **Per-rule traffic limits** for inbound / outbound / total traffic
+- **Automatic reset and recovery** with daily / monthly / yearly cycles or absolute reset time
+- **Collector interval control** (`pfwd stats --interval [30s|1m|5m|10m|30m|1h]`)
 - **Kernel optimization profiles** — balanced / gaming / lowmem
-- **Backup/Import/Export** in JSON format
+- **Backup/Import/Export** in JSON format (v2 export, legacy import compatible)
 - **Boot persistence** via systemd services
-- **Smart download** with GitHub mirror support
 - **`--no-color` / `--no-clear`** modes for scripting
 
 ## Quick Start
 
 ```bash
-# Install
+# Install from a persistent path
 curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd && chmod +x /usr/local/bin/pfwd
 
 # Interactive mode
@@ -38,7 +39,6 @@ pfwd 8080 1.2.3.4 --replace
 
 # Full syntax
 pfwd -m nft -t 1.2.3.4 80,443,8080-8090
-pfwd -m realm -t example.com 80,443 -c "web"
 ```
 
 ## Usage
@@ -52,12 +52,12 @@ Commands:
   list        List all forwarding rules
   status      Show running status and rule counts
   doctor      Run forwarding diagnostics
-  start/stop/restart  Control forwarding (nft / realm / all)
+  start/stop/restart  Control forwarding (nft / all)
   stats       Traffic statistics
+  limit       Manage traffic limits
   export      Export config to JSON
   import      Import config from JSON
-  install     Install realm binary
-  uninstall   Uninstall (realm / nftables / all)
+  uninstall   Uninstall (nftables / all)
   optimize    Kernel optimization [balanced|gaming|lowmem]
   help        Show help
 ```
@@ -65,7 +65,7 @@ Commands:
 ### Add Rules
 
 ```bash
-pfwd -m nft|realm -t <target> [options] <ports>
+pfwd -m nft -t <target> [options] <ports>
 
 # Or shortcut (defaults to nft):
 pfwd <ports> <target> [target_port]
@@ -73,11 +73,16 @@ pfwd <ports> <target> [target_port]
 
 | Option | Description |
 |--------|-------------|
-| `-m, --method` | `nft` or `realm` (required) |
+| `-m, --method` | `nft` (required) |
 | `-t, --target` | Target IP or domain (required) |
 | `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
 | `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
 | `--replace` | nft only: replace an existing rule for the same local port/protocol/IP family |
+| `--limit-in <size>` | nft only: inbound traffic limit, e.g. `500M`, `2G` |
+| `--limit-out <size>` | nft only: outbound traffic limit |
+| `--limit-total <size>` | nft only: total inbound+outbound traffic limit |
+| `--limit-reset-every <Nd|Nmo|Ny>` | nft only: reset cycle, e.g. `1d`, `2mo`, `1y` |
+| `--limit-reset-at <time>` | nft only: absolute reset time, e.g. `2026-04-01 00:00:00` |
 | `-c, --comment` | Comment |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
@@ -109,13 +114,9 @@ pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
 pfwd -m nft -t 1.2.3.4 33389:3389
 pfwd -m nft -t 2.2.2.2 --replace 33389:3389
 
-# realm (domain targets)
-pfwd -m realm -t example.com 80,443 -c "web"
-
 # Delete
 pfwd del -m nft 3389
 pfwd del -m nft 80,443,8080-8082
-pfwd del -m realm 3389
 
 # List / Filter
 pfwd list
@@ -125,6 +126,16 @@ pfwd list -f 8080
 pfwd doctor
 pfwd stats
 pfwd stats --rate
+pfwd stats --interval
+pfwd stats --interval 1m
+
+# Traffic limits
+pfwd -m nft -t 1.2.3.4 --limit-total 100G --limit-reset-every 1mo 443
+pfwd -m nft -t 1.2.3.4 --limit-in 50G --limit-out 20G --limit-reset-at "2026-04-01 00:00:00" 8443:443
+pfwd limit list
+pfwd limit set 443 --limit-total 200G --limit-reset-every 2mo
+pfwd limit restore 443
+pfwd limit unset 443
 
 # Kernel optimization
 pfwd optimize              # balanced (default)
@@ -137,7 +148,13 @@ pfwd import ~/backup.json -m nft
 pfwd import --url https://example.com/backup.json
 ```
 
-## Methods
+Notes:
+
+- `pfwd export` writes the current v2 JSON schema.
+- `pfwd import` accepts both the legacy flat schema and the v2 schema.
+- `jq` must already be installed for import/export and traffic-limit commands.
+
+## Method
 
 ### nftables (with flowtable)
 
@@ -147,13 +164,17 @@ Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loa
 
 Best for: IP-based targets, maximum performance.
 
-### realm
+## Traffic Limit Semantics
 
-Userspace proxy written in Rust. Supports domain-based targets natively.
-
-Best for: Domain targets, environments where kernel-level forwarding is not suitable.
-
-Install: `pfwd install`
+- Limits are configured per nft forwarding rule.
+- `--limit-in`, `--limit-out` and `--limit-total` can be used together. Any one reaching its threshold blocks that rule.
+- When a rule is blocked by limit, pfwd removes that forwarding rule from nftables until the next reset or a manual `pfwd limit restore`.
+- Manual restore always clears the current cycle counters before bringing the rule back.
+- Reset policy supports:
+  - `--limit-reset-every <Nd|Nmo|Ny>` for periodic reset
+  - `--limit-reset-at "<time>"` for one absolute reset point
+  - both together, where the absolute time is treated as the first boundary and the cycle continues afterwards
+- If only `--limit-reset-at` is configured, pfwd performs one automatic reset at that time and does not schedule a later one.
 
 ## Performance
 
@@ -161,7 +182,7 @@ Install: `pfwd install`
 |---------|-------------|
 | Flowtable fast path | Established connections offloaded to ingress |
 | nft output cache | TTL-based cache avoids redundant nft list calls |
-| Batch mode | Bulk add/delete defers save/restart to end |
+| Batch mode | Bulk add/delete defers save and reload to end |
 | Batch delete | Single chain fetch for multi-port deletion |
 | O(1) traffic matching | Hash-based postrouting lookup (replaces O(n²) loop) |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
@@ -173,19 +194,26 @@ Install: `pfwd install`
 |------|---------|
 | `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
 | `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5) |
-| `/etc/realm/config.toml` | realm configuration |
-| `/etc/systemd/system/realm-forward.service` | realm systemd service |
-| `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore |
+| `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore service (calls `pfwd __restore-nft`) |
+| `/etc/systemd/system/pfwd-traffic-save.service` | traffic collector service |
+| `/etc/systemd/system/pfwd-traffic-save.timer` | traffic collector timer |
+| `/var/lib/pfwd/traffic_stats.dat` | accumulated traffic counters |
+| `/var/lib/pfwd/traffic_limits.json` | traffic-limit config and cycle state |
 | `/etc/sysctl.d/99-pfwd.conf` | kernel optimizations |
-| `/var/lib/pfwd/` | backup files and restore scripts |
+| `/var/lib/pfwd/` | backup files and runtime state |
 
 ## Requirements
 
 - Linux with root access
-- nftables (for nft method)
+- nftables
 - Linux kernel >= 4.16 (for flowtable; older kernels fall back to standard forwarding)
-- jq (auto-installed for import/export)
-- curl or wget (for realm installation and URL imports)
+- jq (required for import/export and traffic-limit management)
+
+## Compatibility
+
+- Old `realm` rules in backup files are skipped during import.
+- Exported JSON now uses the v2 schema; imports remain backward-compatible with older flat exports.
+- Existing system-level `realm` files or services are not managed by this script anymore.
 
 ## License
 
