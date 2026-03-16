@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.0"
+readonly VERSION="1.9.1"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -5422,10 +5422,10 @@ interactive_menu() {
         echo -e "  ${CYAN}h)${NC} Help / CLI cheatsheet"
         echo ""
         echo -e "  ${DIM}── System ──${NC}"
-        echo -e "  ${CYAN}9)${NC} ${RED}Uninstall${NC}"
+        echo -e "  ${CYAN}8)${NC} ${RED}Uninstall${NC}"
         echo -e "  ${CYAN}0)${NC} ${DIM}Exit${NC}"
         echo ""
-        read -rp "${CYAN}Select [0-9/s/d/h]:${NC} " choice
+        read -rp "${CYAN}Select [0-8/s/d/h]:${NC} " choice
 
         case "$choice" in
             1) menu_add_rule || true ;;
@@ -5460,7 +5460,7 @@ interactive_menu() {
                 esac
                 ;;
             h|H) show_help; wait_for_enter ;;
-            9) menu_uninstall || true ;;
+            8) menu_uninstall || true ;;
             0) echo "Bye."; exit 0 ;;
             *) msg_warn "Invalid choice"; sleep 1.5 ;;
         esac
