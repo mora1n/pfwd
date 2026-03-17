@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.3"
+readonly VERSION="1.9.4"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -1287,6 +1287,65 @@ validate_target() {
 validate_mss_value() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 536 && value <= 65535 ))
+}
+
+suggest_mss_for_snat_source() {
+    local snat_source="$1"
+    MSS_SUGGEST_IFACE=""
+    MSS_SUGGEST_MTU=""
+    MSS_SUGGEST_VALUE=""
+    MSS_SUGGEST_FAMILY=""
+
+    command -v ip >/dev/null 2>&1 || return 1
+
+    local family family_flag iface mtu overhead suggested
+    family=$(detect_ip_type "$snat_source")
+    case "$family" in
+        ipv4)
+            family_flag="-4"
+            overhead=40
+            MSS_SUGGEST_FAMILY="IPv4"
+            ;;
+        ipv6)
+            family_flag="-6"
+            overhead=60
+            MSS_SUGGEST_FAMILY="IPv6"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    iface=$(ip -o "$family_flag" addr show 2>/dev/null | awk -v target="$snat_source" '
+        {
+            split($4, a, "/")
+            if (a[1] == target) {
+                print $2
+                exit
+            }
+        }
+    ') || true
+    [[ -n "$iface" ]] || return 1
+
+    mtu=$(ip -o link show dev "$iface" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "mtu") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    ') || true
+    [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+
+    suggested=$(( mtu - overhead ))
+    validate_mss_value "$suggested" || return 1
+
+    MSS_SUGGEST_IFACE="$iface"
+    MSS_SUGGEST_MTU="$mtu"
+    MSS_SUGGEST_VALUE="$suggested"
+    return 0
 }
 
 validate_comment() {
@@ -4492,6 +4551,10 @@ Options:
   -q, --quiet                Quiet mode
   --no-color                 Disable colored output
   --no-clear                 Don't clear screen in interactive menu
+
+Interactive note:
+  After choosing fixed SNAT, the menu can suggest a fixed MSS from that source
+  interface MTU. The suggestion is informational; you still choose Off/Clamp/Fixed.
 EOF
 }
 
@@ -5513,6 +5576,7 @@ interactive_menu() {
 menu_add_rule() {
     local mss_mode="" mss_value="" snat_mode="masquerade" snat_source="" replace_mode="false"
     local limit_in=0 limit_out=0 limit_total=0 limit_reset_every="" limit_reset_at_ts=0 limit_reset_at_raw=""
+    local suggested_mss="" suggested_mss_iface="" suggested_mss_mtu="" suggested_mss_family=""
     echo ""
     echo -e "${BOLD}Add Forwarding Rule${NC}"
     echo -e "${DIM}$SEP_DASH_40${NC}"
@@ -5637,6 +5701,14 @@ menu_add_rule() {
                     wait_for_enter
                     return
                 fi
+                if [[ "$proto" != "udp" ]] && suggest_mss_for_snat_source "$snat_source"; then
+                    suggested_mss="$MSS_SUGGEST_VALUE"
+                    suggested_mss_iface="$MSS_SUGGEST_IFACE"
+                    suggested_mss_mtu="$MSS_SUGGEST_MTU"
+                    suggested_mss_family="$MSS_SUGGEST_FAMILY"
+                    msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
+                    msg_dim "  Clamp to PMTU is safer when path MTU may vary; fixed MSS is useful for PPPoE/tunnel setups."
+                fi
                 ;;
             0) return ;;
             *) snat_mode="masquerade"; snat_source="" ;;
@@ -5658,7 +5730,12 @@ menu_add_rule() {
                 2) mss_mode="clamp"; mss_value="" ;;
                 3)
                     mss_mode="set"
-                    read -rp "MSS value: " mss_value
+                    if [[ -n "$suggested_mss" ]]; then
+                        read -rp "MSS value [${suggested_mss}]: " mss_value
+                        [[ -n "$mss_value" ]] || mss_value="$suggested_mss"
+                    else
+                        read -rp "MSS value: " mss_value
+                    fi
                     if ! validate_mss_value "$mss_value"; then
                         msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
                         wait_for_enter

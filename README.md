@@ -92,6 +92,11 @@ pfwd <ports> <target> [target_port]
 | `--no-color` | Disable colored output |
 | `--no-clear` | Don't clear screen in interactive menu |
 
+Interactive mode note:
+
+- After you choose fixed SNAT, `pfwd` can suggest a fixed MSS based on the detected source-interface MTU.
+- The suggestion is informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
+
 ### Port Formats
 
 | Format | Example | Description |
