@@ -18,8 +18,9 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 - **Per-rule traffic limits** for inbound / outbound / total traffic
 - **Automatic reset and recovery** with daily / monthly / yearly cycles or absolute reset time
 - **Collector interval control** (`pfwd stats --interval [30s|1m|5m|10m|30m|1h]`)
+- **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
 - **Kernel optimization profiles** — balanced / gaming / lowmem
-- **Backup/Import/Export** in JSON format (v2 export, legacy import compatible)
+- **Backup/Import/Export** in JSON format (current v2 schema)
 - **Boot persistence** via systemd services
 - **`--no-color` / `--no-clear`** modes for scripting
 
@@ -27,7 +28,10 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 
 ```bash
 # Install from a persistent path
-curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd && chmod +x /usr/local/bin/pfwd
+curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd.sh && chmod +x /usr/local/bin/pfwd.sh
+
+# First root run will auto-create /usr/local/bin/pfwd -> /usr/local/bin/pfwd.sh
+/usr/local/bin/pfwd.sh
 
 # Interactive mode
 pfwd
@@ -83,7 +87,7 @@ pfwd <ports> <target> [target_port]
 | `--limit-total <size>` | nft only: total inbound+outbound traffic limit |
 | `--limit-reset-every <Nd|Nmo|Ny>` | nft only: reset cycle, e.g. `1d`, `2mo`, `1y` |
 | `--limit-reset-at <time>` | nft only: absolute reset time, e.g. `2026-04-01 00:00:00` |
-| `-c, --comment` | Comment |
+| `-c, --comment` | Single-line comment (tabs/newlines rejected) |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
 | `--no-clear` | Don't clear screen in interactive menu |
@@ -151,7 +155,9 @@ pfwd import --url https://example.com/backup.json
 Notes:
 
 - `pfwd export` writes the current v2 JSON schema.
-- `pfwd import` accepts both the legacy flat schema and the v2 schema.
+- `pfwd import` requires the current v2 schema with `forward_rules`.
+- Legacy traffic cache records are ignored; regenerate stats with the current collector if needed.
+- Rule comments must be single-line text; tabs/newlines are rejected.
 - `jq` must already be installed for import/export and traffic-limit commands.
 
 ## Method

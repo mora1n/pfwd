@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.2"
+readonly VERSION="1.9.3"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -189,10 +189,11 @@ plat_iptables_policy() {
 
 json_forward_rules_summary() {
     local filepath="$1"
-    jq -r '
-        .forward_rules[] |
-        "  [\((.kind // .type // "nft"))] :\((.local.port // .local_port)) -> \((.target.host // .target_ip)):\((.target.port // .target_port))"
-    ' "$filepath"
+    while IFS=$'\t' read -r method lport target tport _proto _ipver _comment _mss_mode _mss_value _snat_mode _snat_source \
+        _limit_in _limit_out _limit_total _limit_reset_every _limit_reset_at; do
+        [[ -z "$method" ]] && continue
+        printf '  [%s] :%s -> %s:%s\n' "$method" "$lport" "$target" "$tport"
+    done < <(json_forward_rules_tsv "$filepath")
 }
 
 json_forward_rules_tsv() {
@@ -220,13 +221,26 @@ json_forward_rules_tsv() {
     ' "$filepath"
 }
 
+json_forward_rules_count() {
+    local filepath="$1"
+    jq -r '(.forward_rules | length)' "$filepath"
+}
+
+json_require_v2_backup() {
+    local filepath="$1"
+    jq -e '
+        has("forward_rules")
+        and (.forward_rules | type == "array")
+    ' "$filepath" >/dev/null 2>&1
+}
+
 json_export_rules_from_tsv() {
     local limit_map_json="$1"
     jq -Rn --argjson limit_map "$limit_map_json" '
         [
             inputs
             | select(length > 0)
-            | split("|") as $f
+            | split("\t") as $f
             | ($f[0] + "|" + ($f[1] // "") + "|" + ($f[2] // "")) as $key
             | {
                 kind: "nft",
@@ -388,7 +402,7 @@ _pfwd_collect_state() {
     [[ "$current_cc" == "bbr" ]] && PFWD_BBR_ENABLED=true || PFWD_BBR_ENABLED=false
 
     PFWD_LOOPBACK_DNAT=false
-    if [[ -n "$PFWD_NFT_RULES" ]] && awk -F'|' '$4 ~ /^127\./ || $4 == "::1" { found=1 } END { exit(found ? 0 : 1) }' <<< "$PFWD_NFT_RULES"; then
+    if [[ -n "$PFWD_NFT_RULES" ]] && awk -F'\t' '$4 ~ /^127\./ || $4 == "::1" { found=1 } END { exit(found ? 0 : 1) }' <<< "$PFWD_NFT_RULES"; then
         PFWD_LOOPBACK_DNAT=true
     fi
 
@@ -822,13 +836,13 @@ traffic_limit_collect_rule_defs() {
     active_rules=$(_parse_nft_export_rules)
 
     if [[ -n "$active_rules" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
             [[ -z "$lport" ]] && continue
             traffic_limit_selector_matches "$proto" "$lport" "$ipver" "$port_filter" "$proto_filter" "$ipver_filter" || continue
             local key
             key=$(traffic_limit_rule_key "$proto" "$lport" "$ipver")
             seen["$key"]=1
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
         done <<< "$active_rules"
     fi
@@ -840,7 +854,7 @@ traffic_limit_collect_rule_defs() {
         local key
         key=$(traffic_limit_rule_key "$proto" "$lport" "$ipver")
         [[ -n "${seen[$key]:-}" ]] && continue
-        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
     done < <(traffic_limit_records_tsv)
 }
@@ -879,6 +893,8 @@ PFWD_LIMIT_BLOCKED_COUNT=0
 
 # Network detection cache
 _NET_CACHE_TIME=0
+_AUTO_SHORTCUT_CHECKED=false
+_TRAFFIC_LEGACY_WARNED=false
 
 #===============================================================================
 #  Section 2: Domain Utilities & Validation
@@ -1083,6 +1099,53 @@ detect_script_path() {
     return 1
 }
 
+ensure_shortcut_command() {
+    $_AUTO_SHORTCUT_CHECKED && return 0
+    _AUTO_SHORTCUT_CHECKED=true
+
+    local quiet_requested=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -q|--quiet)
+                quiet_requested=true
+                break
+                ;;
+        esac
+    done
+
+    local source_path="${SCRIPT_PATH:-}"
+    [[ -n "$source_path" && -x "$source_path" ]] || return 0
+    [[ "$source_path" == "$SHORTCUT_LINK" ]] && return 0
+
+    if [[ $EUID -ne 0 ]]; then
+        [[ -x "$SHORTCUT_LINK" ]] || $quiet_requested || msg_dim "  Tip: run once as root from a persistent path to install $SHORTCUT_LINK"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$SHORTCUT_LINK")" 2>/dev/null || true
+
+    if [[ -e "$SHORTCUT_LINK" && ! -L "$SHORTCUT_LINK" ]]; then
+        local existing_path=""
+        existing_path=$(realpath "$SHORTCUT_LINK" 2>/dev/null || readlink -f "$SHORTCUT_LINK" 2>/dev/null || true)
+        [[ "$existing_path" == "$source_path" ]] && return 0
+        $quiet_requested || msg_warn "$SHORTCUT_LINK exists as a regular file; leaving it unchanged"
+        return 0
+    fi
+
+    local current_target=""
+    if [[ -L "$SHORTCUT_LINK" ]]; then
+        current_target=$(readlink -f "$SHORTCUT_LINK" 2>/dev/null || true)
+        [[ "$current_target" == "$source_path" ]] && return 0
+    fi
+
+    if ln -sfn "$source_path" "$SHORTCUT_LINK" 2>/dev/null; then
+        $quiet_requested || msg_ok "Installed shortcut command: $SHORTCUT_LINK"
+    else
+        $quiet_requested || msg_warn "Unable to install shortcut command at $SHORTCUT_LINK"
+    fi
+}
+
 # detect_ip_type <address> -> "ipv4" | "ipv6" | "domain" | "unknown"
 detect_ip_type() {
     local addr="$1"
@@ -1224,6 +1287,18 @@ validate_target() {
 validate_mss_value() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 536 && value <= 65535 ))
+}
+
+validate_comment() {
+    local comment="${1:-}"
+    [[ "$comment" != *$'\n'* && "$comment" != *$'\r'* && "$comment" != *$'\t'* ]]
+}
+
+nft_escape_string() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
 }
 
 # parse_rule <rule_str> -> sets RULE_LPORT, RULE_TARGET, RULE_TPORT
@@ -2063,7 +2138,7 @@ _extract_nft_comment() {
 }
 
 # _sort_parsed_rules - unified sort by protocol then port number
-_sort_parsed_rules() { sort -t'|' -k1,1 -k2,2n; }
+_sort_parsed_rules() { sort -t$'\t' -k1,1 -k2,2n; }
 
 # _nft_traffic_from_chain <chain_data> <port> - extract traffic bytes from cached chain data
 _nft_traffic_from_chain() {
@@ -2411,7 +2486,7 @@ _sync_managed_iptables_family() {
 
     local need_forward=false need_input=false
     local proto lport ipver target tport comment bytes
-    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
         [[ "$ipver" == "$family" ]] || continue
         need_forward=true
@@ -2467,7 +2542,7 @@ nft_find_existing_rule() {
     [[ -z "$parsed" ]] && return 1
 
     local found_proto found_lport found_ipver found_target found_tport found_comment found_bytes
-    while IFS='|' read -r found_proto found_lport found_ipver found_target found_tport found_comment found_bytes; do
+    while IFS=$'\t' read -r found_proto found_lport found_ipver found_target found_tport found_comment found_bytes; do
         [[ -z "$found_lport" ]] && continue
         if [[ "$found_lport" == "$lport" && "$found_proto" == "$proto" && "$found_ipver" == "$ip_ver" ]]; then
             _NFT_EXIST_TARGET="$found_target"
@@ -2619,6 +2694,7 @@ _nft_add_single_rule() {
     local nft_result=0
     local postrouting_action="masquerade"
     local rule_scope rule_tag fwd_tag ret_tag
+    local escaped_comment=""
     rule_scope=$(_pfwd_rule_scope "$lport" "$ipver" "$proto" "$target" "$tport")
     rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
     fwd_tag=$(_pfwd_forward_tag "fwd" "$lport" "$ipver" "$proto" "$target" "$tport")
@@ -2626,10 +2702,13 @@ _nft_add_single_rule() {
     if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
         postrouting_action="snat to $snat_source"
     fi
+    if [[ -n "$comment" ]]; then
+        escaped_comment=$(nft_escape_string "$comment")
+    fi
     if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
         # Append to batch file for atomic commit
         if [[ -n "$comment" ]]; then
-            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$comment\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$escaped_comment\"" >> "$_NFT_BATCH_FILE"
             echo "add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr $target $proto dport $tport counter $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
         else
             echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
@@ -2722,6 +2801,11 @@ nft_add_rule() {
     local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}" comment="${6:-}"
     local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}" replace_mode="${11:-false}"
     local limit_in="${12:-0}" limit_out="${13:-0}" limit_total="${14:-0}" reset_every="${15:-}" reset_at_ts="${16:-0}"
+
+    if ! validate_comment "$comment"; then
+        msg_err "Comment must be a single line without tabs"
+        return 1
+    fi
 
     nft_ensure_table || return 1
 
@@ -3041,13 +3125,17 @@ nft_delete_ports_batch() {
     fi
 }
 
+_nft_prerouting_dnat_lines() {
+    _nft_cached_chain prerouting | grep "dnat" || true
+}
+
 # _parse_nft_prerouting_rules - parse nft prerouting output into structured data
-# Output: proto|lport|ipver|target|tport|comment|bytes (one line per rule)
+# Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>bytes
 # Args: [nft_output] - if empty, fetches from nft
 _parse_nft_prerouting_rules() {
     local nft_output="${1:-}"
     if [[ -z "$nft_output" ]]; then
-        nft_output=$(_nft_cached_chain prerouting | grep "dnat" || true)
+        nft_output=$(_nft_prerouting_dnat_lines)
     fi
     [[ -z "$nft_output" ]] && return 0
 
@@ -3055,7 +3143,6 @@ _parse_nft_prerouting_rules() {
     /dnat/ {
         proto=""; ipver=""; lport=""; target=""; tport=""; comment=""; bytes="0"
 
-        # Extract protocol and IP version
         if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
         else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
         else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
@@ -3067,29 +3154,23 @@ _parse_nft_prerouting_rules() {
             if (match($0, /ip6 daddr/)) ipver="6"
         }
 
-        # Extract local port: "dport NNN"
         if (match($0, /dport [0-9]+/)) {
             s = substr($0, RSTART, RLENGTH)
             sub(/dport /, "", s)
             lport = s
         }
 
-        # Extract DNAT target using index() (mawk-compatible, no bracket regex)
         if (match($0, /dnat ip6 to /)) {
-            # IPv6: "dnat ip6 to [addr]:port"
             rest = substr($0, RSTART + 13)
             p = index(rest, "]:")
-            if (p > 0) {
-                target = substr(rest, 1, p - 1)
+            if (p > 1) {
+                target = substr(rest, 2, p - 2)
                 rest2 = substr(rest, p + 2)
-                # Extract port (digits before space or end)
                 match(rest2, /[0-9]+/)
                 tport = substr(rest2, RSTART, RLENGTH)
             }
         } else if (match($0, /dnat ip to /)) {
-            # IPv4: "dnat ip to 1.2.3.4:5678"
             rest = substr($0, RSTART + 11)
-            # Get until space or end of string
             if (match(rest, /[^ ]+/)) {
                 s = substr(rest, RSTART, RLENGTH)
                 n = split(s, parts, ":")
@@ -3097,29 +3178,28 @@ _parse_nft_prerouting_rules() {
             }
         }
 
-        # Extract bytes: "bytes NNN"
         if (match($0, /bytes [0-9]+/)) {
             s = substr($0, RSTART, RLENGTH)
             sub(/bytes /, "", s)
             bytes = s
         }
 
-        # Extract comment: comment "text"
         if (match($0, /comment "/)) {
             rest = substr($0, RSTART + 9)
             p = index(rest, "\"")
             if (p > 1) comment = substr(rest, 1, p - 1)
         }
+        gsub(/[\t\r\n]/, " ", comment)
 
         if (lport != "" && proto != "") {
-            printf "%s|%s|%s|%s|%s|%s|%s\n", proto, lport, ipver, target, tport, comment, bytes
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", proto, lport, ipver, target, tport, comment, bytes
         }
     }
     '
 }
 
 # _parse_nft_export_rules - parse nft rules plus optional pfwd MSS/SNAT metadata
-# Output: proto|lport|ipver|target|tport|comment|snat_mode|snat_source|mss_mode|mss_value
+# Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>snat_mode<TAB>snat_source<TAB>mss_mode<TAB>mss_value
 _parse_nft_export_rules() {
     local parsed
     parsed=$(_parse_nft_prerouting_rules)
@@ -3130,7 +3210,7 @@ _parse_nft_export_rules() {
     forward_data=$(_nft_cached_chain forward || true)
 
     local proto lport ipver target tport comment bytes
-    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
 
         local tag snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
@@ -3155,110 +3235,45 @@ _parse_nft_export_rules() {
             fi
         fi
 
-        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
             "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
     done <<< "$parsed"
 }
 
 # _parse_nft_bidirectional_traffic - parse prerouting + forward chain for traffic stats
-# Output: proto|lport|ipver|target|tport|comment|in_bytes|out_bytes|total_bytes
+# Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>in_bytes<TAB>out_bytes<TAB>total_bytes
 _parse_nft_bidirectional_traffic() {
-    # Get prerouting rules (inbound traffic)
-    local prerouting_output
-    prerouting_output=$(_nft_cached_chain prerouting | grep "dnat" || true)
-    [[ -z "$prerouting_output" ]] && return 0
+    local parsed_prerouting
+    parsed_prerouting=$(_parse_nft_prerouting_rules)
+    [[ -z "$parsed_prerouting" ]] && return 0
 
-    # Get forward chain return counters (outbound traffic)
     local forward_ret_output
     forward_ret_output=$(_nft_cached_chain forward | grep "pfwd_ret:" || true)
 
-    # Use awk to combine prerouting (inbound) with forward return (outbound) data
-    {
-        echo "===PREROUTING==="
-        echo "$prerouting_output"
-        echo "===FORWARD_RET==="
-        echo "$forward_ret_output"
-    } | awk '
-    /^===PREROUTING===/ { section="pre"; next }
-    /^===FORWARD_RET===/ { section="fwd"; next }
+    declare -A out_bytes_map=()
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ pfwd_ret:([0-9]+):([46]):([a-z]+) ]]; then
+            local key="${BASH_REMATCH[3]}|${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+            local out_bytes=0
+            if [[ "$line" =~ bytes[[:space:]]+([0-9]+) ]]; then
+                out_bytes="${BASH_REMATCH[1]}"
+            fi
+            out_bytes_map["$key"]="$out_bytes"
+        fi
+    done <<< "$forward_ret_output"
 
-    section == "pre" && /dnat/ {
-        proto=""; ipver=""; lport=""; target=""; tport=""; comment=""; bytes="0"
-
-        if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
-        else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
-        else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
-        else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
-
-        # dport
-        if (match($0, /dport [0-9]+/)) {
-            s = substr($0, RSTART, RLENGTH); sub(/dport /, "", s); lport = s
-        }
-        # dnat target (mawk-compatible: avoid bracket regex)
-        if (match($0, /dnat ip6 to /)) {
-            rest = substr($0, RSTART + 13)
-            p = index(rest, "]:")
-            if (p > 0) {
-                target = substr(rest, 1, p - 1)
-                rest2 = substr(rest, p + 2)
-                match(rest2, /[0-9]+/); tport = substr(rest2, RSTART, RLENGTH)
-            }
-        } else if (match($0, /dnat ip to /)) {
-            rest = substr($0, RSTART + 11)
-            if (match(rest, /[^ ]+/)) {
-                s = substr(rest, RSTART, RLENGTH)
-                n = split(s, da, ":"); target = da[1]; tport = da[n]
-            }
-        }
-        # bytes
-        if (match($0, /bytes [0-9]+/)) {
-            s = substr($0, RSTART, RLENGTH); sub(/bytes /, "", s); bytes = s
-        }
-        # comment
-        if (match($0, /comment "/)) {
-            rest = substr($0, RSTART + 9)
-            ci = index(rest, "\"")
-            if (ci > 1) comment = substr(rest, 1, ci - 1)
-        }
-
-        if (lport != "" && proto != "") {
-            key = proto "|" lport "|" ipver
-            in_bytes[key] = bytes
-            info[key] = target "|" tport "|" comment
-        }
-    }
-
-    section == "fwd" && /pfwd_ret:/ {
-        # Extract pfwd_ret:<lport>:<ipver>:<proto> using POSIX match+substr
-        if (match($0, /pfwd_ret:[0-9]+:[46]:[a-z]+/)) {
-            s = substr($0, RSTART, RLENGTH)
-            sub(/pfwd_ret:/, "", s)
-            n = split(s, rp, ":")
-            if (n >= 3) {
-                key = rp[3] "|" rp[1] "|" rp[2]
-                if (key in in_bytes) {
-                    ob = "0"
-                    if (match($0, /bytes [0-9]+/)) {
-                        bs = substr($0, RSTART, RLENGTH)
-                        sub(/bytes /, "", bs)
-                        ob = bs
-                    }
-                    out_bytes[key] = ob
-                }
-            }
-        }
-    }
-
-    END {
-        for (key in in_bytes) {
-            ib = in_bytes[key]
-            ob = (key in out_bytes) ? out_bytes[key] : "0"
-            total = ib + ob
-            printf "%s|%s|%d|%d|%d\n", key, info[key], ib, ob, total
-        }
-    }
-    '
+    local proto lport ipver target tport comment in_bytes
+    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes; do
+        [[ -z "$lport" ]] && continue
+        local key="${proto}|${lport}|${ipver}"
+        local out_bytes="${out_bytes_map[$key]:-0}"
+        local total_bytes=$(( in_bytes + out_bytes ))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$in_bytes" "$out_bytes" "$total_bytes"
+    done <<< "$parsed_prerouting"
 }
 
 # nft_list_rules - display all forwarding rules in a table
@@ -3301,7 +3316,7 @@ nft_list_rules() {
     # Display sorted rules (supports both 10-field export format and older traffic-only formats)
     local idx=0
     local -a detail_lines=()
-    while IFS='|' read -r proto lport ipver target tport comment f7 f8 f9 f10; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment f7 f8 f9 f10; do
         [[ -z "$lport" ]] && continue
         local snat_mode="masquerade" snat_source="" mss_mode="" mss_value="" bytes="0"
         if [[ -n "$f10" || "$f7" == "masquerade" || "$f7" == "snat" || "$f9" == "clamp" || "$f9" == "set" ]]; then
@@ -3592,6 +3607,22 @@ cmd_internal_restore_nft() {
     return 0
 }
 
+_traffic_saved_records_tsv() {
+    [[ -f "$TRAFFIC_DATA" ]] || return 0
+    while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9; do
+        [[ -z "${f1:-}" ]] && continue
+        if [[ "$f1" == "v2" && "$f2" == "nft_rule" ]]; then
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${f3:-}" "${f4:-}" "${f5:-}" "${f6:-0}" "${f7:-0}" "${f8:-0}" "${f9:-0}"
+        elif [[ "$f1" != "v2" ]]; then
+            if ! $_TRAFFIC_LEGACY_WARNED; then
+                msg_warn "Ignoring legacy traffic data in $TRAFFIC_DATA; only v2 nft_rule records are supported"
+                _TRAFFIC_LEGACY_WARNED=true
+            fi
+        fi
+    done < "$TRAFFIC_DATA"
+}
+
 # _traffic_read_merged - read-only merge of saved data + live nft counters
 # Output: same format as _parse_nft_bidirectional_traffic
 _traffic_read_merged() {
@@ -3601,27 +3632,17 @@ _traffic_read_merged() {
 
     # Load saved accumulated + snapshot data
     declare -A acc_in acc_out snap_in snap_out
-    if [[ -f "$TRAFFIC_DATA" ]]; then
-        while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9; do
-            local key=""
-            if [[ "$f1" == "v2" && "$f2" == "nft_rule" ]]; then
-                key="${f3}|${f4}|${f5}"
-                acc_in[$key]="${f6:-0}"
-                acc_out[$key]="${f7:-0}"
-                snap_in[$key]="${f8:-0}"
-                snap_out[$key]="${f9:-0}"
-            elif [[ "$f1" != "v2" && -n "${f2:-}" && -n "${f3:-}" && -n "${f4:-}" && -n "${f7:-}" ]]; then
-                key="${f1}|${f2}|${f3}"
-                acc_in[$key]="${f4:-0}"
-                acc_out[$key]="${f5:-0}"
-                snap_in[$key]="${f6:-0}"
-                snap_out[$key]="${f7:-0}"
-            fi
-        done < "$TRAFFIC_DATA"
-    fi
+    while IFS=$'\t' read -r proto lport ipver saved_acc_in saved_acc_out saved_snap_in saved_snap_out; do
+        [[ -z "$lport" ]] && continue
+        local key="${proto}|${lport}|${ipver}"
+        acc_in[$key]="${saved_acc_in:-0}"
+        acc_out[$key]="${saved_acc_out:-0}"
+        snap_in[$key]="${saved_snap_in:-0}"
+        snap_out[$key]="${saved_snap_out:-0}"
+    done < <(_traffic_saved_records_tsv)
 
     # Merge: accumulated + (current - snapshot) for each rule
-    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
         [[ -z "$lport" ]] && continue
         local key="${proto}|${lport}|${ipver}"
         local prev_snap_in="${snap_in[$key]:-0}"
@@ -3640,7 +3661,8 @@ _traffic_read_merged() {
         local merged_in=$(( ${acc_in[$key]:-0} + delta_in ))
         local merged_out=$(( ${acc_out[$key]:-0} + delta_out ))
         local merged_total=$(( merged_in + merged_out ))
-        echo "${proto}|${lport}|${ipver}|${target}|${tport}|${comment}|${merged_in}|${merged_out}|${merged_total}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$merged_in" "$merged_out" "$merged_total"
     done <<< "$parsed"
 }
 
@@ -3654,7 +3676,7 @@ traffic_limit_show_status_table() {
         limit_in limit_out limit_total reset_every reset_at_ts cycle_start_ts next_reset_ts cycle_in cycle_out disabled reason disabled_at_ts; do
         [[ -z "$lport" ]] && continue
         has_rows=true
-        rows+="${proto}|${lport}|${ipver}|${target}|${tport}|${limit_in}|${limit_out}|${limit_total}|${cycle_in}|${cycle_out}|$(( cycle_in + cycle_out ))|${disabled}|${next_reset_ts}"$'\n'
+        rows+="${proto}"$'\t'"${lport}"$'\t'"${ipver}"$'\t'"${target}"$'\t'"${tport}"$'\t'"${limit_in}"$'\t'"${limit_out}"$'\t'"${limit_total}"$'\t'"${cycle_in}"$'\t'"${cycle_out}"$'\t'"$(( cycle_in + cycle_out ))"$'\t'"${disabled}"$'\t'"${next_reset_ts}"$'\n'
     done < <(traffic_limit_records_tsv)
 
     $has_rows || return 0
@@ -3666,7 +3688,7 @@ traffic_limit_show_status_table() {
         " L.Port" " Proto" " IPvr" " Cycle Use" " In / Limit" " Out / Limit" " Total / Limit" " State" " Next Reset"
     echo -e "  ${DIM}├────────┼──────┼──────┼──────────────────┼────────────┼────────────┼────────────┼────────┼─────────────────────┤${NC}"
 
-    while IFS='|' read -r proto lport ipver target tport limit_in limit_out limit_total cycle_in cycle_out cycle_total disabled next_reset_ts; do
+    while IFS=$'\t' read -r proto lport ipver target tport limit_in limit_out limit_total cycle_in cycle_out cycle_total disabled next_reset_ts; do
         [[ -z "$lport" ]] && continue
         local cycle_label in_label out_label total_label state_label next_reset_label
         cycle_label="$(format_bytes "$cycle_total")"
@@ -3697,26 +3719,18 @@ cmd_internal_traffic_collector() {
     declare -A live_in live_out delta_in_map delta_out_map
 
     if [[ -f "$TRAFFIC_DATA" ]]; then
-        while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9; do
-            [[ -z "${f1:-}" ]] && continue
-            if [[ "$f1" == "v2" && "$f2" == "nft_rule" ]]; then
-                local key="${f3}|${f4}|${f5}"
-                nft_acc_in[$key]="${f6:-0}"
-                nft_acc_out[$key]="${f7:-0}"
-                nft_snap_in[$key]="${f8:-0}"
-                nft_snap_out[$key]="${f9:-0}"
-            elif [[ "$f1" != "v2" && -n "${f2:-}" && -n "${f3:-}" && -n "${f4:-}" && -n "${f7:-}" ]]; then
-                local legacy_key="${f1}|${f2}|${f3}"
-                nft_acc_in[$legacy_key]="${f4:-0}"
-                nft_acc_out[$legacy_key]="${f5:-0}"
-                nft_snap_in[$legacy_key]="${f6:-0}"
-                nft_snap_out[$legacy_key]="${f7:-0}"
-            fi
-        done < "$TRAFFIC_DATA"
+        while IFS=$'\t' read -r proto lport ipver saved_acc_in saved_acc_out saved_snap_in saved_snap_out; do
+            [[ -z "$lport" ]] && continue
+            local key="${proto}|${lport}|${ipver}"
+            nft_acc_in[$key]="${saved_acc_in:-0}"
+            nft_acc_out[$key]="${saved_acc_out:-0}"
+            nft_snap_in[$key]="${saved_snap_in:-0}"
+            nft_snap_out[$key]="${saved_snap_out:-0}"
+        done < <(_traffic_saved_records_tsv)
     fi
 
     if [[ -n "$parsed" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
             [[ -z "$lport" ]] && continue
             local key="${proto}|${lport}|${ipver}"
             local prev_snap_in="${nft_snap_in[$key]:-0}"
@@ -3856,7 +3870,7 @@ show_traffic_stats() {
             sorted_rules=$(echo "$parsed_nft" | _sort_parsed_rules)
 
             # Display sorted rules: proto|lport|ipver|target|tport|comment|in_bytes|out_bytes|total_bytes
-            while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+            while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
                 [[ -z "$lport" ]] && continue
                 local in_traffic out_traffic total_traffic
                 in_traffic=$(format_bytes "$in_bytes")
@@ -3893,7 +3907,7 @@ show_traffic_rate() {
 
     # Store first sample in associative array
     declare -A s1_in s1_out
-    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
         [[ -z "$lport" ]] && continue
         local key="${proto}|${lport}|${ipver}"
         s1_in[$key]="$in_bytes"
@@ -3914,7 +3928,7 @@ show_traffic_rate() {
     local sorted_s2
     sorted_s2=$(echo "$sample2" | _sort_parsed_rules)
 
-    while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
         [[ -z "$lport" ]] && continue
         local key="${proto}|${lport}|${ipver}"
         local prev_in="${s1_in[$key]:-$in_bytes}"
@@ -4056,7 +4070,7 @@ cmd_limit_set() {
         return 1
     fi
 
-    while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
         [[ -z "$lport" ]] && continue
         traffic_limit_upsert_rule \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
@@ -4241,7 +4255,7 @@ cmd_export() {
     msg_ok "Exported to: $filepath"
 
     local count
-    count=$(jq '.forward_rules | length' "$filepath")
+    count=$(json_forward_rules_count "$filepath")
     msg_info "Total rules exported: $count"
 
     # Show SCP hint
@@ -4297,9 +4311,13 @@ cmd_import() {
         msg_err "Invalid JSON file: $filepath"
         return 1
     fi
+    if ! json_require_v2_backup "$filepath"; then
+        msg_err "Unsupported backup format: expected v2 JSON with forward_rules[]"
+        return 1
+    fi
 
     local count
-    count=$(jq '.forward_rules | length' "$filepath")
+    count=$(json_forward_rules_count "$filepath")
     msg_info "Found $count rule(s) in backup"
 
     # Show rules summary
@@ -4309,9 +4327,14 @@ cmd_import() {
     local nft_batch_count=0
 
     _BATCH_MODE=true
-    while IFS='|' read -r method lport target tport proto ipver comment mss_mode mss_value snat_mode snat_source \
+    while IFS=$'\t' read -r method lport target tport proto ipver comment mss_mode mss_value snat_mode snat_source \
         limit_in limit_out limit_total limit_reset_every limit_reset_at; do
         [[ -z "$method" ]] && continue
+        if ! validate_comment "$comment"; then
+            msg_warn "Skipping rule :$lport -> $target:$tport due to invalid multi-line/tab comment"
+            ((failed++)) || true
+            continue
+        fi
         case "$method" in
             nft|nftables)
                 if nft_add_rule "$lport" "$target" "$tport" "$ipver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "false" \
@@ -4416,7 +4439,7 @@ Import / export:
   pfwd export [filepath]
   pfwd import <filepath> [-m nft]
   pfwd import --url <URL> [-m nft]
-  Export writes JSON v2; import accepts both the legacy flat schema and v2.
+  Export and import use the current JSON v2 schema (forward_rules).
   Export/import preserves nft MSS, fixed-SNAT and traffic-limit fields.
 
 New examples:
@@ -4442,6 +4465,7 @@ Common scenarios:
 Performance tips:
   - nft is the fastest path for fixed IP targets.
   - Batch add/delete/import now coalesces nft save and UFW reload.
+  - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
 
 Options:
@@ -4464,7 +4488,7 @@ Options:
   --limit-reset-every <Nd|Nmo|Ny>
                              nft only: cycle reset period (for example 1d / 2mo / 1y)
   --limit-reset-at <time>    nft only: absolute reset time (YYYY-MM-DD[ HH:MM[:SS]])
-  -c, --comment <text>       Add comment to rule
+  -c, --comment <text>       Add single-line comment to rule
   -q, --quiet                Quiet mode
   --no-color                 Disable colored output
   --no-clear                 Don't clear screen in interactive menu
@@ -4542,6 +4566,10 @@ cmd_add() {
             msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
             return 1
         fi
+    fi
+    if ! validate_comment "$comment"; then
+        msg_err "Comment must be a single line without tabs"
+        return 1
     fi
     if [[ "$snat_mode" == "snat" ]]; then
         if [[ "$method" != "nft" ]]; then
@@ -4742,7 +4770,7 @@ verify_forwarding_rules() {
     local errors=0
     local warnings=0
 
-    while IFS='|' read -r proto lport ipver target tport comment bytes; do
+    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
 
         # 验证目标地址格式
@@ -4863,7 +4891,7 @@ cmd_doctor() {
     local parsed_rules has_ipv4_rules=false has_ipv6_rules=false has_loopback_rules=false
     parsed_rules=$(_parse_nft_prerouting_rules)
     if [[ -n "$parsed_rules" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment bytes; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
             [[ -z "$lport" ]] && continue
             if [[ "$ipver" == "4" ]]; then
                 has_ipv4_rules=true
@@ -4964,7 +4992,7 @@ cmd_status() {
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
     if [[ -n "$PFWD_NFT_RULES" ]]; then
         local nft_mss_count=0 nft_snat_count=0
-        while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
             [[ -z "$lport" ]] && continue
             [[ "$snat_mode" == "snat" ]] && ((nft_snat_count++)) || true
             [[ -n "$mss_mode" ]] && ((nft_mss_count++)) || true
@@ -5830,14 +5858,14 @@ menu_delete_rule() {
     local idx=0
 
     if [[ -n "$merged_nft" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
             [[ -z "$lport" ]] && continue
             nft_traffic_map["${proto}|${lport}|${ipver}"]="${total_bytes:-0}"
         done <<< "$merged_nft"
     fi
 
     if [[ -n "$nft_parsed" ]]; then
-        while IFS='|' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+        while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
             [[ -z "$lport" ]] && continue
             ((idx++)) || true
             rule_methods+=("nft")
@@ -6074,6 +6102,7 @@ menu_uninstall() {
 SCRIPT_PATH=""
 
 detect_script_path
+ensure_shortcut_command "$@"
 if cli_requires_root "$@"; then
     require_root "$@"
 fi
