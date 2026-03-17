@@ -95,6 +95,7 @@ pfwd <ports> <target> [target_port]
 Interactive mode note:
 
 - After you choose fixed SNAT, `pfwd` can suggest a fixed MSS based on the detected source-interface MTU.
+- The suggestion also tries to detect PPPoE-style links and shows the calculation logic used for the recommendation.
 - The suggestion is informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
 
 ### Port Formats

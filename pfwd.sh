@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.4"
+readonly VERSION="1.9.6"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -1401,26 +1401,67 @@ validate_mss_value() {
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 536 && value <= 65535 ))
 }
 
+_mss_route_probe_for_source() {
+    local family_flag="$1" snat_source="$2"
+    local probe_target route_output
+    case "$family_flag" in
+        -4) probe_target="1.1.1.1" ;;
+        -6) probe_target="2001:4860:4860::8888" ;;
+        *) return 1 ;;
+    esac
+
+    route_output=$(ip -o "$family_flag" route get "$probe_target" from "$snat_source" 2>/dev/null | head -1 || true)
+    [[ -n "$route_output" ]] || return 1
+    printf '%s\n' "$route_output"
+}
+
+_iface_link_mtu() {
+    local iface="$1"
+    ip -o link show dev "$iface" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "mtu") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+_iface_is_pppoe_like() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 1
+    [[ "$iface" == ppp* ]] && return 0
+    ip -d link show dev "$iface" 2>/dev/null | grep -Eqi 'ppp|pppoe|pointopoint'
+}
+
 suggest_mss_for_snat_source() {
     local snat_source="$1"
     MSS_SUGGEST_IFACE=""
     MSS_SUGGEST_MTU=""
+    MSS_SUGGEST_EFFECTIVE_MTU=""
     MSS_SUGGEST_VALUE=""
     MSS_SUGGEST_FAMILY=""
+    MSS_SUGGEST_LOGIC=""
+    MSS_SUGGEST_PPPoE="false"
 
     command -v ip >/dev/null 2>&1 || return 1
 
-    local family family_flag iface mtu overhead suggested
+    local family family_flag iface route_output route_iface route_mtu mtu effective_mtu overhead suggested
+    local ip_header_bytes tcp_header_bytes=20 pppoe_overhead=8
     family=$(detect_ip_type "$snat_source")
     case "$family" in
         ipv4)
             family_flag="-4"
             overhead=40
+            ip_header_bytes=20
             MSS_SUGGEST_FAMILY="IPv4"
             ;;
         ipv6)
             family_flag="-6"
             overhead=60
+            ip_header_bytes=40
             MSS_SUGGEST_FAMILY="IPv6"
             ;;
         *)
@@ -1439,24 +1480,63 @@ suggest_mss_for_snat_source() {
     ') || true
     [[ -n "$iface" ]] || return 1
 
-    mtu=$(ip -o link show dev "$iface" 2>/dev/null | awk '
-        {
-            for (i = 1; i <= NF; i++) {
-                if ($i == "mtu") {
-                    print $(i + 1)
-                    exit
+    route_output=$(_mss_route_probe_for_source "$family_flag" "$snat_source") || route_output=""
+    if [[ -n "$route_output" ]]; then
+        route_iface=$(awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "dev") {
+                        print $(i + 1)
+                        exit
+                    }
                 }
             }
-        }
-    ') || true
+        ' <<< "$route_output")
+        route_mtu=$(awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "mtu") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        ' <<< "$route_output")
+    fi
+
+    [[ -n "$route_iface" ]] && iface="$route_iface"
+
+    mtu=$(_iface_link_mtu "$iface") || true
     [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
 
-    suggested=$(( mtu - overhead ))
+    effective_mtu="$mtu"
+    if [[ "$route_mtu" =~ ^[0-9]+$ ]] && (( route_mtu > 0 && route_mtu < effective_mtu )); then
+        effective_mtu="$route_mtu"
+    fi
+
+    if _iface_is_pppoe_like "$iface"; then
+        MSS_SUGGEST_PPPoE="true"
+        if (( effective_mtu > 1492 )); then
+            effective_mtu=$(( effective_mtu - pppoe_overhead ))
+        fi
+    fi
+
+    suggested=$(( effective_mtu - overhead ))
     validate_mss_value "$suggested" || return 1
 
     MSS_SUGGEST_IFACE="$iface"
     MSS_SUGGEST_MTU="$mtu"
+    MSS_SUGGEST_EFFECTIVE_MTU="$effective_mtu"
     MSS_SUGGEST_VALUE="$suggested"
+    if [[ "$MSS_SUGGEST_PPPoE" == "true" ]]; then
+        if (( effective_mtu != mtu )); then
+            MSS_SUGGEST_LOGIC="detected PPPoE on ${iface}, effective MTU = ${mtu} - ${pppoe_overhead} = ${effective_mtu}; ${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+        else
+            MSS_SUGGEST_LOGIC="detected PPPoE on ${iface}, effective MTU = ${effective_mtu}; ${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+        fi
+    else
+        MSS_SUGGEST_LOGIC="${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} (effective MTU on ${iface}) - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+    fi
     return 0
 }
 
@@ -5849,8 +5929,15 @@ menu_add_rule() {
                     suggested_mss="$MSS_SUGGEST_VALUE"
                     suggested_mss_iface="$MSS_SUGGEST_IFACE"
                     suggested_mss_mtu="$MSS_SUGGEST_MTU"
+                    suggested_mss_effective_mtu="$MSS_SUGGEST_EFFECTIVE_MTU"
                     suggested_mss_family="$MSS_SUGGEST_FAMILY"
-                    msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
+                    suggested_mss_logic="$MSS_SUGGEST_LOGIC"
+                    if [[ "$suggested_mss_mtu" == "$suggested_mss_effective_mtu" ]]; then
+                        msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
+                    else
+                        msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, effective MTU ${suggested_mss_effective_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
+                    fi
+                    [[ -n "$suggested_mss_logic" ]] && msg_dim "  Logic: ${suggested_mss_logic}"
                     msg_dim "  Clamp to PMTU is safer when path MTU may vary; fixed MSS is useful for PPPoE/tunnel setups."
                 fi
                 ;;
