@@ -185,6 +185,42 @@ Best for: IP-based targets, maximum performance.
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
 | BBR + TCP tuning | Optimized congestion control and buffers |
 
+## Validation & Benchmark (root)
+
+Use this on the target host to confirm forwarding works and compare throughput before/after changes.
+
+```bash
+# 1) Basic health
+pfwd doctor
+
+# 2) Add one test forward rule (example)
+pfwd -m nft -t 127.0.0.1 --tcp 18080:8080
+
+# 3) TCP smoke test in netns
+ip netns add pfwd-test || true
+ip -n pfwd-test link set lo up
+nohup sh -c 'nc -lk 127.0.0.1 8080 >/tmp/pfwd-nc.log 2>&1' >/dev/null 2>&1 &
+ip netns exec pfwd-test sh -c 'echo ok | nc -w2 <HOST_IP> 18080'
+
+# 4) Optional UDP smoke test
+nohup sh -c 'socat -T1 -u UDP-LISTEN:8081,fork - >/tmp/pfwd-udp.log 2>&1' >/dev/null 2>&1 &
+pfwd -m nft -t 127.0.0.1 --udp 18081:8081
+ip netns exec pfwd-test sh -c 'echo ok | socat -u - UDP:<HOST_IP>:18081'
+
+# 5) Throughput benchmark (before/after)
+# add benchmark forward rule first
+pfwd -m nft -t 127.0.0.1 --tcp 18088:8088
+# server:
+iperf3 -s -p 8088
+# client:
+iperf3 -c <HOST_IP> -p 18088 -P 4 -t 30
+```
+
+Suggested acceptance:
+- Forwarding smoke tests pass (TCP/UDP as needed).
+- `pfwd doctor` reports flowtable mode/devices when fast path is active.
+- In identical traffic conditions, throughput improves or CPU usage drops.
+
 ## File Locations
 
 | File | Purpose |

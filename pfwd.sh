@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.1"
+readonly VERSION="2.0.2"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -282,10 +282,12 @@ _nft_cached_table() {
 _nft_table_exists() { [[ -n "$(_nft_cached_table)" ]]; }
 
 _nft_cached_chain() {
-    local chain="$1" data
+    local chain="$1" data chain_data
     data=$(_nft_cached_table)
     [[ -z "$data" ]] && return 1
-    echo "$data" | awk -v c="$chain" '$0 ~ "chain "c" [{]",/^\t[}]/'
+    chain_data=$(echo "$data" | awk -v c="$chain" '$0 ~ "chain "c" [{]",/^\t[}]/')
+    [[ -n "$chain_data" ]] || return 1
+    printf '%s\n' "$chain_data"
 }
 
 _nft_cached_chains_concat() {
@@ -293,6 +295,39 @@ _nft_cached_chains_concat() {
     for chain in "$@"; do
         _nft_cached_chain "$chain" || true
     done
+}
+
+_nft_flowtable_block() {
+    local data block
+    data=$(_nft_cached_table)
+    [[ -z "$data" ]] && return 1
+    block=$(awk '/flowtable ft[[:space:]]*{/,/^[[:space:]]*}/' <<< "$data")
+    [[ -n "$block" ]] || return 1
+    printf '%s\n' "$block"
+}
+
+_nft_flowtable_mode() {
+    local block
+    if ! block=$(_nft_flowtable_block); then
+        echo "disabled"
+        return 0
+    fi
+    if grep -q 'flags offload' <<< "$block"; then
+        echo "offload"
+    else
+        echo "basic"
+    fi
+}
+
+_nft_flowtable_devices() {
+    local block devices
+    if ! block=$(_nft_flowtable_block); then
+        echo "-"
+        return 0
+    fi
+    devices=$(sed -n 's/.*devices[[:space:]]*=[[:space:]]*{[[:space:]]*\([^}]*\)[[:space:]]*}.*/\1/p' <<< "$block" | head -1)
+    devices=$(echo "$devices" | tr -d '[:space:]')
+    echo "${devices:--}"
 }
 
 _nft_invalidate_cache() { _NFT_CACHE="" _NFT_CACHE_TIME=0; }
@@ -380,14 +415,14 @@ _pfwd_subchain_list() {
     local section="$1" ipver proto
     for ipver in 4 6; do
         for proto in tcp udp; do
-            _pfwd_subchain_name "$section" "$proto" "$ipver"
+            printf '%s\n' "$(_pfwd_subchain_name "$section" "$proto" "$ipver")"
         done
     done
 }
 
 _pfwd_rule_chain_candidates() {
     local section="$1" proto="$2" ipver="$3"
-    _pfwd_subchain_name "$section" "$proto" "$ipver"
+    printf '%s\n' "$(_pfwd_subchain_name "$section" "$proto" "$ipver")"
     echo "$section"
 }
 
@@ -396,7 +431,7 @@ _pfwd_port_search_chains() {
     case "$proto" in
         tcp|udp)
             for ipver in 4 6; do
-                _pfwd_subchain_name "$section" "$proto" "$ipver"
+                printf '%s\n' "$(_pfwd_subchain_name "$section" "$proto" "$ipver")"
             done
             ;;
         both)
@@ -1048,7 +1083,11 @@ cli_requires_root() {
 
 require_option_value() {
     local option="$1"
-    if [[ $# -lt 2 || "${2-}" == -* ]]; then
+    local value_candidate="${2-}"
+    if [[ "$value_candidate" == "$option" ]]; then
+        value_candidate="${3-}"
+    fi
+    if [[ -z "$value_candidate" || "$value_candidate" == -* ]]; then
         msg_err "Option $option requires a value"
         return 1
     fi
@@ -2688,14 +2727,14 @@ _ensure_nft_dispatch_chains() {
             tag=$(_pfwd_dispatch_tag prerouting "$proto" "$ipver")
             if [[ "$prerouting_data" != *"comment \"$tag\""* ]]; then
                 plat_nft_quiet add rule $NFT_TABLE prerouting $match_tokens \
-                    jump "$(_pfwd_subchain_name prerouting "$proto" "$ipver")" comment "$tag"
+                    jump "$(_pfwd_subchain_name prerouting "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
                 changed=true
             fi
 
             tag=$(_pfwd_dispatch_tag postrouting "$proto" "$ipver")
             if [[ "$postrouting_data" != *"comment \"$tag\""* ]]; then
                 plat_nft_quiet add rule $NFT_TABLE postrouting ct status dnat $match_tokens \
-                    jump "$(_pfwd_subchain_name postrouting "$proto" "$ipver")" comment "$tag"
+                    jump "$(_pfwd_subchain_name postrouting "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
                 changed=true
             fi
 
@@ -2703,10 +2742,10 @@ _ensure_nft_dispatch_chains() {
             if [[ "$forward_data" != *"comment \"$tag\""* ]]; then
                 if [[ -n "$forward_accept_handle" ]]; then
                     plat_nft_quiet insert rule $NFT_TABLE forward handle "$forward_accept_handle" $match_tokens \
-                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$tag"
+                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
                 else
                     plat_nft_quiet add rule $NFT_TABLE forward $match_tokens \
-                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$tag"
+                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
                 fi
                 changed=true
             fi
@@ -3089,23 +3128,17 @@ _nft_add_single_rule() {
         (( ${#mss_tokens[@]} > 0 )) && nft_append_command "$_NFT_BATCH_FILE" "${mss_tokens[@]}"
     else
         # Direct execution
-        local nft_result=0 tmp_file=""
-        tmp_file=$(mktemp) || {
-            msg_err "Failed to create temporary nft batch file"
-            return 1
-        }
-        nft_append_command "$tmp_file" "${prerouting_tokens[@]}"
-        nft_append_command "$tmp_file" "${postrouting_tokens[@]}"
-
-        if plat_nft_capture -f "$tmp_file"; then
+        local nft_result=0
+        if plat_nft_capture "${prerouting_tokens[@]}" && \
+           plat_nft_capture "${postrouting_tokens[@]}"; then
             nft_result=0
         else
             nft_result=$?
         fi
-        rm -f "$tmp_file"
 
         if (( nft_result != 0 )); then
             msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
+            _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$target" "$tport" >/dev/null 2>&1 || true
             return 1
         fi
 
@@ -5190,11 +5223,21 @@ cmd_doctor() {
                 _doctor_print_check WARN "subchain ${chain} missing" "will be recreated on next nft add"
             fi
         done
-        if _nft_cached_table | grep -q "flowtable ft"; then
-            _doctor_print_check OK "flowtable fast path configured"
-        else
-            _doctor_print_check WARN "flowtable fast path unavailable"
-        fi
+        local ft_mode ft_devices
+        ft_mode=$(_nft_flowtable_mode)
+        ft_devices=$(_nft_flowtable_devices)
+        case "$ft_mode" in
+            offload|basic)
+                if _nft_cached_chain forward | grep -q 'flow add @ft'; then
+                    _doctor_print_check OK "flowtable fast path configured" "mode=${ft_mode}, devices=${ft_devices}"
+                else
+                    _doctor_print_check WARN "flowtable exists but fast-path rule missing" "mode=${ft_mode}, devices=${ft_devices}"
+                fi
+                ;;
+            *)
+                _doctor_print_check WARN "flowtable fast path unavailable"
+                ;;
+        esac
     elif (( saved_rules > 0 )); then
         _doctor_print_check WARN "saved nft config exists but table is not loaded" "run 'pfwd start nft' or 'pfwd restart nft'"
     else
