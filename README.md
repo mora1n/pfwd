@@ -131,6 +131,8 @@ pfwd del -m nft 80,443,8080-8082
 pfwd list
 pfwd list -f 8080
 
+# Fixed SNAT rules show `snat:<source>` in the Options column
+
 # Traffic
 pfwd doctor
 pfwd stats
@@ -162,6 +164,7 @@ Notes:
 - `pfwd export` writes the current v2 JSON schema.
 - `pfwd import` requires the current v2 schema with `forward_rules`.
 - Legacy traffic cache records are ignored; regenerate stats with the current collector if needed.
+- `pfwd list` shows fixed SNAT rules in the `Options` column and keeps the detailed SNAT section for long addresses.
 - Rule comments must be single-line text; tabs/newlines are rejected.
 - `jq` must already be installed for import/export and traffic-limit commands.
 
@@ -195,6 +198,7 @@ Best for: IP-based targets, maximum performance.
 | nft output cache | TTL-based cache avoids redundant nft list calls |
 | Batch mode | Bulk add/delete defers save and reload to end |
 | Batch delete | Single chain fetch for multi-port deletion |
+| Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
 | O(1) traffic matching | Hash-based postrouting lookup (replaces O(n²) loop) |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
 | BBR + TCP tuning | Optimized congestion control and buffers |

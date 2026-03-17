@@ -292,6 +292,13 @@ _nft_cached_chain() {
     echo "$data" | awk -v c="$chain" '$0 ~ "chain "c" [{]",/^\t[}]/'
 }
 
+_nft_cached_chains_concat() {
+    local chain
+    for chain in "$@"; do
+        _nft_cached_chain "$chain" || true
+    done
+}
+
 _nft_invalidate_cache() { _NFT_CACHE="" _NFT_CACHE_TIME=0; }
 
 _mark_nft_dirty() {
@@ -349,22 +356,127 @@ traffic_limit_rule_key() {
     printf '%s|%s|%s' "$1" "$2" "$3"
 }
 
-_pfwd_postrouting_handles_by_tag() {
-    local tag="$1"
-    plat_nft_list_chain_handles $NFT_TABLE postrouting | \
-        { grep -F "comment \"$tag\"" || true; } | \
-        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+_pfwd_chain_prefix() {
+    case "$1" in
+        prerouting) echo "pfwd_pr" ;;
+        postrouting) echo "pfwd_po" ;;
+        forward) echo "pfwd_fw" ;;
+        *) return 1 ;;
+    esac
 }
 
-_pfwd_forward_handles_by_scope() {
-    local scope="$1"
-    local rule_tag="pfwd:${scope}"
+_pfwd_subchain_name() {
+    local section="$1" proto="$2" ipver="$3"
+    local prefix
+    prefix=$(_pfwd_chain_prefix "$section") || return 1
+    printf '%s_v%s_%s' "$prefix" "$ipver" "$proto"
+}
+
+_pfwd_subchain_list() {
+    local section="$1" ipver proto
+    for ipver in 4 6; do
+        for proto in tcp udp; do
+            _pfwd_subchain_name "$section" "$proto" "$ipver"
+        done
+    done
+}
+
+_pfwd_rule_chain_candidates() {
+    local section="$1" proto="$2" ipver="$3"
+    _pfwd_subchain_name "$section" "$proto" "$ipver"
+    echo "$section"
+}
+
+_pfwd_port_search_chains() {
+    local section="$1" proto="${2:-both}" ipver
+    case "$proto" in
+        tcp|udp)
+            for ipver in 4 6; do
+                _pfwd_subchain_name "$section" "$proto" "$ipver"
+            done
+            ;;
+        both)
+            _pfwd_subchain_list "$section"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    echo "$section"
+}
+
+_pfwd_dispatch_tag() {
+    local section="$1" proto="$2" ipver="$3"
+    printf 'pfwd_dispatch:%s:v%s:%s' "$section" "$ipver" "$proto"
+}
+
+_pfwd_dispatch_match_tokens() {
+    local proto="$1" ipver="$2"
+    if [[ "$ipver" == "6" ]]; then
+        printf 'ip6 nexthdr %s' "$proto"
+    else
+        printf 'ip protocol %s' "$proto"
+    fi
+}
+
+_nft_prefixed_chain_handles() {
+    local chain="$1"
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '%s\t%s\n' "$chain" "$line"
+    done < <(plat_nft_list_chain_handles $NFT_TABLE "$chain" || true)
+}
+
+_nft_prefixed_chain_handles_concat() {
+    local chain
+    for chain in "$@"; do
+        _nft_prefixed_chain_handles "$chain"
+    done
+}
+
+_pfwd_postrouting_handle_refs_by_tag() {
+    local tag="$1" proto="$2" ipver="$3"
+    local chain line handle
+    while IFS=$'\t' read -r chain line; do
+        [[ -n "$line" ]] || continue
+        [[ "$line" == *"comment \"$tag\""* ]] || continue
+        handle=""
+        [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
+        [[ -n "$handle" ]] && printf '%s\t%s\n' "$chain" "$handle"
+    done < <(_nft_prefixed_chain_handles_concat $(_pfwd_rule_chain_candidates postrouting "$proto" "$ipver"))
+}
+
+_pfwd_forward_handle_refs_by_rule() {
+    local lport="$1" ipver="$2" proto="$3" target="$4" tport="$5"
+    local scope rule_tag chain line handle
+    scope=$(_pfwd_rule_scope "$lport" "$ipver" "$proto" "$target" "$tport")
+    rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
+    while IFS=$'\t' read -r chain line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" != *"comment \"pfwd_fwd:${scope}\""* && \
+              "$line" != *"comment \"pfwd_ret:${scope}\""* && \
+              "$line" != *"comment \"${rule_tag}:mss\""* ]]; then
+            continue
+        fi
+        handle=""
+        [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
+        [[ -n "$handle" ]] && printf '%s\t%s\n' "$chain" "$handle"
+    done < <(_nft_prefixed_chain_handles_concat $(_pfwd_rule_chain_candidates forward "$proto" "$ipver"))
+}
+
+_nft_forward_established_accept_handle() {
     plat_nft_list_chain_handles $NFT_TABLE forward | \
-        { grep -F \
-            -e "comment \"pfwd_fwd:${scope}\"" \
-            -e "comment \"pfwd_ret:${scope}\"" \
-            -e "comment \"${rule_tag}:mss\"" || true; } | \
-        awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+        awk '
+            /ct state established,related accept/ {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "handle") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        '
 }
 
 _nft_rule_option_summary() {
@@ -1820,7 +1932,7 @@ ufw_sync_loopback_dnat_rules() {
     local block_v4="" block_v6=""
     local line proto tport
     local prerouting_lines
-    prerouting_lines=$(_nft_cached_chain prerouting | grep "dnat" || true)
+    prerouting_lines=$(_nft_prerouting_dnat_lines)
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -2138,13 +2250,11 @@ _extract_nft_dnat_target() {
 # _ensure_forward_counters - auto-migrate: add forward chain counter rules for existing rules
 _ensure_forward_counters() {
     _nft_table_exists || return 0
+    _ensure_nft_dispatch_chains
 
     local pre_output
-    pre_output=$(_nft_cached_chain prerouting | grep "dnat" || true)
+    pre_output=$(_nft_prerouting_dnat_lines)
     [[ -z "$pre_output" ]] && return 0
-
-    local fwd_output
-    fwd_output=$(plat_nft_list_chain $NFT_TABLE forward || true)
 
     local added=0
     while IFS= read -r line; do
@@ -2162,19 +2272,20 @@ _ensure_forward_counters() {
         local target="$_TARGET" tport="$_TPORT"
         [[ -z "$target" || -z "$tport" ]] && continue
 
-        local scope ret_tag fwd_tag
+        local scope ret_tag
         scope=$(_pfwd_rule_scope "$lport" "$ipver" "$proto" "$target" "$tport")
         ret_tag=$(_pfwd_forward_tag "ret" "$lport" "$ipver" "$proto" "$target" "$tport")
-        fwd_tag=$(_pfwd_forward_tag "fwd" "$lport" "$ipver" "$proto" "$target" "$tport")
 
         # Already has forward counter
-        echo "$fwd_output" | grep -Fq "comment \"$ret_tag\"" && continue
+        if _pfwd_forward_handle_refs_by_rule "$lport" "$ipver" "$proto" "$target" "$tport" | grep -q .; then
+            continue
+        fi
 
         local ip_family="ip"
         [[ "$ipver" == "6" ]] && ip_family="ip6"
 
-        plat_nft_quiet insert rule $NFT_TABLE forward $ip_family daddr "$target" "$proto" dport "$tport" counter comment "$fwd_tag" || true
-        plat_nft_quiet insert rule $NFT_TABLE forward $ip_family saddr "$target" "$proto" sport "$tport" counter comment "$ret_tag" || true
+        plat_nft_quiet add rule $NFT_TABLE "$(_pfwd_subchain_name forward "$proto" "$ipver")" \
+            $ip_family saddr "$target" "$proto" sport "$tport" counter comment "$ret_tag" || true
         ((added++)) || true
     done <<< "$pre_output"
 
@@ -2429,12 +2540,70 @@ _parse_delete_input() {
 #  Section 4: Firewall Repository & Mutations
 #===============================================================================
 
+_ensure_nft_dispatch_chains() {
+    _nft_table_exists || return 0
+
+    local changed=false section chain proto ipver tag match_tokens
+    for section in prerouting postrouting forward; do
+        while IFS= read -r chain; do
+            [[ -n "$chain" ]] || continue
+            if ! _nft_cached_chain "$chain" >/dev/null; then
+                plat_nft_quiet add chain $NFT_TABLE "$chain"
+                changed=true
+            fi
+        done < <(_pfwd_subchain_list "$section")
+    done
+
+    local prerouting_data postrouting_data forward_data
+    prerouting_data=$(_nft_cached_chain prerouting || true)
+    postrouting_data=$(_nft_cached_chain postrouting || true)
+    forward_data=$(_nft_cached_chain forward || true)
+
+    local forward_accept_handle=""
+    forward_accept_handle=$(_nft_forward_established_accept_handle)
+
+    for ipver in 4 6; do
+        for proto in tcp udp; do
+            match_tokens=$(_pfwd_dispatch_match_tokens "$proto" "$ipver")
+
+            tag=$(_pfwd_dispatch_tag prerouting "$proto" "$ipver")
+            if [[ "$prerouting_data" != *"comment \"$tag\""* ]]; then
+                plat_nft_quiet add rule $NFT_TABLE prerouting $match_tokens \
+                    jump "$(_pfwd_subchain_name prerouting "$proto" "$ipver")" comment "$tag"
+                changed=true
+            fi
+
+            tag=$(_pfwd_dispatch_tag postrouting "$proto" "$ipver")
+            if [[ "$postrouting_data" != *"comment \"$tag\""* ]]; then
+                plat_nft_quiet add rule $NFT_TABLE postrouting ct status dnat $match_tokens \
+                    jump "$(_pfwd_subchain_name postrouting "$proto" "$ipver")" comment "$tag"
+                changed=true
+            fi
+
+            tag=$(_pfwd_dispatch_tag forward "$proto" "$ipver")
+            if [[ "$forward_data" != *"comment \"$tag\""* ]]; then
+                if [[ -n "$forward_accept_handle" ]]; then
+                    plat_nft_quiet insert rule $NFT_TABLE forward handle "$forward_accept_handle" $match_tokens \
+                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$tag"
+                else
+                    plat_nft_quiet add rule $NFT_TABLE forward $match_tokens \
+                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$tag"
+                fi
+                changed=true
+            fi
+        done
+    done
+
+    $changed && _nft_invalidate_cache
+}
+
 # nft_ensure_table - create table, chains, and flowtable if not exist
 nft_ensure_table() {
     ensure_nft || return 1
 
     # Check if table already exists
     if _nft_table_exists; then
+        _ensure_nft_dispatch_chains
         return 0
     fi
 
@@ -2510,6 +2679,8 @@ nft_ensure_table() {
     # Input chain (for DNAT bypass)
     plat_nft_quiet add chain $NFT_TABLE input '{ type filter hook input priority filter - 10; policy accept; }'
     plat_nft_quiet add rule $NFT_TABLE input ip daddr 127.0.0.0/8 ct status dnat counter accept comment '"Allow DNAT to localhost before iptables"'
+    _nft_invalidate_cache
+    _ensure_nft_dispatch_chains
 
     if $flowtable_ok; then
         msg_ok "nftables table created with flowtable acceleration"
@@ -2656,13 +2827,9 @@ _nft_resolve_targets() {
 
 _nft_prerouting_handles_exact() {
     local lport="$1" proto="$2" ip_ver="$3" target="$4" tport="$5"
-    local chain_data="${6:-}"
-    [[ -n "$chain_data" ]] || chain_data=$(plat_nft_list_chain_handles $NFT_TABLE prerouting || true)
-    [[ -z "$chain_data" ]] && return 0
-
-    local line handle=""
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
+    local chain line handle=""
+    while IFS=$'\t' read -r chain line; do
+        [[ -z "$chain" || -z "$line" ]] && continue
         _extract_nft_proto_ipver "$line"
         [[ "$_PROTO" == "$proto" && "$_IPVER" == "$ip_ver" ]] || continue
         [[ "$line" =~ dport\ ([0-9]+) ]] || continue
@@ -2671,51 +2838,53 @@ _nft_prerouting_handles_exact() {
         [[ "$_TARGET" == "$target" && "$_TPORT" == "$tport" ]] || continue
         handle=""
         [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
-        [[ -n "$handle" ]] && printf '%s\n' "$handle"
-    done <<< "$chain_data"
+        [[ -n "$handle" ]] && printf '%s\t%s\n' "$chain" "$handle"
+    done < <(_nft_prefixed_chain_handles_concat $(_pfwd_rule_chain_candidates prerouting "$proto" "$ip_ver"))
 }
 
 _nft_delete_exact_rule() {
     local lport="$1" proto="$2" ip_ver="$3" target="$4" tport="$5"
-    local scope rule_tag deleted=0
-    scope=$(_pfwd_rule_scope "$lport" "$ip_ver" "$proto" "$target" "$tport")
+    local rule_tag deleted=0
     rule_tag=$(_pfwd_rule_tag "$lport" "$ip_ver" "$proto" "$target" "$tport")
 
     if $_BATCH_MODE && [[ -z "${_NFT_BATCH_FILE:-}" ]]; then
         _NFT_BATCH_FILE=$(mktemp)
     fi
 
-    local prerouting_handles post_handles helper_handles h
+    local prerouting_handles post_handles helper_handles chain h
     prerouting_handles=$(_nft_prerouting_handles_exact "$lport" "$proto" "$ip_ver" "$target" "$tport")
-    post_handles=$(_pfwd_postrouting_handles_by_tag "$rule_tag")
-    helper_handles=$(_pfwd_forward_handles_by_scope "$scope")
+    post_handles=$(_pfwd_postrouting_handle_refs_by_tag "$rule_tag" "$proto" "$ip_ver")
+    helper_handles=$(_pfwd_forward_handle_refs_by_rule "$lport" "$ip_ver" "$proto" "$target" "$tport")
 
-    for h in $prerouting_handles; do
+    while IFS=$'\t' read -r chain h; do
+        [[ -n "$chain" && -n "$h" ]] || continue
         if $_BATCH_MODE && [[ -n "${_NFT_BATCH_FILE:-}" ]]; then
-            echo "delete rule $NFT_TABLE prerouting handle $h" >> "$_NFT_BATCH_FILE"
+            echo "delete rule $NFT_TABLE $chain handle $h" >> "$_NFT_BATCH_FILE"
             ((deleted++)) || true
-        elif plat_nft_delete_rule_handle $NFT_TABLE prerouting "$h"; then
+        elif plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h"; then
             ((deleted++)) || true
         fi
-    done
+    done <<< "$prerouting_handles"
 
-    for h in $post_handles; do
+    while IFS=$'\t' read -r chain h; do
+        [[ -n "$chain" && -n "$h" ]] || continue
         if $_BATCH_MODE && [[ -n "${_NFT_BATCH_FILE:-}" ]]; then
-            echo "delete rule $NFT_TABLE postrouting handle $h" >> "$_NFT_BATCH_FILE"
+            echo "delete rule $NFT_TABLE $chain handle $h" >> "$_NFT_BATCH_FILE"
             ((deleted++)) || true
-        elif plat_nft_delete_rule_handle $NFT_TABLE postrouting "$h"; then
+        elif plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h"; then
             ((deleted++)) || true
         fi
-    done
+    done <<< "$post_handles"
 
-    for h in $helper_handles; do
+    while IFS=$'\t' read -r chain h; do
+        [[ -n "$chain" && -n "$h" ]] || continue
         if $_BATCH_MODE && [[ -n "${_NFT_BATCH_FILE:-}" ]]; then
-            echo "delete rule $NFT_TABLE forward handle $h" >> "$_NFT_BATCH_FILE"
+            echo "delete rule $NFT_TABLE $chain handle $h" >> "$_NFT_BATCH_FILE"
             ((deleted++)) || true
-        elif plat_nft_delete_rule_handle $NFT_TABLE forward "$h"; then
+        elif plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h"; then
             ((deleted++)) || true
         fi
-    done
+    done <<< "$helper_handles"
 
     (( deleted > 0 )) || return 1
     $_BATCH_MODE || _nft_invalidate_cache
@@ -2752,12 +2921,14 @@ _nft_add_single_rule() {
 
     local nft_result=0
     local postrouting_action="masquerade"
-    local rule_scope rule_tag fwd_tag ret_tag
+    local rule_tag ret_tag
     local escaped_comment=""
-    rule_scope=$(_pfwd_rule_scope "$lport" "$ipver" "$proto" "$target" "$tport")
+    local prerouting_chain postrouting_chain forward_chain
     rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
-    fwd_tag=$(_pfwd_forward_tag "fwd" "$lport" "$ipver" "$proto" "$target" "$tport")
     ret_tag=$(_pfwd_forward_tag "ret" "$lport" "$ipver" "$proto" "$target" "$tport")
+    prerouting_chain=$(_pfwd_subchain_name prerouting "$proto" "$ipver")
+    postrouting_chain=$(_pfwd_subchain_name postrouting "$proto" "$ipver")
+    forward_chain=$(_pfwd_subchain_name forward "$proto" "$ipver")
     if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
         postrouting_action="snat to $snat_source"
     fi
@@ -2767,54 +2938,48 @@ _nft_add_single_rule() {
     if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
         # Append to batch file for atomic commit
         if [[ -n "$comment" ]]; then
-            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$escaped_comment\"" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr $target $proto dport $tport counter $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE $prerouting_chain $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target comment \"$escaped_comment\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE $postrouting_chain ct status dnat $ip_family daddr $target $proto dport $tport $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
         else
-            echo "add rule $NFT_TABLE prerouting $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr $target $proto dport $tport counter $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE $prerouting_chain $ip_match $proto $proto dport $lport counter dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
+            echo "add rule $NFT_TABLE $postrouting_chain ct status dnat $ip_family daddr $target $proto dport $tport $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
         fi
-        echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport counter comment \"$fwd_tag\"" >> "$_NFT_BATCH_FILE"
-        echo "insert rule $NFT_TABLE forward $ip_family saddr $target $proto sport $tport counter comment \"$ret_tag\"" >> "$_NFT_BATCH_FILE"
+        echo "add rule $NFT_TABLE $forward_chain $ip_family saddr $target $proto sport $tport counter comment \"$ret_tag\"" >> "$_NFT_BATCH_FILE"
         if [[ "$proto" == "tcp" ]]; then
             if [[ "$mss_mode" == "clamp" ]]; then
-                echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set rt mtu comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
+                echo "add rule $NFT_TABLE $forward_chain $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set rt mtu comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
             elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
-                echo "insert rule $NFT_TABLE forward $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set $mss_value comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
+                echo "add rule $NFT_TABLE $forward_chain $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set $mss_value comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
             fi
         fi
     else
         # Direct execution
         if [[ -n "$comment" ]]; then
-            plat_nft_capture add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" comment "$comment" && \
-            plat_nft_capture add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" counter $postrouting_action comment "$rule_tag"
+            plat_nft_capture add rule $NFT_TABLE "$prerouting_chain" $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" comment "$comment" && \
+            plat_nft_capture add rule $NFT_TABLE "$postrouting_chain" ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" $postrouting_action comment "$rule_tag"
             nft_result=$?
         else
-            plat_nft_capture add rule $NFT_TABLE prerouting $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" && \
-            plat_nft_capture add rule $NFT_TABLE postrouting ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" counter $postrouting_action comment "$rule_tag"
+            plat_nft_capture add rule $NFT_TABLE "$prerouting_chain" $ip_match "$proto" "$proto" dport "$lport" counter dnat $dnat_keyword to "$dnat_target" && \
+            plat_nft_capture add rule $NFT_TABLE "$postrouting_chain" ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" $postrouting_action comment "$rule_tag"
             nft_result=$?
         fi
 
         if (( nft_result == 0 )); then
-            plat_nft_quiet insert rule $NFT_TABLE forward $ip_family daddr "$target" "$proto" dport "$tport" counter comment "$fwd_tag" || true
-            plat_nft_quiet insert rule $NFT_TABLE forward $ip_family saddr "$target" "$proto" sport "$tport" counter comment "$ret_tag" || true
+            plat_nft_quiet add rule $NFT_TABLE "$forward_chain" \
+                $ip_family saddr "$target" "$proto" sport "$tport" counter comment "$ret_tag" || true
             if [[ "$proto" == "tcp" ]]; then
                 if [[ "$mss_mode" == "clamp" ]]; then
-                    plat_nft_quiet insert rule $NFT_TABLE forward $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment "${rule_tag}:mss" || true
+                    plat_nft_quiet add rule $NFT_TABLE "$forward_chain" \
+                        $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment "${rule_tag}:mss" || true
                 elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
-                    plat_nft_quiet insert rule $NFT_TABLE forward $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set "$mss_value" comment "${rule_tag}:mss" || true
+                    plat_nft_quiet add rule $NFT_TABLE "$forward_chain" \
+                        $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set "$mss_value" comment "${rule_tag}:mss" || true
                 fi
             fi
         else
             msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
             # Rollback: remove prerouting rule if it was added but postrouting failed
-            local rb_handle
-            rb_handle=$(plat_nft_list_chain_handles $NFT_TABLE prerouting | \
-                { grep -E "$ip_match $proto.*dport $lport.*dnat $dnat_keyword to .*$target.*$tport" || true; } | \
-                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' | tail -1)
-            if [[ -n "$rb_handle" ]]; then
-                plat_nft_delete_rule_handle $NFT_TABLE prerouting "$rb_handle"
-                msg_dim "  Rolled back prerouting rule (handle $rb_handle)"
-            fi
+            _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$target" "$tport" >/dev/null 2>&1 || true
             return 1
         fi
     fi
@@ -2994,82 +3159,59 @@ nft_delete_port() {
     fi
 
     local deleted=0
-
-    # Step 1: Find prerouting DNAT rules matching dport $port (with protocol filter)
     local prerouting_lines
-    case "$proto" in
-        tcp)
-            prerouting_lines=$(plat_nft_list_chain_handles $NFT_TABLE prerouting | \
-                { grep -E "(ip protocol tcp|ip6 nexthdr tcp).*dport $port\b" || true; })
-            ;;
-        udp)
-            prerouting_lines=$(plat_nft_list_chain_handles $NFT_TABLE prerouting | \
-                { grep -E "(ip protocol udp|ip6 nexthdr udp).*dport $port\b" || true; })
-            ;;
-        both)
-            prerouting_lines=$(plat_nft_list_chain_handles $NFT_TABLE prerouting | \
-                { grep -E "dport $port\b" || true; })
-            ;;
-        *)
-            msg_err "Invalid protocol: $proto"
-            return 1
-            ;;
-    esac
+    prerouting_lines=$(_nft_prefixed_chain_handles_concat $(_pfwd_port_search_chains prerouting "$proto"))
 
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
+    local chain line h
+    while IFS=$'\t' read -r chain line; do
+        [[ -n "$line" ]] || continue
+        case "$proto" in
+            tcp) [[ "$line" =~ (ip\ protocol\ tcp|ip6\ nexthdr\ tcp).*dport\ $port($|[^0-9]) ]] || continue ;;
+            udp) [[ "$line" =~ (ip\ protocol\ udp|ip6\ nexthdr\ udp).*dport\ $port($|[^0-9]) ]] || continue ;;
+            both) [[ "$line" =~ dport\ $port($|[^0-9]) ]] || continue ;;
+            *) msg_err "Invalid protocol: $proto"; return 1 ;;
+        esac
 
         # Extract handle from prerouting rule
         local handle=""
-        if [[ "$line" =~ handle\ ([0-9]+) ]]; then
-            handle="${BASH_REMATCH[1]}"
-        fi
+        [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
         [[ -z "$handle" ]] && continue
 
         # Extract DNAT target address and port for postrouting matching
-        local dnat_addr="" dnat_port="" rule_tag="" rule_scope=""
-        # IPv4: dnat ip to 1.2.3.4:3389
+        local dnat_addr="" dnat_port="" rule_tag=""
         if [[ "$line" =~ dnat\ ip\ to\ ([0-9.]+):([0-9]+) ]]; then
             dnat_addr="${BASH_REMATCH[1]}"
             dnat_port="${BASH_REMATCH[2]}"
-        # IPv6: dnat ip6 to [::1]:3389
         elif [[ "$line" =~ dnat\ ip6\ to\ \[([^\]]+)\]:([0-9]+) ]]; then
             dnat_addr="${BASH_REMATCH[1]}"
             dnat_port="${BASH_REMATCH[2]}"
         fi
         _extract_nft_proto_ipver "$line"
         if [[ -n "$_PROTO" && -n "$_IPVER" && -n "$dnat_addr" && -n "$dnat_port" ]]; then
-            rule_scope=$(_pfwd_rule_scope "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
             rule_tag=$(_pfwd_rule_tag "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
         fi
 
         # Delete the prerouting rule
-        plat_nft_delete_rule_handle $NFT_TABLE prerouting "$handle" && ((deleted++)) || true
+        plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$handle" && ((deleted++)) || true
 
         # Step 2: Delete matching postrouting SNAT/masquerade rule using managed tag when available
         if [[ -n "$rule_tag" ]]; then
             local tagged_post_handles
-            tagged_post_handles=$(_pfwd_postrouting_handles_by_tag "$rule_tag")
-            for h in $tagged_post_handles; do
-                plat_nft_delete_rule_handle $NFT_TABLE postrouting "$h" && ((deleted++)) || true
-            done
-        elif [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
-            local post_handles
-            post_handles=$(plat_nft_list_chain_handles $NFT_TABLE postrouting | \
-                { grep -E "daddr $dnat_addr.*dport $dnat_port" || true; } | \
-                awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
-            for h in $post_handles; do
-                plat_nft_delete_rule_handle $NFT_TABLE postrouting "$h" && ((deleted++)) || true
-            done
+            tagged_post_handles=$(_pfwd_postrouting_handle_refs_by_tag "$rule_tag" "$_PROTO" "$_IPVER")
+            while IFS=$'\t' read -r chain h; do
+                [[ -n "$chain" && -n "$h" ]] || continue
+                plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h" && ((deleted++)) || true
+            done <<< "$tagged_post_handles"
         fi
 
         # Step 2b: Delete managed forward helper rules (including optional MSS rule)
-        if [[ -n "$rule_scope" ]]; then
+        if [[ -n "$dnat_addr" && -n "$dnat_port" && -n "$_PROTO" && -n "$_IPVER" ]]; then
             local helper_handles
-            helper_handles=$(_pfwd_forward_handles_by_scope "$rule_scope")
-            for h in $helper_handles; do
-                plat_nft_delete_rule_handle $NFT_TABLE forward "$h" && ((deleted++)) || true
-            done
+            helper_handles=$(_pfwd_forward_handle_refs_by_rule "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
+            while IFS=$'\t' read -r chain h; do
+                [[ -n "$chain" && -n "$h" ]] || continue
+                plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h" && ((deleted++)) || true
+            done <<< "$helper_handles"
         fi
     done <<< "$prerouting_lines"
 
@@ -3101,12 +3243,11 @@ nft_delete_ports_batch() {
     fi
 
     # Fetch all chain data once with handles
-    local pre_data post_data fwd_data
-    pre_data=$(plat_nft_list_chain_handles $NFT_TABLE prerouting || true)
-    post_data=$(plat_nft_list_chain_handles $NFT_TABLE postrouting || true)
-    fwd_data=$(plat_nft_list_chain_handles $NFT_TABLE forward || true)
+    local pre_data
+    pre_data=$(_nft_prefixed_chain_handles_concat $(_pfwd_port_search_chains prerouting "$proto"))
 
     local total_deleted=0
+    local chain line h
 
     for port in "${_ports_ref[@]}"; do
         local deleted=0
@@ -3114,18 +3255,18 @@ nft_delete_ports_batch() {
         # Filter prerouting lines for this port
         local prerouting_lines=""
         case "$proto" in
-            tcp) prerouting_lines=$(echo "$pre_data" | { grep -E "(ip protocol tcp|ip6 nexthdr tcp).*dport $port\b" || true; }) ;;
-            udp) prerouting_lines=$(echo "$pre_data" | { grep -E "(ip protocol udp|ip6 nexthdr udp).*dport $port\b" || true; }) ;;
-            both) prerouting_lines=$(echo "$pre_data" | { grep -E "dport $port\b" || true; }) ;;
+            tcp) prerouting_lines=$(echo "$pre_data" | { grep -E $'\t.*(ip protocol tcp|ip6 nexthdr tcp).*dport '"$port"'($|[^0-9])' || true; }) ;;
+            udp) prerouting_lines=$(echo "$pre_data" | { grep -E $'\t.*(ip protocol udp|ip6 nexthdr udp).*dport '"$port"'($|[^0-9])' || true; }) ;;
+            both) prerouting_lines=$(echo "$pre_data" | { grep -E $'\t.*dport '"$port"'($|[^0-9])' || true; }) ;;
         esac
 
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
+        while IFS=$'\t' read -r chain line; do
+            [[ -z "$chain" || -z "$line" ]] && continue
             local handle=""
             [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
             [[ -z "$handle" ]] && continue
 
-            local dnat_addr="" dnat_port="" rule_tag="" rule_scope=""
+            local dnat_addr="" dnat_port="" rule_tag=""
             if [[ "$line" =~ dnat\ ip\ to\ ([0-9.]+):([0-9]+) ]]; then
                 dnat_addr="${BASH_REMATCH[1]}"; dnat_port="${BASH_REMATCH[2]}"
             elif [[ "$line" =~ dnat\ ip6\ to\ \[([^\]]+)\]:([0-9]+) ]]; then
@@ -3133,36 +3274,25 @@ nft_delete_ports_batch() {
             fi
             _extract_nft_proto_ipver "$line"
             if [[ -n "$_PROTO" && -n "$_IPVER" && -n "$dnat_addr" && -n "$dnat_port" ]]; then
-                rule_scope=$(_pfwd_rule_scope "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
                 rule_tag=$(_pfwd_rule_tag "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
             fi
 
-            plat_nft_delete_rule_handle $NFT_TABLE prerouting "$handle" && ((deleted++)) || true
+            plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$handle" && ((deleted++)) || true
 
             if [[ -n "$rule_tag" ]]; then
                 local post_handles
-                post_handles=$(echo "$post_data" | { grep -F "comment \"$rule_tag\"" || true; } | \
-                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
-                for h in $post_handles; do
-                    plat_nft_delete_rule_handle $NFT_TABLE postrouting "$h" && ((deleted++)) || true
-                done
+                post_handles=$(_pfwd_postrouting_handle_refs_by_tag "$rule_tag" "$_PROTO" "$_IPVER")
+                while IFS=$'\t' read -r chain h; do
+                    [[ -n "$chain" && -n "$h" ]] || continue
+                    plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h" && ((deleted++)) || true
+                done <<< "$post_handles"
 
                 local helper_handles
-                helper_handles=$(echo "$fwd_data" | grep -F \
-                    -e "comment \"pfwd_fwd:${rule_scope}\"" \
-                    -e "comment \"pfwd_ret:${rule_scope}\"" \
-                    -e "comment \"${rule_tag}:mss\"" | \
-                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }' || true)
-                for h in $helper_handles; do
-                    plat_nft_delete_rule_handle $NFT_TABLE forward "$h" && ((deleted++)) || true
-                done
-            elif [[ -n "$dnat_addr" && -n "$dnat_port" ]]; then
-                local post_handles
-                post_handles=$(echo "$post_data" | { grep -E "daddr $dnat_addr.*dport $dnat_port" || true; } | \
-                    awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }')
-                for h in $post_handles; do
-                    plat_nft_delete_rule_handle $NFT_TABLE postrouting "$h" && ((deleted++)) || true
-                done
+                helper_handles=$(_pfwd_forward_handle_refs_by_rule "$port" "$_IPVER" "$_PROTO" "$dnat_addr" "$dnat_port")
+                while IFS=$'\t' read -r chain h; do
+                    [[ -n "$chain" && -n "$h" ]] || continue
+                    plat_nft_delete_rule_handle $NFT_TABLE "$chain" "$h" && ((deleted++)) || true
+                done <<< "$helper_handles"
             fi
         done <<< "$prerouting_lines"
 
@@ -3185,7 +3315,7 @@ nft_delete_ports_batch() {
 }
 
 _nft_prerouting_dnat_lines() {
-    _nft_cached_chain prerouting | grep "dnat" || true
+    _nft_cached_chains_concat prerouting $(_pfwd_subchain_list prerouting) | grep "dnat" || true
 }
 
 # _parse_nft_prerouting_rules - parse nft prerouting output into structured data
@@ -3265,8 +3395,8 @@ _parse_nft_export_rules() {
     [[ -z "$parsed" ]] && return 0
 
     local post_data forward_data
-    post_data=$(_nft_cached_chain postrouting || true)
-    forward_data=$(_nft_cached_chain forward || true)
+    post_data=$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)
+    forward_data=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)
 
     local proto lport ipver target tport comment bytes
     while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
@@ -3308,7 +3438,7 @@ _parse_nft_bidirectional_traffic() {
     [[ -z "$parsed_prerouting" ]] && return 0
 
     local forward_ret_output
-    forward_ret_output=$(_nft_cached_chain forward | grep "pfwd_ret:" || true)
+    forward_ret_output=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) | grep "pfwd_ret:" || true)
 
     declare -A out_bytes_map=()
     local line
@@ -3350,12 +3480,7 @@ nft_list_rules() {
     fi
 
     if [[ -z "$parsed" ]]; then
-        parsed=$(_traffic_read_merged)
-    fi
-
-    # Fallback to prerouting-only if no merged data (e.g. no dat file yet)
-    if [[ -z "$parsed" ]]; then
-        parsed=$(_parse_nft_prerouting_rules)
+        parsed=$(_nft_rules_for_display)
     fi
 
     if [[ -z "$parsed" ]]; then
@@ -3372,21 +3497,12 @@ nft_list_rules() {
     local sorted_rules
     sorted_rules=$(echo "$parsed" | _sort_parsed_rules)
 
-    # Display sorted rules (supports both 10-field export format and older traffic-only formats)
     local idx=0
     local -a detail_lines=()
-    while IFS=$'\t' read -r proto lport ipver target tport comment f7 f8 f9 f10; do
+    local snat_mode snat_source mss_mode mss_value bytes
+    while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value bytes; do
         [[ -z "$lport" ]] && continue
-        local snat_mode="masquerade" snat_source="" mss_mode="" mss_value="" bytes="0"
-        if [[ -n "$f10" || "$f7" == "masquerade" || "$f7" == "snat" || "$f9" == "clamp" || "$f9" == "set" ]]; then
-            snat_mode="$f7"
-            snat_source="$f8"
-            mss_mode="$f9"
-            mss_value="$f10"
-            bytes=$(nft_get_traffic "$lport")
-        else
-            bytes="${f9:-$f7}"
-        fi
+        bytes="${bytes:-0}"
         # Apply filter if specified
         if [[ -n "$filter" ]]; then
             local opts_text
@@ -3430,16 +3546,6 @@ nft_list_rules() {
             echo -e "  ${DIM}${detail_line}${NC}"
         done
     fi
-}
-
-# nft_get_traffic <port> - get traffic bytes for a port
-nft_get_traffic() {
-    local port="$1"
-    local chain_data
-    chain_data=$(_nft_cached_chain prerouting) || chain_data=""
-    local bytes
-    bytes=$(_nft_traffic_from_chain "$chain_data" "$port")
-    echo "${bytes:-0}"
 }
 
 # nft_save - persist rules to file
@@ -3723,6 +3829,31 @@ _traffic_read_merged() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$merged_in" "$merged_out" "$merged_total"
     done <<< "$parsed"
+}
+
+# _nft_rules_for_display - merge rule metadata with accumulated traffic totals
+# Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>snat_mode<TAB>snat_source<TAB>mss_mode<TAB>mss_value<TAB>total_bytes
+_nft_rules_for_display() {
+    local rules traffic
+    rules=$(_parse_nft_export_rules)
+    [[ -z "$rules" ]] && return 0
+
+    traffic=$(_traffic_read_merged)
+    declare -A traffic_total=()
+    local proto lport ipver target tport comment in_bytes out_bytes total_bytes
+    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes out_bytes total_bytes; do
+        [[ -z "$lport" ]] && continue
+        traffic_total["${proto}|${lport}|${ipver}"]="${total_bytes:-0}"
+    done <<< "$traffic"
+
+    local snat_mode snat_source mss_mode mss_value
+    while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
+        [[ -z "$lport" ]] && continue
+        total_bytes="${traffic_total[${proto}|${lport}|${ipver}]:-0}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
+            "$snat_mode" "$snat_source" "$mss_mode" "$mss_value" "$total_bytes"
+    done <<< "$rules"
 }
 
 traffic_limit_show_status_table() {
@@ -4800,7 +4931,7 @@ cmd_list() {
     echo -e "${DIM}$SEP_EQ${NC}"
     [[ -n "$filter" ]] && echo -e "  ${DIM}Filter: $filter${NC}"
     echo ""
-    nft_list_rules "$filter" "$(_traffic_read_merged)"
+    nft_list_rules "$filter" "$(_nft_rules_for_display)"
 }
 
 # _nft_saved_rule_count - count persisted prerouting DNAT rules in NFT_CONFIG
@@ -4899,6 +5030,18 @@ cmd_doctor() {
                 _doctor_print_check ERROR "chain ${chain} missing" "runtime table is incomplete"
             fi
         done
+        for chain in $(_pfwd_subchain_list prerouting) $(_pfwd_subchain_list postrouting) $(_pfwd_subchain_list forward); do
+            if _nft_cached_chain "$chain" >/dev/null; then
+                _doctor_print_check OK "subchain ${chain} present"
+            else
+                _doctor_print_check WARN "subchain ${chain} missing" "will be recreated on next nft add"
+            fi
+        done
+        if _nft_cached_table | grep -q "flowtable ft"; then
+            _doctor_print_check OK "flowtable fast path configured"
+        else
+            _doctor_print_check WARN "flowtable fast path unavailable"
+        fi
     elif (( saved_rules > 0 )); then
         _doctor_print_check WARN "saved nft config exists but table is not loaded" "run 'pfwd start nft' or 'pfwd restart nft'"
     else
@@ -4929,6 +5072,7 @@ cmd_doctor() {
     fwd6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
     [[ "$fwd4" == "1" ]] && _doctor_print_check OK "IPv4 forwarding enabled" || _doctor_print_check ERROR "IPv4 forwarding disabled" "run 'pfwd optimize balanced' or enable net.ipv4.ip_forward=1"
     [[ "$fwd6" == "1" ]] && _doctor_print_check OK "IPv6 forwarding enabled" || _doctor_print_check WARN "IPv6 forwarding disabled"
+    _doctor_print_check OK "traffic collector interval" "$(traffic_current_interval)"
 
     if $PFWD_LOOPBACK_DNAT; then
         local route_all route_default
