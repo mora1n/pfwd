@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.0.1"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -1549,6 +1549,26 @@ nft_escape_string() {
     printf '%s' "$value"
 }
 
+nft_quote_token() {
+    printf '"%s"' "$(nft_escape_string "${1:-}")"
+}
+
+nft_join_tokens() {
+    local line="" token
+    for token in "$@"; do
+        [[ -n "$line" ]] && line+=" "
+        line+="$token"
+    done
+    printf '%s' "$line"
+}
+
+nft_append_command() {
+    local file="$1"
+    shift
+    nft_join_tokens "$@" >> "$file"
+    printf '\n' >> "$file"
+}
+
 # parse_rule <rule_str> -> sets RULE_LPORT, RULE_TARGET, RULE_TPORT
 # Formats: port:target:port  or  port:[ipv6]:port
 parse_rule() {
@@ -2996,10 +3016,11 @@ _nft_delete_exact_rule() {
 _nft_add_single_rule() {
     local ip_family="$1" proto="$2" lport="$3" target="$4" tport="$5" comment="${6:-}"
     local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}" replace_mode="${11:-false}"
-    local ipver="4" ip_match="ip protocol" dnat_keyword="ip" dnat_target="$target:$tport"
+    local ipver="4" dnat_keyword="ip" dnat_target="$target:$tport"
+    local -a ip_match_tokens=(ip protocol)
     if [[ "$ip_family" == "ip6" ]]; then
         ipver="6"
-        ip_match="ip6 nexthdr"
+        ip_match_tokens=(ip6 nexthdr)
         dnat_keyword="ip6"
         dnat_target="[$target]:$tport"
     fi
@@ -3017,65 +3038,78 @@ _nft_add_single_rule() {
         fi
     fi
 
-    local nft_result=0
-    local postrouting_action="masquerade"
     local rule_tag
-    local escaped_comment=""
     local prerouting_chain postrouting_chain forward_chain
+    local -a postrouting_action_tokens=(masquerade)
+    local -a prerouting_tokens=() postrouting_tokens=() mss_tokens=()
     rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
     prerouting_chain=$(_pfwd_subchain_name prerouting "$proto" "$ipver")
     postrouting_chain=$(_pfwd_subchain_name postrouting "$proto" "$ipver")
     forward_chain=$(_pfwd_subchain_name forward "$proto" "$ipver")
     if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
-        postrouting_action="snat to $snat_source"
+        postrouting_action_tokens=(snat to "$snat_source")
     fi
-    if [[ -n "$comment" ]]; then
-        escaped_comment=$(nft_escape_string "$comment")
+
+    prerouting_tokens=(
+        add rule inet port_forward "$prerouting_chain"
+        "${ip_match_tokens[@]}" "$proto" "$proto" dport "$lport"
+        dnat "$dnat_keyword" to "$dnat_target"
+    )
+    [[ -n "$comment" ]] && prerouting_tokens+=(comment "$(nft_quote_token "$comment")")
+
+    postrouting_tokens=(
+        add rule inet port_forward "$postrouting_chain"
+        ct status dnat "$ip_family" daddr "$target" "$proto" dport "$tport"
+        "${postrouting_action_tokens[@]}"
+        comment "$(nft_quote_token "$rule_tag")"
+    )
+
+    if [[ "$proto" == "tcp" ]]; then
+        if [[ "$mss_mode" == "clamp" ]]; then
+            mss_tokens=(
+                add rule inet port_forward "$forward_chain"
+                "$ip_family" daddr "$target" tcp dport "$tport"
+                tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+                comment "$(nft_quote_token "${rule_tag}:mss")"
+            )
+        elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
+            mss_tokens=(
+                add rule inet port_forward "$forward_chain"
+                "$ip_family" daddr "$target" tcp dport "$tport"
+                tcp flags syn / syn,rst tcp option maxseg size set "$mss_value"
+                comment "$(nft_quote_token "${rule_tag}:mss")"
+            )
+        fi
     fi
+
     if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
         # Append to batch file for atomic commit
-        if [[ -n "$comment" ]]; then
-            echo "add rule $NFT_TABLE $prerouting_chain $ip_match $proto $proto dport $lport dnat $dnat_keyword to $dnat_target comment \"$escaped_comment\"" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE $postrouting_chain ct status dnat $ip_family daddr $target $proto dport $tport $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
-        else
-            echo "add rule $NFT_TABLE $prerouting_chain $ip_match $proto $proto dport $lport dnat $dnat_keyword to $dnat_target" >> "$_NFT_BATCH_FILE"
-            echo "add rule $NFT_TABLE $postrouting_chain ct status dnat $ip_family daddr $target $proto dport $tport $postrouting_action comment \"$rule_tag\"" >> "$_NFT_BATCH_FILE"
-        fi
-        if [[ "$proto" == "tcp" ]]; then
-            if [[ "$mss_mode" == "clamp" ]]; then
-                echo "add rule $NFT_TABLE $forward_chain $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set rt mtu comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
-            elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
-                echo "add rule $NFT_TABLE $forward_chain $ip_family daddr $target $proto dport $tport $proto flags syn / syn,rst tcp option maxseg size set $mss_value comment \"${rule_tag}:mss\"" >> "$_NFT_BATCH_FILE"
-            fi
-        fi
+        nft_append_command "$_NFT_BATCH_FILE" "${prerouting_tokens[@]}"
+        nft_append_command "$_NFT_BATCH_FILE" "${postrouting_tokens[@]}"
+        (( ${#mss_tokens[@]} > 0 )) && nft_append_command "$_NFT_BATCH_FILE" "${mss_tokens[@]}"
     else
         # Direct execution
-        if [[ -n "$comment" ]]; then
-            plat_nft_capture add rule $NFT_TABLE "$prerouting_chain" $ip_match "$proto" "$proto" dport "$lport" dnat $dnat_keyword to "$dnat_target" comment "$comment" && \
-            plat_nft_capture add rule $NFT_TABLE "$postrouting_chain" ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" $postrouting_action comment "$rule_tag"
-            nft_result=$?
+        local nft_result=0 tmp_file=""
+        tmp_file=$(mktemp) || {
+            msg_err "Failed to create temporary nft batch file"
+            return 1
+        }
+        nft_append_command "$tmp_file" "${prerouting_tokens[@]}"
+        nft_append_command "$tmp_file" "${postrouting_tokens[@]}"
+
+        if plat_nft_capture -f "$tmp_file"; then
+            nft_result=0
         else
-            plat_nft_capture add rule $NFT_TABLE "$prerouting_chain" $ip_match "$proto" "$proto" dport "$lport" dnat $dnat_keyword to "$dnat_target" && \
-            plat_nft_capture add rule $NFT_TABLE "$postrouting_chain" ct status dnat $ip_family daddr "$target" "$proto" dport "$tport" $postrouting_action comment "$rule_tag"
             nft_result=$?
         fi
+        rm -f "$tmp_file"
 
-        if (( nft_result == 0 )); then
-            if [[ "$proto" == "tcp" ]]; then
-                if [[ "$mss_mode" == "clamp" ]]; then
-                    plat_nft_quiet add rule $NFT_TABLE "$forward_chain" \
-                        $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment "${rule_tag}:mss" || true
-                elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
-                    plat_nft_quiet add rule $NFT_TABLE "$forward_chain" \
-                        $ip_family daddr "$target" tcp dport "$tport" tcp flags syn / syn,rst tcp option maxseg size set "$mss_value" comment "${rule_tag}:mss" || true
-                fi
-            fi
-        else
+        if (( nft_result != 0 )); then
             msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
-            # Rollback: remove prerouting rule if it was added but postrouting failed
-            _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$target" "$tport" >/dev/null 2>&1 || true
             return 1
         fi
+
+        (( ${#mss_tokens[@]} > 0 )) && plat_nft_quiet "${mss_tokens[@]}" || true
     fi
 
     if $_BATCH_MODE; then
