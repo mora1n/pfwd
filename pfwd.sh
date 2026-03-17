@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.7"
+readonly VERSION="1.9.8"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -5411,6 +5411,7 @@ cmd_uninstall() {
                 sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
                 plat_sysctl_apply_file "$SYSCTL_CONF"
             fi
+            rm -f "$SHORTCUT_LINK"
             rm -rf "$DATA_DIR"
             msg_ok "All pfwd components removed"
             ;;
