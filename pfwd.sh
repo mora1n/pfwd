@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="1.9.6"
+readonly VERSION="1.9.7"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -2476,8 +2476,9 @@ _batch_finalize() {
     case "$method" in
         nft|nftables)
             # If batch file exists, commit atomically
+            local batch_ok=true batch_err=""
             if [[ -n "$_NFT_BATCH_FILE" && -f "$_NFT_BATCH_FILE" ]]; then
-                if plat_nft_apply_file "$_NFT_BATCH_FILE"; then
+                if batch_err=$(plat_nft_capture -f "$_NFT_BATCH_FILE"); then
                     msg_dim "  Atomic batch commit successful"
                     if [[ -n "$_LIMIT_PENDING_FILE" && -f "$_LIMIT_PENDING_FILE" ]]; then
                         traffic_limit_apply_pending "$_LIMIT_PENDING_FILE" || msg_warn "Failed to sync traffic limit state after batch add"
@@ -2485,6 +2486,8 @@ _batch_finalize() {
                     _mark_nft_dirty
                 else
                     msg_warn "Atomic batch failed"
+                    [[ -n "$batch_err" ]] && msg_dim "  nft: ${batch_err//$'\n'/ }"
+                    batch_ok=false
                 fi
                 rm -f "$_NFT_BATCH_FILE"
                 _NFT_BATCH_FILE=""
@@ -2492,6 +2495,7 @@ _batch_finalize() {
                 _LIMIT_PENDING_FILE=""
                 _nft_invalidate_cache
             fi
+            $batch_ok || return 1
             if $_DIRTY_NFT; then
                 sync_managed_firewall_state
                 nft_save "auto"
@@ -3064,7 +3068,11 @@ _nft_add_single_rule() {
         fi
     fi
 
-    msg_dim "  Added IPv$ipver $proto :$lport -> $dnat_target"
+    if $_BATCH_MODE; then
+        msg_dim "  Queued IPv$ipver $proto :$lport -> $dnat_target"
+    else
+        msg_dim "  Added IPv$ipver $proto :$lport -> $dnat_target"
+    fi
     if traffic_limit_has_values "$limit_in" "$limit_out" "$limit_total"; then
         if $_BATCH_MODE; then
             traffic_limit_queue_pending \
@@ -4908,17 +4916,17 @@ cmd_add() {
 
     local added=0 failed=0
 
-    # Enable batch mode: skip per-rule save/restart
-    _BATCH_MODE=true
-
     if ! validate_target "$target"; then
         msg_err "Invalid target: $target"
-        _BATCH_MODE=false
         return 1
     fi
     if ! expand_port_spec "$rules_str" "$target"; then
-        _BATCH_MODE=false
         return 1
+    fi
+    if (( ${#EXPANDED_RULES[@]} > 1 )); then
+        _BATCH_MODE=true
+    else
+        _BATCH_MODE=false
     fi
     for expanded in "${EXPANDED_RULES[@]}"; do
         if ! parse_rule "$expanded"; then
@@ -4933,8 +4941,16 @@ cmd_add() {
     done
 
     # Batch finalize: save/persist/restart once
+    local used_batch=$_BATCH_MODE
     _BATCH_MODE=false
-    _batch_finalize "$method"
+    if ! _batch_finalize "$method"; then
+        if $used_batch; then
+            failed=$(( failed + added ))
+            added=0
+        else
+            return 1
+        fi
+    fi
 
     if (( added > 0 || failed > 0 )); then
         msg_info "Result: $added added, $failed failed"
@@ -6122,9 +6138,13 @@ menu_add_rule() {
 
     ensure_ip_forwarding 2>/dev/null || true
 
-    _BATCH_MODE=true
     local added=0 failed=0
     local total_rules=${#EXPANDED_RULES[@]}
+    if (( total_rules > 1 )); then
+        _BATCH_MODE=true
+    else
+        _BATCH_MODE=false
+    fi
     local progress_idx=0
     for expanded in "${EXPANDED_RULES[@]}"; do
         ((progress_idx++)) || true
@@ -6140,8 +6160,17 @@ menu_add_rule() {
         fi
     done
 
+    local used_batch=$_BATCH_MODE
     _BATCH_MODE=false
-    _batch_finalize "$method"
+    if ! _batch_finalize "$method"; then
+        if $used_batch; then
+            failed=$(( failed + added ))
+            added=0
+        else
+            wait_for_enter
+            return
+        fi
+    fi
 
     echo ""
     msg_info "Result: $added rules added, $failed failed"
