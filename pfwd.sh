@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.5"
+readonly VERSION="2.0.6"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -977,11 +977,11 @@ pfwd_state_add_rule() {
                 replace_keys["$p|$lport|$effective_ipver"]=1
                 msg_info "Replacing existing IPv${effective_ipver} $p rule for port $lport"
             fi
-            additions+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$p" "$lport" "$effective_ipver" "$target_input" "$tport" "$comment" \
-                "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
-            display_additions+=$(printf 'IPv%s %s :%s -> %s:%s\n' \
-                "$effective_ipver" "$p" "$lport" "$resolved_ip" "$tport")
+            printf -v additions '%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$additions" "$p" "$lport" "$effective_ipver" "$target_input" "$tport" "$comment" \
+                "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
+            printf -v display_additions '%sIPv%s %s :%s -> %s:%s\n' \
+                "$display_additions" "$effective_ipver" "$p" "$lport" "$resolved_ip" "$tport"
         done <<< "$resolved_targets"
     done
 
