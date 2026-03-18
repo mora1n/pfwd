@@ -50,6 +50,7 @@ Commands:
   list        List all forwarding rules
   status      Show running status and rule counts
   doctor      Run forwarding diagnostics
+  refresh     Re-resolve targets and rebuild nftables from saved state
   start/stop/restart  Control forwarding (nft / all)
   stats       Traffic statistics
   export      Export config to JSON
@@ -75,6 +76,8 @@ pfwd <ports> <target> [target_port]
 | `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
 | `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
 | `--replace` | nft only: replace an existing rule for the same local port/protocol/IP family |
+| `--mss-clamp` / `--mss <value>` | nft only: clamp to PMTU or set a fixed TCP MSS |
+| `--snat-source <addr>` / `--masquerade` | nft only: fixed SNAT source or default masquerade (`--snat-source` auto-switches `-46` to the matching family) |
 | `-c, --comment` | Single-line comment (tabs/newlines rejected) |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
@@ -82,8 +85,9 @@ pfwd <ports> <target> [target_port]
 
 Interactive mode note:
 
-- After you choose fixed SNAT, `pfwd` can suggest a fixed MSS from the smaller local-path MTU it can observe on the source-side and backend-side.
-- The suggestion still accounts for PPPoE-style links and remains informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
+- Fixed SNAT is single-stack; if you leave IP version at `-46`, `pfwd` auto-switches to IPv4 or IPv6 based on the SNAT source address.
+- After you choose fixed SNAT, `pfwd` prefers route `advmss`, then route MTU, then link MTU when suggesting a fixed MSS from the smaller source-side/backend-side path.
+- The suggestion remains informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
 
 ### Port Formats
 
@@ -103,6 +107,7 @@ Interactive mode note:
 pfwd 8080 1.2.3.4 80
 pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
 pfwd -m nft -t 2.2.2.2 --replace 33389:3389
+pfwd -m nft -4 -t 2.2.2.2 --snat-source 192.168.1.2 9443:443
 
 # Delete
 pfwd del -m nft 3389
@@ -116,6 +121,7 @@ pfwd list -f 8080
 
 # Traffic
 pfwd doctor
+pfwd refresh
 pfwd stats
 pfwd stats --rate
 pfwd stats --interval
@@ -134,8 +140,10 @@ pfwd import --url https://example.com/backup.json
 
 Notes:
 
-- Import/export use the current v3 JSON schema with `forward_rules`; backups containing legacy traffic-limit fields are rejected.
-- Legacy traffic cache records are ignored; regenerate stats with the current collector if needed.
+- Import/export use the current v3 JSON schema with `forward_rules`.
+- `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
+- Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
+- Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.
 - `pfwd list` shows fixed SNAT rules in the `Options` column and keeps a detailed SNAT section for long addresses.
 - Rule comments must be single-line text, and `jq` is required for import/export.
 
@@ -154,15 +162,18 @@ Best for: IP-based targets, maximum performance.
 - Statistics are collected out of band from conntrack state, not from per-rule nft counters.
 - When `conntrack` is unavailable, pfwd falls back to `/proc/net/nf_conntrack`.
 - The collector stores accumulated per-rule inbound / outbound totals and a lightweight flow snapshot for delta calculation.
+- Traffic history is keyed by full rule identity (`proto/ipver/lport/target/tport`), so reusing a local port for a new backend does not inherit old counters.
 - Flowtable-accelerated connections remain visible through conntrack accounting, so stats keep working without putting counters back on the forwarding path.
 
 ## Performance
 
 | Feature | Description |
 |---------|-------------|
+| State-driven apply | `/var/lib/pfwd/rules.v1.tsv` is rendered into nftables atomically |
 | Flowtable fast path | Established connections offloaded to ingress |
-| Observer-only stats | Traffic collection avoids per-rule nft counters and helper rules |
-| Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers save and reload to end |
+| Observer-only stats | Traffic collection avoids per-rule nft counters and hot-path helper rules |
+| Port aggregation | Same-backend rules are grouped into nft port sets / intervals where possible |
+| Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |
 | nft output cache | TTL-based cache avoids redundant `nft list` calls |
 | Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
@@ -172,6 +183,7 @@ Best for: IP-based targets, maximum performance.
 
 | File | Purpose |
 |------|---------|
+| `/var/lib/pfwd/rules.v1.tsv` | pfwd source-of-truth state file |
 | `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
 | `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5) |
 | `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore service (calls `pfwd __restore-nft`) |
@@ -185,9 +197,27 @@ Best for: IP-based targets, maximum performance.
 ## Requirements
 
 - Linux with root access
-- nftables
+- Core forwarding tools:
+  - `nftables` (`nft`)
+  - `iproute2` / `iproute` (`ip`)
+- Feature-specific tool:
+  - `jq` (required for import/export)
+- Recommended tool:
+  - `conntrack` / `conntrack-tools` (preferred traffic stats backend; otherwise pfwd falls back to `/proc/net/nf_conntrack`)
 - Linux kernel >= 4.16 (for flowtable; older kernels fall back to standard forwarding)
-- jq (required for import/export)
+
+On the first non-internal run, `pfwd` checks the tools above once and prints a distro-matched install hint if any are missing.
+
+Common package install commands:
+
+| Distro | Command |
+|--------|---------|
+| Debian / Ubuntu | `apt-get install -y nftables iproute2 jq conntrack` |
+| Fedora / Rocky / Alma / Amazon Linux / Oracle Linux | `dnf install -y nftables iproute jq conntrack-tools` |
+| CentOS / RHEL (legacy) | `yum install -y nftables iproute jq conntrack-tools` |
+| openSUSE / SUSE | `zypper install -y nftables iproute2 jq conntrack-tools` |
+| Arch Linux | `pacman -Sy --needed nftables iproute2 jq conntrack-tools` |
+| Alpine | `apk add nftables iproute2 jq conntrack-tools` |
 
 ## License
 
