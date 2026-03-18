@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.2"
+readonly VERSION="2.0.3"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -46,28 +46,37 @@ readonly IPTABLES_FWD_EST_COMMENT="pfwd-managed forward established"
 readonly IPTABLES_INPUT_DNAT_COMMENT="pfwd-managed input dnat"
 
 # Colors (use $'...' so escape chars are real, works with echo -e and read -rp)
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'
-CYAN=$'\033[0;36m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-NC=$'\033[0m'
+reset_colors() {
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    NC=$'\033[0m'
+}
+
+reset_colors
 
 # disable_colors - strip all color codes
 disable_colors() {
     RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
 }
 
-# Pre-scan for --no-color / --no-clear before anything else
-for _arg in "$@"; do
-    case "$_arg" in
-        --no-color) disable_colors; ;;
-        --no-clear) _NO_CLEAR=true; ;;
-    esac
-done
-unset _arg
+init_runtime_flags() {
+    local arg
+    reset_colors
+    _NO_CLEAR=false
+    PFWD_MAIN_ARGS=()
+    for arg in "$@"; do
+        case "$arg" in
+            --no-color) disable_colors ;;
+            --no-clear) _NO_CLEAR=true ;;
+            *) PFWD_MAIN_ARGS+=("$arg") ;;
+        esac
+    done
+}
 
 # Magic number constants
 readonly MAX_PORT_RANGE=100        # max ports in a single range expansion
@@ -82,6 +91,7 @@ readonly SEP_DASH_40="----------------------------------------"
 
 # Quiet mode flag
 QUIET=false
+PFWD_MAIN_ARGS=()
 
 # Batch mode flag: when true, per-rule save/restart is skipped
 _BATCH_MODE=false
@@ -290,6 +300,24 @@ _nft_cached_chain() {
     printf '%s\n' "$chain_data"
 }
 
+_nft_chain_has_rules() {
+    local chain="$1" chain_data body
+    if ! chain_data=$(_nft_cached_chain "$chain"); then
+        return 1
+    fi
+    body=$(printf '%s\n' "$chain_data" | sed '1d;$d')
+    grep -Eq '^[[:space:]]+[^[:space:]}]' <<< "$body"
+}
+
+_nft_rule_handles_by_comment() {
+    local chain="$1" tag="$2" line
+    while IFS= read -r line; do
+        [[ "$line" == *"comment \"$tag\""* ]] || continue
+        [[ "$line" =~ handle[[:space:]]+([0-9]+) ]] || continue
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    done < <(plat_nft_list_chain_handles $NFT_TABLE "$chain" || true)
+}
+
 _nft_cached_chains_concat() {
     local chain
     for chain in "$@"; do
@@ -330,7 +358,87 @@ _nft_flowtable_devices() {
     echo "${devices:--}"
 }
 
-_nft_invalidate_cache() { _NFT_CACHE="" _NFT_CACHE_TIME=0; }
+_nft_reset_snapshot() {
+    _NFT_SNAPSHOT_READY=false
+    _NFT_SNAPSHOT_CACHE_TIME=0
+    _NFT_SNAPSHOT_PREROUTING=""
+    _NFT_SNAPSHOT_PARSED=""
+    _NFT_SNAPSHOT_POSTROUTING=""
+    _NFT_SNAPSHOT_FORWARD=""
+    _NFT_SNAPSHOT_SNAT_MODE=()
+    _NFT_SNAPSHOT_SNAT_SOURCE=()
+    _NFT_SNAPSHOT_MSS_MODE=()
+    _NFT_SNAPSHOT_MSS_VALUE=()
+    _NFT_SNAPSHOT_OUT_BYTES=()
+}
+
+_nft_index_postrouting_snapshot() {
+    local line tag snat_source
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _extract_nft_comment "$line"
+        tag="$_COMMENT"
+        [[ -n "$tag" ]] || continue
+
+        if [[ "$line" =~ snat([[:space:]]+ip6?|[[:space:]]+ip)?[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
+            snat_source="${BASH_REMATCH[2]}"
+            snat_source="${snat_source#[}"
+            snat_source="${snat_source%]}"
+            _NFT_SNAPSHOT_SNAT_MODE["$tag"]="snat"
+            _NFT_SNAPSHOT_SNAT_SOURCE["$tag"]="$snat_source"
+        fi
+    done <<< "$1"
+}
+
+_nft_index_forward_snapshot() {
+    local line tag ret_lport ret_ipver ret_proto
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+
+        _extract_nft_comment "$line"
+        tag="$_COMMENT"
+        if [[ -n "$tag" ]]; then
+            if [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ rt\ mtu ]]; then
+                _NFT_SNAPSHOT_MSS_MODE["$tag"]="clamp"
+            elif [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ ([0-9]+) ]]; then
+                _NFT_SNAPSHOT_MSS_MODE["$tag"]="set"
+                _NFT_SNAPSHOT_MSS_VALUE["$tag"]="${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        [[ "$tag" =~ ^pfwd_ret:([0-9]+):([46]):([a-z]+): ]] || continue
+        ret_lport="${BASH_REMATCH[1]}"
+        ret_ipver="${BASH_REMATCH[2]}"
+        ret_proto="${BASH_REMATCH[3]}"
+        _extract_nft_bytes "$line"
+        _NFT_SNAPSHOT_OUT_BYTES["${ret_proto}|${ret_lport}|${ret_ipver}"]="${_BYTES:-0}"
+    done <<< "$1"
+}
+
+_nft_prepare_snapshot() {
+    _nft_cached_table >/dev/null
+    if $_NFT_SNAPSHOT_READY && (( _NFT_SNAPSHOT_CACHE_TIME == _NFT_CACHE_TIME )); then
+        return 0
+    fi
+
+    _nft_reset_snapshot
+    _NFT_SNAPSHOT_CACHE_TIME=$_NFT_CACHE_TIME
+    _NFT_SNAPSHOT_PREROUTING=$(_nft_prerouting_dnat_lines)
+    _NFT_SNAPSHOT_PARSED=$(_parse_nft_prerouting_rules "$_NFT_SNAPSHOT_PREROUTING")
+    _NFT_SNAPSHOT_POSTROUTING=$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)
+    _NFT_SNAPSHOT_FORWARD=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)
+
+    [[ -n "$_NFT_SNAPSHOT_POSTROUTING" ]] && _nft_index_postrouting_snapshot "$_NFT_SNAPSHOT_POSTROUTING"
+    [[ -n "$_NFT_SNAPSHOT_FORWARD" ]] && _nft_index_forward_snapshot "$_NFT_SNAPSHOT_FORWARD"
+
+    _NFT_SNAPSHOT_READY=true
+}
+
+_nft_invalidate_cache() {
+    _NFT_CACHE=""
+    _NFT_CACHE_TIME=0
+    _nft_reset_snapshot
+}
 
 _mark_nft_dirty() {
     _DIRTY_NFT=true
@@ -351,7 +459,8 @@ _reset_change_flags() {
 _nft_count_rules() {
     local parsed="${1:-}"
     if [[ -z "$parsed" ]]; then
-        parsed=$(_parse_nft_prerouting_rules)
+        _nft_prepare_snapshot
+        parsed="$_NFT_SNAPSHOT_PARSED"
     fi
     if [[ -z "$parsed" ]]; then
         echo 0
@@ -543,8 +652,9 @@ _nft_rule_option_summary() {
 }
 
 _pfwd_collect_state() {
-    PFWD_NFT_RULES=$(_parse_nft_export_rules)
-    PFWD_NFT_COUNT=$(_nft_count_rules "$(_parse_nft_prerouting_rules)")
+    _nft_prepare_snapshot
+    PFWD_NFT_RULES=$(_parse_nft_export_rules "$_NFT_SNAPSHOT_PARSED")
+    PFWD_NFT_COUNT=$(_nft_count_rules "$_NFT_SNAPSHOT_PARSED")
     PFWD_NFT_RUNNING=false
     _nft_table_exists && PFWD_NFT_RUNNING=true
 
@@ -1023,6 +1133,28 @@ _DIRTY_UFW_RELOAD=false
 _NFT_BACKUP_NEEDED=false
 _UFW_FILES_CHANGED=false
 
+# Cached nft snapshot for repeated read-only views
+_NFT_SNAPSHOT_READY=false
+_NFT_SNAPSHOT_CACHE_TIME=0
+_NFT_SNAPSHOT_PREROUTING=""
+_NFT_SNAPSHOT_PARSED=""
+_NFT_SNAPSHOT_POSTROUTING=""
+_NFT_SNAPSHOT_FORWARD=""
+declare -A _NFT_SNAPSHOT_SNAT_MODE=()
+declare -A _NFT_SNAPSHOT_SNAT_SOURCE=()
+declare -A _NFT_SNAPSHOT_MSS_MODE=()
+declare -A _NFT_SNAPSHOT_MSS_VALUE=()
+declare -A _NFT_SNAPSHOT_OUT_BYTES=()
+
+# Shared add workflow result state
+PFWD_ADD_ADDED=0
+PFWD_ADD_FAILED=0
+PFWD_ADD_TOTAL=0
+PFWD_SHORTCUT_ARGS=()
+PFWD_IMPORT_PATH=""
+PFWD_IMPORT_METHOD=""
+PFWD_IMPORT_URL=""
+
 # Cached state snapshot for UI/status views
 PFWD_NFT_RULES=""
 PFWD_NFT_COUNT=0
@@ -1437,18 +1569,49 @@ validate_mss_value() {
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 536 && value <= 65535 ))
 }
 
-_mss_route_probe_for_source() {
-    local family_flag="$1" snat_source="$2"
-    local probe_target route_output
+_mss_default_probe_target() {
+    local family_flag="$1"
     case "$family_flag" in
-        -4) probe_target="1.1.1.1" ;;
-        -6) probe_target="2001:4860:4860::8888" ;;
+        -4) printf '1.1.1.1\n' ;;
+        -6) printf '2001:4860:4860::8888\n' ;;
         *) return 1 ;;
     esac
+}
 
-    route_output=$(ip -o "$family_flag" route get "$probe_target" from "$snat_source" 2>/dev/null | head -1 || true)
+_mss_route_probe() {
+    local family_flag="$1" route_target="$2" route_source="${3:-}"
+    local route_output
+    if [[ -n "$route_source" ]]; then
+        route_output=$(ip -o "$family_flag" route get "$route_target" from "$route_source" 2>/dev/null | head -1 || true)
+    else
+        route_output=$(ip -o "$family_flag" route get "$route_target" 2>/dev/null | head -1 || true)
+    fi
     [[ -n "$route_output" ]] || return 1
     printf '%s\n' "$route_output"
+}
+
+_mss_route_field() {
+    local route_output="$1" field_name="$2"
+    local prev="" token
+    for token in $route_output; do
+        if [[ "$prev" == "$field_name" ]]; then
+            printf '%s\n' "$token"
+            return 0
+        fi
+        prev="$token"
+    done
+    return 1
+}
+
+_mss_iface_for_address() {
+    local family_flag="$1" target_addr="$2"
+    local _idx iface _family addr _rest
+    while read -r _idx iface _family addr _rest; do
+        [[ "${addr%/*}" == "$target_addr" ]] || continue
+        printf '%s\n' "$iface"
+        return 0
+    done < <(ip -o "$family_flag" addr show 2>/dev/null)
+    return 1
 }
 
 _iface_link_mtu() {
@@ -1472,8 +1635,83 @@ _iface_is_pppoe_like() {
     ip -d link show dev "$iface" 2>/dev/null | grep -Eqi 'ppp|pppoe|pointopoint'
 }
 
+_mss_resolve_target_for_family() {
+    local target="$1" family="$2"
+    local target_type resolved=""
+    case "$family" in
+        ipv4|4) family="ipv4" ;;
+        ipv6|6) family="ipv6" ;;
+        *) return 1 ;;
+    esac
+
+    target_type=$(detect_ip_type "$target")
+    case "$target_type" in
+        "$family")
+            printf '%s\n' "$target"
+            return 0
+            ;;
+        domain)
+            if [[ "$family" == "ipv4" ]]; then
+                resolved=$(getent ahosts "$target" 2>/dev/null | awk '/STREAM/{print $1}' | grep -E '^[0-9]+\.' | head -1 || true)
+            else
+                resolved=$(getent ahosts "$target" 2>/dev/null | awk '/STREAM/{print $1}' | grep ':' | head -1 || true)
+            fi
+            [[ -n "$resolved" ]] || return 1
+            printf '%s\n' "$resolved"
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_mss_collect_path_mtu() {
+    local family_flag="$1" route_target="$2" fallback_addr="${3:-}" route_source="${4:-}"
+    local route_output="" route_iface="" route_mtu="" iface="" mtu="" effective_mtu=""
+    local pppoe_overhead=8
+
+    MSS_PATH_IFACE=""
+    MSS_PATH_MTU=""
+    MSS_PATH_ROUTE_MTU=""
+    MSS_PATH_EFFECTIVE_MTU=""
+    MSS_PATH_PPPoE="false"
+
+    route_output=$(_mss_route_probe "$family_flag" "$route_target" "$route_source") || route_output=""
+    if [[ -n "$route_output" ]]; then
+        route_iface=$(_mss_route_field "$route_output" dev || true)
+        route_mtu=$(_mss_route_field "$route_output" mtu || true)
+    fi
+
+    iface="$route_iface"
+    if [[ -z "$iface" && -n "$fallback_addr" ]]; then
+        iface=$(_mss_iface_for_address "$family_flag" "$fallback_addr" || true)
+    fi
+    [[ -n "$iface" ]] || return 1
+
+    mtu=$(_iface_link_mtu "$iface") || true
+    [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+
+    effective_mtu="$mtu"
+    if [[ "$route_mtu" =~ ^[0-9]+$ ]] && (( route_mtu > 0 && route_mtu < effective_mtu )); then
+        effective_mtu="$route_mtu"
+    fi
+
+    if _iface_is_pppoe_like "$iface"; then
+        MSS_PATH_PPPoE="true"
+        if (( effective_mtu > 1492 )); then
+            effective_mtu=$(( effective_mtu - pppoe_overhead ))
+        fi
+    fi
+
+    MSS_PATH_IFACE="$iface"
+    MSS_PATH_MTU="$mtu"
+    MSS_PATH_ROUTE_MTU="$route_mtu"
+    MSS_PATH_EFFECTIVE_MTU="$effective_mtu"
+}
+
 suggest_mss_for_snat_source() {
-    local snat_source="$1"
+    local snat_source="$1" target="${2:-}"
     MSS_SUGGEST_IFACE=""
     MSS_SUGGEST_MTU=""
     MSS_SUGGEST_EFFECTIVE_MTU=""
@@ -1481,11 +1719,24 @@ suggest_mss_for_snat_source() {
     MSS_SUGGEST_FAMILY=""
     MSS_SUGGEST_LOGIC=""
     MSS_SUGGEST_PPPoE="false"
+    MSS_SUGGEST_SOURCE_IFACE=""
+    MSS_SUGGEST_SOURCE_MTU=""
+    MSS_SUGGEST_SOURCE_ROUTE_MTU=""
+    MSS_SUGGEST_SOURCE_EFFECTIVE_MTU=""
+    MSS_SUGGEST_SOURCE_PPPoE="false"
+    MSS_SUGGEST_TARGET_ADDR=""
+    MSS_SUGGEST_TARGET_IFACE=""
+    MSS_SUGGEST_TARGET_MTU=""
+    MSS_SUGGEST_TARGET_ROUTE_MTU=""
+    MSS_SUGGEST_TARGET_EFFECTIVE_MTU=""
+    MSS_SUGGEST_TARGET_PPPoE="false"
+    MSS_SUGGEST_BOTTLENECK=""
 
     command -v ip >/dev/null 2>&1 || return 1
 
-    local family family_flag iface route_output route_iface route_mtu mtu effective_mtu overhead suggested
-    local ip_header_bytes tcp_header_bytes=20 pppoe_overhead=8
+    local family family_flag source_probe_target resolved_target overhead suggested selected_effective
+    local ip_header_bytes tcp_header_bytes=20 chosen_ifc chosen_mtu chosen_route_mtu chosen_pppoe chosen_label
+    local source_available=false target_available=false
     family=$(detect_ip_type "$snat_source")
     case "$family" in
         ipv4)
@@ -1505,73 +1756,97 @@ suggest_mss_for_snat_source() {
             ;;
     esac
 
-    iface=$(ip -o "$family_flag" addr show 2>/dev/null | awk -v target="$snat_source" '
-        {
-            split($4, a, "/")
-            if (a[1] == target) {
-                print $2
-                exit
-            }
-        }
-    ') || true
-    [[ -n "$iface" ]] || return 1
-
-    route_output=$(_mss_route_probe_for_source "$family_flag" "$snat_source") || route_output=""
-    if [[ -n "$route_output" ]]; then
-        route_iface=$(awk '
-            {
-                for (i = 1; i <= NF; i++) {
-                    if ($i == "dev") {
-                        print $(i + 1)
-                        exit
-                    }
-                }
-            }
-        ' <<< "$route_output")
-        route_mtu=$(awk '
-            {
-                for (i = 1; i <= NF; i++) {
-                    if ($i == "mtu") {
-                        print $(i + 1)
-                        exit
-                    }
-                }
-            }
-        ' <<< "$route_output")
+    source_probe_target=$(_mss_default_probe_target "$family_flag" || true)
+    if [[ -n "$source_probe_target" ]] && _mss_collect_path_mtu "$family_flag" "$source_probe_target" "$snat_source" "$snat_source"; then
+        source_available=true
+        MSS_SUGGEST_SOURCE_IFACE="$MSS_PATH_IFACE"
+        MSS_SUGGEST_SOURCE_MTU="$MSS_PATH_MTU"
+        MSS_SUGGEST_SOURCE_ROUTE_MTU="$MSS_PATH_ROUTE_MTU"
+        MSS_SUGGEST_SOURCE_EFFECTIVE_MTU="$MSS_PATH_EFFECTIVE_MTU"
+        MSS_SUGGEST_SOURCE_PPPoE="$MSS_PATH_PPPoE"
     fi
 
-    [[ -n "$route_iface" ]] && iface="$route_iface"
-
-    mtu=$(_iface_link_mtu "$iface") || true
-    [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
-
-    effective_mtu="$mtu"
-    if [[ "$route_mtu" =~ ^[0-9]+$ ]] && (( route_mtu > 0 && route_mtu < effective_mtu )); then
-        effective_mtu="$route_mtu"
+    resolved_target=$(_mss_resolve_target_for_family "$target" "$family" || true)
+    if [[ -n "$resolved_target" ]] && _mss_collect_path_mtu "$family_flag" "$resolved_target"; then
+        target_available=true
+        MSS_SUGGEST_TARGET_ADDR="$resolved_target"
+        MSS_SUGGEST_TARGET_IFACE="$MSS_PATH_IFACE"
+        MSS_SUGGEST_TARGET_MTU="$MSS_PATH_MTU"
+        MSS_SUGGEST_TARGET_ROUTE_MTU="$MSS_PATH_ROUTE_MTU"
+        MSS_SUGGEST_TARGET_EFFECTIVE_MTU="$MSS_PATH_EFFECTIVE_MTU"
+        MSS_SUGGEST_TARGET_PPPoE="$MSS_PATH_PPPoE"
     fi
 
-    if _iface_is_pppoe_like "$iface"; then
-        MSS_SUGGEST_PPPoE="true"
-        if (( effective_mtu > 1492 )); then
-            effective_mtu=$(( effective_mtu - pppoe_overhead ))
+    $source_available || $target_available || return 1
+
+    if $source_available && $target_available; then
+        if (( MSS_SUGGEST_SOURCE_EFFECTIVE_MTU < MSS_SUGGEST_TARGET_EFFECTIVE_MTU )); then
+            MSS_SUGGEST_BOTTLENECK="source"
+        elif (( MSS_SUGGEST_TARGET_EFFECTIVE_MTU < MSS_SUGGEST_SOURCE_EFFECTIVE_MTU )); then
+            MSS_SUGGEST_BOTTLENECK="target"
+        else
+            MSS_SUGGEST_BOTTLENECK="both"
         fi
+    elif $source_available; then
+        MSS_SUGGEST_BOTTLENECK="source"
+    else
+        MSS_SUGGEST_BOTTLENECK="target"
     fi
 
-    suggested=$(( effective_mtu - overhead ))
+    case "$MSS_SUGGEST_BOTTLENECK" in
+        source)
+            selected_effective="$MSS_SUGGEST_SOURCE_EFFECTIVE_MTU"
+            chosen_ifc="$MSS_SUGGEST_SOURCE_IFACE"
+            chosen_mtu="$MSS_SUGGEST_SOURCE_MTU"
+            chosen_route_mtu="$MSS_SUGGEST_SOURCE_ROUTE_MTU"
+            chosen_pppoe="$MSS_SUGGEST_SOURCE_PPPoE"
+            chosen_label="source-side"
+            ;;
+        target)
+            selected_effective="$MSS_SUGGEST_TARGET_EFFECTIVE_MTU"
+            chosen_ifc="$MSS_SUGGEST_TARGET_IFACE"
+            chosen_mtu="$MSS_SUGGEST_TARGET_MTU"
+            chosen_route_mtu="$MSS_SUGGEST_TARGET_ROUTE_MTU"
+            chosen_pppoe="$MSS_SUGGEST_TARGET_PPPoE"
+            chosen_label="backend-side"
+            ;;
+        both)
+            selected_effective="$MSS_SUGGEST_SOURCE_EFFECTIVE_MTU"
+            chosen_ifc="$MSS_SUGGEST_SOURCE_IFACE"
+            chosen_mtu="$MSS_SUGGEST_SOURCE_MTU"
+            chosen_route_mtu="$MSS_SUGGEST_SOURCE_ROUTE_MTU"
+            chosen_pppoe="$MSS_SUGGEST_SOURCE_PPPoE"
+            chosen_label="shared"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    suggested=$(( selected_effective - overhead ))
     validate_mss_value "$suggested" || return 1
 
-    MSS_SUGGEST_IFACE="$iface"
-    MSS_SUGGEST_MTU="$mtu"
-    MSS_SUGGEST_EFFECTIVE_MTU="$effective_mtu"
+    MSS_SUGGEST_IFACE="$chosen_ifc"
+    MSS_SUGGEST_MTU="$chosen_mtu"
+    MSS_SUGGEST_EFFECTIVE_MTU="$selected_effective"
     MSS_SUGGEST_VALUE="$suggested"
-    if [[ "$MSS_SUGGEST_PPPoE" == "true" ]]; then
-        if (( effective_mtu != mtu )); then
-            MSS_SUGGEST_LOGIC="detected PPPoE on ${iface}, effective MTU = ${mtu} - ${pppoe_overhead} = ${effective_mtu}; ${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
-        else
-            MSS_SUGGEST_LOGIC="detected PPPoE on ${iface}, effective MTU = ${effective_mtu}; ${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
-        fi
+    MSS_SUGGEST_PPPoE="$chosen_pppoe"
+    if $source_available && $target_available; then
+        case "$MSS_SUGGEST_BOTTLENECK" in
+            source)
+                MSS_SUGGEST_LOGIC="source-side effective MTU ${MSS_SUGGEST_SOURCE_EFFECTIVE_MTU} on ${MSS_SUGGEST_SOURCE_IFACE}; backend-side effective MTU ${MSS_SUGGEST_TARGET_EFFECTIVE_MTU} to ${MSS_SUGGEST_TARGET_ADDR} via ${MSS_SUGGEST_TARGET_IFACE}; using the smaller source-side value ${selected_effective}; ${MSS_SUGGEST_FAMILY} MSS = ${selected_effective} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+                ;;
+            target)
+                MSS_SUGGEST_LOGIC="source-side effective MTU ${MSS_SUGGEST_SOURCE_EFFECTIVE_MTU} on ${MSS_SUGGEST_SOURCE_IFACE}; backend-side effective MTU ${MSS_SUGGEST_TARGET_EFFECTIVE_MTU} to ${MSS_SUGGEST_TARGET_ADDR} via ${MSS_SUGGEST_TARGET_IFACE}; using the smaller backend-side value ${selected_effective}; ${MSS_SUGGEST_FAMILY} MSS = ${selected_effective} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+                ;;
+            both)
+                MSS_SUGGEST_LOGIC="source-side and backend-side both resolve to effective MTU ${selected_effective}; ${MSS_SUGGEST_FAMILY} MSS = ${selected_effective} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+                ;;
+        esac
+    elif $source_available; then
+        MSS_SUGGEST_LOGIC="backend-side path unavailable; using source-side effective MTU ${selected_effective} on ${MSS_SUGGEST_SOURCE_IFACE}; ${MSS_SUGGEST_FAMILY} MSS = ${selected_effective} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
     else
-        MSS_SUGGEST_LOGIC="${MSS_SUGGEST_FAMILY} MSS = ${effective_mtu} (effective MTU on ${iface}) - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
+        MSS_SUGGEST_LOGIC="source-side path unavailable; using backend-side effective MTU ${selected_effective} to ${MSS_SUGGEST_TARGET_ADDR} via ${MSS_SUGGEST_TARGET_IFACE}; ${MSS_SUGGEST_FAMILY} MSS = ${selected_effective} - ${ip_header_bytes} (IP) - ${tcp_header_bytes} (TCP) = ${suggested}"
     fi
     return 0
 }
@@ -1723,6 +1998,130 @@ expand_port_spec() {
         msg_err "No valid port specs found"
         return 1
     fi
+}
+
+_validate_add_request() {
+    local method="$1" target="$2" rules_str="$3" comment="$4"
+    local mss_mode="${5:-}" mss_value="${6:-}" snat_mode="${7:-masquerade}" snat_source="${8:-}" replace_mode="${9:-false}"
+
+    if [[ -z "$method" ]]; then
+        msg_err "Method is required. Use -m nft"
+        return 1
+    fi
+    if [[ "$method" == "realm" ]]; then
+        return 0
+    fi
+    if [[ -z "$rules_str" ]]; then
+        msg_err "No ports specified"
+        msg_err "Usage: pfwd -m nft -t <target> <ports>"
+        return 1
+    fi
+    if [[ -z "$target" ]]; then
+        msg_err "Target is required. Use -t <ip|domain>"
+        return 1
+    fi
+    if [[ -n "$mss_mode" && "$method" != "nft" ]]; then
+        msg_err "MSS options are only supported with -m nft"
+        return 1
+    fi
+    if [[ "$mss_mode" == "set" ]]; then
+        if ! validate_mss_value "$mss_value"; then
+            msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
+            return 1
+        fi
+    fi
+    if ! validate_comment "$comment"; then
+        msg_err "Comment must be a single line without tabs"
+        return 1
+    fi
+    if [[ "$snat_mode" == "snat" ]]; then
+        local snat_type
+        if [[ "$method" != "nft" ]]; then
+            msg_err "Fixed SNAT source is only supported with -m nft"
+            return 1
+        fi
+        snat_type=$(detect_ip_type "$snat_source")
+        if [[ "$snat_type" != "ipv4" && "$snat_type" != "ipv6" ]]; then
+            msg_err "Invalid SNAT source address: $snat_source"
+            return 1
+        fi
+    fi
+    if [[ "$replace_mode" == "true" && "$method" != "nft" ]]; then
+        msg_err "--replace is only supported with -m nft"
+        return 1
+    fi
+    if ! validate_target "$target"; then
+        msg_err "Invalid target: $target"
+        return 1
+    fi
+}
+
+_prepare_add_request() {
+    local method="$1" target="$2" rules_str="$3" comment="$4"
+    local mss_mode="${5:-}" mss_value="${6:-}" snat_mode="${7:-masquerade}" snat_source="${8:-}" replace_mode="${9:-false}"
+
+    if ! _validate_add_request "$method" "$target" "$rules_str" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
+        return 1
+    fi
+    [[ "$method" == "realm" ]] && return 0
+
+    if ! expand_port_spec "$rules_str" "$target"; then
+        return 1
+    fi
+}
+
+_execute_add_request() {
+    local method="$1" ip_ver="$2" proto="$3" comment="$4"
+    local mss_mode="${5:-}" mss_value="${6:-}" snat_mode="${7:-masquerade}" snat_source="${8:-}" replace_mode="${9:-false}"
+    local progress_label="${10:-Adding}" progress_mode="${11:-false}"
+    local added=0 failed=0 progress_idx=0
+    local total_rules=${#EXPANDED_RULES[@]}
+    local used_batch=false
+
+    PFWD_ADD_ADDED=0
+    PFWD_ADD_FAILED=0
+    PFWD_ADD_TOTAL=$total_rules
+
+    ensure_ip_forwarding 2>/dev/null || true
+
+    if (( total_rules > 1 )); then
+        _BATCH_MODE=true
+        used_batch=true
+    else
+        _BATCH_MODE=false
+    fi
+
+    local expanded
+    for expanded in "${EXPANDED_RULES[@]}"; do
+        ((progress_idx++)) || true
+        if [[ "$progress_mode" == "true" && $total_rules -gt 3 ]]; then
+            show_progress "$progress_idx" "$total_rules" "$progress_label"
+        fi
+        if ! parse_rule "$expanded"; then
+            ((failed++)) || true
+            continue
+        fi
+        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
+            ((added++)) || true
+        else
+            ((failed++)) || true
+        fi
+    done
+
+    _BATCH_MODE=false
+    if ! _batch_finalize "$method"; then
+        if $used_batch; then
+            failed=$(( failed + added ))
+            added=0
+        else
+            PFWD_ADD_ADDED=$added
+            PFWD_ADD_FAILED=$failed
+            return 1
+        fi
+    fi
+
+    PFWD_ADD_ADDED=$added
+    PFWD_ADD_FAILED=$failed
 }
 
 # format_bytes <bytes> -> human readable string
@@ -2571,6 +2970,7 @@ _batch_finalize() {
             fi
             $batch_ok || return 1
             if $_DIRTY_NFT; then
+                _ensure_nft_dispatch_chains
                 sync_managed_firewall_state
                 nft_save "auto"
                 nft_setup_persistence
@@ -2701,16 +3101,19 @@ _parse_delete_input() {
 _ensure_nft_dispatch_chains() {
     _nft_table_exists || return 0
 
-    local changed=false section chain proto ipver tag match_tokens
+    local chains_changed=false dispatch_changed=false
+    local section chain proto ipver tag match_tokens subchain
     for section in prerouting postrouting forward; do
         while IFS= read -r chain; do
             [[ -n "$chain" ]] || continue
             if ! _nft_cached_chain "$chain" >/dev/null; then
                 plat_nft_quiet add chain $NFT_TABLE "$chain"
-                changed=true
+                chains_changed=true
             fi
         done < <(_pfwd_subchain_list "$section")
     done
+
+    $chains_changed && _nft_invalidate_cache
 
     local prerouting_data postrouting_data forward_data
     prerouting_data=$(_nft_cached_chain prerouting || true)
@@ -2725,34 +3128,61 @@ _ensure_nft_dispatch_chains() {
             match_tokens=$(_pfwd_dispatch_match_tokens "$proto" "$ipver")
 
             tag=$(_pfwd_dispatch_tag prerouting "$proto" "$ipver")
-            if [[ "$prerouting_data" != *"comment \"$tag\""* ]]; then
-                plat_nft_quiet add rule $NFT_TABLE prerouting $match_tokens \
-                    jump "$(_pfwd_subchain_name prerouting "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
-                changed=true
+            subchain=$(_pfwd_subchain_name prerouting "$proto" "$ipver")
+            if _nft_chain_has_rules "$subchain"; then
+                if [[ "$prerouting_data" != *"comment \"$tag\""* ]]; then
+                    plat_nft_quiet add rule $NFT_TABLE prerouting $match_tokens \
+                        jump "$subchain" comment "$(nft_quote_token "$tag")"
+                    dispatch_changed=true
+                fi
+            else
+                while IFS= read -r handle; do
+                    [[ -n "$handle" ]] || continue
+                    plat_nft_delete_rule_handle $NFT_TABLE prerouting "$handle"
+                    dispatch_changed=true
+                done < <(_nft_rule_handles_by_comment prerouting "$tag")
             fi
 
             tag=$(_pfwd_dispatch_tag postrouting "$proto" "$ipver")
-            if [[ "$postrouting_data" != *"comment \"$tag\""* ]]; then
-                plat_nft_quiet add rule $NFT_TABLE postrouting ct status dnat $match_tokens \
-                    jump "$(_pfwd_subchain_name postrouting "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
-                changed=true
+            subchain=$(_pfwd_subchain_name postrouting "$proto" "$ipver")
+            if _nft_chain_has_rules "$subchain"; then
+                if [[ "$postrouting_data" != *"comment \"$tag\""* ]]; then
+                    plat_nft_quiet add rule $NFT_TABLE postrouting ct status dnat $match_tokens \
+                        jump "$subchain" comment "$(nft_quote_token "$tag")"
+                    dispatch_changed=true
+                fi
+            else
+                while IFS= read -r handle; do
+                    [[ -n "$handle" ]] || continue
+                    plat_nft_delete_rule_handle $NFT_TABLE postrouting "$handle"
+                    dispatch_changed=true
+                done < <(_nft_rule_handles_by_comment postrouting "$tag")
             fi
 
             tag=$(_pfwd_dispatch_tag forward "$proto" "$ipver")
-            if [[ "$forward_data" != *"comment \"$tag\""* ]]; then
-                if [[ -n "$forward_accept_handle" ]]; then
-                    plat_nft_quiet insert rule $NFT_TABLE forward handle "$forward_accept_handle" $match_tokens \
-                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
-                else
-                    plat_nft_quiet add rule $NFT_TABLE forward $match_tokens \
-                        jump "$(_pfwd_subchain_name forward "$proto" "$ipver")" comment "$(nft_quote_token "$tag")"
+            subchain=$(_pfwd_subchain_name forward "$proto" "$ipver")
+            if _nft_chain_has_rules "$subchain"; then
+                if [[ "$forward_data" != *"comment \"$tag\""* ]]; then
+                    if [[ -n "$forward_accept_handle" ]]; then
+                        plat_nft_quiet insert rule $NFT_TABLE forward handle "$forward_accept_handle" $match_tokens \
+                            jump "$subchain" comment "$(nft_quote_token "$tag")"
+                    else
+                        plat_nft_quiet add rule $NFT_TABLE forward $match_tokens \
+                            jump "$subchain" comment "$(nft_quote_token "$tag")"
+                    fi
+                    dispatch_changed=true
                 fi
-                changed=true
+            else
+                while IFS= read -r handle; do
+                    [[ -n "$handle" ]] || continue
+                    plat_nft_delete_rule_handle $NFT_TABLE forward "$handle"
+                    dispatch_changed=true
+                done < <(_nft_rule_handles_by_comment forward "$tag")
             fi
         done
     done
 
-    $changed && _nft_invalidate_cache
+    $dispatch_changed && _nft_invalidate_cache
 }
 
 # nft_ensure_table - create table, chains, and flowtable if not exist
@@ -3254,7 +3684,8 @@ _nft_collect_add_conflicts() {
     NFT_ADD_CONFLICTS=()
 
     local parsed resolved_targets
-    parsed=$(_parse_nft_prerouting_rules)
+    _nft_prepare_snapshot
+    parsed="$_NFT_SNAPSHOT_PARSED"
     [[ -n "$parsed" ]] || return 0
     if ! resolved_targets=$(_nft_resolve_targets "$target" "$ip_ver"); then
         return 1
@@ -3459,9 +3890,10 @@ _nft_prerouting_dnat_lines() {
 # Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>bytes
 # Args: [nft_output] - if empty, fetches from nft
 _parse_nft_prerouting_rules() {
-    local nft_output="${1:-}"
-    if [[ -z "$nft_output" ]]; then
-        nft_output=$(_nft_prerouting_dnat_lines)
+    local nft_output="${1-__PFWD_DEFAULT__}"
+    if [[ "$nft_output" == "__PFWD_DEFAULT__" ]]; then
+        _nft_prepare_snapshot
+        nft_output="$_NFT_SNAPSHOT_PREROUTING"
     fi
     [[ -z "$nft_output" ]] && return 0
 
@@ -3487,7 +3919,7 @@ _parse_nft_prerouting_rules() {
         }
 
         if (match($0, /dnat ip6 to /)) {
-            rest = substr($0, RSTART + 13)
+            rest = substr($0, RSTART + RLENGTH)
             p = index(rest, "]:")
             if (p > 1) {
                 target = substr(rest, 2, p - 2)
@@ -3540,39 +3972,23 @@ _parse_nft_prerouting_rules() {
 # _parse_nft_export_rules - parse nft rules plus optional pfwd MSS/SNAT metadata
 # Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>snat_mode<TAB>snat_source<TAB>mss_mode<TAB>mss_value
 _parse_nft_export_rules() {
-    local parsed
-    parsed=$(_parse_nft_prerouting_rules)
+    local parsed="${1:-}"
+    if [[ -z "$parsed" ]]; then
+        _nft_prepare_snapshot
+        parsed="$_NFT_SNAPSHOT_PARSED"
+    fi
     [[ -z "$parsed" ]] && return 0
-
-    local post_data forward_data
-    post_data=$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)
-    forward_data=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)
 
     local proto lport ipver target tport comment bytes
     while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
 
         local tag snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
-        local post_line="" mss_line=""
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
-
-        post_line=$(printf '%s\n' "$post_data" | grep -F "comment \"$tag\"" | head -1 || true)
-        if [[ -n "$post_line" && "$post_line" =~ snat([[:space:]]+ip6?|[[:space:]]+ip)?[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
-            snat_mode="snat"
-            snat_source="${BASH_REMATCH[2]}"
-            snat_source="${snat_source#[}"
-            snat_source="${snat_source%]}"
-        fi
-
-        mss_line=$(printf '%s\n' "$forward_data" | grep -F "comment \"${tag}:mss\"" | head -1 || true)
-        if [[ -n "$mss_line" ]]; then
-            if [[ "$mss_line" =~ tcp\ option\ maxseg\ size\ set\ rt\ mtu ]]; then
-                mss_mode="clamp"
-            elif [[ "$mss_line" =~ tcp\ option\ maxseg\ size\ set\ ([0-9]+) ]]; then
-                mss_mode="set"
-                mss_value="${BASH_REMATCH[1]}"
-            fi
-        fi
+        [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]] && snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
+        [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
+        [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]] && mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
+        [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
 
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
@@ -3583,32 +3999,18 @@ _parse_nft_export_rules() {
 # _parse_nft_bidirectional_traffic - parse prerouting + forward chain for traffic stats
 # Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>in_bytes<TAB>out_bytes<TAB>total_bytes
 _parse_nft_bidirectional_traffic() {
-    local parsed_prerouting
-    parsed_prerouting=$(_parse_nft_prerouting_rules)
+    local parsed_prerouting="${1:-}"
+    if [[ -z "$parsed_prerouting" ]]; then
+        _nft_prepare_snapshot
+        parsed_prerouting="$_NFT_SNAPSHOT_PARSED"
+    fi
     [[ -z "$parsed_prerouting" ]] && return 0
-
-    local forward_ret_output
-    forward_ret_output=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) | grep "pfwd_ret:" || true)
-
-    declare -A out_bytes_map=()
-    local line
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        if [[ "$line" =~ pfwd_ret:([0-9]+):([46]):([a-z]+) ]]; then
-            local key="${BASH_REMATCH[3]}|${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
-            local out_bytes=0
-            if [[ "$line" =~ bytes[[:space:]]+([0-9]+) ]]; then
-                out_bytes="${BASH_REMATCH[1]}"
-            fi
-            out_bytes_map["$key"]="$out_bytes"
-        fi
-    done <<< "$forward_ret_output"
 
     local proto lport ipver target tport comment in_bytes
     while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes; do
         [[ -z "$lport" ]] && continue
         local key="${proto}|${lport}|${ipver}"
-        local out_bytes="${out_bytes_map[$key]:-0}"
+        local out_bytes="${_NFT_SNAPSHOT_OUT_BYTES[$key]:-0}"
         local total_bytes=$(( in_bytes + out_bytes ))
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" "$in_bytes" "$out_bytes" "$total_bytes"
@@ -4911,8 +5313,9 @@ Options:
   --no-clear                 Don't clear screen in interactive menu
 
 Interactive note:
-  After choosing fixed SNAT, the menu can suggest a fixed MSS from that source
-  interface MTU. The suggestion is informational; you still choose Off/Clamp/Fixed.
+  After choosing fixed SNAT, the menu can suggest a fixed MSS from the
+  smaller local path MTU it can observe on the source-side and backend-side.
+  The suggestion is informational; you still choose Off/Clamp/Fixed.
 EOF
 }
 
@@ -4951,99 +5354,18 @@ cmd_add() {
         rules_str="${positional_args[*]}"
     fi
 
-    if [[ -z "$method" ]]; then
-        msg_err "Method is required. Use -m nft"
+    if ! _prepare_add_request "$method" "$target" "$rules_str" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
         return 1
     fi
 
-    if [[ "$method" == "realm" ]]; then
-        return 0
-    fi
+    [[ "$method" == "realm" ]] && return 0
 
-    if [[ -z "$rules_str" ]]; then
-        msg_err "No ports specified"
-        msg_err "Usage: pfwd -m nft -t <target> <ports>"
+    if ! _execute_add_request "$method" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
         return 1
     fi
 
-    if [[ -z "$target" ]]; then
-        msg_err "Target is required. Use -t <ip|domain>"
-        return 1
-    fi
-
-    if [[ -n "$mss_mode" && "$method" != "nft" ]]; then
-        msg_err "MSS options are only supported with -m nft"
-        return 1
-    fi
-    if [[ "$mss_mode" == "set" ]]; then
-        if ! validate_mss_value "$mss_value"; then
-            msg_err "Invalid MSS value: $mss_value (must be 536-65535)"
-            return 1
-        fi
-    fi
-    if ! validate_comment "$comment"; then
-        msg_err "Comment must be a single line without tabs"
-        return 1
-    fi
-    if [[ "$snat_mode" == "snat" ]]; then
-        if [[ "$method" != "nft" ]]; then
-            msg_err "Fixed SNAT source is only supported with -m nft"
-            return 1
-        fi
-        local snat_type
-        snat_type=$(detect_ip_type "$snat_source")
-        if [[ "$snat_type" != "ipv4" && "$snat_type" != "ipv6" ]]; then
-            msg_err "Invalid SNAT source address: $snat_source"
-            return 1
-        fi
-    fi
-    if [[ "$replace_mode" == "true" && "$method" != "nft" ]]; then
-        msg_err "--replace is only supported with -m nft"
-        return 1
-    fi
-
-    # Ensure IP forwarding is on (full optimization: use 'pfwd optimize [profile]')
-    ensure_ip_forwarding 2>/dev/null || true
-
-    local added=0 failed=0
-
-    if ! validate_target "$target"; then
-        msg_err "Invalid target: $target"
-        return 1
-    fi
-    if ! expand_port_spec "$rules_str" "$target"; then
-        return 1
-    fi
-    if (( ${#EXPANDED_RULES[@]} > 1 )); then
-        _BATCH_MODE=true
-    else
-        _BATCH_MODE=false
-    fi
-    for expanded in "${EXPANDED_RULES[@]}"; do
-        if ! parse_rule "$expanded"; then
-            ((failed++)) || true; continue
-        fi
-        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
-            ((added++)) || true
-        else
-            ((failed++)) || true
-        fi
-    done
-
-    # Batch finalize: save/persist/restart once
-    local used_batch=$_BATCH_MODE
-    _BATCH_MODE=false
-    if ! _batch_finalize "$method"; then
-        if $used_batch; then
-            failed=$(( failed + added ))
-            added=0
-        else
-            return 1
-        fi
-    fi
-
-    if (( added > 0 || failed > 0 )); then
-        msg_info "Result: $added added, $failed failed"
+    if (( PFWD_ADD_ADDED > 0 || PFWD_ADD_FAILED > 0 )); then
+        msg_info "Result: $PFWD_ADD_ADDED added, $PFWD_ADD_FAILED failed"
     fi
 }
 
@@ -5528,6 +5850,68 @@ cmd_uninstall() {
     esac
 }
 
+_rewrite_shortcut_args() {
+    PFWD_SHORTCUT_ARGS=()
+    if [[ $# -lt 2 ]]; then
+        return 1
+    fi
+    if [[ ! "$1" =~ ^[0-9] || "$2" =~ ^- ]]; then
+        return 1
+    fi
+
+    local first="$1" second="$2" target_port="" extra_start=3 arg_index rewritten_ports
+    if [[ "$1" =~ ^[0-9]+$ && $# -ge 3 && "${3:-}" =~ ^[0-9]+$ ]]; then
+        target_port=":$3"
+        extra_start=4
+    fi
+
+    if [[ -n "$target_port" ]]; then
+        rewritten_ports="${first}${target_port}"
+    else
+        rewritten_ports="$first"
+    fi
+
+    PFWD_SHORTCUT_ARGS=("-m" "nft" "-t" "$second" "$rewritten_ports")
+    for (( arg_index=extra_start; arg_index<=$#; arg_index++ )); do
+        PFWD_SHORTCUT_ARGS+=("${!arg_index}")
+    done
+    return 0
+}
+
+_parse_import_args() {
+    PFWD_IMPORT_PATH=""
+    PFWD_IMPORT_METHOD=""
+    PFWD_IMPORT_URL=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --url)
+                require_option_value "$1" "$@" || return 1
+                PFWD_IMPORT_URL="$2"
+                shift 2
+                ;;
+            -m|--method)
+                require_option_value "$1" "$@" || return 1
+                PFWD_IMPORT_METHOD="$2"
+                shift 2
+                ;;
+            -*)
+                msg_err "Unknown option: $1"
+                return 1
+                ;;
+            *)
+                PFWD_IMPORT_PATH="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$PFWD_IMPORT_URL" && -z "$PFWD_IMPORT_PATH" ]]; then
+        msg_err "Specify a file path or --url"
+        return 1
+    fi
+}
+
 # parse_cli_args - main CLI entry point
 parse_cli_args() {
     if [[ $# -eq 0 ]]; then
@@ -5535,37 +5919,9 @@ parse_cli_args() {
         return
     fi
 
-    # Shortcut syntax: pfwd <port> <target> [tport]
-    # Detect: first arg is a number/port-spec and second arg exists
-    if [[ $# -ge 2 && "$1" =~ ^[0-9] && ! "$1" =~ ^[0-9]+$ ]] || \
-       [[ $# -ge 2 && "$1" =~ ^[0-9]+$ ]]; then
-        local _first="$1"
-        local _second="${2:-}"
-        # Make sure second arg is not a known subcommand flag
-        if [[ -n "$_second" && ! "$_second" =~ ^- ]]; then
-            local _tport_arg=""
-            local _extra_start=3
-            if [[ $# -ge 3 && "${3:-}" =~ ^[0-9]+$ ]]; then
-                # pfwd 8080 1.2.3.4 80 → port mapping
-                _tport_arg=":$3"
-                _extra_start=4
-            fi
-            # Rewrite: pfwd <ports> <target> [tport] → pfwd add -m nft -t <target> <ports_with_mapping>
-            local _rewritten_ports
-            if [[ -n "$_tport_arg" ]]; then
-                # Single port with target port mapping
-                _rewritten_ports="${_first}${_tport_arg}"
-            else
-                _rewritten_ports="$_first"
-            fi
-            local -a _shortcut_args=("-m" "nft" "-t" "$_second" "$_rewritten_ports")
-            local _arg_index
-            for (( _arg_index=_extra_start; _arg_index<=$#; _arg_index++ )); do
-                _shortcut_args+=("${!_arg_index}")
-            done
-            cmd_add "${_shortcut_args[@]}"
-            return
-        fi
+    if _rewrite_shortcut_args "$@"; then
+        cmd_add "${PFWD_SHORTCUT_ARGS[@]}"
+        return
     fi
 
     case "$1" in
@@ -5639,21 +5995,8 @@ parse_cli_args() {
             ;;
         import)
             shift
-            local import_path="" import_method="" import_url=""
-            while [[ $# -gt 0 ]]; do
-                case "$1" in
-                    --url) require_option_value "$1" "$@" || return 1; import_url="$2"; shift 2 ;;
-                    -m|--method) require_option_value "$1" "$@" || return 1; import_method="$2"; shift 2 ;;
-                    -*) msg_err "Unknown option: $1"; return 1 ;;
-                    *)  import_path="$1"; shift ;;
-                esac
-            done
-            local src="${import_url:-$import_path}"
-            if [[ -z "$src" ]]; then
-                msg_err "Specify a file path or --url"
-                return 1
-            fi
-            cmd_import "$src" "$import_method"
+            _parse_import_args "$@" || return 1
+            cmd_import "${PFWD_IMPORT_URL:-$PFWD_IMPORT_PATH}" "$PFWD_IMPORT_METHOD"
             ;;
         uninstall)
             shift
@@ -5682,16 +6025,6 @@ parse_cli_args() {
             ;;
         -q|--quiet)
             QUIET=true
-            shift
-            parse_cli_args "$@"
-            ;;
-        --no-color)
-            # Already handled in pre-scan, just consume the flag
-            shift
-            parse_cli_args "$@"
-            ;;
-        --no-clear)
-            # Already handled in pre-scan, just consume the flag
             shift
             parse_cli_args "$@"
             ;;
@@ -5918,7 +6251,9 @@ interactive_menu() {
 # menu_add_rule - interactive rule addition
 menu_add_rule() {
     local mss_mode="" mss_value="" snat_mode="masquerade" snat_source="" replace_mode="false"
-    local suggested_mss="" suggested_mss_iface="" suggested_mss_mtu="" suggested_mss_family=""
+    local suggested_mss="" suggested_mss_iface="" suggested_mss_mtu="" suggested_mss_effective_mtu="" suggested_mss_family="" suggested_mss_logic=""
+    local suggested_mss_side="" suggested_mss_source_iface="" suggested_mss_source_mtu="" suggested_mss_source_effective_mtu=""
+    local suggested_mss_target_addr="" suggested_mss_target_iface="" suggested_mss_target_mtu="" suggested_mss_target_effective_mtu=""
     echo ""
     echo -e "${BOLD}Add Forwarding Rule${NC}"
     echo -e "${DIM}$SEP_DASH_40${NC}"
@@ -6043,18 +6378,41 @@ menu_add_rule() {
                     wait_for_enter
                     return
                 fi
-                if [[ "$proto" != "udp" ]] && suggest_mss_for_snat_source "$snat_source"; then
+                if [[ "$proto" != "udp" ]] && suggest_mss_for_snat_source "$snat_source" "$target"; then
                     suggested_mss="$MSS_SUGGEST_VALUE"
                     suggested_mss_iface="$MSS_SUGGEST_IFACE"
                     suggested_mss_mtu="$MSS_SUGGEST_MTU"
                     suggested_mss_effective_mtu="$MSS_SUGGEST_EFFECTIVE_MTU"
                     suggested_mss_family="$MSS_SUGGEST_FAMILY"
                     suggested_mss_logic="$MSS_SUGGEST_LOGIC"
-                    if [[ "$suggested_mss_mtu" == "$suggested_mss_effective_mtu" ]]; then
-                        msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
-                    else
-                        msg_dim "  Detected ${suggested_mss_iface} MTU ${suggested_mss_mtu}, effective MTU ${suggested_mss_effective_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})"
+                    suggested_mss_side="$MSS_SUGGEST_BOTTLENECK"
+                    suggested_mss_source_iface="$MSS_SUGGEST_SOURCE_IFACE"
+                    suggested_mss_source_mtu="$MSS_SUGGEST_SOURCE_MTU"
+                    suggested_mss_source_effective_mtu="$MSS_SUGGEST_SOURCE_EFFECTIVE_MTU"
+                    suggested_mss_target_addr="$MSS_SUGGEST_TARGET_ADDR"
+                    suggested_mss_target_iface="$MSS_SUGGEST_TARGET_IFACE"
+                    suggested_mss_target_mtu="$MSS_SUGGEST_TARGET_MTU"
+                    suggested_mss_target_effective_mtu="$MSS_SUGGEST_TARGET_EFFECTIVE_MTU"
+                    if [[ -n "$suggested_mss_source_iface" ]]; then
+                        if [[ "$suggested_mss_source_mtu" == "$suggested_mss_source_effective_mtu" ]]; then
+                            msg_dim "  Source-side path via ${suggested_mss_source_iface}: MTU ${suggested_mss_source_mtu}"
+                        else
+                            msg_dim "  Source-side path via ${suggested_mss_source_iface}: MTU ${suggested_mss_source_mtu}, effective MTU ${suggested_mss_source_effective_mtu}"
+                        fi
                     fi
+                    if [[ -n "$suggested_mss_target_iface" ]]; then
+                        if [[ "$suggested_mss_target_mtu" == "$suggested_mss_target_effective_mtu" ]]; then
+                            msg_dim "  Backend path to ${suggested_mss_target_addr} via ${suggested_mss_target_iface}: MTU ${suggested_mss_target_mtu}"
+                        else
+                            msg_dim "  Backend path to ${suggested_mss_target_addr} via ${suggested_mss_target_iface}: MTU ${suggested_mss_target_mtu}, effective MTU ${suggested_mss_target_effective_mtu}"
+                        fi
+                    fi
+                    case "$suggested_mss_side" in
+                        source) msg_dim "  Using smaller source-side path, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})" ;;
+                        target) msg_dim "  Using smaller backend-side path, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})" ;;
+                        both) msg_dim "  Both sides converge on MTU ${suggested_mss_effective_mtu}, suggested fixed MSS ${suggested_mss} (${suggested_mss_family})" ;;
+                        *) msg_dim "  Suggested fixed MSS ${suggested_mss} (${suggested_mss_family})" ;;
+                    esac
                     [[ -n "$suggested_mss_logic" ]] && msg_dim "  Logic: ${suggested_mss_logic}"
                     msg_dim "  Clamp to PMTU is safer when path MTU may vary; fixed MSS is useful for PPPoE/tunnel setups."
                 fi
@@ -6097,7 +6455,7 @@ menu_add_rule() {
         fi
     fi
 
-    if ! expand_port_spec "$port_spec" "$target"; then
+    if ! _prepare_add_request "$method" "$target" "$port_spec" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
         msg_err "Failed to expand port spec"
         wait_for_enter
         return
@@ -6171,43 +6529,13 @@ menu_add_rule() {
     echo ""
     msg_info "Processing ${#EXPANDED_RULES[@]} expanded rule(s)..."
 
-    ensure_ip_forwarding 2>/dev/null || true
-
-    local added=0 failed=0
-    local total_rules=${#EXPANDED_RULES[@]}
-    if (( total_rules > 1 )); then
-        _BATCH_MODE=true
-    else
-        _BATCH_MODE=false
-    fi
-    local progress_idx=0
-    for expanded in "${EXPANDED_RULES[@]}"; do
-        ((progress_idx++)) || true
-        (( total_rules > 3 )) && show_progress "$progress_idx" "$total_rules" "Adding"
-        if ! parse_rule "$expanded"; then
-            ((failed++)) || true; continue
-        fi
-        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
-            ((added++)) || true
-        else
-            ((failed++)) || true
-        fi
-    done
-
-    local used_batch=$_BATCH_MODE
-    _BATCH_MODE=false
-    if ! _batch_finalize "$method"; then
-        if $used_batch; then
-            failed=$(( failed + added ))
-            added=0
-        else
-            wait_for_enter
-            return
-        fi
+    if ! _execute_add_request "$method" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode" "Adding" "true"; then
+        wait_for_enter
+        return
     fi
 
     echo ""
-    msg_info "Result: $added rules added, $failed failed"
+    msg_info "Result: $PFWD_ADD_ADDED rules added, $PFWD_ADD_FAILED failed"
     wait_for_enter
 }
 
@@ -6469,12 +6797,19 @@ menu_uninstall() {
 #  Section 10: Main Entry
 #===============================================================================
 
+main() {
+    init_runtime_flags "$@"
+    detect_script_path
+    ensure_shortcut_command "${PFWD_MAIN_ARGS[@]}"
+    if cli_requires_root "${PFWD_MAIN_ARGS[@]}"; then
+        require_root "${PFWD_MAIN_ARGS[@]}"
+    fi
+    parse_cli_args "${PFWD_MAIN_ARGS[@]}"
+}
+
 # Initialize script path detection
 SCRIPT_PATH=""
 
-detect_script_path
-ensure_shortcut_command "$@"
-if cli_requires_root "$@"; then
-    require_root "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-parse_cli_args "$@"

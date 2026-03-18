@@ -7,16 +7,11 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 - **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
 - **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
 - **Safe conflict handling** — duplicate nft port/protocol/IP-family rules are rejected unless you pass `--replace`
-- **Atomic nft persistence** — saved nft config is written via temp file + atomic replace
-- **Batch mode** — bulk add/delete with single save/restart cycle
-- **nft output caching** — TTL-based cache eliminates redundant `nft list` calls
 - **Flexible port syntax** — single ports, ranges, mappings, mixed formats
 - **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
 - **CLI + Interactive menu** with numbered rules and color coding
-- **Rule filtering** — `pfwd list -f <pattern>` for regex search
-- **Per-rule traffic statistics** with optional live rate display (`pfwd stats --rate`)
-- **Observer-only traffic collection** via conntrack or `/proc/net/nf_conntrack`, without per-rule nft counters
-- **Collector interval control** (`pfwd stats --interval [30s|1m|5m|10m|30m|1h]`)
+- **Rule filtering and traffic stats** — `pfwd list -f <pattern>`, `pfwd stats`, `pfwd stats --rate`
+- **Collector interval control** — `pfwd stats --interval [30s|1m|5m|10m|30m|1h]`
 - **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
 - **Kernel optimization profiles** — balanced / gaming / lowmem
 - **Backup/Import/Export** in JSON format (current v3 schema)
@@ -87,9 +82,8 @@ pfwd <ports> <target> [target_port]
 
 Interactive mode note:
 
-- After you choose fixed SNAT, `pfwd` can suggest a fixed MSS based on the detected source-interface MTU.
-- The suggestion also tries to detect PPPoE-style links and shows the calculation logic used for the recommendation.
-- The suggestion is informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
+- After you choose fixed SNAT, `pfwd` can suggest a fixed MSS from the smaller local-path MTU it can observe on the source-side and backend-side.
+- The suggestion still accounts for PPPoE-style links and remains informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
 
 ### Port Formats
 
@@ -105,16 +99,9 @@ Interactive mode note:
 ### Examples
 
 ```bash
-# Shortcut
-pfwd 8080 1.2.3.4
-pfwd 80,443 1.2.3.4
-pfwd 8080 1.2.3.4 80          # local 8080 -> remote 80
-pfwd 8080 1.2.3.4 --replace   # replace an existing nft rule explicitly
-
-# nftables
-pfwd -m nft -t 1.2.3.4 80,443,8080-8090
+# Add
+pfwd 8080 1.2.3.4 80
 pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
-pfwd -m nft -t 1.2.3.4 33389:3389
 pfwd -m nft -t 2.2.2.2 --replace 33389:3389
 
 # Delete
@@ -147,13 +134,10 @@ pfwd import --url https://example.com/backup.json
 
 Notes:
 
-- `pfwd export` writes the current v3 JSON schema.
-- `pfwd import` requires the current v3 schema with `forward_rules`.
-- Legacy backups that still contain traffic-limit fields are no longer accepted.
+- Import/export use the current v3 JSON schema with `forward_rules`; backups containing legacy traffic-limit fields are rejected.
 - Legacy traffic cache records are ignored; regenerate stats with the current collector if needed.
-- `pfwd list` shows fixed SNAT rules in the `Options` column and keeps the detailed SNAT section for long addresses.
-- Rule comments must be single-line text; tabs/newlines are rejected.
-- `jq` must already be installed for import/export.
+- `pfwd list` shows fixed SNAT rules in the `Options` column and keeps a detailed SNAT section for long addresses.
+- Rule comments must be single-line text, and `jq` is required for import/export.
 
 ## Method
 
@@ -178,48 +162,11 @@ Best for: IP-based targets, maximum performance.
 |---------|-------------|
 | Flowtable fast path | Established connections offloaded to ingress |
 | Observer-only stats | Traffic collection avoids per-rule nft counters and helper rules |
-| nft output cache | TTL-based cache avoids redundant nft list calls |
-| Batch mode | Bulk add/delete defers save and reload to end |
-| Batch delete | Single chain fetch for multi-port deletion |
+| Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers save and reload to end |
+| nft output cache | TTL-based cache avoids redundant `nft list` calls |
 | Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
 | BBR + TCP tuning | Optimized congestion control and buffers |
-
-## Validation & Benchmark (root)
-
-Use this on the target host to confirm forwarding works and compare throughput before/after changes.
-
-```bash
-# 1) Basic health
-pfwd doctor
-
-# 2) Add one test forward rule (example)
-pfwd -m nft -t 127.0.0.1 --tcp 18080:8080
-
-# 3) TCP smoke test in netns
-ip netns add pfwd-test || true
-ip -n pfwd-test link set lo up
-nohup sh -c 'nc -lk 127.0.0.1 8080 >/tmp/pfwd-nc.log 2>&1' >/dev/null 2>&1 &
-ip netns exec pfwd-test sh -c 'echo ok | nc -w2 <HOST_IP> 18080'
-
-# 4) Optional UDP smoke test
-nohup sh -c 'socat -T1 -u UDP-LISTEN:8081,fork - >/tmp/pfwd-udp.log 2>&1' >/dev/null 2>&1 &
-pfwd -m nft -t 127.0.0.1 --udp 18081:8081
-ip netns exec pfwd-test sh -c 'echo ok | socat -u - UDP:<HOST_IP>:18081'
-
-# 5) Throughput benchmark (before/after)
-# add benchmark forward rule first
-pfwd -m nft -t 127.0.0.1 --tcp 18088:8088
-# server:
-iperf3 -s -p 8088
-# client:
-iperf3 -c <HOST_IP> -p 18088 -P 4 -t 30
-```
-
-Suggested acceptance:
-- Forwarding smoke tests pass (TCP/UDP as needed).
-- `pfwd doctor` reports flowtable mode/devices when fast path is active.
-- In identical traffic conditions, throughput improves or CPU usage drops.
 
 ## File Locations
 
@@ -241,12 +188,6 @@ Suggested acceptance:
 - nftables
 - Linux kernel >= 4.16 (for flowtable; older kernels fall back to standard forwarding)
 - jq (required for import/export)
-
-## Compatibility
-
-- Old `realm` rules in backup files are skipped during import.
-- Exported JSON now uses the v3 schema; older backups with legacy limit fields are intentionally rejected.
-- Existing system-level `realm` files or services are not managed by this script anymore.
 
 ## License
 
