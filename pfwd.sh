@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.4"
+readonly VERSION="2.0.5"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -718,11 +718,12 @@ _pfwd_state_target_file() {
                 : > "$PFWD_STATE_BATCH_FILE"
             fi
         fi
-        printf '%s\n' "$PFWD_STATE_BATCH_FILE"
+        PFWD_STATE_TARGET_FILE="$PFWD_STATE_BATCH_FILE"
     else
         mkdir -p "$DATA_DIR"
-        printf '%s\n' "$RULES_STATE_FILE"
+        PFWD_STATE_TARGET_FILE="$RULES_STATE_FILE"
     fi
+    return 0
 }
 
 _pfwd_state_discard_batch() {
@@ -730,6 +731,7 @@ _pfwd_state_discard_batch() {
         rm -f "$PFWD_STATE_BATCH_FILE" 2>/dev/null || true
         PFWD_STATE_BATCH_FILE=""
     fi
+    PFWD_STATE_TARGET_FILE=""
 }
 
 _pfwd_state_commit_batch() {
@@ -737,6 +739,7 @@ _pfwd_state_commit_batch() {
     mkdir -p "$DATA_DIR"
     _atomic_replace_file "$PFWD_STATE_BATCH_FILE" "$RULES_STATE_FILE" 0644
     PFWD_STATE_BATCH_FILE=""
+    PFWD_STATE_TARGET_FILE=""
 }
 
 pfwd_state_rules_tsv() {
@@ -942,7 +945,8 @@ pfwd_state_add_rule() {
     fi
 
     pfwd_state_ensure_initialized
-    target_file=$(_pfwd_state_target_file) || return 1
+    _pfwd_state_target_file || return 1
+    target_file="$PFWD_STATE_TARGET_FILE"
     current_rules=$(pfwd_state_rules_tsv "$target_file")
 
     local resolved_targets
@@ -1023,7 +1027,8 @@ pfwd_state_delete_exact_rule() {
     local target_file current_rules tmp_file deleted=0
 
     pfwd_state_ensure_initialized
-    target_file=$(_pfwd_state_target_file) || return 1
+    _pfwd_state_target_file || return 1
+    target_file="$PFWD_STATE_TARGET_FILE"
     current_rules=$(pfwd_state_rules_tsv "$target_file")
     [[ -n "$current_rules" ]] || return 1
 
@@ -1054,7 +1059,8 @@ pfwd_state_delete_port_rules() {
     local target_file current_rules tmp_file deleted=0
 
     pfwd_state_ensure_initialized
-    target_file=$(_pfwd_state_target_file) || return 1
+    _pfwd_state_target_file || return 1
+    target_file="$PFWD_STATE_TARGET_FILE"
     current_rules=$(pfwd_state_rules_tsv "$target_file")
     [[ -n "$current_rules" ]] || return 1
 
@@ -1619,6 +1625,7 @@ PFWD_IMPORT_URL=""
 PFWD_EFFECTIVE_IP_VER=""
 PFWD_REQUEST_IP_VER=""
 PFWD_STATE_BATCH_FILE=""
+PFWD_STATE_TARGET_FILE=""
 
 # Cached state snapshot for UI/status views
 PFWD_NFT_RULES=""
