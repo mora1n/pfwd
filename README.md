@@ -121,6 +121,8 @@ pfwd list -f 8080
 
 # Traffic
 pfwd doctor
+pfwd doctor --tcp-probe
+pfwd doctor --tcp-probe --probe-timeout 5
 pfwd refresh
 pfwd stats
 pfwd stats --rate
@@ -135,18 +137,22 @@ pfwd optimize lowmem       # for small VPS
 # Export/Import
 pfwd export ~/backup.json
 pfwd import ~/backup.json -m nft
-pfwd import --url https://example.com/backup.json
 ```
 
 Notes:
 
 - Import/export use the current v3 JSON schema with `forward_rules`.
+- `pfwd import` only accepts local JSON files; download remote backups first if needed.
 - Exported rules keep SNAT/MSS/comment data in `options`, and also write flat compatibility fields such as `snat_mode` / `snat_source`.
 - `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
+- `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
 - Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
 - Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.
 - `pfwd list` shows fixed SNAT rules in the `Options` column and keeps a detailed SNAT section for long addresses.
+- `pfwd status` shows degraded runtime guard state directly, including managed FORWARD exceptions and UFW persistence.
+- `pfwd doctor --tcp-probe` adds active TCP backend probes so you can distinguish `connect ok`, `connection refused`, and `timeout`.
 - Rule comments must be single-line text, and `jq` is required for import/export.
+- For tests, set `PFWD_ROOT_PREFIX` to redirect managed `/etc`, `/var/lib`, `/root`, and `/usr/local/bin` paths into a temporary tree.
 
 ## Method
 

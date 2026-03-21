@@ -15,21 +15,36 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.7"
+readonly VERSION="2.0.8"
+
+pfwd_path() {
+    local path="$1"
+    local prefix="${PFWD_ROOT_PREFIX:-}"
+    if [[ -z "$prefix" ]]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+    prefix="${prefix%/}"
+    if [[ "$path" == "/" ]]; then
+        printf '%s\n' "$prefix"
+    else
+        printf '%s%s\n' "$prefix" "$path"
+    fi
+}
 
 # Paths
-readonly DATA_DIR="/var/lib/pfwd"
+readonly DATA_DIR="$(pfwd_path /var/lib/pfwd)"
 readonly RULES_STATE_FILE="$DATA_DIR/rules.v1.tsv"
-readonly NFT_CONFIG="/etc/nftables.d/port_forward.nft"
-readonly NFT_BACKUP_DIR="/root/.pfwd_backup"
-readonly NFT_RESTORE_SERVICE="/etc/systemd/system/pfwd-nft-restore.service"
-readonly SYSCTL_CONF="/etc/sysctl.d/99-pfwd.conf"
-readonly UFW_BEFORE_RULES="/etc/ufw/before.rules"
-readonly UFW_BEFORE6_RULES="/etc/ufw/before6.rules"
+readonly NFT_CONFIG="$(pfwd_path /etc/nftables.d/port_forward.nft)"
+readonly NFT_BACKUP_DIR="$(pfwd_path /root/.pfwd_backup)"
+readonly NFT_RESTORE_SERVICE="$(pfwd_path /etc/systemd/system/pfwd-nft-restore.service)"
+readonly SYSCTL_CONF="$(pfwd_path /etc/sysctl.d/99-pfwd.conf)"
+readonly UFW_BEFORE_RULES="$(pfwd_path /etc/ufw/before.rules)"
+readonly UFW_BEFORE6_RULES="$(pfwd_path /etc/ufw/before6.rules)"
 readonly TRAFFIC_DATA="$DATA_DIR/traffic_stats.dat"
 readonly TRAFFIC_FLOW_DATA="$DATA_DIR/traffic_flows.dat"
-readonly TRAFFIC_SAVE_SERVICE="/etc/systemd/system/pfwd-traffic-save.service"
-readonly TRAFFIC_SAVE_TIMER="/etc/systemd/system/pfwd-traffic-save.timer"
+readonly TRAFFIC_SAVE_SERVICE="$(pfwd_path /etc/systemd/system/pfwd-traffic-save.service)"
+readonly TRAFFIC_SAVE_TIMER="$(pfwd_path /etc/systemd/system/pfwd-traffic-save.timer)"
 readonly TRAFFIC_DEFAULT_INTERVAL="1m"
 readonly TRAFFIC_DATA_VERSION="4"
 readonly TRAFFIC_FLOW_VERSION="2"
@@ -37,8 +52,9 @@ readonly EXPORT_FORMAT_VERSION="3"
 readonly TRAFFIC_STALE_MULTIPLIER="3"
 readonly REQUIREMENTS_NOTICE_VERSION="1"
 
-readonly INSTALLED_SCRIPT="/usr/local/bin/pfwd.sh"
-readonly SHORTCUT_LINK="/usr/local/bin/pfwd"
+readonly INSTALLED_SCRIPT="$(pfwd_path /usr/local/bin/pfwd.sh)"
+readonly SHORTCUT_LINK="$(pfwd_path /usr/local/bin/pfwd)"
+readonly NF_FLOW_TABLE_MODULES_CONF="$(pfwd_path /etc/modules-load.d/nf_flow_table.conf)"
 
 # nftables names
 readonly NFT_TABLE="inet port_forward"
@@ -99,6 +115,16 @@ _BATCH_MODE=false
 
 # nft output cache (TTL-based, avoids repeated nft list table calls)
 _NFT_CACHE="" _NFT_CACHE_TIME=0 _NFT_CACHE_TTL=2
+
+# Per-run caches for repeated add/import/refresh operations
+declare -A _TARGET_RESOLVE_CACHE=()
+declare -A _TARGET_RESOLVE_STATUS=()
+_PORT_USAGE_SNAPSHOT_READY=false
+_PORT_USAGE_BACKEND="none"
+_PORT_USAGE_TCP_LISTEN=""
+_PORT_USAGE_TCP_PROC=""
+_PORT_USAGE_UDP_LISTEN=""
+_PORT_USAGE_UDP_PROC=""
 
 plat_nft_list_table() {
     nft list table "$@" 2>/dev/null
@@ -698,6 +724,183 @@ _pfwd_collect_state() {
     PFWD_TRAFFIC_BACKEND=$(traffic_stats_backend)
 }
 
+_pfwd_collect_runtime_health() {
+    local parsed="${1:-}"
+    if [[ -z "$parsed" ]]; then
+        parsed=$(_pfwd_runtime_rules_to_parsed_tsv "$(_pfwd_state_runtime_rules_tsv "$PFWD_NFT_RULES" "false")")
+    fi
+
+    PFWD_HEALTH_HAS_IPV4_RULES=false
+    PFWD_HEALTH_HAS_IPV6_RULES=false
+    PFWD_HEALTH_HAS_LOOPBACK_RULES=false
+    PFWD_IPTABLES_V4_FORWARD_STATE="n/a"
+    PFWD_IPTABLES_V6_FORWARD_STATE="n/a"
+    PFWD_IPTABLES_V4_INPUT_STATE="n/a"
+    PFWD_IPTABLES_V6_INPUT_STATE="n/a"
+    PFWD_UFW_PERSISTENCE_STATE="n/a"
+    PFWD_RUNTIME_HEALTH_DEGRADED=false
+
+    local proto lport ipver target tport comment bytes
+    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
+        [[ -z "$lport" ]] && continue
+        case "$ipver" in
+            4)
+                PFWD_HEALTH_HAS_IPV4_RULES=true
+                [[ "$target" =~ ^127\. ]] && PFWD_HEALTH_HAS_LOOPBACK_RULES=true
+                ;;
+            6)
+                PFWD_HEALTH_HAS_IPV6_RULES=true
+                [[ "$target" == "::1" ]] && PFWD_HEALTH_HAS_LOOPBACK_RULES=true
+                ;;
+        esac
+    done <<< "$parsed"
+
+    local forward_policy input_policy
+    if command -v iptables >/dev/null 2>&1; then
+        forward_policy=$(plat_iptables_policy iptables FORWARD)
+        input_policy=$(plat_iptables_policy iptables INPUT)
+        if $PFWD_HEALTH_HAS_IPV4_RULES; then
+            if [[ "$forward_policy" == "DROP" ]]; then
+                if _iptables_rule_present iptables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+                   _iptables_rule_present iptables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                    PFWD_IPTABLES_V4_FORWARD_STATE="ok"
+                else
+                    PFWD_IPTABLES_V4_FORWARD_STATE="missing"
+                    PFWD_RUNTIME_HEALTH_DEGRADED=true
+                fi
+            else
+                PFWD_IPTABLES_V4_FORWARD_STATE="policy-open"
+            fi
+        else
+            PFWD_IPTABLES_V4_FORWARD_STATE="not-needed"
+        fi
+
+        if $PFWD_HEALTH_HAS_LOOPBACK_RULES; then
+            if [[ "$input_policy" == "DROP" ]]; then
+                if _iptables_rule_present iptables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
+                    PFWD_IPTABLES_V4_INPUT_STATE="ok"
+                else
+                    PFWD_IPTABLES_V4_INPUT_STATE="missing"
+                    PFWD_RUNTIME_HEALTH_DEGRADED=true
+                fi
+            else
+                PFWD_IPTABLES_V4_INPUT_STATE="policy-open"
+            fi
+        else
+            PFWD_IPTABLES_V4_INPUT_STATE="not-needed"
+        fi
+    else
+        if $PFWD_HEALTH_HAS_IPV4_RULES; then
+            PFWD_IPTABLES_V4_FORWARD_STATE="unavailable"
+        else
+            PFWD_IPTABLES_V4_FORWARD_STATE="not-needed"
+        fi
+        if $PFWD_HEALTH_HAS_LOOPBACK_RULES; then
+            PFWD_IPTABLES_V4_INPUT_STATE="unavailable"
+        else
+            PFWD_IPTABLES_V4_INPUT_STATE="not-needed"
+        fi
+    fi
+
+    local forward_policy6 input_policy6
+    if command -v ip6tables >/dev/null 2>&1; then
+        forward_policy6=$(plat_iptables_policy ip6tables FORWARD)
+        input_policy6=$(plat_iptables_policy ip6tables INPUT)
+        if $PFWD_HEALTH_HAS_IPV6_RULES; then
+            if [[ "$forward_policy6" == "DROP" ]]; then
+                if _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
+                   _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
+                    PFWD_IPTABLES_V6_FORWARD_STATE="ok"
+                else
+                    PFWD_IPTABLES_V6_FORWARD_STATE="missing"
+                    PFWD_RUNTIME_HEALTH_DEGRADED=true
+                fi
+            else
+                PFWD_IPTABLES_V6_FORWARD_STATE="policy-open"
+            fi
+        else
+            PFWD_IPTABLES_V6_FORWARD_STATE="not-needed"
+        fi
+
+        if $PFWD_HEALTH_HAS_LOOPBACK_RULES; then
+            if [[ "$input_policy6" == "DROP" ]]; then
+                if _iptables_rule_present ip6tables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
+                    PFWD_IPTABLES_V6_INPUT_STATE="ok"
+                else
+                    PFWD_IPTABLES_V6_INPUT_STATE="missing"
+                    PFWD_RUNTIME_HEALTH_DEGRADED=true
+                fi
+            else
+                PFWD_IPTABLES_V6_INPUT_STATE="policy-open"
+            fi
+        else
+            PFWD_IPTABLES_V6_INPUT_STATE="not-needed"
+        fi
+    else
+        if $PFWD_HEALTH_HAS_IPV6_RULES; then
+            PFWD_IPTABLES_V6_FORWARD_STATE="unavailable"
+        else
+            PFWD_IPTABLES_V6_FORWARD_STATE="not-needed"
+        fi
+        if $PFWD_HEALTH_HAS_LOOPBACK_RULES; then
+            PFWD_IPTABLES_V6_INPUT_STATE="unavailable"
+        else
+            PFWD_IPTABLES_V6_INPUT_STATE="not-needed"
+        fi
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        case "$PFWD_UFW_LOOPBACK_STATE" in
+            ok) PFWD_UFW_PERSISTENCE_STATE="ok" ;;
+            missing)
+                PFWD_UFW_PERSISTENCE_STATE="degraded"
+                PFWD_RUNTIME_HEALTH_DEGRADED=true
+                ;;
+            idle) PFWD_UFW_PERSISTENCE_STATE="idle" ;;
+            disabled) PFWD_UFW_PERSISTENCE_STATE="disabled" ;;
+            *) PFWD_UFW_PERSISTENCE_STATE="n/a" ;;
+        esac
+    else
+        PFWD_UFW_PERSISTENCE_STATE="unavailable"
+    fi
+}
+
+_pfwd_repair_runtime_health() {
+    local parsed="${1:-}"
+    sync_managed_iptables_accept_rules "$parsed" || return 1
+    ufw_sync_loopback_dnat_rules || return 1
+    if $_DIRTY_UFW_RELOAD; then
+        ufw_reload_if_enabled || return 1
+        sync_managed_iptables_accept_rules "$parsed" || return 1
+    fi
+}
+
+_pfwd_report_runtime_health_failure() {
+    [[ "$PFWD_IPTABLES_V4_FORWARD_STATE" == "missing" ]] && msg_err "IPv4 iptables FORWARD managed exceptions are still missing"
+    [[ "$PFWD_IPTABLES_V6_FORWARD_STATE" == "missing" ]] && msg_err "IPv6 ip6tables FORWARD managed exceptions are still missing"
+    [[ "$PFWD_IPTABLES_V4_INPUT_STATE" == "missing" ]] && msg_err "IPv4 iptables INPUT loopback DNAT exception is still missing"
+    [[ "$PFWD_IPTABLES_V6_INPUT_STATE" == "missing" ]] && msg_err "IPv6 ip6tables INPUT loopback DNAT exception is still missing"
+    [[ "$PFWD_UFW_PERSISTENCE_STATE" == "degraded" ]] && msg_err "UFW loopback DNAT persistence is still degraded"
+}
+
+_pfwd_enforce_runtime_health() {
+    local parsed="${1:-}"
+    _pfwd_collect_state
+    _pfwd_collect_runtime_health "$parsed"
+    $PFWD_RUNTIME_HEALTH_DEGRADED || return 0
+
+    msg_warn "Detected degraded firewall guard state; attempting repair"
+    _pfwd_repair_runtime_health "$parsed" || true
+
+    _pfwd_collect_state
+    _pfwd_collect_runtime_health "$parsed"
+    if $PFWD_RUNTIME_HEALTH_DEGRADED; then
+        _pfwd_report_runtime_health_failure
+        return 1
+    fi
+    return 0
+}
+
 _mktemp_in_dir() {
     local target="$1" dir
     dir=$(dirname "$target")
@@ -1244,8 +1447,6 @@ _pfwd_ports_to_nft_expr() {
 
 _pfwd_render_nft_config() {
     local runtime_rules="$1" output_file="$2" flow_mode="$3" devices_csv="${4:-}"
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
 
     declare -A prerouting_ports=()
     declare -A prerouting_seen=()
@@ -1390,8 +1591,6 @@ _pfwd_render_nft_config() {
         done
         echo "}"
     } > "$output_file"
-
-    rm -rf "$tmp_dir" 2>/dev/null || true
 }
 
 _pfwd_validate_rendered_nft() {
@@ -1433,7 +1632,7 @@ pfwd_apply_saved_state() {
         plat_nft_delete_table $NFT_TABLE || true
         _nft_invalidate_cache
         rm -f "$NFT_CONFIG"
-        sync_managed_firewall_state ""
+        sync_managed_firewall_state "" || return 1
         ufw_reload_if_enabled || true
         return 0
     fi
@@ -1483,10 +1682,10 @@ pfwd_apply_saved_state() {
     fi
 
     _DIRTY_UFW_SYNC=true
-    sync_managed_firewall_state "$parsed_runtime"
+    sync_managed_firewall_state "$parsed_runtime" || return 1
     if $_DIRTY_UFW_RELOAD; then
-        ufw_reload_if_enabled
-        sync_managed_iptables_accept_rules "$parsed_runtime"
+        ufw_reload_if_enabled || return 1
+        sync_managed_iptables_accept_rules "$parsed_runtime" || return 1
     fi
     return 0
 }
@@ -1592,7 +1791,20 @@ _backup_nft_config() {
     [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]] || return 0
     mkdir -p "$NFT_BACKUP_DIR"
     cp "$NFT_CONFIG" "$NFT_BACKUP_DIR/nftables_$(date +%Y%m%d_%H%M%S).nft" 2>/dev/null || true
-    ls -t "$NFT_BACKUP_DIR"/nftables_*.nft 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+
+    local -a backups=()
+    local backup_path
+    shopt -s nullglob
+    backups=("$NFT_BACKUP_DIR"/nftables_*.nft)
+    shopt -u nullglob
+    (( ${#backups[@]} > 5 )) || return 0
+
+    mapfile -t backups < <(printf '%s\n' "${backups[@]}" | sort)
+    while (( ${#backups[@]} > 5 )); do
+        backup_path="${backups[0]}"
+        rm -f -- "$backup_path" 2>/dev/null || true
+        backups=("${backups[@]:1}")
+    done
 }
 
 # nft batch file for atomic operations (Phase 2)
@@ -1628,7 +1840,6 @@ PFWD_ADD_TOTAL=0
 PFWD_SHORTCUT_ARGS=()
 PFWD_IMPORT_PATH=""
 PFWD_IMPORT_METHOD=""
-PFWD_IMPORT_URL=""
 PFWD_EFFECTIVE_IP_VER=""
 PFWD_REQUEST_IP_VER=""
 PFWD_STATE_BATCH_FILE=""
@@ -1643,6 +1854,15 @@ PFWD_LOOPBACK_DNAT=false
 PFWD_UFW_LOOPBACK_STATE="n/a"
 PFWD_TRAFFIC_INTERVAL="$TRAFFIC_DEFAULT_INTERVAL"
 PFWD_TRAFFIC_BACKEND="none"
+PFWD_HEALTH_HAS_IPV4_RULES=false
+PFWD_HEALTH_HAS_IPV6_RULES=false
+PFWD_HEALTH_HAS_LOOPBACK_RULES=false
+PFWD_IPTABLES_V4_FORWARD_STATE="n/a"
+PFWD_IPTABLES_V6_FORWARD_STATE="n/a"
+PFWD_IPTABLES_V4_INPUT_STATE="n/a"
+PFWD_IPTABLES_V6_INPUT_STATE="n/a"
+PFWD_UFW_PERSISTENCE_STATE="n/a"
+PFWD_RUNTIME_HEALTH_DEGRADED=false
 _TRAFFIC_SNAPSHOT_RULES=""
 _TRAFFIC_SNAPSHOT_FLOWS=""
 _TRAFFIC_DATA_WARNED=false
@@ -1737,35 +1957,59 @@ wait_for_enter() {
     read -rp "Press Enter to return to main menu..."
 }
 
+_pfwd_port_usage_collect() {
+    $_PORT_USAGE_SNAPSHOT_READY && return 0
+
+    if command -v ss >/dev/null 2>&1; then
+        _PORT_USAGE_BACKEND="ss"
+        _PORT_USAGE_TCP_LISTEN=$(ss -H -tln 2>/dev/null || true)
+        _PORT_USAGE_TCP_PROC=$(ss -H -tlnp 2>/dev/null || true)
+        _PORT_USAGE_UDP_LISTEN=$(ss -H -uln 2>/dev/null || true)
+        _PORT_USAGE_UDP_PROC=$(ss -H -ulnp 2>/dev/null || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        _PORT_USAGE_BACKEND="netstat"
+        _PORT_USAGE_TCP_LISTEN=$(netstat -tln 2>/dev/null || true)
+        _PORT_USAGE_UDP_LISTEN=$(netstat -uln 2>/dev/null || true)
+        _PORT_USAGE_TCP_PROC=""
+        _PORT_USAGE_UDP_PROC=""
+    else
+        _PORT_USAGE_BACKEND="none"
+        _PORT_USAGE_TCP_LISTEN=""
+        _PORT_USAGE_TCP_PROC=""
+        _PORT_USAGE_UDP_LISTEN=""
+        _PORT_USAGE_UDP_PROC=""
+    fi
+
+    _PORT_USAGE_SNAPSHOT_READY=true
+}
+
+_pfwd_port_snapshot_match() {
+    local snapshot="$1" port="$2"
+    [[ -n "$snapshot" ]] || return 1
+    grep -Eq "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)" <<< "$snapshot"
+}
+
 # check_port_in_use <port> [proto] - Check if port is in use
 # proto: tcp/udp/both (default: tcp)
 # Returns: 0=not in use, 1=in use
 check_port_in_use() {
     local port=$1
     local proto=${2:-tcp}
+    local process_info=""
+
+    _pfwd_port_usage_collect
 
     # Check TCP port
     if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-        if command -v ss >/dev/null 2>&1; then
-            if ss -tuln 2>/dev/null | grep -q ":$port "; then
+        if [[ "$_PORT_USAGE_BACKEND" == "ss" || "$_PORT_USAGE_BACKEND" == "netstat" ]]; then
+            if _pfwd_port_snapshot_match "$_PORT_USAGE_TCP_LISTEN" "$port"; then
                 msg_warn "Port $port (TCP) is already in use"
-                # Try to show process info
-                if command -v ss >/dev/null 2>&1; then
-                    local process_info=$(ss -tlnp 2>/dev/null | grep ":$port " | head -1)
+                if [[ "$_PORT_USAGE_BACKEND" == "ss" ]]; then
+                    process_info=$(grep -E "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)" <<< "$_PORT_USAGE_TCP_PROC" | head -1 || true)
                     if [[ -n "$process_info" ]]; then
                         msg_dim "  Process: $process_info"
                     fi
                 fi
-                if ! can_prompt_user; then
-                    msg_err "Port $port (TCP) is already in use; refusing to continue in non-interactive mode"
-                    return 1
-                fi
-                read -rp "Continue adding rule anyway? [y/N]: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
-            fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -tuln 2>/dev/null | grep -q ":$port "; then
-                msg_warn "Port $port (TCP) is already in use"
                 if ! can_prompt_user; then
                     msg_err "Port $port (TCP) is already in use; refusing to continue in non-interactive mode"
                     return 1
@@ -1778,23 +2022,15 @@ check_port_in_use() {
 
     # Check UDP port
     if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-        if command -v ss >/dev/null 2>&1; then
-            if ss -uln 2>/dev/null | grep -q ":$port "; then
+        if [[ "$_PORT_USAGE_BACKEND" == "ss" || "$_PORT_USAGE_BACKEND" == "netstat" ]]; then
+            if _pfwd_port_snapshot_match "$_PORT_USAGE_UDP_LISTEN" "$port"; then
                 msg_warn "Port $port (UDP) is already in use"
-                local process_info=$(ss -ulnp 2>/dev/null | grep ":$port " | head -1)
-                if [[ -n "$process_info" ]]; then
-                    msg_dim "  Process: $process_info"
+                if [[ "$_PORT_USAGE_BACKEND" == "ss" ]]; then
+                    process_info=$(grep -E "(^|[[:space:]])[^[:space:]]*:${port}([[:space:]]|$)" <<< "$_PORT_USAGE_UDP_PROC" | head -1 || true)
+                    if [[ -n "$process_info" ]]; then
+                        msg_dim "  Process: $process_info"
+                    fi
                 fi
-                if ! can_prompt_user; then
-                    msg_err "Port $port (UDP) is already in use; refusing to continue in non-interactive mode"
-                    return 1
-                fi
-                read -rp "Continue adding rule anyway? [y/N]: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
-            fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -uln 2>/dev/null | grep -q ":$port "; then
-                msg_warn "Port $port (UDP) is already in use"
                 if ! can_prompt_user; then
                     msg_err "Port $port (UDP) is already in use; refusing to continue in non-interactive mode"
                     return 1
@@ -3071,8 +3307,11 @@ _rewrite_ufw_file() {
     fi
 
     local tmp_file block_file
-    tmp_file=$(mktemp)
-    block_file=$(mktemp)
+    tmp_file=$(_mktemp_in_dir "$file") || return 1
+    block_file=$(_mktemp_in_dir "$file.block") || {
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    }
 
     if [[ -n "$block" ]]; then
         {
@@ -3085,7 +3324,7 @@ _rewrite_ufw_file() {
         : > "$block_file"
     fi
 
-    awk -v start="$marker_start" -v end="$marker_end" -v anchor="$anchor" -v block_file="$block_file" '
+    if ! awk -v start="$marker_start" -v end="$marker_end" -v anchor="$anchor" -v block_file="$block_file" '
         BEGIN {
             inserted = 0
             block = ""
@@ -3132,10 +3371,13 @@ _rewrite_ufw_file() {
                 printf "%s", block
             }
         }
-    ' "$file" > "$tmp_file"
+    ' "$file" > "$tmp_file"; then
+        rm -f "$tmp_file" "$block_file" 2>/dev/null || true
+        return 1
+    fi
 
     mv "$tmp_file" "$file"
-    rm -f "$block_file"
+    rm -f "$block_file" 2>/dev/null || true
 }
 
 # ufw_sync_loopback_dnat_rules - sync UFW before.rules accepts for loopback DNAT rules
@@ -3566,8 +3808,9 @@ sync_managed_firewall_state() {
     if [[ -z "$parsed" ]]; then
         parsed=$(_pfwd_runtime_rules_to_parsed_tsv "$(_pfwd_state_runtime_rules_tsv "" "false")")
     fi
-    sync_managed_iptables_accept_rules "$parsed"
-    ufw_sync_loopback_dnat_rules
+    sync_managed_iptables_accept_rules "$parsed" || return 1
+    ufw_sync_loopback_dnat_rules || return 1
+    return 0
 }
 
 # _batch_finalize <method> - finalize after batch add (save/persist/restart once)
@@ -3588,11 +3831,11 @@ _batch_finalize() {
                 nft_setup_persistence
                 _reset_change_flags
             elif $_DIRTY_UFW_SYNC; then
-                ufw_sync_loopback_dnat_rules
+                ufw_sync_loopback_dnat_rules || return 1
             fi
             if $_DIRTY_UFW_RELOAD; then
-                ufw_reload_if_enabled
-                sync_managed_iptables_accept_rules
+                ufw_reload_if_enabled || return 1
+                sync_managed_iptables_accept_rules || return 1
             fi
             if [[ -n "$PFWD_STATE_BATCH_FILE" && ! $_DIRTY_NFT ]]; then
                 _pfwd_state_discard_batch
@@ -3840,9 +4083,9 @@ nft_ensure_table() {
             if modprobe nf_flow_table 2>/dev/null; then
                 msg_ok "nf_flow_table module loaded"
                 # Auto-persist module (idempotent)
-                local modules_conf="/etc/modules-load.d/nf_flow_table.conf"
+                local modules_conf="$NF_FLOW_TABLE_MODULES_CONF"
                 if [[ ! -f "$modules_conf" ]] || ! grep -q '^nf_flow_table$' "$modules_conf" 2>/dev/null; then
-                    mkdir -p /etc/modules-load.d
+                    mkdir -p "$(dirname "$modules_conf")"
                     echo 'nf_flow_table' >> "$modules_conf"
                     msg_dim "  Module persisted to $modules_conf"
                 fi
@@ -3905,8 +4148,10 @@ _iptables_rule_present() {
 _iptables_rule_ensure() {
     local bin="$1"; shift
     if ! _iptables_rule_present "$bin" "$@"; then
-        "$bin" -I "$@" >/dev/null 2>&1 || true
+        "$bin" -I "$@" >/dev/null 2>&1 || return 1
+        _iptables_rule_present "$bin" "$@" || return 1
     fi
+    return 0
 }
 
 _iptables_rule_delete_all() {
@@ -3936,15 +4181,15 @@ _sync_managed_iptables_family() {
     input_policy=$("$bin" -S INPUT 2>/dev/null | awk '/-P INPUT/{print $3}')
 
     if [[ "$forward_policy" == "DROP" && "$need_forward" == true ]]; then
-        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT
-        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT
+        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT || return 1
+        _iptables_rule_ensure "$bin" FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT || return 1
     else
         _iptables_rule_delete_all "$bin" FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT
         _iptables_rule_delete_all "$bin" FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT
     fi
 
     if [[ "$input_policy" == "DROP" && "$need_input" == true ]]; then
-        _iptables_rule_ensure "$bin" INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT
+        _iptables_rule_ensure "$bin" INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT || return 1
     else
         _iptables_rule_delete_all "$bin" INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT
     fi
@@ -3956,8 +4201,9 @@ sync_managed_iptables_accept_rules() {
         parsed=$(_pfwd_runtime_rules_to_parsed_tsv "$(_pfwd_state_runtime_rules_tsv "" "false")")
     fi
 
-    _sync_managed_iptables_family iptables 4 "$parsed"
-    _sync_managed_iptables_family ip6tables 6 "$parsed"
+    _sync_managed_iptables_family iptables 4 "$parsed" || return 1
+    _sync_managed_iptables_family ip6tables 6 "$parsed" || return 1
+    return 0
 }
 
 # ensure_forward_accept - keep managed iptables ACCEPT rules in sync with current nft state
@@ -3965,294 +4211,74 @@ ensure_forward_accept() {
     sync_managed_iptables_accept_rules
 }
 
-# nft_rule_exists <lport> <proto> <ip_ver> -> 0=exists, 1=not found
-nft_find_existing_rule() {
-    local lport="$1" proto="$2" ip_ver="$3" parsed="${4:-}"
-    _NFT_EXIST_TARGET=""
-    _NFT_EXIST_TPORT=""
-    _NFT_EXIST_COMMENT=""
-    _NFT_EXIST_BYTES="0"
-    if [[ -z "$parsed" ]]; then
-        parsed=$(_parse_nft_prerouting_rules)
-    fi
-    [[ -z "$parsed" ]] && return 1
-
-    local found_proto found_lport found_ipver found_target found_tport found_comment found_bytes
-    while IFS=$'\t' read -r found_proto found_lport found_ipver found_target found_tport found_comment found_bytes; do
-        [[ -z "$found_lport" ]] && continue
-        if [[ "$found_lport" == "$lport" && "$found_proto" == "$proto" && "$found_ipver" == "$ip_ver" ]]; then
-            _NFT_EXIST_TARGET="$found_target"
-            _NFT_EXIST_TPORT="$found_tport"
-            _NFT_EXIST_COMMENT="$found_comment"
-            _NFT_EXIST_BYTES="$found_bytes"
-            return 0
-        fi
-    done <<< "$parsed"
-
-    return 1
-}
-
-nft_rule_exists() {
-    nft_find_existing_rule "$1" "$2" "$3"
-}
-
 _nft_resolve_targets() {
     local target="$1" ip_ver="${2:-46}"
-    local target_type resolved_v4="" resolved_v6=""
+    local target_type resolved_v4="" resolved_v6="" cache_key resolved_lines cached_status=0
+    cache_key="${target}|${ip_ver}"
+    if [[ -n "${_TARGET_RESOLVE_STATUS["$cache_key"]+_}" ]]; then
+        cached_status="${_TARGET_RESOLVE_STATUS["$cache_key"]}"
+        if (( cached_status == 0 )) && [[ -n "${_TARGET_RESOLVE_CACHE["$cache_key"]:-}" ]]; then
+            printf '%s\n' "${_TARGET_RESOLVE_CACHE["$cache_key"]}"
+        fi
+        return "$cached_status"
+    fi
+
     target_type=$(detect_ip_type "$target")
 
     case "$target_type" in
         ipv4)
-            [[ "$ip_ver" == "6" ]] && return 0
+            if [[ "$ip_ver" == "6" ]]; then
+                _TARGET_RESOLVE_CACHE["$cache_key"]=""
+                _TARGET_RESOLVE_STATUS["$cache_key"]=0
+                return 0
+            fi
+            _TARGET_RESOLVE_CACHE["$cache_key"]="ip|4|$target"
+            _TARGET_RESOLVE_STATUS["$cache_key"]=0
             printf 'ip|4|%s\n' "$target"
             ;;
         ipv6)
-            [[ "$ip_ver" == "4" ]] && return 0
+            if [[ "$ip_ver" == "4" ]]; then
+                _TARGET_RESOLVE_CACHE["$cache_key"]=""
+                _TARGET_RESOLVE_STATUS["$cache_key"]=0
+                return 0
+            fi
+            _TARGET_RESOLVE_CACHE["$cache_key"]="ip6|6|$target"
+            _TARGET_RESOLVE_STATUS["$cache_key"]=0
             printf 'ip6|6|%s\n' "$target"
             ;;
         domain)
-            resolved_v4=$(getent ahosts "$target" 2>/dev/null | awk '/STREAM/{print $1}' | grep -E '^[0-9]+\.' | head -1 || true)
-            resolved_v6=$(getent ahosts "$target" 2>/dev/null | awk '/STREAM/{print $1}' | grep ':' | head -1 || true)
+            resolved_lines=$(getent ahosts "$target" 2>/dev/null || true)
+            resolved_v4=$(awk '/STREAM/ && $1 ~ /^[0-9]+\./ { print $1; exit }' <<< "$resolved_lines")
+            resolved_v6=$(awk '/STREAM/ && $1 ~ /:/ { print $1; exit }' <<< "$resolved_lines")
             if [[ -z "$resolved_v4" && -z "$resolved_v6" ]]; then
+                _TARGET_RESOLVE_CACHE["$cache_key"]=""
+                _TARGET_RESOLVE_STATUS["$cache_key"]=1
                 msg_err "Cannot resolve domain: $target"
                 msg_err "Use a literal IPv4/IPv6 address or fix DNS resolution"
                 return 1
             fi
+            _TARGET_RESOLVE_CACHE["$cache_key"]=""
             if [[ -n "$resolved_v4" && ( "$ip_ver" == "4" || "$ip_ver" == "46" ) ]]; then
-                printf 'ip|4|%s\n' "$resolved_v4"
+                _TARGET_RESOLVE_CACHE["$cache_key"]+="ip|4|$resolved_v4"$'\n'
             fi
             if [[ -n "$resolved_v6" && ( "$ip_ver" == "6" || "$ip_ver" == "46" ) ]]; then
-                printf 'ip6|6|%s\n' "$resolved_v6"
+                _TARGET_RESOLVE_CACHE["$cache_key"]+="ip6|6|$resolved_v6"$'\n'
             fi
+            _TARGET_RESOLVE_CACHE["$cache_key"]="${_TARGET_RESOLVE_CACHE["$cache_key"]%$'\n'}"
+            _TARGET_RESOLVE_STATUS["$cache_key"]=0
+            [[ -n "${_TARGET_RESOLVE_CACHE["$cache_key"]}" ]] && printf '%s\n' "${_TARGET_RESOLVE_CACHE["$cache_key"]}"
             ;;
         *)
+            _TARGET_RESOLVE_CACHE["$cache_key"]=""
+            _TARGET_RESOLVE_STATUS["$cache_key"]=1
             return 1
             ;;
     esac
-}
-
-_nft_prerouting_handles_exact() {
-    local lport="$1" proto="$2" ip_ver="$3" target="$4" tport="$5"
-    local chain line handle=""
-    while IFS=$'\t' read -r chain line; do
-        [[ -z "$chain" || -z "$line" ]] && continue
-        _extract_nft_proto_ipver "$line"
-        [[ "$_PROTO" == "$proto" && "$_IPVER" == "$ip_ver" ]] || continue
-        [[ "$line" =~ dport\ ([0-9]+) ]] || continue
-        [[ "${BASH_REMATCH[1]}" == "$lport" ]] || continue
-        _extract_nft_dnat_target "$line"
-        [[ "$_TARGET" == "$target" && "$_TPORT" == "$tport" ]] || continue
-        handle=""
-        [[ "$line" =~ handle\ ([0-9]+) ]] && handle="${BASH_REMATCH[1]}"
-        [[ -n "$handle" ]] && printf '%s\t%s\n' "$chain" "$handle"
-    done < <(_nft_prefixed_chain_handles_concat $(_pfwd_rule_chain_candidates prerouting "$proto" "$ip_ver"))
 }
 
 _nft_delete_exact_rule() {
     local lport="$1" proto="$2" ip_ver="$3" target="$4" tport="$5"
     pfwd_state_delete_exact_rule "$proto" "$lport" "$ip_ver" "$target" "$tport"
-}
-
-# _nft_add_single_rule <ip_family> <proto> <lport> <target> <tport> <comment>
-# Unified helper for adding a single nft rule (IPv4 or IPv6).
-# In batch mode, appends to $_NFT_BATCH_FILE instead of executing directly.
-_nft_add_single_rule() {
-    local ip_family="$1" proto="$2" lport="$3" target="$4" tport="$5" comment="${6:-}"
-    local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}" replace_mode="${11:-false}"
-    local ipver="4" dnat_keyword="ip" dnat_target="$target:$tport"
-    local -a ip_match_tokens=(ip protocol)
-    if [[ "$ip_family" == "ip6" ]]; then
-        ipver="6"
-        ip_match_tokens=(ip6 nexthdr)
-        dnat_keyword="ip6"
-        dnat_target="[$target]:$tport"
-    fi
-
-    if nft_rule_exists "$lport" "$proto" "$ipver"; then
-        if [[ "$replace_mode" != "true" ]]; then
-            msg_err "Conflict: IPv$ipver $proto port $lport already forwards to ${_NFT_EXIST_TARGET}:${_NFT_EXIST_TPORT}"
-            msg_err "Use --replace to update that rule explicitly"
-            return 1
-        fi
-        msg_info "Replacing existing IPv$ipver $proto rule for port $lport"
-        if ! _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$_NFT_EXIST_TARGET" "$_NFT_EXIST_TPORT"; then
-            msg_err "Failed to prepare replacement for IPv$ipver $proto port $lport"
-            return 1
-        fi
-    fi
-
-    local rule_tag
-    local prerouting_chain postrouting_chain forward_chain
-    local -a postrouting_action_tokens=(masquerade)
-    local -a prerouting_tokens=() postrouting_tokens=() mss_tokens=()
-    rule_tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
-    prerouting_chain=$(_pfwd_subchain_name prerouting "$proto" "$ipver")
-    postrouting_chain=$(_pfwd_subchain_name postrouting "$proto" "$ipver")
-    forward_chain=$(_pfwd_subchain_name forward "$proto" "$ipver")
-    if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
-        postrouting_action_tokens=(snat to "$snat_source")
-    fi
-
-    prerouting_tokens=(
-        add rule inet port_forward "$prerouting_chain"
-        "${ip_match_tokens[@]}" "$proto" "$proto" dport "$lport"
-        dnat "$dnat_keyword" to "$dnat_target"
-    )
-    [[ -n "$comment" ]] && prerouting_tokens+=(comment "$(nft_quote_token "$comment")")
-
-    postrouting_tokens=(
-        add rule inet port_forward "$postrouting_chain"
-        ct status dnat "$ip_family" daddr "$target" "$proto" dport "$tport"
-        "${postrouting_action_tokens[@]}"
-        comment "$(nft_quote_token "$rule_tag")"
-    )
-
-    if [[ "$proto" == "tcp" ]]; then
-        if [[ "$mss_mode" == "clamp" ]]; then
-            mss_tokens=(
-                add rule inet port_forward "$forward_chain"
-                "$ip_family" daddr "$target" tcp dport "$tport"
-                tcp flags syn / syn,rst tcp option maxseg size set rt mtu
-                comment "$(nft_quote_token "${rule_tag}:mss")"
-            )
-        elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
-            mss_tokens=(
-                add rule inet port_forward "$forward_chain"
-                "$ip_family" daddr "$target" tcp dport "$tport"
-                tcp flags syn / syn,rst tcp option maxseg size set "$mss_value"
-                comment "$(nft_quote_token "${rule_tag}:mss")"
-            )
-        fi
-    fi
-
-    if $_BATCH_MODE && [[ -n "$_NFT_BATCH_FILE" ]]; then
-        # Append to batch file for atomic commit
-        nft_append_command "$_NFT_BATCH_FILE" "${prerouting_tokens[@]}"
-        nft_append_command "$_NFT_BATCH_FILE" "${postrouting_tokens[@]}"
-        (( ${#mss_tokens[@]} > 0 )) && nft_append_command "$_NFT_BATCH_FILE" "${mss_tokens[@]}"
-    else
-        # Direct execution
-        local nft_result=0
-        if plat_nft_capture "${prerouting_tokens[@]}" && \
-           plat_nft_capture "${postrouting_tokens[@]}"; then
-            nft_result=0
-        else
-            nft_result=$?
-        fi
-
-        if (( nft_result != 0 )); then
-            msg_err "Failed to add IPv$ipver $proto rule :$lport -> $dnat_target"
-            _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$target" "$tport" >/dev/null 2>&1 || true
-            return 1
-        fi
-
-        (( ${#mss_tokens[@]} > 0 )) && plat_nft_quiet "${mss_tokens[@]}" || true
-    fi
-
-    if $_BATCH_MODE; then
-        msg_dim "  Queued IPv$ipver $proto :$lport -> $dnat_target"
-    else
-        msg_dim "  Added IPv$ipver $proto :$lport -> $dnat_target"
-    fi
-    return 0
-}
-
-# nft_add_rule <lport> <target> <tport> <ip_ver> <proto> <comment>
-# ip_ver: 4, 6, or 46
-# proto: tcp, udp, or both
-# comment: optional comment for the rule
-# mss_mode: empty, clamp, or set
-# mss_value: MSS value when mss_mode=set
-# snat_mode: masquerade (default) or snat
-# snat_source: source IP when snat_mode=snat
-# replace_mode: false (default) or true
-nft_add_rule() {
-    local lport="$1" target="$2" tport="$3" ip_ver="${4:-46}" proto="${5:-tcp}" comment="${6:-}"
-    local mss_mode="${7:-}" mss_value="${8:-}" snat_mode="${9:-masquerade}" snat_source="${10:-}" replace_mode="${11:-false}"
-
-    if ! validate_comment "$comment"; then
-        msg_err "Comment must be a single line without tabs"
-        return 1
-    fi
-    validate_snat_request "$ip_ver" "$snat_mode" "$snat_source" || return 1
-    ip_ver="${PFWD_EFFECTIVE_IP_VER:-$ip_ver}"
-
-    nft_ensure_table || return 1
-
-    # Initialize batch file if in batch mode and not yet created
-    if $_BATCH_MODE && [[ -z "$_NFT_BATCH_FILE" ]]; then
-        _NFT_BATCH_FILE=$(mktemp)
-    fi
-
-    # Check port availability
-    if ! check_port_in_use "$lport" "$proto"; then
-        msg_info "Cancelled"
-        return 1
-    fi
-
-    local target_type
-    target_type=$(detect_ip_type "$target")
-
-    local resolved_targets
-    if ! resolved_targets=$(_nft_resolve_targets "$target" "$ip_ver"); then
-        return 1
-    fi
-    if [[ "$target_type" == "domain" ]]; then
-        local resolved_summary=()
-        while IFS='|' read -r _family _ipver resolved_target; do
-            [[ -z "$resolved_target" ]] && continue
-            resolved_summary+=("IPv${_ipver}:${resolved_target}")
-        done <<< "$resolved_targets"
-        if (( ${#resolved_summary[@]} > 0 )); then
-            local IFS=' '
-            msg_dim "  Resolved $target -> ${resolved_summary[*]}"
-        fi
-    fi
-
-    local protos=()
-    case "$proto" in
-        tcp)  protos=(tcp) ;;
-        udp)  protos=(udp) ;;
-        both) protos=(tcp udp) ;;
-        *)    msg_err "Invalid protocol: $proto"; return 1 ;;
-    esac
-
-    # Enable route_localnet if forwarding to loopback
-    local _effective_target="$target"
-    if [[ -n "$resolved_targets" ]]; then
-        while IFS='|' read -r _family _ipver resolved_target; do
-            if [[ "$_ipver" == "4" && -n "$resolved_target" ]]; then
-                _effective_target="$resolved_target"
-                break
-            fi
-        done <<< "$resolved_targets"
-    fi
-    if [[ "$_effective_target" =~ ^127\. ]]; then
-        ensure_route_localnet
-    fi
-
-    local added=0
-
-    local p family resolved_ip effective_ipver
-    for p in "${protos[@]}"; do
-        while IFS='|' read -r family effective_ipver resolved_ip; do
-            [[ -n "$family" && -n "$effective_ipver" && -n "$resolved_ip" ]] || continue
-            if _nft_add_single_rule "$family" "$p" "$lport" "$resolved_ip" "$tport" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
-                ((added++)) || true
-            fi
-        done <<< "$resolved_targets"
-    done
-
-    if (( added == 0 )); then
-        msg_err "No rules were added for :$lport -> $target:$tport"
-        return 1
-    fi
-
-    _mark_nft_dirty
-    if ! $_BATCH_MODE; then
-        _batch_finalize nft
-    fi
-    msg_ok "nftables rule added: :$lport -> $target:$tport ($proto, IPv$ip_ver)"
 }
 
 _nft_collect_add_conflicts() {
@@ -4757,40 +4783,6 @@ EOF
     plat_systemctl_enable pfwd-nft-restore
     plat_systemctl_enable_now pfwd-traffic-save.timer
 }
-
-_nft_refresh_rule_layout() {
-    local prerouting_lines forward_lines
-    prerouting_lines=$(_nft_prerouting_dnat_lines)
-    forward_lines=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)
-
-    if ! grep -Eq '(^|[[:space:]])counter([[:space:]]|$)' <<< "$prerouting_lines" && [[ "$forward_lines" != *'pfwd_ret:'* ]]; then
-        return 0
-    fi
-
-    local rules
-    rules=$(_parse_nft_export_rules)
-    [[ -n "$rules" ]] || return 0
-
-    msg_info "Refreshing nft rules for observer-only traffic stats..."
-
-    local proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value
-    while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value; do
-        [[ -z "$lport" ]] && continue
-        _nft_delete_exact_rule "$lport" "$proto" "$ipver" "$target" "$tport" >/dev/null 2>&1 || true
-        local family="ip"
-        [[ "$ipver" == "6" ]] && family="ip6"
-        if ! _nft_add_single_rule "$family" "$proto" "$lport" "$target" "$tport" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "false"; then
-            msg_err "Failed to refresh IPv${ipver} ${proto} rule for port ${lport}"
-            return 1
-        fi
-    done <<< "$rules"
-
-    _mark_nft_dirty
-    sync_managed_firewall_state
-    nft_save "auto"
-    nft_setup_persistence
-}
-
 #===============================================================================
 #  Section 5: Traffic & Service Use Cases
 #===============================================================================
@@ -4810,6 +4802,10 @@ cmd_internal_restore_nft() {
     fi
 
     nft_setup_persistence
+    if ! _pfwd_enforce_runtime_health; then
+        _reset_change_flags
+        return 1
+    fi
     _pfwd_collect_state
     _reset_change_flags
     return 0
@@ -5469,27 +5465,16 @@ cmd_export() {
 
     # cmd_import <filepath> [method] - import rules from JSON
 cmd_import() {
-    require_root "$0 import"
     local filepath="$1"
     local override_method="${2:-}"
 
-    ensure_jq || return 1
-
-    # Handle URL imports
     if [[ "$filepath" =~ ^https?:// ]]; then
-        local tmp_file
-        tmp_file=$(mktemp)
-        msg_info "Downloading from: $filepath"
-        if command -v curl >/dev/null 2>&1; then
-            curl -sL -o "$tmp_file" "$filepath"
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$tmp_file" "$filepath"
-        else
-            msg_err "Neither curl nor wget available"
-            return 1
-        fi
-        filepath="$tmp_file"
+        msg_err "Remote URL import has been removed; download the JSON file locally first"
+        return 1
     fi
+
+    require_root "$0 import"
+    ensure_jq || return 1
 
     if [[ ! -f "$filepath" ]]; then
         msg_err "File not found: $filepath"
@@ -5620,6 +5605,8 @@ Traffic / diagnosis:
   pfwd list -f mss
   pfwd status
   pfwd doctor
+  pfwd doctor --tcp-probe
+  pfwd doctor --tcp-probe --probe-timeout 5
   pfwd refresh
   pfwd stats
   pfwd stats --rate
@@ -5629,7 +5616,6 @@ Traffic / diagnosis:
 Import / export:
   pfwd export [filepath]
   pfwd import <filepath> [-m nft]
-  pfwd import --url <URL> [-m nft]
   Export and import use the current JSON v3 schema (forward_rules).
   Export/import preserves nft MSS and fixed-SNAT fields.
 
@@ -5727,6 +5713,9 @@ cmd_add() {
         return 1
     fi
     ip_ver="${PFWD_REQUEST_IP_VER:-$ip_ver}"
+    if [[ "$snat_mode" == "snat" ]]; then
+        _pfwd_print_fixed_snat_notice "$snat_source"
+    fi
 
     [[ "$method" == "realm" ]] && return 0
 
@@ -5889,8 +5878,140 @@ verify_forwarding_rules() {
     fi
 }
 
+_pfwd_fixed_snat_targets_ssh() {
+    local expanded
+    for expanded in "${EXPANDED_RULES[@]:-}"; do
+        parse_rule "$expanded" || continue
+        if [[ "$RULE_LPORT" == "22" || "$RULE_TPORT" == "22" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_pfwd_print_fixed_snat_notice() {
+    local snat_source="$1"
+    [[ -n "$snat_source" ]] || return 0
+
+    msg_warn "Fixed SNAT enabled: backend hosts will only see source ${snat_source}"
+    msg_warn "If the backend uses fail2ban, ACLs, or IP allowlists, explicitly allow ${snat_source}"
+    if _pfwd_fixed_snat_targets_ssh; then
+        msg_warn "SSH forwarding detected: backend sshd/fail2ban policy can block ${snat_source} and break forwarded SSH access"
+    fi
+}
+
+_pfwd_tcp_probe_backend() {
+    local host="$1" port="$2" probe_timeout="${3:-3}"
+    local output="" status=0
+
+    PFWD_TCP_PROBE_RESULT="error"
+    PFWD_TCP_PROBE_DETAIL=""
+
+    if command -v timeout >/dev/null 2>&1; then
+        if output=$(timeout "${probe_timeout}s" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>&1); then
+            PFWD_TCP_PROBE_RESULT="ok"
+            return 0
+        fi
+        status=$?
+        case "$status" in
+            124)
+                PFWD_TCP_PROBE_RESULT="timeout"
+                return 124
+                ;;
+            *)
+                if [[ "$output" == *"Connection refused"* ]]; then
+                    PFWD_TCP_PROBE_RESULT="refused"
+                    return 111
+                fi
+                PFWD_TCP_PROBE_DETAIL="$output"
+                return "$status"
+                ;;
+        esac
+    fi
+
+    if command -v nc >/dev/null 2>&1; then
+        if output=$(nc -z -w "$probe_timeout" "$host" "$port" 2>&1); then
+            PFWD_TCP_PROBE_RESULT="ok"
+            return 0
+        fi
+        status=$?
+        if [[ "$output" == *"Connection refused"* ]]; then
+            PFWD_TCP_PROBE_RESULT="refused"
+            return 111
+        fi
+        if [[ "$output" == *"timed out"* || "$output" == *"timeout"* ]]; then
+            PFWD_TCP_PROBE_RESULT="timeout"
+            return 124
+        fi
+        PFWD_TCP_PROBE_DETAIL="$output"
+        return "$status"
+    fi
+
+    PFWD_TCP_PROBE_RESULT="unavailable"
+    PFWD_TCP_PROBE_DETAIL="need timeout(1) or nc"
+    return 127
+}
+
+_pfwd_doctor_tcp_probe() {
+    local probe_timeout="${1:-3}"
+    local runtime_rules seen_unavailable=false
+    runtime_rules=$(_pfwd_state_runtime_rules_tsv "$PFWD_NFT_RULES" "false")
+    [[ -n "$runtime_rules" ]] || return 0
+
+    local proto lport ipver target_input resolved_target tport comment snat_mode snat_source mss_mode mss_value
+    while IFS=$'\t' read -r proto lport ipver target_input resolved_target tport comment snat_mode snat_source mss_mode mss_value; do
+        [[ -z "$lport" || "$proto" != "tcp" || -z "$resolved_target" ]] && continue
+        _pfwd_tcp_probe_backend "$resolved_target" "$tport" "$probe_timeout" || true
+        case "$PFWD_TCP_PROBE_RESULT" in
+            ok)
+                _doctor_print_check OK "TCP probe connect ok" ":$lport IPv${ipver} -> ${resolved_target}:${tport}"
+                ;;
+            refused)
+                _doctor_print_check WARN "TCP probe connection refused" ":$lport IPv${ipver} -> ${resolved_target}:${tport}"
+                ;;
+            timeout)
+                _doctor_print_check WARN "TCP probe timeout" ":$lport IPv${ipver} -> ${resolved_target}:${tport}"
+                ;;
+            unavailable)
+                if [[ "$seen_unavailable" == false ]]; then
+                    _doctor_print_check WARN "TCP probe unavailable" "$PFWD_TCP_PROBE_DETAIL"
+                    seen_unavailable=true
+                fi
+                return 0
+                ;;
+            *)
+                _doctor_print_check WARN "TCP probe failed" ":$lport IPv${ipver} -> ${resolved_target}:${tport} ${PFWD_TCP_PROBE_DETAIL:+- $PFWD_TCP_PROBE_DETAIL}"
+                ;;
+        esac
+    done <<< "$runtime_rules"
+}
+
 cmd_doctor() {
+    local tcp_probe=false probe_timeout=3
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tcp-probe)
+                tcp_probe=true
+                shift
+                ;;
+            --probe-timeout)
+                require_option_value "$1" "$@" || return 1
+                probe_timeout="$2"
+                [[ "$probe_timeout" =~ ^[0-9]+$ && "$probe_timeout" -ge 1 ]] || {
+                    msg_err "Probe timeout must be a positive integer (seconds)"
+                    return 1
+                }
+                shift 2
+                ;;
+            *)
+                msg_err "Unknown doctor option: $1"
+                return 1
+                ;;
+        esac
+    done
+
     _pfwd_collect_state
+    _pfwd_collect_runtime_health
     echo -e "${BOLD}pfwd Doctor${NC}"
     echo -e "${DIM}$SEP_EQ${NC}"
 
@@ -6041,9 +6162,9 @@ cmd_doctor() {
         fi
 
         if command -v ufw >/dev/null 2>&1; then
-            case "$PFWD_UFW_LOOPBACK_STATE" in
+            case "$PFWD_UFW_PERSISTENCE_STATE" in
                 ok) _doctor_print_check OK "UFW loopback DNAT exceptions synced" ;;
-                missing) _doctor_print_check ERROR "UFW loopback DNAT exceptions missing" "reload pfwd rules or run 'ufw reload'" ;;
+                degraded) _doctor_print_check ERROR "UFW loopback DNAT exceptions missing" "reload pfwd rules or run 'ufw reload'" ;;
                 disabled) _doctor_print_check WARN "UFW disabled; loopback exception sync not needed" ;;
                 *) _doctor_print_check WARN "UFW loopback state: $PFWD_UFW_LOOPBACK_STATE" ;;
             esac
@@ -6095,59 +6216,28 @@ cmd_doctor() {
         done <<< "$(_traffic_rules_with_keys "$PFWD_NFT_RULES")"
     fi
 
-    if command -v iptables >/dev/null 2>&1; then
-        local fwd_policy input_policy
-        fwd_policy=$(plat_iptables_policy iptables FORWARD)
-        input_policy=$(plat_iptables_policy iptables INPUT)
-        if [[ "$fwd_policy" == "DROP" ]]; then
-            if [[ "$has_ipv4_rules" == true ]]; then
-                if _iptables_rule_present iptables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
-                   _iptables_rule_present iptables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
-                    _doctor_print_check OK "iptables FORWARD managed exceptions present"
-                else
-                    _doctor_print_check ERROR "iptables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft' or reload UFW"
-                fi
-            else
-                _doctor_print_check OK "iptables FORWARD policy is DROP (no IPv4 rules, no exceptions needed)"
-            fi
-        else
-            _doctor_print_check OK "iptables FORWARD policy is ${fwd_policy:-unset}"
-        fi
-        if [[ "$input_policy" == "DROP" && $PFWD_LOOPBACK_DNAT == true && "$has_loopback_rules" == true ]]; then
-            if _iptables_rule_present iptables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
-                _doctor_print_check OK "iptables INPUT managed exception present for loopback DNAT"
-            else
-                _doctor_print_check ERROR "iptables INPUT loopback DNAT exception missing" "run 'pfwd restart nft' or reload UFW"
-            fi
-        fi
-    fi
-
-    if command -v ip6tables >/dev/null 2>&1; then
-        local fwd_policy6 input_policy6
-        fwd_policy6=$(plat_iptables_policy ip6tables FORWARD)
-        input_policy6=$(plat_iptables_policy ip6tables INPUT)
-        if [[ "$fwd_policy6" == "DROP" ]]; then
-            if [[ "$has_ipv6_rules" == true ]]; then
-                if _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_FWD_DNAT_COMMENT" -j ACCEPT && \
-                   _iptables_rule_present ip6tables FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$IPTABLES_FWD_EST_COMMENT" -j ACCEPT; then
-                    _doctor_print_check OK "ip6tables FORWARD managed exceptions present"
-                else
-                    _doctor_print_check ERROR "ip6tables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd restart nft'"
-                fi
-            else
-                _doctor_print_check OK "ip6tables FORWARD policy is DROP (no IPv6 rules, no exceptions needed)"
-            fi
-        else
-            _doctor_print_check OK "ip6tables FORWARD policy is ${fwd_policy6:-unset}"
-        fi
-        if [[ "$input_policy6" == "DROP" && $PFWD_LOOPBACK_DNAT == true && "$has_loopback_rules" == true ]]; then
-            if _iptables_rule_present ip6tables INPUT -m conntrack --ctstate DNAT -m comment --comment "$IPTABLES_INPUT_DNAT_COMMENT" -j ACCEPT; then
-                _doctor_print_check OK "ip6tables INPUT managed exception present for loopback DNAT"
-            else
-                _doctor_print_check ERROR "ip6tables INPUT loopback DNAT exception missing" "run 'pfwd restart nft'"
-            fi
-        fi
-    fi
+    case "$PFWD_IPTABLES_V4_FORWARD_STATE" in
+        ok) _doctor_print_check OK "iptables FORWARD managed exceptions present" ;;
+        missing) _doctor_print_check ERROR "iptables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
+        not-needed) _doctor_print_check OK "iptables FORWARD policy needs no IPv4 exceptions" ;;
+        policy-open) _doctor_print_check OK "iptables FORWARD policy is not DROP" ;;
+        unavailable) _doctor_print_check WARN "iptables command unavailable for IPv4 FORWARD checks" ;;
+    esac
+    case "$PFWD_IPTABLES_V6_FORWARD_STATE" in
+        ok) _doctor_print_check OK "ip6tables FORWARD managed exceptions present" ;;
+        missing) _doctor_print_check ERROR "ip6tables FORWARD policy is DROP but pfwd exceptions are missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
+        not-needed) _doctor_print_check OK "ip6tables FORWARD policy needs no IPv6 exceptions" ;;
+        policy-open) _doctor_print_check OK "ip6tables FORWARD policy is not DROP" ;;
+        unavailable) _doctor_print_check WARN "ip6tables command unavailable for IPv6 FORWARD checks" ;;
+    esac
+    case "$PFWD_IPTABLES_V4_INPUT_STATE" in
+        ok) _doctor_print_check OK "iptables INPUT managed exception present for loopback DNAT" ;;
+        missing) _doctor_print_check ERROR "iptables INPUT loopback DNAT exception missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
+    esac
+    case "$PFWD_IPTABLES_V6_INPUT_STATE" in
+        ok) _doctor_print_check OK "ip6tables INPUT managed exception present for loopback DNAT" ;;
+        missing) _doctor_print_check ERROR "ip6tables INPUT loopback DNAT exception missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
+    esac
 
     if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
         _doctor_print_check OK "boot restore service present" "$NFT_RESTORE_SERVICE"
@@ -6171,17 +6261,31 @@ cmd_doctor() {
     else
         _doctor_print_check WARN "traffic collector timer missing" "background traffic stats will not persist"
     fi
+
+    if $tcp_probe; then
+        _doctor_print_check OK "active TCP probe enabled" "timeout=${probe_timeout}s"
+        _pfwd_doctor_tcp_probe "$probe_timeout"
+    fi
 }
 
 # cmd_stop - stop forwarding without removing config
 # cmd_status - show running status and rule counts
 cmd_status() {
     _pfwd_collect_state
+    _pfwd_collect_runtime_health
     echo -e "${BOLD}pfwd Status${NC}"
     echo -e "${DIM}$SEP_EQ_40${NC}"
 
     local nft_status
-    $PFWD_NFT_RUNNING && nft_status="${GREEN}running${NC}" || nft_status="${RED}stopped${NC}"
+    if $PFWD_NFT_RUNNING; then
+        if $PFWD_RUNTIME_HEALTH_DEGRADED; then
+            nft_status="${YELLOW}running (degraded)${NC}"
+        else
+            nft_status="${GREEN}running${NC}"
+        fi
+    else
+        nft_status="${RED}stopped${NC}"
+    fi
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
     if [[ -n "$PFWD_NFT_RULES" ]]; then
         local nft_mss_count=0 nft_snat_count=0
@@ -6200,6 +6304,37 @@ cmd_status() {
             echo -e "  nft opts:  mss=${CYAN}${nft_mss_count}${NC}, fixed-snat=${CYAN}${nft_snat_count}${NC}"
         fi
     fi
+
+    local iptables_forward_status=""
+    case "$PFWD_IPTABLES_V4_FORWARD_STATE" in
+        ok) iptables_forward_status+="IPv4 ${GREEN}ok${NC}" ;;
+        missing) iptables_forward_status+="IPv4 ${RED}missing${NC}" ;;
+        policy-open) iptables_forward_status+="IPv4 ${DIM}policy-open${NC}" ;;
+        not-needed) iptables_forward_status+="IPv4 ${DIM}idle${NC}" ;;
+        unavailable) iptables_forward_status+="IPv4 ${YELLOW}unknown${NC}" ;;
+    esac
+    if [[ -n "$iptables_forward_status" ]]; then
+        iptables_forward_status+=", "
+    fi
+    case "$PFWD_IPTABLES_V6_FORWARD_STATE" in
+        ok) iptables_forward_status+="IPv6 ${GREEN}ok${NC}" ;;
+        missing) iptables_forward_status+="IPv6 ${RED}missing${NC}" ;;
+        policy-open) iptables_forward_status+="IPv6 ${DIM}policy-open${NC}" ;;
+        not-needed) iptables_forward_status+="IPv6 ${DIM}idle${NC}" ;;
+        unavailable) iptables_forward_status+="IPv6 ${YELLOW}unknown${NC}" ;;
+    esac
+    [[ -n "$iptables_forward_status" ]] && echo -e "  iptables fwd: ${iptables_forward_status}"
+
+    local ufw_persist_status=""
+    case "$PFWD_UFW_PERSISTENCE_STATE" in
+        ok) ufw_persist_status="${GREEN}ok${NC}" ;;
+        degraded) ufw_persist_status="${RED}degraded${NC}" ;;
+        idle) ufw_persist_status="${DIM}idle${NC}" ;;
+        disabled) ufw_persist_status="${DIM}ufw off${NC}" ;;
+        unavailable) ufw_persist_status="${DIM}n/a${NC}" ;;
+        *) ufw_persist_status="${YELLOW}${PFWD_UFW_PERSISTENCE_STATE}${NC}" ;;
+    esac
+    echo -e "  UFW persist: ${ufw_persist_status}"
 
     echo -e "  traffic int: ${CYAN}${PFWD_TRAFFIC_INTERVAL}${NC}"
     local traffic_backend_label
@@ -6269,13 +6404,23 @@ cmd_start() {
     case "$target" in
         nft|nftables)
             if _nft_table_exists; then
-                msg_warn "nftables forwarding is already running"
+                msg_warn "nftables forwarding is already running; validating guard state"
+                if ! _pfwd_enforce_runtime_health; then
+                    msg_err "nftables forwarding is running but degraded"
+                    return 1
+                fi
+                msg_ok "nftables forwarding already running and healthy"
                 return 0
             fi
             if cmd_internal_restore_nft; then
                 _pfwd_collect_state
+                if $PFWD_RUNTIME_HEALTH_DEGRADED; then
+                    msg_err "nftables forwarding started but guard validation is degraded"
+                    return 1
+                fi
                 msg_ok "nftables forwarding started ($PFWD_NFT_COUNT state rule(s) restored)"
             else
+                msg_err "Failed to start nftables forwarding cleanly"
                 return 1
             fi
             ;;
@@ -6301,6 +6446,11 @@ cmd_refresh() {
         return 1
     fi
     nft_setup_persistence
+    if ! _pfwd_enforce_runtime_health; then
+        _reset_change_flags
+        msg_err "pfwd state refreshed but guard validation failed"
+        return 1
+    fi
     _pfwd_collect_state
     _reset_change_flags
     msg_ok "pfwd state refreshed and nftables rules rebuilt"
@@ -6366,15 +6516,9 @@ _rewrite_shortcut_args() {
 _parse_import_args() {
     PFWD_IMPORT_PATH=""
     PFWD_IMPORT_METHOD=""
-    PFWD_IMPORT_URL=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --url)
-                require_option_value "$1" "$@" || return 1
-                PFWD_IMPORT_URL="$2"
-                shift 2
-                ;;
             -m|--method)
                 require_option_value "$1" "$@" || return 1
                 PFWD_IMPORT_METHOD="$2"
@@ -6391,8 +6535,8 @@ _parse_import_args() {
         esac
     done
 
-    if [[ -z "$PFWD_IMPORT_URL" && -z "$PFWD_IMPORT_PATH" ]]; then
-        msg_err "Specify a file path or --url"
+    if [[ -z "$PFWD_IMPORT_PATH" ]]; then
+        msg_err "Specify a local JSON file path"
         return 1
     fi
 }
@@ -6445,7 +6589,7 @@ parse_cli_args() {
         restart)
             shift
             local rt="${1:-all}"
-            cmd_stop "$rt"
+            cmd_stop "$rt" || return 1
             cmd_start "$rt"
             ;;
         refresh)
@@ -6469,7 +6613,8 @@ parse_cli_args() {
             cmd_status
             ;;
         doctor|diagnose)
-            cmd_doctor
+            shift
+            cmd_doctor "$@"
             ;;
         verify)
             verify_forwarding_rules
@@ -6484,7 +6629,7 @@ parse_cli_args() {
         import)
             shift
             _parse_import_args "$@" || return 1
-            cmd_import "${PFWD_IMPORT_URL:-$PFWD_IMPORT_PATH}" "$PFWD_IMPORT_METHOD"
+            cmd_import "$PFWD_IMPORT_PATH" "$PFWD_IMPORT_METHOD"
             ;;
         uninstall)
             shift
@@ -6957,6 +7102,10 @@ menu_add_rule() {
         return
     fi
     ip_ver="${PFWD_REQUEST_IP_VER:-$ip_ver}"
+    if [[ "$snat_mode" == "snat" ]]; then
+        echo ""
+        _pfwd_print_fixed_snat_notice "$snat_source"
+    fi
 
     echo ""
     echo -e "${BOLD}=== Confirmation ===${NC}"
@@ -7187,11 +7336,10 @@ menu_export_import() {
     echo ""
     echo "  1) Export to JSON file"
     echo "  2) Import from JSON file"
-    echo "  3) Import from URL"
-    echo "  4) List backup files"
+    echo "  3) List backup files"
     echo "  0) Back"
     echo ""
-    read -rp "Choice [0-4]: " ie_choice
+    read -rp "Choice [0-3]: " ie_choice
 
     case "$ie_choice" in
         1)
@@ -7218,17 +7366,6 @@ menu_export_import() {
             cmd_import "$ipath" "$imethod"
             ;;
         3)
-            echo ""
-            read -rp "URL: " iurl
-            if [[ -z "$iurl" ]]; then
-                msg_info "Cancelled"
-                return
-            fi
-            echo ""
-            read -rp "Override method [keep original]: " imethod
-            cmd_import "$iurl" "$imethod"
-            ;;
-        4)
             echo ""
             echo -e "${BOLD}Backup files:${NC}"
             if ls "$DATA_DIR"/backup_*.json >/dev/null 2>&1; then
