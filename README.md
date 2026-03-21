@@ -141,6 +141,7 @@ pfwd import --url https://example.com/backup.json
 Notes:
 
 - Import/export use the current v3 JSON schema with `forward_rules`.
+- Exported rules keep SNAT/MSS/comment data in `options`, and also write flat compatibility fields such as `snat_mode` / `snat_source`.
 - `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
 - Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
 - Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.

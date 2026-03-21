@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.6"
+readonly VERSION="2.0.7"
 
 # Paths
 readonly DATA_DIR="/var/lib/pfwd"
@@ -208,11 +208,13 @@ plat_conntrack_dump_family() {
 }
 
 json_forward_rules_summary() {
-    local filepath="$1"
-    while IFS=$'\t' read -r method lport target tport _proto _ipver _comment _mss_mode _mss_value _snat_mode _snat_source; do
+    local filepath="$1" override_method="${2:-}"
+    while IFS=$'\t' read -r method lport target tport _proto _ipver comment mss_mode mss_value snat_mode snat_source; do
         [[ -z "$method" ]] && continue
-        printf '  [%s] :%s -> %s:%s\n' "$method" "$lport" "$target" "$tport"
-    done < <(json_forward_rules_tsv "$filepath")
+        local options_summary
+        options_summary=$(_nft_rule_option_summary "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
+        printf '  [%s] :%s -> %s:%s [opts:%s]\n' "$method" "$lport" "$target" "$tport" "$options_summary"
+    done < <(json_forward_rules_tsv "$filepath" "$override_method")
 }
 
 json_forward_rules_tsv() {
@@ -220,7 +222,7 @@ json_forward_rules_tsv() {
     jq -r --arg override "$override_method" '
         .forward_rules[] |
         [
-            ($override | select(length > 0) // .kind // .type // "nft"),
+            (if ($override | length) > 0 then $override else (.kind // .type // "nft") end),
             ((.local.port // .local_port) | tostring),
             ((.target.host // .target_ip) | tostring),
             ((.target.port // .target_port) | tostring),
@@ -271,6 +273,11 @@ json_export_rules_from_tsv() {
                     protocol: ($f[0] // "tcp"),
                     ip_version: ($f[2] // "46")
                 },
+                comment: ($f[5] // ""),
+                snat_mode: ($f[6] // "masquerade"),
+                snat_source: ($f[7] // ""),
+                mss_mode: ($f[8] // ""),
+                mss_value: ($f[9] // ""),
                 options: {
                     comment: ($f[5] // ""),
                     snat_mode: ($f[6] // "masquerade"),
@@ -4982,7 +4989,20 @@ _traffic_saved_flow_records_tsv() {
 
 _traffic_conntrack_dump() {
     if [[ $EUID -eq 0 ]] && command -v conntrack >/dev/null 2>&1; then
-        { plat_conntrack_dump_family ipv4; plat_conntrack_dump_family ipv6; } 2>/dev/null || true
+        local family line
+        for family in ipv4 ipv6; do
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                case "$line" in
+                    ipv4\ *|ipv6\ *)
+                        printf '%s\n' "$line"
+                        ;;
+                    *)
+                        printf '%s %s\n' "$family" "$line"
+                        ;;
+                esac
+            done < <(plat_conntrack_dump_family "$family" 2>/dev/null || true)
+        done
         return 0
     fi
 
@@ -5023,10 +5043,12 @@ _traffic_active_flows_tsv() {
             nf = split(line, fields, /[[:space:]]+/)
             if (fields[1] == "ipv4") {
                 ipver = "4"
-                proto = fields[3]
+                if (fields[2] == "tcp" || fields[2] == "udp") proto = fields[2]
+                else proto = fields[3]
             } else if (fields[1] == "ipv6") {
                 ipver = "6"
-                proto = fields[3]
+                if (fields[2] == "tcp" || fields[2] == "udp") proto = fields[2]
+                else proto = fields[3]
             } else {
                 next
             }
@@ -5489,7 +5511,7 @@ cmd_import() {
     msg_info "Found $count rule(s) in backup"
 
     # Show rules summary
-    json_forward_rules_summary "$filepath"
+    json_forward_rules_summary "$filepath" "$override_method"
 
     local imported=0 failed=0 skipped=0
     local nft_batch_count=0
