@@ -133,7 +133,7 @@ pfwd stats --interval 1m
 pfwd optimize              # balanced (default)
 pfwd optimize gaming       # low latency
 pfwd optimize lowmem       # for small VPS
-pfwd optimize relay        # tcpx-inspired forwarding tuning
+pfwd optimize relay        # relay-focused forwarding tuning
 
 # Export/Import
 pfwd export ~/backup.json

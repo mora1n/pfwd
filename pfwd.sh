@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.9"
+readonly VERSION="2.1.0"
 
 pfwd_path() {
     local path="$1"
@@ -3289,10 +3289,10 @@ _pfwd_sysctl_append_setting() {
     local key="$1" value="$2"
     if sysctl_key_supported "$key"; then
         _pfwd_sysctl_append_line "$key = $value"
-        return 0
+    else
+        _PFWD_SYSCTL_SKIPPED_KEYS+=("$key")
     fi
-    _PFWD_SYSCTL_SKIPPED_KEYS+=("$key")
-    return 1
+    return 0
 }
 
 _pfwd_sysctl_print_skipped() {
@@ -3484,7 +3484,7 @@ optimize_kernel() {
     local tcp_synack_retries tcp_fin_timeout tcp_ecn tcp_frto
     local inotify_instances inotify_watches accept_ra_default="" accept_ra_all=""
     local enable_ipv6_lo_forwarding=false enable_accept_ra=false
-    local enable_tcpx_tuning=false bbr_supported=false
+    local enable_relay_tuning=false bbr_supported=false
 
     case "$profile" in
         gaming)
@@ -3592,7 +3592,7 @@ optimize_kernel() {
             enable_accept_ra=true
             accept_ra_all=2
             accept_ra_default=2
-            enable_tcpx_tuning=true
+            enable_relay_tuning=true
             ;;
         balanced)
             buf_max=33554432         # 32MB
@@ -3703,7 +3703,7 @@ optimize_kernel() {
     _pfwd_sysctl_append_setting net.ipv4.ip_local_port_range "1024 65535"
     _pfwd_sysctl_append_setting net.ipv4.tcp_max_syn_backlog "$max_syn_backlog"
     _pfwd_sysctl_append_setting net.ipv4.tcp_max_tw_buckets "$max_tw_buckets"
-    if $enable_tcpx_tuning; then
+    if $enable_relay_tuning; then
         _pfwd_sysctl_append_setting net.ipv4.tcp_fack 1
         _pfwd_sysctl_append_setting net.ipv4.neigh.default.unres_qlen 10000
     fi
@@ -7029,7 +7029,7 @@ interactive_menu() {
                 echo -e "  ${CYAN}1)${NC} balanced  (default, high bandwidth)"
                 echo -e "  ${CYAN}2)${NC} gaming    (low latency, longer UDP timeout)"
                 echo -e "  ${CYAN}3)${NC} lowmem    (for 512MB-1GB VPS)"
-                echo -e "  ${CYAN}4)${NC} relay     (tcpx-inspired forwarding tuning)"
+                echo -e "  ${CYAN}4)${NC} relay     (relay-focused forwarding tuning)"
                 echo -e "  ${CYAN}5)${NC} ${YELLOW}Reset${NC}     (undo optimization, remove pfwd config)"
                 echo -e "  ${CYAN}0)${NC} ${DIM}Back${NC}"
                 echo ""
