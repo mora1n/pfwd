@@ -13,7 +13,7 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 - **Rule filtering and traffic stats** — `pfwd list -f <pattern>`, `pfwd stats`, `pfwd stats --rate`
 - **Collector interval control** — `pfwd stats --interval [30s|1m|5m|10m|30m|1h]`
 - **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
-- **Kernel optimization profiles** — balanced / gaming / lowmem / relay
+- **Kernel optimization profiles** — balanced / gaming / lowmem / relay, with kernel preflight and post-apply verification
 - **Backup/Import/Export** in JSON format (current v3 schema)
 - **Boot persistence** via systemd services
 - **`--no-color` / `--no-clear`** modes for scripting
@@ -56,7 +56,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Kernel optimization [balanced|gaming|lowmem|relay]
+  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay]
   help        Show help
 ```
 
@@ -130,7 +130,7 @@ pfwd stats --interval
 pfwd stats --interval 1m
 
 # Kernel optimization
-pfwd optimize              # balanced (default)
+pfwd optimize              # balanced (default) + prints preflight/recommendation
 pfwd optimize gaming       # low latency
 pfwd optimize lowmem       # for small VPS
 pfwd optimize relay        # relay-focused forwarding tuning
@@ -148,7 +148,9 @@ Notes:
 - `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
 - `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
 - Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
-- `pfwd optimize` skips unsupported sysctl keys instead of failing the whole profile.
+- `pfwd optimize` prints kernel capability preflight, skips unsupported sysctl keys, and verifies the live result.
+- `pfwd` detects newer performance kernels such as XanMod, but does not install or switch kernels for you.
+- `pfwd` does not manage legacy TCP accelerator stacks such as Lotserver/ServerSpeeder.
 - Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.
 - `pfwd list` shows fixed SNAT rules in the `Options` column and keeps a detailed SNAT section for long addresses.
 - `pfwd status` shows degraded runtime guard state directly, including managed FORWARD exceptions and UFW persistence.

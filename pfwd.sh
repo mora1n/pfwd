@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.1.1"
 
 pfwd_path() {
     local path="$1"
@@ -722,6 +722,8 @@ _pfwd_collect_state() {
 
     PFWD_TRAFFIC_INTERVAL=$(traffic_current_interval)
     PFWD_TRAFFIC_BACKEND=$(traffic_stats_backend)
+    _pfwd_kernel_collect_facts
+    _pfwd_recommend_optimize_profile
 }
 
 _pfwd_collect_runtime_health() {
@@ -3257,6 +3259,314 @@ ensure_bbr_enabled() {
 #  Section 3: System Policy & Kernel Tuning
 #===============================================================================
 
+_pfwd_module_loaded() {
+    local module="$1"
+    command -v lsmod >/dev/null 2>&1 || return 1
+    lsmod | awk -v name="$module" '$1 == name { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+_pfwd_module_loadable() {
+    local module="$1"
+    command -v modprobe >/dev/null 2>&1 || return 1
+    modprobe -nq "$module" >/dev/null 2>&1
+}
+
+_pfwd_kernel_version_at_least() {
+    local want_major="$1" want_minor="$2"
+    local have_major have_minor
+    read -r have_major have_minor < <(uname -r | awk -F'[.-]' '{print $1, $2}')
+    [[ "$have_major" =~ ^[0-9]+$ ]] || return 1
+    [[ "$have_minor" =~ ^[0-9]+$ ]] || have_minor=0
+    if (( have_major > want_major )); then
+        return 0
+    fi
+    if (( have_major == want_major && have_minor >= want_minor )); then
+        return 0
+    fi
+    return 1
+}
+
+_pfwd_kernel_detect_flavor() {
+    local release="${1,,}"
+    case "$release" in
+        *xanmod*) echo "xanmod" ;;
+        *liquorix*) echo "liquorix" ;;
+        *aws*) echo "aws" ;;
+        *gcp*) echo "gcp" ;;
+        *azure*) echo "azure" ;;
+        *amzn*|*amazon*) echo "amazon" ;;
+        *oracle*|*uek*) echo "oracle" ;;
+        *cloud*) echo "cloud" ;;
+        *generic*) echo "generic" ;;
+        *) echo "distro" ;;
+    esac
+}
+
+_pfwd_kernel_collect_facts() {
+    local release flavor
+    release=$(uname -r 2>/dev/null || echo "unknown")
+    flavor=$(_pfwd_kernel_detect_flavor "$release")
+
+    PFWD_KERNEL_RELEASE="$release"
+    PFWD_KERNEL_FLAVOR="$flavor"
+    PFWD_KERNEL_MEM_MB=$(awk '/MemTotal:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null || echo "0")
+    PFWD_KERNEL_CC=$(plat_sysctl_get net.ipv4.tcp_congestion_control "")
+    PFWD_KERNEL_QDISC=$(plat_sysctl_get net.core.default_qdisc "")
+    PFWD_KERNEL_BBR_ACTIVE=false
+    PFWD_KERNEL_BBR_AVAILABLE=false
+    PFWD_KERNEL_BBR_LOADABLE=false
+    PFWD_KERNEL_FLOWTABLE_KERNEL_OK=false
+    PFWD_KERNEL_NF_FLOW_TABLE_LOADED=false
+    PFWD_KERNEL_NF_FLOW_TABLE_LOADABLE=false
+    PFWD_KERNEL_NFT_FLOW_OFFLOAD_LOADABLE=false
+    PFWD_KERNEL_FORWARDING4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+    PFWD_KERNEL_FORWARDING6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
+    PFWD_KERNEL_ROUTE_LOCALNET_ALL=$(plat_sysctl_get net.ipv4.conf.all.route_localnet 0)
+    PFWD_KERNEL_ROUTE_LOCALNET_DEFAULT=$(plat_sysctl_get net.ipv4.conf.default.route_localnet 0)
+    PFWD_KERNEL_CONNTRACK_ACCT=$(plat_sysctl_get net.netfilter.nf_conntrack_acct 0)
+
+    [[ "$PFWD_KERNEL_CC" == "bbr" ]] && PFWD_KERNEL_BBR_ACTIVE=true
+    if sysctl_cc_supported bbr; then
+        PFWD_KERNEL_BBR_AVAILABLE=true
+    elif _pfwd_module_loadable tcp_bbr; then
+        PFWD_KERNEL_BBR_LOADABLE=true
+    fi
+
+    if _pfwd_kernel_version_at_least 4 16; then
+        PFWD_KERNEL_FLOWTABLE_KERNEL_OK=true
+    fi
+    _pfwd_module_loaded nf_flow_table && PFWD_KERNEL_NF_FLOW_TABLE_LOADED=true
+    _pfwd_module_loadable nf_flow_table && PFWD_KERNEL_NF_FLOW_TABLE_LOADABLE=true
+    _pfwd_module_loadable nft_flow_offload && PFWD_KERNEL_NFT_FLOW_OFFLOAD_LOADABLE=true
+
+    case "$flavor" in
+        xanmod)
+            PFWD_KERNEL_FLAVOR_LABEL="XanMod performance kernel"
+            PFWD_KERNEL_TRACK_LABEL="performance-tuned distro kernel"
+            ;;
+        liquorix)
+            PFWD_KERNEL_FLAVOR_LABEL="Liquorix performance kernel"
+            PFWD_KERNEL_TRACK_LABEL="performance-tuned distro kernel"
+            ;;
+        aws|gcp|azure|amazon|oracle|cloud)
+            PFWD_KERNEL_FLAVOR_LABEL="${flavor^^} cloud kernel"
+            PFWD_KERNEL_TRACK_LABEL="cloud vendor kernel"
+            ;;
+        generic)
+            PFWD_KERNEL_FLAVOR_LABEL="generic distro kernel"
+            PFWD_KERNEL_TRACK_LABEL="standard distro kernel"
+            ;;
+        *)
+            PFWD_KERNEL_FLAVOR_LABEL="distribution kernel"
+            PFWD_KERNEL_TRACK_LABEL="standard distro kernel"
+            ;;
+    esac
+}
+
+_pfwd_recommend_optimize_profile() {
+    local mem_mb="${PFWD_KERNEL_MEM_MB:-0}"
+    local rule_count="${PFWD_NFT_COUNT:-0}"
+
+    PFWD_OPTIMIZE_RECOMMENDED_PROFILE="balanced"
+    PFWD_OPTIMIZE_RECOMMEND_REASON="general forwarding baseline"
+
+    if (( mem_mb > 0 && mem_mb <= 1280 )); then
+        PFWD_OPTIMIZE_RECOMMENDED_PROFILE="lowmem"
+        PFWD_OPTIMIZE_RECOMMEND_REASON="small VPS footprint (${mem_mb}MB RAM)"
+    elif (( rule_count >= 12 )); then
+        PFWD_OPTIMIZE_RECOMMENDED_PROFILE="relay"
+        PFWD_OPTIMIZE_RECOMMEND_REASON="heavier forwarding node (${rule_count} saved rules)"
+    fi
+}
+
+_pfwd_optimize_profile_summary() {
+    case "$1" in
+        balanced) echo "general forwarding baseline for most VPSes" ;;
+        gaming) echo "latency-biased tuning for interactive traffic" ;;
+        lowmem) echo "reduced buffers and conntrack footprint for small VPSes" ;;
+        relay) echo "higher-capacity forwarding and relay-oriented queue tuning" ;;
+        *) echo "kernel/network tuning" ;;
+    esac
+}
+
+_pfwd_optimize_profile_caution() {
+    case "$1" in
+        balanced) echo "safe default when you do not need a specialized profile" ;;
+        gaming) echo "biases for latency and can trade some bulk throughput headroom" ;;
+        lowmem) echo "uses smaller queues and buffers to reduce memory pressure" ;;
+        relay) echo "uses larger conntrack/buffer limits and assumes a forwarding-heavy role" ;;
+        *) echo "review before applying" ;;
+    esac
+}
+
+_pfwd_bql_limits_state() {
+    local limit="${1:-65536}"
+    local count=0 mismatched=0 value path sample=""
+    for path in /sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max; do
+        [[ -f "$path" ]] || continue
+        ((count++)) || true
+        value=$(tr -d '[:space:]' < "$path" 2>/dev/null || true)
+        if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value > limit )); then
+            ((mismatched++)) || true
+            [[ -z "$sample" ]] && sample="${path#/sys/class/net/}=${value:-?}"
+        fi
+    done
+
+    if (( count == 0 )); then
+        echo "unsupported"
+    elif (( mismatched == 0 )); then
+        echo "ok:$count"
+    else
+        echo "drift:$count:$sample"
+    fi
+}
+
+_pfwd_print_optimize_preflight() {
+    local profile="$1"
+
+    _pfwd_collect_state
+
+    echo ""
+    echo -e "${BOLD}Optimize Preflight${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
+    msg_dim "  Kernel: ${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
+    msg_dim "  Track: ${PFWD_KERNEL_TRACK_LABEL}"
+    msg_dim "  Current congestion/qdisc: ${PFWD_KERNEL_CC:-unknown} / ${PFWD_KERNEL_QDISC:-unknown}"
+    if $PFWD_KERNEL_BBR_ACTIVE; then
+        msg_dim "  BBR: already active"
+    elif $PFWD_KERNEL_BBR_AVAILABLE; then
+        msg_dim "  BBR: available on this kernel"
+    elif $PFWD_KERNEL_BBR_LOADABLE; then
+        msg_dim "  BBR: tcp_bbr module is loadable"
+    else
+        msg_warn "  BBR: unavailable on this kernel; optimize will skip persistent BBR"
+    fi
+
+    if ! $PFWD_KERNEL_FLOWTABLE_KERNEL_OK; then
+        msg_warn "  Flowtable baseline: kernel < 4.16; nft fast path will stay disabled"
+    elif $PFWD_KERNEL_NF_FLOW_TABLE_LOADED; then
+        msg_dim "  Flowtable baseline: nf_flow_table already loaded"
+    elif $PFWD_KERNEL_NF_FLOW_TABLE_LOADABLE; then
+        msg_dim "  Flowtable baseline: nf_flow_table can be loaded when needed"
+    else
+        msg_warn "  Flowtable baseline: nf_flow_table is not currently available"
+    fi
+    if $PFWD_KERNEL_NFT_FLOW_OFFLOAD_LOADABLE; then
+        msg_dim "  Flow offload module: nft_flow_offload available"
+    fi
+
+    msg_dim "  Profile goal: $(_pfwd_optimize_profile_summary "$profile")"
+    msg_dim "  Profile note: $(_pfwd_optimize_profile_caution "$profile")"
+    if [[ "$profile" == "$PFWD_OPTIMIZE_RECOMMENDED_PROFILE" ]]; then
+        msg_dim "  Recommended profile: ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} (${PFWD_OPTIMIZE_RECOMMEND_REASON})"
+    else
+        msg_warn "  Recommended profile: ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} (${PFWD_OPTIMIZE_RECOMMEND_REASON})"
+    fi
+
+    msg_dim "  Plan: persist forwarding, route_localnet, conntrack accounting, socket buffers, and BQL guardrails"
+    if [[ "$profile" == "relay" ]]; then
+        msg_dim "  Plan: apply relay-only TCP and neighbor queue tuning"
+    fi
+}
+
+_pfwd_print_optimize_verification() {
+    local profile="$1" conntrack_max="$2" ft_tcp_timeout="$3" ft_udp_timeout="$4" expect_bbr="$5" bql_limit="${6:-65536}"
+    local cc qdisc fwd4 fwd6 route_all route_default traffic_acct current_conntrack current_ft_tcp current_ft_udp bql_state
+
+    echo ""
+    echo -e "${BOLD}Optimize Verification${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
+
+    fwd4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+    fwd6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
+    route_all=$(plat_sysctl_get net.ipv4.conf.all.route_localnet 0)
+    route_default=$(plat_sysctl_get net.ipv4.conf.default.route_localnet 0)
+    cc=$(plat_sysctl_get net.ipv4.tcp_congestion_control "")
+    qdisc=$(plat_sysctl_get net.core.default_qdisc "")
+    traffic_acct=$(plat_sysctl_get net.netfilter.nf_conntrack_acct 0)
+    current_conntrack=$(plat_sysctl_get net.netfilter.nf_conntrack_max "")
+
+    [[ "$fwd4" == "1" ]] && _doctor_print_check OK "IPv4 forwarding enabled" || _doctor_print_check ERROR "IPv4 forwarding disabled" "port forwarding will not work until net.ipv4.ip_forward=1"
+    [[ "$fwd6" == "1" ]] && _doctor_print_check OK "IPv6 forwarding enabled" || _doctor_print_check WARN "IPv6 forwarding disabled"
+    if [[ "$route_all" == "1" && "$route_default" == "1" ]]; then
+        _doctor_print_check OK "route_localnet persisted"
+    else
+        _doctor_print_check WARN "route_localnet not fully persisted" "loopback DNAT rules may fail until both all/default are set"
+    fi
+
+    if [[ "$expect_bbr" == "true" ]]; then
+        [[ "$cc" == "bbr" ]] && _doctor_print_check OK "BBR active after optimize" || _doctor_print_check WARN "BBR requested but not active" "current=${cc:-unknown}"
+        [[ "$qdisc" == "fq" ]] && _doctor_print_check OK "fq qdisc active" || _doctor_print_check WARN "fq qdisc not active" "current=${qdisc:-unknown}"
+    else
+        _doctor_print_check WARN "BBR skipped on this kernel" "kernel does not currently expose tcp_bbr"
+    fi
+
+    if [[ -n "$current_conntrack" && "$current_conntrack" == "$conntrack_max" ]]; then
+        _doctor_print_check OK "nf_conntrack_max applied" "$current_conntrack"
+    else
+        _doctor_print_check WARN "nf_conntrack_max differs from profile target" "expected=${conntrack_max}, current=${current_conntrack:-unknown}"
+    fi
+
+    [[ "$traffic_acct" == "1" ]] && _doctor_print_check OK "nf_conntrack_acct enabled" || _doctor_print_check WARN "nf_conntrack_acct disabled" "traffic stats may stay at zero"
+
+    current_ft_tcp=$(plat_sysctl_get net.netfilter.nf_flowtable_tcp_timeout "")
+    current_ft_udp=$(plat_sysctl_get net.netfilter.nf_flowtable_udp_timeout "")
+    if [[ -n "$current_ft_tcp" ]]; then
+        [[ "$current_ft_tcp" == "$ft_tcp_timeout" ]] && _doctor_print_check OK "flowtable TCP timeout applied" "${current_ft_tcp}s" || _doctor_print_check WARN "flowtable TCP timeout differs" "expected=${ft_tcp_timeout}, current=${current_ft_tcp}"
+    else
+        _doctor_print_check WARN "flowtable TCP timeout unsupported on this kernel"
+    fi
+    if [[ -n "$current_ft_udp" ]]; then
+        [[ "$current_ft_udp" == "$ft_udp_timeout" ]] && _doctor_print_check OK "flowtable UDP timeout applied" "${current_ft_udp}s" || _doctor_print_check WARN "flowtable UDP timeout differs" "expected=${ft_udp_timeout}, current=${current_ft_udp}"
+    else
+        _doctor_print_check WARN "flowtable UDP timeout unsupported on this kernel"
+    fi
+
+    bql_state=$(_pfwd_bql_limits_state "$bql_limit")
+    case "$bql_state" in
+        ok:*)
+            _doctor_print_check OK "BQL limit_max cap applied" "${bql_state#ok:} TX queue(s) at <= ${bql_limit} bytes"
+            ;;
+        drift:*)
+            _doctor_print_check WARN "BQL limit_max cap drifted" "${bql_state#drift:}"
+            ;;
+        *)
+            _doctor_print_check WARN "BQL limit_max unsupported" "kernel/NIC does not expose byte_queue_limits"
+            ;;
+    esac
+
+    msg_dim "  Profile ${profile}: $(_pfwd_optimize_profile_summary "$profile")"
+}
+
+_pfwd_print_reset_verification() {
+    local marker_start="# pfwd-managed-start"
+    local still_active=()
+    local cc fwd4 fwd6
+
+    echo ""
+    echo -e "${BOLD}Reset Verification${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
+
+    if [[ -f "$SYSCTL_CONF" ]] && grep -q "$marker_start" "$SYSCTL_CONF" 2>/dev/null; then
+        _doctor_print_check ERROR "pfwd-managed sysctl block still present" "$SYSCTL_CONF"
+    else
+        _doctor_print_check OK "pfwd-managed sysctl block removed"
+    fi
+
+    fwd4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+    fwd6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
+    cc=$(plat_sysctl_get net.ipv4.tcp_congestion_control "")
+    [[ "$fwd4" == "1" ]] && still_active+=("IPv4 forwarding")
+    [[ "$fwd6" == "1" ]] && still_active+=("IPv6 forwarding")
+    [[ "$cc" == "bbr" ]] && still_active+=("BBR")
+
+    if (( ${#still_active[@]} > 0 )); then
+        _doctor_print_check WARN "live kernel state still reflects prior optimize run" "${still_active[*]} may remain until reboot or manual reset"
+    else
+        _doctor_print_check OK "live kernel state no longer shows optimize leftovers"
+    fi
+}
+
 sysctl_key_supported() {
     sysctl -N "$1" >/dev/null 2>&1
 }
@@ -3635,7 +3945,8 @@ optimize_kernel() {
             ;;
     esac
 
-    msg_info "Applying kernel optimizations (profile: $profile)..."
+    _pfwd_print_optimize_preflight "$profile"
+    msg_info "Stage 1/2: writing managed sysctl profile ($profile)"
 
     if ! sysctl_cc_supported bbr; then
         modprobe tcp_bbr 2>/dev/null || true
@@ -3756,6 +4067,7 @@ $marker_start
 $_PFWD_SYSCTL_RENDERED$marker_end
 EOF
 
+    msg_info "Stage 2/2: applying live sysctl values and verifying result"
     plat_sysctl_apply_file "$SYSCTL_CONF"
 
     # Cap BQL limit_max to prevent bufferbloat
@@ -3790,6 +4102,7 @@ EOF
     msg_dim "  Flowtable acceleration: via nftables"
     msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
     _pfwd_sysctl_print_skipped
+    _pfwd_print_optimize_verification "$profile" "$conntrack_max" "$ft_tcp_timeout" "$ft_udp_timeout" "$bbr_supported" "65536"
 }
 
 # reset_kernel_optimization - remove pfwd-managed sysctl block and reload
@@ -3812,6 +4125,7 @@ reset_kernel_optimization() {
     plat_sysctl_apply_file "$SYSCTL_CONF"
     msg_ok "Kernel optimization removed (pfwd-managed block deleted)"
     msg_dim "  Note: some live kernel parameters may remain until reboot"
+    _pfwd_print_reset_verification
 }
 
 # apply_bql_limits - cap NIC TX byte queue limits to prevent bufferbloat
@@ -5740,7 +6054,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Run kernel optimization [balanced|gaming|lowmem|relay]
+  optimize    Run kernel optimization with preflight + verify [balanced|gaming|lowmem|relay]
   help        Show this help
 
 Quick syntax:
@@ -5802,6 +6116,7 @@ Common scenarios:
   pfwd -m nft -t 127.0.0.1 33389:3389
   pfwd doctor
   pfwd import backup.json
+  pfwd optimize            # prints kernel preflight + recommended profile
   pfwd optimize balanced
   pfwd optimize relay
 
@@ -5811,7 +6126,8 @@ Performance tips:
   - nft is the fastest path for fixed IP targets.
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
-  - optimize skips unsupported sysctl keys instead of failing the whole profile.
+  - optimize prints kernel capability preflight, skips unsupported sysctl keys, and verifies live state.
+  - pfwd detects performance kernels such as XanMod, but does not install or switch kernels for you.
 
 Options:
   -m, --method <nft>         Forwarding method (required)
@@ -6199,6 +6515,32 @@ cmd_doctor() {
         _doctor_print_check WARN "state file missing" "$RULES_STATE_FILE"
     fi
 
+    _doctor_print_check OK "kernel release detected" "${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
+    if [[ "$PFWD_KERNEL_FLAVOR" == "xanmod" || "$PFWD_KERNEL_FLAVOR" == "liquorix" ]]; then
+        _doctor_print_check OK "performance kernel detected" "${PFWD_KERNEL_TRACK_LABEL}"
+    else
+        _doctor_print_check OK "kernel track" "${PFWD_KERNEL_TRACK_LABEL}"
+    fi
+    if $PFWD_KERNEL_BBR_ACTIVE; then
+        _doctor_print_check OK "BBR active" "qdisc=${PFWD_KERNEL_QDISC:-unknown}"
+    elif $PFWD_KERNEL_BBR_AVAILABLE || $PFWD_KERNEL_BBR_LOADABLE; then
+        _doctor_print_check WARN "BBR available but not active" "run 'pfwd optimize ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}' to persist it"
+    else
+        _doctor_print_check WARN "BBR unavailable on current kernel" "optimize will skip BBR persistence"
+    fi
+    if $PFWD_KERNEL_FLOWTABLE_KERNEL_OK; then
+        _doctor_print_check OK "kernel meets flowtable baseline" ">= 4.16"
+        if $PFWD_KERNEL_NF_FLOW_TABLE_LOADED; then
+            _doctor_print_check OK "nf_flow_table module ready" "loaded"
+        elif $PFWD_KERNEL_NF_FLOW_TABLE_LOADABLE; then
+            _doctor_print_check OK "nf_flow_table module ready" "loadable"
+        else
+            _doctor_print_check WARN "nf_flow_table module unavailable" "fast path may stay disabled on this kernel build"
+        fi
+    else
+        _doctor_print_check WARN "kernel too old for flowtable fast path" "requires Linux >= 4.16"
+    fi
+
     local unresolved_count=0
     if [[ -n "$PFWD_NFT_RULES" ]]; then
         local rule_proto rule_lport rule_ipver rule_target rule_tport rule_comment rule_snat_mode rule_snat_source rule_mss_mode rule_mss_value
@@ -6513,6 +6855,8 @@ cmd_status() {
         *) traffic_backend_label="${RED}${PFWD_TRAFFIC_BACKEND}${NC}" ;;
     esac
     echo -e "  traffic src: ${traffic_backend_label}"
+    echo -e "  kernel:     ${CYAN}${PFWD_KERNEL_RELEASE}${NC} ${DIM}(${PFWD_KERNEL_FLAVOR_LABEL})${NC}"
+    echo -e "  optimize:   ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} ${DIM}${PFWD_OPTIMIZE_RECOMMEND_REASON}${NC}"
 
     # kernel forwarding
     local fwd4 fwd6
@@ -7025,11 +7369,15 @@ interactive_menu() {
             d|D) cmd_doctor; wait_for_enter ;;
             6) menu_export_import || true ;;
             7)
+                _pfwd_collect_state
                 echo ""
-                echo -e "  ${CYAN}1)${NC} balanced  (default, high bandwidth)"
-                echo -e "  ${CYAN}2)${NC} gaming    (low latency, longer UDP timeout)"
-                echo -e "  ${CYAN}3)${NC} lowmem    (for 512MB-1GB VPS)"
-                echo -e "  ${CYAN}4)${NC} relay     (relay-focused forwarding tuning)"
+                echo -e "  ${DIM}Kernel:${NC} ${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
+                echo -e "  ${DIM}Recommended:${NC} ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} (${PFWD_OPTIMIZE_RECOMMEND_REASON})"
+                echo ""
+                echo -e "  ${CYAN}1)${NC} balanced  (recommended general forwarding baseline)"
+                echo -e "  ${CYAN}2)${NC} gaming    (latency-biased tuning for interactive traffic)"
+                echo -e "  ${CYAN}3)${NC} lowmem    (small VPS, reduced buffer footprint)"
+                echo -e "  ${CYAN}4)${NC} relay     (heavier relay/forwarding node tuning)"
                 echo -e "  ${CYAN}5)${NC} ${YELLOW}Reset${NC}     (undo optimization, remove pfwd config)"
                 echo -e "  ${CYAN}0)${NC} ${DIM}Back${NC}"
                 echo ""
