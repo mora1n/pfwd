@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.0.8"
+readonly VERSION="2.0.9"
 
 pfwd_path() {
     local path="$1"
@@ -3257,6 +3257,55 @@ ensure_bbr_enabled() {
 #  Section 3: System Policy & Kernel Tuning
 #===============================================================================
 
+sysctl_key_supported() {
+    sysctl -N "$1" >/dev/null 2>&1
+}
+
+sysctl_cc_supported() {
+    local cc="$1" available
+    available=$(plat_sysctl_get net.ipv4.tcp_available_congestion_control "")
+    [[ " $available " == *" $cc "* ]]
+}
+
+_PFWD_SYSCTL_RENDERED=""
+_PFWD_SYSCTL_SKIPPED_KEYS=()
+
+_pfwd_sysctl_reset_render() {
+    _PFWD_SYSCTL_RENDERED=""
+    _PFWD_SYSCTL_SKIPPED_KEYS=()
+}
+
+_pfwd_sysctl_append_line() {
+    printf -v _PFWD_SYSCTL_RENDERED '%s%s\n' "$_PFWD_SYSCTL_RENDERED" "$1"
+}
+
+_pfwd_sysctl_append_section() {
+    local title="$1"
+    [[ -n "$_PFWD_SYSCTL_RENDERED" ]] && _pfwd_sysctl_append_line ""
+    _pfwd_sysctl_append_line "# $title"
+}
+
+_pfwd_sysctl_append_setting() {
+    local key="$1" value="$2"
+    if sysctl_key_supported "$key"; then
+        _pfwd_sysctl_append_line "$key = $value"
+        return 0
+    fi
+    _PFWD_SYSCTL_SKIPPED_KEYS+=("$key")
+    return 1
+}
+
+_pfwd_sysctl_print_skipped() {
+    local -A seen=()
+    local key
+    for key in "${_PFWD_SYSCTL_SKIPPED_KEYS[@]}"; do
+        [[ -n "$key" ]] || continue
+        [[ -n "${seen[$key]:-}" ]] && continue
+        seen["$key"]=1
+        msg_dim "  Skipped unsupported sysctl: $key"
+    done
+}
+
 # ensure_kernel_optimized - skip optimize_kernel if already configured
 # Checks ip_forward and sysctl file; only runs full optimization if needed
 ensure_ip_forwarding() {
@@ -3424,29 +3473,27 @@ ufw_sync_loopback_dnat_rules() {
 optimize_kernel() {
     local profile="${1:-balanced}"
     require_root "$0 optimize $profile"
-    msg_info "Applying kernel optimizations (profile: $profile)..."
-
     local marker_start="# pfwd-managed-start"
     local marker_end="# pfwd-managed-end"
-
-    # Remove old managed block if exists
-    if [[ -f "$SYSCTL_CONF" ]]; then
-        sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
-    fi
-
-    mkdir -p "$(dirname "$SYSCTL_CONF")"
-
-    # Profile-specific values
     local buf_max conntrack_max conntrack_tcp_est udp_timeout udp_stream_timeout
+    local conntrack_tcp_time_wait conntrack_tcp_close_wait conntrack_tcp_fin_wait
     local tcp_rmem tcp_wmem tcp_mem backlog somaxconn file_max
     local ft_tcp_timeout ft_udp_timeout conntrack_buckets gro_normal_batch
-    local max_syn_backlog max_tw_buckets
+    local max_syn_backlog max_tw_buckets netdev_budget netdev_budget_usecs
+    local optmem_max keepalive_time keepalive_intvl keepalive_probes
+    local tcp_synack_retries tcp_fin_timeout tcp_ecn tcp_frto
+    local inotify_instances inotify_watches accept_ra_default="" accept_ra_all=""
+    local enable_ipv6_lo_forwarding=false enable_accept_ra=false
+    local enable_tcpx_tuning=false bbr_supported=false
 
     case "$profile" in
         gaming)
             buf_max=134217728        # 128MB
             conntrack_max=524288
             conntrack_tcp_est=3600
+            conntrack_tcp_time_wait=15
+            conntrack_tcp_close_wait=60
+            conntrack_tcp_fin_wait=30
             udp_timeout=120          # Longer UDP timeout for gaming
             udp_stream_timeout=300
             tcp_rmem="4096 131072 134217728"
@@ -3461,11 +3508,26 @@ optimize_kernel() {
             gro_normal_batch=8
             max_syn_backlog=16384
             max_tw_buckets=262144
+            netdev_budget=600
+            netdev_budget_usecs=4000
+            optmem_max=65536
+            keepalive_time=300
+            keepalive_intvl=15
+            keepalive_probes=3
+            tcp_synack_retries=2
+            tcp_fin_timeout=10
+            tcp_ecn=2
+            tcp_frto=2
+            inotify_instances=8192
+            inotify_watches=262144
             ;;
         lowmem)
             buf_max=16777216         # 16MB
             conntrack_max=131072
             conntrack_tcp_est=3600
+            conntrack_tcp_time_wait=15
+            conntrack_tcp_close_wait=30
+            conntrack_tcp_fin_wait=20
             udp_timeout=30
             udp_stream_timeout=120
             tcp_rmem="4096 65536 16777216"
@@ -3480,11 +3542,65 @@ optimize_kernel() {
             gro_normal_batch=4
             max_syn_backlog=4096
             max_tw_buckets=65536
+            netdev_budget=300
+            netdev_budget_usecs=3000
+            optmem_max=32768
+            keepalive_time=300
+            keepalive_intvl=15
+            keepalive_probes=3
+            tcp_synack_retries=2
+            tcp_fin_timeout=10
+            tcp_ecn=2
+            tcp_frto=2
+            inotify_instances=4096
+            inotify_watches=131072
             ;;
-        balanced|*)
+        relay)
+            buf_max=67108864         # 64MB
+            conntrack_max=1048576
+            conntrack_tcp_est=7200
+            conntrack_tcp_time_wait=15
+            conntrack_tcp_close_wait=60
+            conntrack_tcp_fin_wait=30
+            udp_timeout=120
+            udp_stream_timeout=300
+            tcp_rmem="4096 131072 67108864"
+            tcp_wmem="4096 65536 67108864"
+            tcp_mem="131072 196608 262144"
+            backlog=65536
+            somaxconn=65535
+            file_max=6815744
+            ft_tcp_timeout=300
+            ft_udp_timeout=120
+            conntrack_buckets=262144
+            gro_normal_batch=8
+            max_syn_backlog=131072
+            max_tw_buckets=262144
+            netdev_budget=600
+            netdev_budget_usecs=5000
+            optmem_max=65536
+            keepalive_time=600
+            keepalive_intvl=15
+            keepalive_probes=2
+            tcp_synack_retries=1
+            tcp_fin_timeout=15
+            tcp_ecn=1
+            tcp_frto=0
+            inotify_instances=8192
+            inotify_watches=524288
+            enable_ipv6_lo_forwarding=true
+            enable_accept_ra=true
+            accept_ra_all=2
+            accept_ra_default=2
+            enable_tcpx_tuning=true
+            ;;
+        balanced)
             buf_max=33554432         # 32MB
             conntrack_max=1048576
             conntrack_tcp_est=7200
+            conntrack_tcp_time_wait=15
+            conntrack_tcp_close_wait=60
+            conntrack_tcp_fin_wait=30
             udp_timeout=60
             udp_stream_timeout=180
             tcp_rmem="4096 131072 33554432"
@@ -3499,101 +3615,146 @@ optimize_kernel() {
             gro_normal_batch=8
             max_syn_backlog=4096
             max_tw_buckets=262144
+            netdev_budget=300
+            netdev_budget_usecs=3000
+            optmem_max=65536
+            keepalive_time=300
+            keepalive_intvl=15
+            keepalive_probes=3
+            tcp_synack_retries=2
+            tcp_fin_timeout=10
+            tcp_ecn=2
+            tcp_frto=2
+            inotify_instances=8192
+            inotify_watches=262144
+            ;;
+        *)
+            msg_err "Unknown optimize profile: $profile"
+            msg_dim "  Valid profiles: balanced, gaming, lowmem, relay"
+            return 1
             ;;
     esac
 
+    msg_info "Applying kernel optimizations (profile: $profile)..."
+
+    if ! sysctl_cc_supported bbr; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if sysctl_cc_supported bbr; then
+        bbr_supported=true
+    fi
+
+    if [[ -f "$SYSCTL_CONF" ]]; then
+        sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
+    fi
+
+    mkdir -p "$(dirname "$SYSCTL_CONF")"
+    touch "$SYSCTL_CONF"
+    _pfwd_sysctl_reset_render
+
+    _pfwd_sysctl_append_line "# Profile: $profile"
+
+    _pfwd_sysctl_append_section "File System"
+    _pfwd_sysctl_append_setting fs.file-max "$file_max"
+    _pfwd_sysctl_append_setting fs.inotify.max_user_instances "$inotify_instances"
+    _pfwd_sysctl_append_setting fs.inotify.max_user_watches "$inotify_watches"
+
+    _pfwd_sysctl_append_section "IP Forwarding"
+    _pfwd_sysctl_append_setting net.ipv4.ip_forward 1
+    _pfwd_sysctl_append_setting net.ipv6.conf.all.forwarding 1
+    _pfwd_sysctl_append_setting net.ipv4.conf.all.forwarding 1
+    _pfwd_sysctl_append_setting net.ipv4.conf.default.forwarding 1
+    _pfwd_sysctl_append_setting net.ipv6.conf.default.forwarding 1
+    if $enable_ipv6_lo_forwarding; then
+        _pfwd_sysctl_append_setting net.ipv6.conf.lo.forwarding 1
+    fi
+    if $enable_accept_ra; then
+        _pfwd_sysctl_append_setting net.ipv6.conf.all.accept_ra "$accept_ra_all"
+        _pfwd_sysctl_append_setting net.ipv6.conf.default.accept_ra "$accept_ra_default"
+    fi
+
+    _pfwd_sysctl_append_section "Congestion Control"
+    if $bbr_supported; then
+        _pfwd_sysctl_append_setting net.core.default_qdisc fq
+        _pfwd_sysctl_append_setting net.ipv4.tcp_congestion_control bbr
+    fi
+
+    _pfwd_sysctl_append_section "TCP Optimization"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_fastopen 3
+    _pfwd_sysctl_append_setting net.ipv4.tcp_early_retrans 3
+    _pfwd_sysctl_append_setting net.ipv4.tcp_slow_start_after_idle 0
+    _pfwd_sysctl_append_setting net.ipv4.tcp_notsent_lowat 16384
+    _pfwd_sysctl_append_setting net.ipv4.tcp_mtu_probing 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_timestamps 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_sack 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_window_scaling 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_moderate_rcvbuf 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_no_metrics_save 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_rfc1337 0
+    _pfwd_sysctl_append_setting net.ipv4.tcp_ecn "$tcp_ecn"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_frto "$tcp_frto"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_keepalive_time "$keepalive_time"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_keepalive_intvl "$keepalive_intvl"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_keepalive_probes "$keepalive_probes"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_tw_reuse 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_fin_timeout "$tcp_fin_timeout"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_syncookies 1
+    _pfwd_sysctl_append_setting net.ipv4.tcp_synack_retries "$tcp_synack_retries"
+    _pfwd_sysctl_append_setting net.ipv4.ip_local_port_range "1024 65535"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_max_syn_backlog "$max_syn_backlog"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_max_tw_buckets "$max_tw_buckets"
+    if $enable_tcpx_tuning; then
+        _pfwd_sysctl_append_setting net.ipv4.tcp_fack 1
+        _pfwd_sysctl_append_setting net.ipv4.neigh.default.unres_qlen 10000
+    fi
+    if sysctl_key_supported net.ipv4.tcp_adv_win_scale; then
+        _pfwd_sysctl_append_setting net.ipv4.tcp_adv_win_scale 1
+    fi
+
+    _pfwd_sysctl_append_section "UDP Optimization"
+    _pfwd_sysctl_append_setting net.ipv4.udp_rmem_min 8192
+    _pfwd_sysctl_append_setting net.ipv4.udp_wmem_min 8192
+
+    _pfwd_sysctl_append_section "Buffers"
+    _pfwd_sysctl_append_setting net.core.rmem_max "$buf_max"
+    _pfwd_sysctl_append_setting net.core.wmem_max "$buf_max"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_mem "$tcp_mem"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_rmem "$tcp_rmem"
+    _pfwd_sysctl_append_setting net.ipv4.tcp_wmem "$tcp_wmem"
+    _pfwd_sysctl_append_setting net.core.optmem_max "$optmem_max"
+    _pfwd_sysctl_append_setting net.core.netdev_max_backlog "$backlog"
+    _pfwd_sysctl_append_setting net.core.netdev_budget "$netdev_budget"
+    _pfwd_sysctl_append_setting net.core.netdev_budget_usecs "$netdev_budget_usecs"
+    _pfwd_sysctl_append_setting net.core.somaxconn "$somaxconn"
+    _pfwd_sysctl_append_setting net.core.gro_normal_batch "$gro_normal_batch"
+
+    _pfwd_sysctl_append_section "Connection Tracking"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_max "$conntrack_max"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_tcp_timeout_established "$conntrack_tcp_est"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_tcp_timeout_time_wait "$conntrack_tcp_time_wait"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_tcp_timeout_close_wait "$conntrack_tcp_close_wait"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_tcp_timeout_fin_wait "$conntrack_tcp_fin_wait"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_tcp_loose 1
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_udp_timeout "$udp_timeout"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_udp_timeout_stream "$udp_stream_timeout"
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_acct 1
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_helper 0
+    _pfwd_sysctl_append_setting net.netfilter.nf_conntrack_buckets "$conntrack_buckets"
+
+    _pfwd_sysctl_append_section "Flowtable Timeout"
+    _pfwd_sysctl_append_setting net.netfilter.nf_flowtable_tcp_timeout "$ft_tcp_timeout"
+    _pfwd_sysctl_append_setting net.netfilter.nf_flowtable_udp_timeout "$ft_udp_timeout"
+
+    _pfwd_sysctl_append_section "DNAT Optimization"
+    _pfwd_sysctl_append_setting net.ipv4.conf.all.rp_filter 0
+    _pfwd_sysctl_append_setting net.ipv4.conf.default.rp_filter 0
+    _pfwd_sysctl_append_setting net.ipv4.conf.all.route_localnet 1
+    _pfwd_sysctl_append_setting net.ipv4.conf.default.route_localnet 1
+
     cat >> "$SYSCTL_CONF" << EOF
 $marker_start
-
-# Profile: $profile
-
-# File System
-fs.file-max = $file_max
-
-# IP Forwarding
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.ipv4.conf.all.forwarding = 1
-net.ipv4.conf.default.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-
-# BBR Congestion Control
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# TCP Optimization
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_early_retrans = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_rfc1337 = 0                    # 防止 TIME-WAIT 暗杀攻击（0=防护，1=严格 RFC1337）
-net.ipv4.tcp_ecn = 2
-net.ipv4.tcp_frto = 2
-
-# UDP Optimization
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# Buffers
-net.core.rmem_max = $buf_max
-net.core.wmem_max = $buf_max
-net.ipv4.tcp_mem = $tcp_mem
-net.ipv4.tcp_rmem = $tcp_rmem
-net.ipv4.tcp_wmem = $tcp_wmem
-net.core.netdev_max_backlog = $backlog
-net.core.somaxconn = $somaxconn
-
-# Connection Tracking
-net.netfilter.nf_conntrack_max = $conntrack_max
-net.netfilter.nf_conntrack_tcp_timeout_established = $conntrack_tcp_est
-net.netfilter.nf_conntrack_tcp_loose = 1
-net.netfilter.nf_conntrack_udp_timeout = $udp_timeout
-net.netfilter.nf_conntrack_udp_timeout_stream = $udp_stream_timeout
-net.netfilter.nf_conntrack_acct = 1
-net.netfilter.nf_conntrack_helper = 0
-net.netfilter.nf_conntrack_buckets = $conntrack_buckets
-
-# Flowtable Timeout
-net.netfilter.nf_flowtable_tcp_timeout = $ft_tcp_timeout
-net.netfilter.nf_flowtable_udp_timeout = $ft_udp_timeout
-
-# GRO Optimization
-net.core.gro_normal_batch = $gro_normal_batch
-
-# DNAT Optimization
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.conf.all.route_localnet = 1
-
-# TCP Keepalive
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-
-# SYN 防护与连接管理
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_max_syn_backlog = $max_syn_backlog
-net.ipv4.tcp_max_tw_buckets = $max_tw_buckets
-
-$marker_end
+$_PFWD_SYSCTL_RENDERED$marker_end
 EOF
-
-    # tcp_adv_win_scale obsolete since kernel 6.6; skip on newer kernels
-    local kver_num
-    kver_num=$(uname -r | awk -F'[.-]' '{printf "%d%03d", $1, $2}')
-    if (( kver_num < 6006 )); then
-        echo "net.ipv4.tcp_adv_win_scale = 1" >> "$SYSCTL_CONF"
-    fi
 
     plat_sysctl_apply_file "$SYSCTL_CONF"
 
@@ -3617,13 +3778,18 @@ EOF
 
     msg_ok "Kernel optimizations applied ($profile profile)"
     msg_dim "  IP forwarding: enabled"
-    msg_dim "  BBR congestion control: enabled"
+    if $bbr_supported; then
+        msg_dim "  BBR congestion control: enabled"
+    else
+        msg_warn "BBR is not available on this kernel; skipped persistence"
+    fi
     msg_dim "  TCP fast open: enabled"
     msg_dim "  Conntrack max: $conntrack_max (buckets: $conntrack_buckets)"
     msg_dim "  Conntrack accounting: enabled"
     msg_dim "  Flowtable timeout: tcp=${ft_tcp_timeout}s udp=${ft_udp_timeout}s"
     msg_dim "  Flowtable acceleration: via nftables"
     msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
+    _pfwd_sysctl_print_skipped
 }
 
 # reset_kernel_optimization - remove pfwd-managed sysctl block and reload
@@ -5574,7 +5740,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Run kernel optimization [balanced|gaming|lowmem]
+  optimize    Run kernel optimization [balanced|gaming|lowmem|relay]
   help        Show this help
 
 Quick syntax:
@@ -5637,6 +5803,7 @@ Common scenarios:
   pfwd doctor
   pfwd import backup.json
   pfwd optimize balanced
+  pfwd optimize relay
 
 Performance tips:
   - pfwd now treats $RULES_STATE_FILE as the source of truth.
@@ -5644,6 +5811,7 @@ Performance tips:
   - nft is the fastest path for fixed IP targets.
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
+  - optimize skips unsupported sysctl keys instead of failing the whole profile.
 
 Options:
   -m, --method <nft>         Forwarding method (required)
@@ -6861,15 +7029,17 @@ interactive_menu() {
                 echo -e "  ${CYAN}1)${NC} balanced  (default, high bandwidth)"
                 echo -e "  ${CYAN}2)${NC} gaming    (low latency, longer UDP timeout)"
                 echo -e "  ${CYAN}3)${NC} lowmem    (for 512MB-1GB VPS)"
-                echo -e "  ${CYAN}4)${NC} ${YELLOW}Reset${NC}     (undo optimization, remove pfwd config)"
+                echo -e "  ${CYAN}4)${NC} relay     (tcpx-inspired forwarding tuning)"
+                echo -e "  ${CYAN}5)${NC} ${YELLOW}Reset${NC}     (undo optimization, remove pfwd config)"
                 echo -e "  ${CYAN}0)${NC} ${DIM}Back${NC}"
                 echo ""
-                read -rp "Select [0-4, default=1]: " _kp
+                read -rp "Select [0-5, default=1]: " _kp
                 case "$_kp" in
                     0) continue ;;
                     2) optimize_kernel gaming; wait_for_enter ;;
                     3) optimize_kernel lowmem; wait_for_enter ;;
-                    4) reset_kernel_optimization; wait_for_enter ;;
+                    4) optimize_kernel relay; wait_for_enter ;;
+                    5) reset_kernel_optimization; wait_for_enter ;;
                     *) optimize_kernel balanced; wait_for_enter ;;
                 esac
                 ;;
