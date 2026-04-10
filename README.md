@@ -71,7 +71,7 @@ pfwd <ports> <target> [target_port]
 
 | Option | Description |
 |--------|-------------|
-| `-m, --method` | `nft` (required) |
+| `-m, --method` | `nft` only (required) |
 | `-t, --target` | Target IP or domain (required) |
 | `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
 | `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
@@ -137,13 +137,14 @@ pfwd optimize relay        # relay-focused forwarding tuning
 
 # Export/Import
 pfwd export ~/backup.json
-pfwd import ~/backup.json -m nft
+pfwd import ~/backup.json
 ```
 
 Notes:
 
-- Import/export use the current v3 JSON schema with `forward_rules`.
+- Import/export use the current v3 JSON schema with `forward_rules` for nft rules.
 - `pfwd import` only accepts local JSON files; download remote backups first if needed.
+- `pfwd import` rejects backups that contain non-nft rule kinds.
 - Exported rules keep SNAT/MSS/comment data in `options`, and also write flat compatibility fields such as `snat_mode` / `snat_source`.
 - `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
 - `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
@@ -166,6 +167,8 @@ Kernel-level DNAT forwarding with flowtable fast path acceleration. Established 
 
 Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loads, and persists the module, falling back gracefully if unavailable.
 
+When `conntrack` is available, `pfwd doctor` can inspect live `[OFFLOAD]` and `[HW_OFFLOAD]` tags instead of relying on extra hot-path nft counters.
+
 Best for: IP-based targets, maximum performance.
 
 ## Traffic Statistics
@@ -175,13 +178,14 @@ Best for: IP-based targets, maximum performance.
 - The collector stores accumulated per-rule inbound / outbound totals and a lightweight flow snapshot for delta calculation.
 - Traffic history is keyed by full rule identity (`proto/ipver/lport/target/tport`), so reusing a local port for a new backend does not inherit old counters.
 - Flowtable-accelerated connections remain visible through conntrack accounting, so stats keep working without putting counters back on the forwarding path.
+- `pfwd doctor` prefers conntrack offload tags over nft hot-path counters for flowtable observability.
 
 ## Performance
 
 | Feature | Description |
 |---------|-------------|
 | State-driven apply | `/var/lib/pfwd/rules.v1.tsv` is rendered into nftables atomically |
-| Flowtable fast path | Established connections offloaded to ingress |
+| Flowtable fast path | Established DNAT flows are offloaded to ingress; live `[OFFLOAD]` / `[HW_OFFLOAD]` visibility comes from conntrack |
 | Observer-only stats | Traffic collection avoids per-rule nft counters and hot-path helper rules |
 | Port aggregation | Same-backend rules are grouped into nft port sets / intervals where possible |
 | Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |

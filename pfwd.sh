@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.1"
+readonly VERSION="2.1.2"
 
 pfwd_path() {
     local path="$1"
@@ -234,21 +234,21 @@ plat_conntrack_dump_family() {
 }
 
 json_forward_rules_summary() {
-    local filepath="$1" override_method="${2:-}"
+    local filepath="$1"
     while IFS=$'\t' read -r method lport target tport _proto _ipver comment mss_mode mss_value snat_mode snat_source; do
         [[ -z "$method" ]] && continue
         local options_summary
         options_summary=$(_nft_rule_option_summary "$snat_mode" "$snat_source" "$mss_mode" "$mss_value")
         printf '  [%s] :%s -> %s:%s [opts:%s]\n' "$method" "$lport" "$target" "$tport" "$options_summary"
-    done < <(json_forward_rules_tsv "$filepath" "$override_method")
+    done < <(json_forward_rules_tsv "$filepath")
 }
 
 json_forward_rules_tsv() {
-    local filepath="$1" override_method="${2:-}"
-    jq -r --arg override "$override_method" '
+    local filepath="$1"
+    jq -r '
         .forward_rules[] |
         [
-            (if ($override | length) > 0 then $override else (.kind // .type // "nft") end),
+            ((.kind // .type // "nft") | tostring),
             ((.local.port // .local_port) | tostring),
             ((.target.host // .target_ip) | tostring),
             ((.target.port // .target_port) | tostring),
@@ -274,6 +274,17 @@ json_require_v3_backup() {
         has("forward_rules")
         and (.forward_rules | type == "array")
         and (.export_info.version_format // 0) == 3
+    ' "$filepath" >/dev/null 2>&1
+}
+
+json_require_nft_rules() {
+    local filepath="$1"
+    jq -e '
+        all(
+            .forward_rules[];
+            ((.kind // .type // "nft") | tostring) as $kind
+            | ($kind == "nft" or $kind == "nftables")
+        )
     ' "$filepath" >/dev/null 2>&1
 }
 
@@ -383,6 +394,31 @@ _nft_flowtable_mode() {
     else
         echo "basic"
     fi
+}
+
+_pfwd_conntrack_offload_counts_from_text() {
+    awk '
+        /\[HW_OFFLOAD\]/ { hw++ }
+        /\[OFFLOAD\]/ { sw++ }
+        END { printf "%d\t%d\n", sw+0, hw+0 }
+    '
+}
+
+_pfwd_conntrack_offload_status_tsv() {
+    if ! command -v conntrack >/dev/null 2>&1; then
+        printf 'missing\t0\t0\n'
+        return 0
+    fi
+    if [[ $EUID -ne 0 ]]; then
+        printf 'needs-root\t0\t0\n'
+        return 0
+    fi
+
+    local dump_v4 dump_v6 counts
+    dump_v4=$(plat_conntrack_dump_family ipv4 2>/dev/null || true)
+    dump_v6=$(plat_conntrack_dump_family ipv6 2>/dev/null || true)
+    counts=$(printf '%s\n%s\n' "$dump_v4" "$dump_v6" | _pfwd_conntrack_offload_counts_from_text)
+    printf 'ok\t%s\n' "$counts"
 }
 
 _nft_flowtable_devices() {
@@ -1393,7 +1429,7 @@ _pfwd_flowtable_modes() {
         echo "disabled"
         return 0
     fi
-    printf '%s\n' offload counter basic disabled
+    printf '%s\n' offload basic disabled
 }
 
 _pfwd_ports_to_nft_expr() {
@@ -1482,8 +1518,7 @@ _pfwd_render_nft_config() {
             printf '        hook ingress priority 0;\n'
             printf '        devices = { %s };\n' "${devices_csv//,/\, }"
             case "$flow_mode" in
-                offload) printf '        flags offload;\n        counter;\n' ;;
-                counter) printf '        counter;\n' ;;
+                offload) printf '        flags offload;\n' ;;
             esac
             printf '    }\n\n'
         fi
@@ -1516,7 +1551,7 @@ _pfwd_render_nft_config() {
         printf '    chain forward {\n'
         printf '        type filter hook forward priority 0; policy accept;\n'
         if [[ "$flow_mode" != "disabled" && -n "$devices_csv" ]]; then
-            printf '        ct state established flow add @ft counter\n'
+            printf '        ct status dnat ct state established flow add @ft\n'
         fi
         for ipver in 4 6; do
             for proto in tcp udp; do
@@ -1841,7 +1876,6 @@ PFWD_ADD_FAILED=0
 PFWD_ADD_TOTAL=0
 PFWD_SHORTCUT_ARGS=()
 PFWD_IMPORT_PATH=""
-PFWD_IMPORT_METHOD=""
 PFWD_EFFECTIVE_IP_VER=""
 PFWD_REQUEST_IP_VER=""
 PFWD_STATE_BATCH_FILE=""
@@ -1888,6 +1922,23 @@ require_root() {
 
 can_prompt_user() {
     [[ -t 0 && -t 1 ]]
+}
+
+is_nft_method() {
+    local method="${1:-}"
+    [[ "$method" == "nft" || "$method" == "nftables" ]]
+}
+
+require_nft_method() {
+    local method="${1:-}"
+    if [[ -z "$method" ]]; then
+        msg_err "Method is required. Use -m nft"
+        return 1
+    fi
+    if ! is_nft_method "$method"; then
+        msg_err "Unsupported method: $method (only nft is supported)"
+        return 1
+    fi
 }
 
 cli_requires_root() {
@@ -2875,13 +2926,7 @@ _validate_add_request() {
     local method="$1" ip_ver="${2:-46}" target="$3" rules_str="$4" comment="$5"
     local mss_mode="${6:-}" mss_value="${7:-}" snat_mode="${8:-masquerade}" snat_source="${9:-}" replace_mode="${10:-false}"
 
-    if [[ -z "$method" ]]; then
-        msg_err "Method is required. Use -m nft"
-        return 1
-    fi
-    if [[ "$method" == "realm" ]]; then
-        return 0
-    fi
+    require_nft_method "$method" || return 1
     if [[ -z "$rules_str" ]]; then
         msg_err "No ports specified"
         msg_err "Usage: pfwd -m nft -t <target> <ports>"
@@ -2906,13 +2951,13 @@ _validate_add_request() {
         return 1
     fi
     if [[ "$snat_mode" == "snat" ]]; then
-        if [[ "$method" != "nft" ]]; then
+        if ! is_nft_method "$method"; then
             msg_err "Fixed SNAT source is only supported with -m nft"
             return 1
         fi
         validate_snat_request "$ip_ver" "$snat_mode" "$snat_source" "true" || return 1
     fi
-    if [[ "$replace_mode" == "true" && "$method" != "nft" ]]; then
+    if [[ "$replace_mode" == "true" ]] && ! is_nft_method "$method"; then
         msg_err "--replace is only supported with -m nft"
         return 1
     fi
@@ -2933,7 +2978,6 @@ _prepare_add_request() {
     if [[ "$snat_mode" == "snat" ]]; then
         PFWD_REQUEST_IP_VER="${PFWD_EFFECTIVE_IP_VER:-$ip_ver}"
     fi
-    [[ "$method" == "realm" ]] && return 0
 
     if ! expand_port_spec "$rules_str" "$target"; then
         return 1
@@ -2941,9 +2985,9 @@ _prepare_add_request() {
 }
 
 _execute_add_request() {
-    local method="$1" ip_ver="$2" proto="$3" comment="$4"
-    local mss_mode="${5:-}" mss_value="${6:-}" snat_mode="${7:-masquerade}" snat_source="${8:-}" replace_mode="${9:-false}"
-    local progress_label="${10:-Adding}" progress_mode="${11:-false}"
+    local ip_ver="$1" proto="$2" comment="$3"
+    local mss_mode="${4:-}" mss_value="${5:-}" snat_mode="${6:-masquerade}" snat_source="${7:-}" replace_mode="${8:-false}"
+    local progress_label="${9:-Adding}" progress_mode="${10:-false}"
     local added=0 failed=0 progress_idx=0
     local total_rules=${#EXPANDED_RULES[@]}
 
@@ -2965,7 +3009,7 @@ _execute_add_request() {
             ((failed++)) || true
             continue
         fi
-        if _dispatch_add_rule "$method" "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
+        if pfwd_state_add_rule "$RULE_LPORT" "$RULE_TARGET" "$RULE_TPORT" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
             ((added++)) || true
         else
             ((failed++)) || true
@@ -2973,7 +3017,7 @@ _execute_add_request() {
     done
 
     _BATCH_MODE=false
-    if ! _batch_finalize "$method"; then
+    if ! _batch_finalize; then
         failed=$(( failed + added ))
         added=0
         PFWD_ADD_ADDED=$added
@@ -4250,22 +4294,6 @@ _nft_handles_by_port() {
     echo "$lines" | awk '/handle [0-9]+/ { for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
 }
 
-# _dispatch_add_rule <method> <lport> <target> <tport> <ip_ver> <proto> <comment> [mss_mode] [mss_value] [snat_mode] [snat_source] [replace_mode]
-# Unified add rule dispatcher for nft
-_dispatch_add_rule() {
-    local method="$1" lport="$2" target="$3" tport="$4" ip_ver="$5" proto="$6" comment="$7"
-    local mss_mode="${8:-}" mss_value="${9:-}" snat_mode="${10:-}" snat_source="${11:-}" replace_mode="${12:-false}"
-    case "$method" in
-        nft|nftables)
-            pfwd_state_add_rule "$lport" "$target" "$tport" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"
-            ;;
-        *)
-            msg_err "Unknown method: $method (use nft)"
-            return 1
-            ;;
-    esac
-}
-
 # _expand_port_list <ports_str> - expand comma-separated port specs into array
 # Sets: all_ports array (caller must declare: local -a all_ports=())
 _expand_port_list() {
@@ -4293,37 +4321,32 @@ sync_managed_firewall_state() {
     return 0
 }
 
-# _batch_finalize <method> - finalize after batch add (save/persist/restart once)
+# _batch_finalize - finalize after nft batch add/delete/import
 _batch_finalize() {
-    local method="$1"
-    case "$method" in
-        nft|nftables)
-            if $_DIRTY_NFT; then
-                local state_source=""
-                [[ -n "$PFWD_STATE_BATCH_FILE" ]] && state_source="$PFWD_STATE_BATCH_FILE"
-                if ! pfwd_apply_saved_state "$state_source"; then
-                    _pfwd_state_discard_batch
-                    return 1
-                fi
-                if [[ -n "$PFWD_STATE_BATCH_FILE" ]]; then
-                    _pfwd_state_commit_batch || return 1
-                fi
-                nft_setup_persistence
-                _reset_change_flags
-            elif $_DIRTY_UFW_SYNC; then
-                ufw_sync_loopback_dnat_rules || return 1
-            fi
-            if $_DIRTY_UFW_RELOAD; then
-                ufw_reload_if_enabled || return 1
-                sync_managed_iptables_accept_rules || return 1
-            fi
-            if [[ -n "$PFWD_STATE_BATCH_FILE" && ! $_DIRTY_NFT ]]; then
-                _pfwd_state_discard_batch
-            fi
-            rm -f "$_NFT_BATCH_FILE" 2>/dev/null || true
-            _NFT_BATCH_FILE=""
-            ;;
-    esac
+    if $_DIRTY_NFT; then
+        local state_source=""
+        [[ -n "$PFWD_STATE_BATCH_FILE" ]] && state_source="$PFWD_STATE_BATCH_FILE"
+        if ! pfwd_apply_saved_state "$state_source"; then
+            _pfwd_state_discard_batch
+            return 1
+        fi
+        if [[ -n "$PFWD_STATE_BATCH_FILE" ]]; then
+            _pfwd_state_commit_batch || return 1
+        fi
+        nft_setup_persistence
+        _reset_change_flags
+    elif $_DIRTY_UFW_SYNC; then
+        ufw_sync_loopback_dnat_rules || return 1
+    fi
+    if $_DIRTY_UFW_RELOAD; then
+        ufw_reload_if_enabled || return 1
+        sync_managed_iptables_accept_rules || return 1
+    fi
+    if [[ -n "$PFWD_STATE_BATCH_FILE" && ! $_DIRTY_NFT ]]; then
+        _pfwd_state_discard_batch
+    fi
+    rm -f "$_NFT_BATCH_FILE" 2>/dev/null || true
+    _NFT_BATCH_FILE=""
 }
 
 # _parse_delete_input <input_str> <total_rules> - parse delete input with prefix support
@@ -4578,15 +4601,12 @@ nft_ensure_table() {
 
         # Try to create flowtable (three-level fallback)
         local ft_err
-        if ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; flags offload; counter; }"); then
+        if ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; flags offload; }"); then
             flowtable_ok=true
-            msg_dim "  Flowtable: hardware offload + counter enabled"
-        elif ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; counter; }"); then
-            flowtable_ok=true
-            msg_dim "  Flowtable: counter enabled (no hardware offload)"
+            msg_dim "  Flowtable: hardware offload enabled"
         elif ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }"); then
             flowtable_ok=true
-            msg_dim "  Flowtable: basic mode (kernel < 5.7, no counter)"
+            msg_dim "  Flowtable: software fast path enabled"
         else
             msg_warn "Flowtable creation failed, continuing without fast path"
             msg_dim "  devices=($nics) error: $ft_err"
@@ -4600,7 +4620,7 @@ nft_ensure_table() {
     # Forward chain with optional flowtable offload
     plat_nft_quiet add chain $NFT_TABLE forward '{ type filter hook forward priority 0; policy accept; }'
     if $flowtable_ok; then
-        plat_nft_quiet add rule $NFT_TABLE forward ct state established flow add @ft counter || \
+        plat_nft_quiet add rule $NFT_TABLE forward ct status dnat ct state established flow add @ft || \
             msg_dim "  Flowtable offload rule skipped"
     fi
     plat_nft_quiet add rule $NFT_TABLE forward ct state established,related accept
@@ -4814,7 +4834,7 @@ nft_delete_port() {
         _traffic_delete_records nft_port "$port" "$proto"
         if $started_batch; then
             _BATCH_MODE=false
-            if ! _batch_finalize nft; then
+            if ! _batch_finalize; then
                 msg_err "Failed to apply state-driven deletion batch for port $port"
                 return 1
             fi
@@ -4861,7 +4881,7 @@ nft_delete_ports_batch() {
     if (( total_deleted > 0 )); then
         if $started_batch; then
             _BATCH_MODE=false
-            if ! _batch_finalize nft; then
+            if ! _batch_finalize; then
                 msg_err "Failed to apply state-driven deletion batch"
                 return 1
             fi
@@ -5943,10 +5963,9 @@ cmd_export() {
     return 0
 }
 
-    # cmd_import <filepath> [method] - import rules from JSON
+    # cmd_import <filepath> - import nft rules from JSON
 cmd_import() {
     local filepath="$1"
-    local override_method="${2:-}"
 
     if [[ "$filepath" =~ ^https?:// ]]; then
         msg_err "Remote URL import has been removed; download the JSON file locally first"
@@ -5970,15 +5989,19 @@ cmd_import() {
         msg_err "Unsupported backup format: expected v3 JSON with forward_rules"
         return 1
     fi
+    if ! json_require_nft_rules "$filepath"; then
+        msg_err "Unsupported backup contents: pfwd import only accepts nft rules"
+        return 1
+    fi
 
     local count
     count=$(json_forward_rules_count "$filepath")
     msg_info "Found $count rule(s) in backup"
 
     # Show rules summary
-    json_forward_rules_summary "$filepath" "$override_method"
+    json_forward_rules_summary "$filepath"
 
-    local imported=0 failed=0 skipped=0
+    local imported=0 failed=0
     local nft_batch_count=0
 
     _BATCH_MODE=true
@@ -5999,25 +6022,22 @@ cmd_import() {
                     ((failed++)) || true
                 fi
                 ;;
-            realm)
-                ((skipped++)) || true
-                ;;
             *)
-                msg_warn "Unknown method '$method' for rule :$lport, skipping"
+                msg_warn "Unsupported method '$method' for rule :$lport"
                 ((failed++)) || true
                 ;;
         esac
-    done < <(json_forward_rules_tsv "$filepath" "$override_method")
+    done < <(json_forward_rules_tsv "$filepath")
     _BATCH_MODE=false
 
-    if (( nft_batch_count > 0 )) && ! _batch_finalize nft; then
+    if (( nft_batch_count > 0 )) && ! _batch_finalize; then
         msg_err "Failed to apply imported nftables batch"
         return 1
     elif (( nft_batch_count == 0 )); then
         _pfwd_state_discard_batch
     fi
 
-    msg_ok "Import complete: $imported imported, $failed failed, $skipped skipped"
+    msg_ok "Import complete: $imported imported, $failed failed"
 }
 
 #===============================================================================
@@ -6095,8 +6115,8 @@ Traffic / diagnosis:
 
 Import / export:
   pfwd export [filepath]
-  pfwd import <filepath> [-m nft]
-  Export and import use the current JSON v3 schema (forward_rules).
+  pfwd import <filepath>
+  Export and import use the current JSON v3 schema (forward_rules) for nft rules.
   Export/import preserves nft MSS and fixed-SNAT fields.
 
 New examples:
@@ -6130,7 +6150,7 @@ Performance tips:
   - pfwd detects performance kernels such as XanMod, but does not install or switch kernels for you.
 
 Options:
-  -m, --method <nft>         Forwarding method (required)
+  -m, --method <nft>         Forwarding method (nft only)
   -t, --target <addr>        Target IP or domain (required)
   -4                         IPv4 only
   -6                         IPv6 only
@@ -6201,9 +6221,7 @@ cmd_add() {
         _pfwd_print_fixed_snat_notice "$snat_source"
     fi
 
-    [[ "$method" == "realm" ]] && return 0
-
-    if ! _execute_add_request "$method" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
+    if ! _execute_add_request "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode"; then
         return 1
     fi
 
@@ -6229,14 +6247,7 @@ cmd_delete() {
         esac
     done
 
-    if [[ -z "$method" ]]; then
-        msg_err "Method is required. Use -m nft"
-        return 1
-    fi
-
-    if [[ "$method" == "realm" ]]; then
-        return 0
-    fi
+    require_nft_method "$method" || return 1
 
     if [[ -z "$ports_str" ]]; then
         msg_err "No ports specified"
@@ -6252,20 +6263,12 @@ cmd_delete() {
         return 1
     fi
 
-    # Delete ports (use batch for nft when multiple ports)
-    case "$method" in
-        nft|nftables)
-            if (( ${#all_ports[@]} > 1 )); then
-                nft_delete_ports_batch all_ports "$proto"
-            else
-                nft_delete_port "${all_ports[0]}" "$proto"
-            fi
-            ;;
-        *)
-            msg_err "Unknown method: $method"
-            return 1
-            ;;
-    esac
+    # Delete ports (use batch when multiple ports)
+    if (( ${#all_ports[@]} > 1 )); then
+        nft_delete_ports_batch all_ports "$proto"
+    else
+        nft_delete_port "${all_ports[0]}" "$proto"
+    fi
 }
 
 # cmd_list - list all forwarding rules
@@ -6574,14 +6577,37 @@ cmd_doctor() {
                 _doctor_print_check WARN "subchain ${chain} missing" "will be recreated on next nft add"
             fi
         done
-        local ft_mode ft_devices expected_ft_devices
+        local ft_mode ft_devices expected_ft_devices offload_status offload_sw offload_hw
         ft_mode=$(_nft_flowtable_mode)
         ft_devices=$(_nft_flowtable_devices)
         expected_ft_devices=$(_pfwd_collect_flowtable_devices "$(_pfwd_state_runtime_rules_tsv "$PFWD_NFT_RULES" "false")" || true)
         case "$ft_mode" in
             offload|counter|basic)
-                if _nft_cached_chain forward | grep -q 'flow add @ft'; then
+                if _nft_cached_chain forward | grep -Eq 'ct (status dnat )?ct state established flow add @ft'; then
                     _doctor_print_check OK "flowtable fast path configured" "mode=${ft_mode}, devices=${ft_devices}"
+                    IFS=$'\t' read -r offload_status offload_sw offload_hw <<< "$(_pfwd_conntrack_offload_status_tsv)"
+                    case "$offload_status" in
+                        ok)
+                            if (( offload_sw > 0 )); then
+                                _doctor_print_check OK "software flow offload live" "${offload_sw} conntrack entr$( (( offload_sw == 1 )) && echo y || echo ies ) tagged [OFFLOAD]"
+                            else
+                                _doctor_print_check WARN "software flow offload not observed yet" "no live [OFFLOAD] conntrack entries"
+                            fi
+                            if [[ "$ft_mode" == "offload" ]]; then
+                                if (( offload_hw > 0 )); then
+                                    _doctor_print_check OK "hardware flow offload live" "${offload_hw} conntrack entr$( (( offload_hw == 1 )) && echo y || echo ies ) tagged [HW_OFFLOAD]"
+                                else
+                                    _doctor_print_check WARN "hardware flow offload not observed yet" "no live [HW_OFFLOAD] conntrack entries"
+                                fi
+                            fi
+                            ;;
+                        needs-root)
+                            _doctor_print_check WARN "flow offload observability requires root" "run doctor as root to inspect conntrack [OFFLOAD]/[HW_OFFLOAD] tags"
+                            ;;
+                        missing)
+                            _doctor_print_check WARN "flow offload observability unavailable" "install conntrack-tools to inspect [OFFLOAD]/[HW_OFFLOAD] tags"
+                            ;;
+                    esac
                 else
                     _doctor_print_check WARN "flowtable exists but fast-path rule missing" "mode=${ft_mode}, devices=${ft_devices}"
                 fi
@@ -6797,6 +6823,38 @@ cmd_status() {
         nft_status="${RED}stopped${NC}"
     fi
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
+    local flowtable_label=""
+    if _nft_table_exists; then
+        local ft_mode offload_status offload_sw offload_hw
+        ft_mode=$(_nft_flowtable_mode)
+        if [[ "$ft_mode" == "offload" || "$ft_mode" == "basic" || "$ft_mode" == "counter" ]]; then
+            if _nft_cached_chain forward | grep -Eq 'ct (status dnat )?ct state established flow add @ft'; then
+                IFS=$'\t' read -r offload_status offload_sw offload_hw <<< "$(_pfwd_conntrack_offload_status_tsv)"
+                case "$offload_status" in
+                    ok)
+                        if [[ "$ft_mode" == "offload" ]]; then
+                            flowtable_label="mode=${CYAN}${ft_mode}${NC} sw=${CYAN}${offload_sw}${NC} hw=${CYAN}${offload_hw}${NC}"
+                        else
+                            flowtable_label="mode=${CYAN}${ft_mode}${NC} sw=${CYAN}${offload_sw}${NC}"
+                        fi
+                        ;;
+                    needs-root)
+                        flowtable_label="mode=${CYAN}${ft_mode}${NC} ${DIM}(root for live offload stats)${NC}"
+                        ;;
+                    *)
+                        flowtable_label="mode=${CYAN}${ft_mode}${NC} ${DIM}(install conntrack-tools for live offload stats)${NC}"
+                        ;;
+                esac
+            else
+                flowtable_label="mode=${YELLOW}${ft_mode}${NC} ${DIM}(fast-path rule missing)${NC}"
+            fi
+        else
+            flowtable_label="${DIM}disabled${NC}"
+        fi
+    else
+        flowtable_label="${DIM}inactive${NC}"
+    fi
+    echo -e "  flowtable: ${flowtable_label}"
     if [[ -n "$PFWD_NFT_RULES" ]]; then
         local nft_mss_count=0 nft_snat_count=0
         local rule_key proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value
@@ -7027,14 +7085,12 @@ _rewrite_shortcut_args() {
 
 _parse_import_args() {
     PFWD_IMPORT_PATH=""
-    PFWD_IMPORT_METHOD=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -m|--method)
-                require_option_value "$1" "$@" || return 1
-                PFWD_IMPORT_METHOD="$2"
-                shift 2
+                msg_err "Import only supports nft backups; do not pass $1"
+                return 1
                 ;;
             -*)
                 msg_err "Unknown option: $1"
@@ -7141,7 +7197,7 @@ parse_cli_args() {
         import)
             shift
             _parse_import_args "$@" || return 1
-            cmd_import "$PFWD_IMPORT_PATH" "$PFWD_IMPORT_METHOD"
+            cmd_import "$PFWD_IMPORT_PATH"
             ;;
         uninstall)
             shift
@@ -7693,7 +7749,7 @@ menu_add_rule() {
     echo ""
     msg_info "Processing ${#EXPANDED_RULES[@]} expanded rule(s)..."
 
-    if ! _execute_add_request "$method" "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode" "Adding" "true"; then
+    if ! _execute_add_request "$ip_ver" "$proto" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$replace_mode" "Adding" "true"; then
         wait_for_enter
         return
     fi
@@ -7819,7 +7875,7 @@ menu_delete_rule() {
         done
         _BATCH_MODE=false
         if (( nft_rule_deleted > 0 )); then
-            if ! _batch_finalize nft; then
+            if ! _batch_finalize; then
                 msg_err "Failed to apply nftables deletion batch"
                 wait_for_enter
                 return
@@ -7876,12 +7932,7 @@ menu_export_import() {
                 msg_info "Cancelled"
                 return
             fi
-            echo ""
-            echo "Override method? (leave empty to keep original)"
-            echo "  nft   - Import all as nftables"
-            echo ""
-            read -rp "Method [keep original]: " imethod
-            cmd_import "$ipath" "$imethod"
+            cmd_import "$ipath"
             ;;
         3)
             echo ""
