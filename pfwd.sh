@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.2"
+readonly VERSION="2.1.3"
 
 pfwd_path() {
     local path="$1"
@@ -465,18 +465,62 @@ _nft_index_postrouting_snapshot() {
 }
 
 _nft_index_forward_snapshot() {
-    local line tag ret_lport ret_ipver ret_proto
+    local line tag ret_lport ret_ipver ret_proto mode value family_keyword entry_blob entry target tport snapshot_key
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
 
         _extract_nft_comment "$line"
         tag="$_COMMENT"
-        if [[ -n "$tag" ]]; then
-            if [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ rt\ mtu ]]; then
-                _NFT_SNAPSHOT_MSS_MODE["$tag"]="clamp"
-            elif [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ ([0-9]+) ]]; then
-                _NFT_SNAPSHOT_MSS_MODE["$tag"]="set"
-                _NFT_SNAPSHOT_MSS_VALUE["$tag"]="${BASH_REMATCH[1]}"
+
+        mode=""
+        value=""
+        if [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ rt\ mtu ]]; then
+            mode="clamp"
+        elif [[ "$line" =~ tcp\ option\ maxseg\ size\ set\ ([0-9]+) ]]; then
+            mode="set"
+            value="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$mode" ]]; then
+            if [[ -n "$tag" ]]; then
+                _NFT_SNAPSHOT_MSS_MODE["$tag"]="$mode"
+                if [[ -n "$value" ]]; then
+                    _NFT_SNAPSHOT_MSS_VALUE["$tag"]="$value"
+                else
+                    unset '_NFT_SNAPSHOT_MSS_VALUE[$tag]'
+                fi
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]*(ip6?)\ daddr\ \.\ tcp\ dport\ \{\ (.*)\ \}\ tcp\ flags\ syn\ /\ syn,rst\ tcp\ option\ maxseg\ size\ set\  ]]; then
+                family_keyword="${BASH_REMATCH[1]}"
+                entry_blob="${BASH_REMATCH[2]}"
+                ret_proto="tcp"
+                ret_ipver=$([[ "$family_keyword" == "ip6" ]] && echo 6 || echo 4)
+                while IFS= read -r entry; do
+                    [[ -n "$entry" ]] || continue
+                    target="${entry%% . *}"
+                    tport="${entry##* . }"
+                    snapshot_key=$(_pfwd_mss_snapshot_key "$ret_proto" "$ret_ipver" "$target" "$tport")
+                    _NFT_SNAPSHOT_MSS_MODE["$snapshot_key"]="$mode"
+                    if [[ -n "$value" ]]; then
+                        _NFT_SNAPSHOT_MSS_VALUE["$snapshot_key"]="$value"
+                    else
+                        unset '_NFT_SNAPSHOT_MSS_VALUE[$snapshot_key]'
+                    fi
+                done < <(tr ',' '\n' <<< "$entry_blob" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            elif [[ "$line" =~ ^[[:space:]]*(ip6?)\ daddr\ ([^[:space:]]+)\ tcp\ dport\ ([0-9]+)\ tcp\ flags\ syn\ /\ syn,rst\ tcp\ option\ maxseg\ size\ set\  ]]; then
+                family_keyword="${BASH_REMATCH[1]}"
+                target="${BASH_REMATCH[2]}"
+                tport="${BASH_REMATCH[3]}"
+                ret_proto="tcp"
+                ret_ipver=$([[ "$family_keyword" == "ip6" ]] && echo 6 || echo 4)
+                snapshot_key=$(_pfwd_mss_snapshot_key "$ret_proto" "$ret_ipver" "$target" "$tport")
+                _NFT_SNAPSHOT_MSS_MODE["$snapshot_key"]="$mode"
+                if [[ -n "$value" ]]; then
+                    _NFT_SNAPSHOT_MSS_VALUE["$snapshot_key"]="$value"
+                else
+                    unset '_NFT_SNAPSHOT_MSS_VALUE[$snapshot_key]'
+                fi
             fi
         fi
 
@@ -572,6 +616,11 @@ _pfwd_forward_tag() {
     local scope
     scope=$(_pfwd_rule_scope "$@")
     printf 'pfwd_%s:%s' "$kind" "$scope"
+}
+
+_pfwd_mss_snapshot_key() {
+    local proto="$1" ipver="$2" target="$3" tport="$4"
+    printf '%s|%s|%s|%s' "$proto" "$ipver" "$target" "$tport"
 }
 
 _traffic_rule_key() {
@@ -1145,12 +1194,18 @@ _pfwd_state_rules_from_nft_text() {
 
     while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
-        local tag snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
+        local tag mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
+        mss_key=$(_pfwd_mss_snapshot_key "$proto" "$ipver" "$target" "$tport")
         [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]] && snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
         [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
-        [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]] && mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
-        [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
+        if [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]]; then
+            mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
+            [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
+        elif [[ -n "${_NFT_SNAPSHOT_MSS_MODE[$mss_key]:-}" ]]; then
+            mss_mode="${_NFT_SNAPSHOT_MSS_MODE[$mss_key]}"
+            [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[$mss_key]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[$mss_key]}"
+        fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
             "$snat_mode" "$snat_source" "$mss_mode" "$mss_value"
@@ -1432,6 +1487,18 @@ _pfwd_flowtable_modes() {
     printf '%s\n' offload basic disabled
 }
 
+_pfwd_dnat_render_modes() {
+    printf '%s\n' map legacy
+}
+
+_pfwd_postrouting_render_modes() {
+    printf '%s\n' grouped legacy
+}
+
+_pfwd_mss_render_modes() {
+    printf '%s\n' grouped legacy
+}
+
 _pfwd_ports_to_nft_expr() {
     local ports_csv="$1"
     local -a ports=()
@@ -1483,8 +1550,279 @@ _pfwd_ports_to_nft_expr() {
     printf '{ %s }\n' "${expr_parts[*]}"
 }
 
+_pfwd_dnat_map_name() {
+    local proto="$1" ipver="$2"
+    printf 'pfwd_dnat_v%s_%s' "$ipver" "$proto"
+}
+
+_pfwd_dnat_map_value_type() {
+    local ipver="$1"
+    case "$ipver" in
+        4) echo 'ipv4_addr . inet_service' ;;
+        6) echo 'ipv6_addr . inet_service' ;;
+        *) return 1 ;;
+    esac
+}
+
+_pfwd_dnat_statement_prefix() {
+    local ipver="$1"
+    case "$ipver" in
+        4) echo 'dnat ip addr . port to' ;;
+        6) echo 'dnat ip6 addr . port to' ;;
+        *) return 1 ;;
+    esac
+}
+
+_pfwd_dnat_map_elements_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" '
+        $1 == want_proto && $3 == want_ipver && $2 != "" && $5 != "" && $6 != "" {
+            key = $2
+            value = $5 "\t" $6
+            if (!(key in seen)) {
+                seen[key] = value
+                print $2 "\t" value
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1n
+}
+
+_pfwd_render_dnat_map_block() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    local map_name map_type entries
+    map_name=$(_pfwd_dnat_map_name "$proto" "$ipver") || return 1
+    map_type=$(_pfwd_dnat_map_value_type "$ipver") || return 1
+    entries=$(_pfwd_dnat_map_elements_tsv "$runtime_rules" "$proto" "$ipver")
+    [[ -n "$entries" ]] || return 1
+
+    printf '    map %s {\n' "$map_name"
+    printf '        type inet_service : %s;\n' "$map_type"
+    printf '        elements = {\n'
+
+    local entry_count=0 total_entries
+    total_entries=$(awk 'END { print NR+0 }' <<< "$entries")
+    local lport target tport
+    while IFS=$'\t' read -r lport target tport; do
+        [[ -n "$lport" ]] || continue
+        ((entry_count++)) || true
+        if (( entry_count < total_entries )); then
+            printf '            %s : %s . %s,\n' "$lport" "$target" "$tport"
+        else
+            printf '            %s : %s . %s\n' "$lport" "$target" "$tport"
+        fi
+    done <<< "$entries"
+
+    printf '        }\n'
+    printf '    }\n\n'
+}
+
+_pfwd_render_dnat_map_rule() {
+    local proto="$1" ipver="$2"
+    local map_name statement_prefix
+    map_name=$(_pfwd_dnat_map_name "$proto" "$ipver") || return 1
+    statement_prefix=$(_pfwd_dnat_statement_prefix "$ipver") || return 1
+    printf '        %s %s dport map @%s\n' "$statement_prefix" "$proto" "$map_name"
+}
+
+_pfwd_dnat_renderer_mode_from_text() {
+    local text="${1:-}"
+    if grep -q 'map @pfwd_dnat_v' <<< "$text"; then
+        echo "map"
+    elif grep -q 'dnat ' <<< "$text"; then
+        echo "legacy"
+    else
+        echo "none"
+    fi
+}
+
+_pfwd_runtime_dnat_renderer() {
+    if ! _nft_table_exists; then
+        echo "inactive"
+        return 0
+    fi
+    _pfwd_dnat_renderer_mode_from_text "$(_nft_cached_chains_concat prerouting $(_pfwd_subchain_list prerouting) || true)"
+}
+
+_pfwd_saved_dnat_renderer() {
+    if [[ ! -f "$NFT_CONFIG" ]]; then
+        echo "missing"
+        return 0
+    fi
+    _pfwd_dnat_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+}
+
+_pfwd_postrouting_renderer_mode_from_text() {
+    local text="${1:-}"
+    if grep -Eq 'ct status dnat ip6? daddr \. (tcp|udp) dport \{' <<< "$text"; then
+        echo "grouped"
+    elif grep -Eq 'snat to|masquerade' <<< "$text"; then
+        echo "legacy"
+    else
+        echo "none"
+    fi
+}
+
+_pfwd_runtime_postrouting_renderer() {
+    if ! _nft_table_exists; then
+        echo "inactive"
+        return 0
+    fi
+    _pfwd_postrouting_renderer_mode_from_text "$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)"
+}
+
+_pfwd_saved_postrouting_renderer() {
+    if [[ ! -f "$NFT_CONFIG" ]]; then
+        echo "missing"
+        return 0
+    fi
+    _pfwd_postrouting_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+}
+
+_pfwd_mss_renderer_mode_from_text() {
+    local text="${1:-}"
+    if grep -Eq 'ip6? daddr \. tcp dport \{ .* tcp option maxseg size set ' <<< "$text"; then
+        echo "grouped"
+    elif grep -Eq 'ip6? daddr [^[:space:]]+ tcp dport [0-9]+ tcp flags syn / syn,rst tcp option maxseg size set ' <<< "$text"; then
+        echo "legacy"
+    else
+        echo "none"
+    fi
+}
+
+_pfwd_runtime_mss_renderer() {
+    if ! _nft_table_exists; then
+        echo "inactive"
+        return 0
+    fi
+    _pfwd_mss_renderer_mode_from_text "$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)"
+}
+
+_pfwd_saved_mss_renderer() {
+    if [[ ! -f "$NFT_CONFIG" ]]; then
+        echo "missing"
+        return 0
+    fi
+    _pfwd_mss_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+}
+
+_pfwd_postrouting_group_keys_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" '
+        $1 == want_proto && $3 == want_ipver && $5 != "" && $6 != "" {
+            mode = ($8 == "snat" && $9 != "") ? "snat" : "masquerade"
+            source = (mode == "snat") ? $9 : ""
+            key = mode "\t" source
+            if (!(key in seen)) {
+                seen[key] = 1
+                print key
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1 -k2,2
+}
+
+_pfwd_postrouting_group_elements_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3" snat_mode="$4" snat_source="${5:-}"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" -v want_mode="$snat_mode" -v want_source="$snat_source" '
+        $1 == want_proto && $3 == want_ipver && $5 != "" && $6 != "" {
+            mode = ($8 == "snat" && $9 != "") ? "snat" : "masquerade"
+            source = (mode == "snat") ? $9 : ""
+            if (mode != want_mode || source != want_source) {
+                next
+            }
+            key = $5 "\t" $6
+            if (!(key in seen)) {
+                seen[key] = 1
+                print key
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1 -k2,2n
+}
+
+_pfwd_render_postrouting_grouped_rule() {
+    local runtime_rules="$1" proto="$2" ipver="$3" snat_mode="$4" snat_source="${5:-}"
+    local entries family_keyword total_entries entry_count=0 target tport
+    entries=$(_pfwd_postrouting_group_elements_tsv "$runtime_rules" "$proto" "$ipver" "$snat_mode" "$snat_source")
+    [[ -n "$entries" ]] || return 1
+    family_keyword=$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)
+    total_entries=$(awk 'END { print NR+0 }' <<< "$entries")
+
+    printf '        ct status dnat %s daddr . %s dport { ' "$family_keyword" "$proto"
+    while IFS=$'\t' read -r target tport; do
+        [[ -n "$target" && -n "$tport" ]] || continue
+        ((entry_count++)) || true
+        if (( entry_count > 1 )); then
+            printf ', '
+        fi
+        printf '%s . %s' "$target" "$tport"
+    done <<< "$entries"
+    printf ' } '
+    if [[ "$snat_mode" == "snat" && -n "$snat_source" ]]; then
+        printf 'snat to %s\n' "$snat_source"
+    else
+        printf 'masquerade\n'
+    fi
+}
+
+_pfwd_mss_group_keys_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" '
+        $1 == want_proto && $3 == want_ipver && $5 != "" && $6 != "" && $10 != "" {
+            mode = $10
+            value = (mode == "set") ? $11 : ""
+            key = mode "\t" value
+            if (!(key in seen)) {
+                seen[key] = 1
+                print key
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1 -k2,2n
+}
+
+_pfwd_mss_group_elements_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3" mss_mode="$4" mss_value="${5:-}"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" -v want_mode="$mss_mode" -v want_value="$mss_value" '
+        $1 == want_proto && $3 == want_ipver && $5 != "" && $6 != "" && $10 != "" {
+            mode = $10
+            value = (mode == "set") ? $11 : ""
+            if (mode != want_mode || value != want_value) {
+                next
+            }
+            key = $5 "\t" $6
+            if (!(key in seen)) {
+                seen[key] = 1
+                print key
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1 -k2,2n
+}
+
+_pfwd_render_mss_grouped_rule() {
+    local runtime_rules="$1" proto="$2" ipver="$3" mss_mode="$4" mss_value="${5:-}"
+    local entries family_keyword entry_count=0 target tport
+    entries=$(_pfwd_mss_group_elements_tsv "$runtime_rules" "$proto" "$ipver" "$mss_mode" "$mss_value")
+    [[ -n "$entries" ]] || return 1
+    family_keyword=$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)
+
+    printf '        %s daddr . tcp dport { ' "$family_keyword"
+    while IFS=$'\t' read -r target tport; do
+        [[ -n "$target" && -n "$tport" ]] || continue
+        ((entry_count++)) || true
+        if (( entry_count > 1 )); then
+            printf ', '
+        fi
+        printf '%s . %s' "$target" "$tport"
+    done <<< "$entries"
+    if [[ "$mss_mode" == "clamp" ]]; then
+        printf ' } tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n'
+    elif [[ "$mss_mode" == "set" && -n "$mss_value" ]]; then
+        printf ' } tcp flags syn / syn,rst tcp option maxseg size set %s\n' "$mss_value"
+    else
+        return 1
+    fi
+}
+
 _pfwd_render_nft_config() {
-    local runtime_rules="$1" output_file="$2" flow_mode="$3" devices_csv="${4:-}"
+    local runtime_rules="$1" output_file="$2" flow_mode="$3" devices_csv="${4:-}" dnat_renderer="${5:-legacy}" postrouting_renderer="${6:-legacy}" mss_renderer="${7:-legacy}"
 
     declare -A prerouting_ports=()
     declare -A prerouting_seen=()
@@ -1492,8 +1830,21 @@ _pfwd_render_nft_config() {
     declare -A forward_keys=()
     declare -A subchain_nonempty=()
 
-    local proto lport ipver target_input resolved_target tport comment snat_mode snat_source mss_mode mss_value group_key
-    while IFS=$'\t' read -r proto lport ipver target_input resolved_target tport comment snat_mode snat_source mss_mode mss_value; do
+    local line proto lport ipver target_input resolved_target tport comment snat_mode snat_source mss_mode mss_value group_key
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target_input="${PFWD_TSV_FIELDS[3]:-}"
+        resolved_target="${PFWD_TSV_FIELDS[4]:-}"
+        tport="${PFWD_TSV_FIELDS[5]:-}"
+        comment="${PFWD_TSV_FIELDS[6]:-}"
+        snat_mode="${PFWD_TSV_FIELDS[7]:-}"
+        snat_source="${PFWD_TSV_FIELDS[8]:-}"
+        mss_mode="${PFWD_TSV_FIELDS[9]:-}"
+        mss_value="${PFWD_TSV_FIELDS[10]:-}"
         [[ -n "$lport" && -n "$resolved_target" ]] || continue
         group_key="${proto}|${ipver}|${resolved_target}|${tport}|${snat_mode}|${snat_source}|${mss_mode}|${mss_value}"
         if [[ -z "${prerouting_seen["$group_key|$lport"]:-}" ]]; then
@@ -1521,6 +1872,17 @@ _pfwd_render_nft_config() {
                 offload) printf '        flags offload;\n' ;;
             esac
             printf '    }\n\n'
+        fi
+
+        if [[ "$dnat_renderer" == "map" ]]; then
+            local map_ipver map_proto map_section_key
+            for map_ipver in 4 6; do
+                for map_proto in tcp udp; do
+                    map_section_key="prerouting|${map_ipver}|${map_proto}"
+                    [[ -n "${subchain_nonempty[$map_section_key]:-}" ]] || continue
+                    _pfwd_render_dnat_map_block "$runtime_rules" "$map_proto" "$map_ipver" || return 1
+                done
+            done
         fi
 
         printf '    chain prerouting {\n'
@@ -1579,50 +1941,70 @@ _pfwd_render_nft_config() {
 
                 printf '    chain %s {\n' "$pr_chain"
                 local key
-                while IFS= read -r key; do
-                    [[ -n "$key" ]] || continue
-                    IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-                    [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
-                    local dnat_keyword="ip" dnat_target="" port_expr=""
-                    port_expr=$(_pfwd_ports_to_nft_expr "${prerouting_ports[$key]}")
-                    if [[ "$ipver" == "6" ]]; then
-                        dnat_keyword="ip6"
-                        dnat_target="[$key_target]:$key_tport"
-                    else
-                        dnat_target="$key_target:$key_tport"
-                    fi
-                    printf '        %s dport %s dnat %s to %s\n' "$proto" "$port_expr" "$dnat_keyword" "$dnat_target"
-                done < <(printf '%s\n' "${!prerouting_ports[@]}" | sort)
+                if [[ "$dnat_renderer" == "map" ]]; then
+                    _pfwd_render_dnat_map_rule "$proto" "$ipver"
+                else
+                    while IFS= read -r key; do
+                        [[ -n "$key" ]] || continue
+                        IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+                        [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
+                        local dnat_keyword="ip" dnat_target="" port_expr=""
+                        port_expr=$(_pfwd_ports_to_nft_expr "${prerouting_ports[$key]}")
+                        if [[ "$ipver" == "6" ]]; then
+                            dnat_keyword="ip6"
+                            dnat_target="[$key_target]:$key_tport"
+                        else
+                            dnat_target="$key_target:$key_tport"
+                        fi
+                        printf '        %s dport %s dnat %s to %s\n' "$proto" "$port_expr" "$dnat_keyword" "$dnat_target"
+                    done < <(printf '%s\n' "${!prerouting_ports[@]}" | sort)
+                fi
                 printf '    }\n\n'
 
                 printf '    chain %s {\n' "$po_chain"
-                while IFS= read -r key; do
-                    [[ -n "$key" ]] || continue
-                    IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-                    [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
-                    if [[ "$key_snat_mode" == "snat" && -n "$key_snat_source" ]]; then
-                        printf '        ct status dnat %s daddr %s %s dport %s snat to %s\n' \
-                            "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$proto" "$key_tport" "$key_snat_source"
-                    else
-                        printf '        ct status dnat %s daddr %s %s dport %s masquerade\n' \
-                            "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$proto" "$key_tport"
-                    fi
-                done < <(printf '%s\n' "${!postrouting_keys[@]}" | sort)
+                if [[ "$postrouting_renderer" == "grouped" ]]; then
+                    local snat_mode_key snat_source_key
+                    while IFS=$'\t' read -r snat_mode_key snat_source_key; do
+                        [[ -n "$snat_mode_key" ]] || continue
+                        _pfwd_render_postrouting_grouped_rule "$runtime_rules" "$proto" "$ipver" "$snat_mode_key" "$snat_source_key"
+                    done < <(_pfwd_postrouting_group_keys_tsv "$runtime_rules" "$proto" "$ipver")
+                else
+                    while IFS= read -r key; do
+                        [[ -n "$key" ]] || continue
+                        IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+                        [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
+                        if [[ "$key_snat_mode" == "snat" && -n "$key_snat_source" ]]; then
+                            printf '        ct status dnat %s daddr %s %s dport %s snat to %s\n' \
+                                "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$proto" "$key_tport" "$key_snat_source"
+                        else
+                            printf '        ct status dnat %s daddr %s %s dport %s masquerade\n' \
+                                "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$proto" "$key_tport"
+                        fi
+                    done < <(printf '%s\n' "${!postrouting_keys[@]}" | sort)
+                fi
                 printf '    }\n\n'
 
                 printf '    chain %s {\n' "$fw_chain"
-                while IFS= read -r key; do
-                    [[ -n "$key" ]] || continue
-                    IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-                    [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
-                    if [[ "$key_mss_mode" == "clamp" ]]; then
-                        printf '        %s daddr %s tcp dport %s tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n' \
-                            "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$key_tport"
-                    elif [[ "$key_mss_mode" == "set" && -n "$key_mss_value" ]]; then
-                        printf '        %s daddr %s tcp dport %s tcp flags syn / syn,rst tcp option maxseg size set %s\n' \
-                            "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$key_tport" "$key_mss_value"
-                    fi
-                done < <(printf '%s\n' "${!forward_keys[@]}" | sort)
+                if [[ "$mss_renderer" == "grouped" ]]; then
+                    local mss_mode_key mss_value_key
+                    while IFS=$'\t' read -r mss_mode_key mss_value_key; do
+                        [[ -n "$mss_mode_key" ]] || continue
+                        _pfwd_render_mss_grouped_rule "$runtime_rules" "$proto" "$ipver" "$mss_mode_key" "$mss_value_key"
+                    done < <(_pfwd_mss_group_keys_tsv "$runtime_rules" "$proto" "$ipver")
+                else
+                    while IFS= read -r key; do
+                        [[ -n "$key" ]] || continue
+                        IFS='|' read -r key_proto key_ipver key_target key_tport key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+                        [[ "$key_proto" == "$proto" && "$key_ipver" == "$ipver" ]] || continue
+                        if [[ "$key_mss_mode" == "clamp" ]]; then
+                            printf '        %s daddr %s tcp dport %s tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n' \
+                                "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$key_tport"
+                        elif [[ "$key_mss_mode" == "set" && -n "$key_mss_value" ]]; then
+                            printf '        %s daddr %s tcp dport %s tcp flags syn / syn,rst tcp option maxseg size set %s\n' \
+                                "$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)" "$key_target" "$key_tport" "$key_mss_value"
+                        fi
+                    done < <(printf '%s\n' "${!forward_keys[@]}" | sort)
+                fi
                 printf '    }\n\n'
             done
         done
@@ -1655,7 +2037,7 @@ _pfwd_apply_rendered_nft() {
 
 pfwd_apply_saved_state() {
     local state_file="${1:-}" rules runtime_rules devices_csv=""
-    local generated_ok=false flow_mode candidate_file parsed_runtime=""
+    local generated_ok=false flow_mode dnat_renderer postrouting_renderer mss_renderer candidate_file parsed_runtime=""
 
     ensure_nft || return 1
     pfwd_state_ensure_initialized
@@ -1684,27 +2066,42 @@ pfwd_apply_saved_state() {
     parsed_runtime=$(_pfwd_runtime_rules_to_parsed_tsv "$runtime_rules")
 
     for flow_mode in $(_pfwd_flowtable_modes "$devices_csv"); do
-        candidate_file=$(_mktemp_in_dir "$NFT_CONFIG") || return 1
-        _pfwd_render_nft_config "$runtime_rules" "$candidate_file" "$flow_mode" "$devices_csv"
-        if ! _pfwd_validate_rendered_nft "$candidate_file"; then
-            rm -f "$candidate_file" 2>/dev/null || true
-            continue
-        fi
-        if ! _pfwd_apply_rendered_nft "$candidate_file"; then
-            rm -f "$candidate_file" 2>/dev/null || true
-            continue
-        fi
-        if [[ "$flow_mode" != "disabled" ]]; then
-            msg_dim "  Flowtable mode: $flow_mode (${devices_csv//,/ })"
-        else
-            msg_dim "  Flowtable mode: disabled"
-        fi
-        if [[ "$_NFT_BACKUP_NEEDED" == true ]]; then
-            _backup_nft_config
-        fi
-        _atomic_replace_file "$candidate_file" "$NFT_CONFIG" 0644
-        generated_ok=true
-        break
+        for dnat_renderer in $(_pfwd_dnat_render_modes); do
+            for postrouting_renderer in $(_pfwd_postrouting_render_modes); do
+                for mss_renderer in $(_pfwd_mss_render_modes); do
+                    candidate_file=$(_mktemp_in_dir "$NFT_CONFIG") || return 1
+                    if ! _pfwd_render_nft_config "$runtime_rules" "$candidate_file" "$flow_mode" "$devices_csv" "$dnat_renderer" "$postrouting_renderer" "$mss_renderer"; then
+                        rm -f "$candidate_file" 2>/dev/null || true
+                        continue
+                    fi
+                    if ! _pfwd_validate_rendered_nft "$candidate_file"; then
+                        rm -f "$candidate_file" 2>/dev/null || true
+                        continue
+                    fi
+                    if ! _pfwd_apply_rendered_nft "$candidate_file"; then
+                        rm -f "$candidate_file" 2>/dev/null || true
+                        continue
+                    fi
+                    if [[ "$flow_mode" != "disabled" ]]; then
+                        msg_dim "  Flowtable mode: $flow_mode (${devices_csv//,/ })"
+                    else
+                        msg_dim "  Flowtable mode: disabled"
+                    fi
+                    msg_dim "  DNAT renderer: $dnat_renderer"
+                    msg_dim "  Postrouting renderer: $postrouting_renderer"
+                    msg_dim "  MSS renderer: $mss_renderer"
+                    if [[ "$_NFT_BACKUP_NEEDED" == true ]]; then
+                        _backup_nft_config
+                    fi
+                    _atomic_replace_file "$candidate_file" "$NFT_CONFIG" 0644
+                    generated_ok=true
+                    break
+                done
+                $generated_ok && break
+            done
+            $generated_ok && break
+        done
+        $generated_ok && break
     done
 
     $generated_ok || {
@@ -4896,6 +5293,14 @@ _nft_prerouting_dnat_lines() {
     _nft_cached_chains_concat prerouting $(_pfwd_subchain_list prerouting) | grep "dnat" || true
 }
 
+_nft_postrouting_nat_lines() {
+    _nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) | grep -E "snat to|masquerade" || true
+}
+
+_nft_forward_mss_lines() {
+    _nft_cached_chains_concat forward $(_pfwd_subchain_list forward) | grep 'tcp option maxseg size set ' || true
+}
+
 # _parse_nft_prerouting_rules - parse nft prerouting output into structured data
 # Output: proto<TAB>lport<TAB>ipver<TAB>target<TAB>tport<TAB>comment<TAB>bytes
 # Args: [nft_output] - if empty, fetches from nft
@@ -4993,12 +5398,18 @@ _parse_nft_export_rules() {
     while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
         [[ -z "$lport" ]] && continue
 
-        local tag snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
+        local tag mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
+        mss_key=$(_pfwd_mss_snapshot_key "$proto" "$ipver" "$target" "$tport")
         [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]] && snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
         [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
-        [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]] && mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
-        [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
+        if [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]]; then
+            mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
+            [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
+        elif [[ -n "${_NFT_SNAPSHOT_MSS_MODE[$mss_key]:-}" ]]; then
+            mss_mode="${_NFT_SNAPSHOT_MSS_MODE[$mss_key]}"
+            [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[$mss_key]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[$mss_key]}"
+        fi
 
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
@@ -6294,6 +6705,16 @@ _nft_saved_rule_count() {
     awk '/dnat ip to / || /dnat ip6 to / { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
 }
 
+_nft_saved_postrouting_rule_count() {
+    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
+    awk '/snat to / || /masquerade/ { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
+}
+
+_nft_saved_forward_mss_rule_count() {
+    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
+    awk '/tcp option maxseg size set / { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
+}
+
 _doctor_print_check() {
     local level="$1" title="$2" detail="${3:-}"
     local color="$GREEN"
@@ -6504,7 +6925,11 @@ cmd_doctor() {
 
     local state_rules="$PFWD_NFT_COUNT"
     local running_groups=0 saved_groups saved_valid=false
+    local running_postrouting_groups=0 saved_postrouting_groups=0
+    local running_mss_groups=0 saved_mss_groups=0
     saved_groups=$(_nft_saved_rule_count)
+    saved_postrouting_groups=$(_nft_saved_postrouting_rule_count)
+    saved_mss_groups=$(_nft_saved_forward_mss_rule_count)
 
     if command -v nft >/dev/null 2>&1; then
         _doctor_print_check OK "nft command available"
@@ -6577,10 +7002,15 @@ cmd_doctor() {
                 _doctor_print_check WARN "subchain ${chain} missing" "will be recreated on next nft add"
             fi
         done
-        local ft_mode ft_devices expected_ft_devices offload_status offload_sw offload_hw
+        local ft_mode ft_devices expected_ft_devices offload_status offload_sw offload_hw dnat_renderer postrouting_renderer mss_renderer
         ft_mode=$(_nft_flowtable_mode)
         ft_devices=$(_nft_flowtable_devices)
+        dnat_renderer=$(_pfwd_runtime_dnat_renderer)
+        postrouting_renderer=$(_pfwd_runtime_postrouting_renderer)
+        mss_renderer=$(_pfwd_runtime_mss_renderer)
         expected_ft_devices=$(_pfwd_collect_flowtable_devices "$(_pfwd_state_runtime_rules_tsv "$PFWD_NFT_RULES" "false")" || true)
+        running_postrouting_groups=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_nft_postrouting_nat_lines)")
+        running_mss_groups=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_nft_forward_mss_lines)")
         case "$ft_mode" in
             offload|counter|basic)
                 if _nft_cached_chain forward | grep -Eq 'ct (status dnat )?ct state established flow add @ft'; then
@@ -6616,6 +7046,39 @@ cmd_doctor() {
                 _doctor_print_check WARN "flowtable fast path unavailable"
                 ;;
         esac
+        case "$dnat_renderer" in
+            map)
+                _doctor_print_check OK "DNAT renderer active" "map"
+                ;;
+            legacy)
+                _doctor_print_check OK "DNAT renderer active" "legacy"
+                ;;
+            *)
+                _doctor_print_check WARN "DNAT renderer unavailable" "$dnat_renderer"
+                ;;
+        esac
+        case "$postrouting_renderer" in
+            grouped)
+                _doctor_print_check OK "Postrouting renderer active" "grouped"
+                ;;
+            legacy)
+                _doctor_print_check OK "Postrouting renderer active" "legacy"
+                ;;
+            *)
+                _doctor_print_check WARN "Postrouting renderer unavailable" "$postrouting_renderer"
+                ;;
+        esac
+        case "$mss_renderer" in
+            grouped)
+                _doctor_print_check OK "MSS renderer active" "grouped"
+                ;;
+            legacy)
+                _doctor_print_check OK "MSS renderer active" "legacy"
+                ;;
+            *)
+                _doctor_print_check WARN "MSS renderer unavailable" "$mss_renderer"
+                ;;
+        esac
         if [[ -n "$expected_ft_devices" && "$ft_devices" != "-" && "$expected_ft_devices" != "$ft_devices" ]]; then
             _doctor_print_check WARN "flowtable devices differ from current routes" "expected=${expected_ft_devices}, runtime=${ft_devices}"
         fi
@@ -6628,7 +7091,7 @@ cmd_doctor() {
     if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
         if command -v nft >/dev/null 2>&1 && _pfwd_validate_rendered_nft "$NFT_CONFIG"; then
             saved_valid=true
-            _doctor_print_check OK "persisted nft config is valid" "$saved_groups rendered DNAT group(s) saved"
+            _doctor_print_check OK "persisted nft config is valid" "$saved_groups rendered DNAT group(s), $saved_postrouting_groups rendered postrouting rule(s), $saved_mss_groups rendered MSS rule(s) saved"
         else
             _doctor_print_check ERROR "persisted nft config failed validation" "$NFT_CONFIG"
         fi
@@ -6646,6 +7109,19 @@ cmd_doctor() {
 
     if (( state_rules > 0 && running_groups > 0 && running_groups < state_rules )); then
         _doctor_print_check OK "rule aggregation active" "state=${state_rules}, rendered=${running_groups}"
+        if [[ "${dnat_renderer:-none}" == "map" ]]; then
+            _doctor_print_check OK "DNAT map compression active" "state=${state_rules}, rendered-prerouting=${running_groups}"
+        fi
+    fi
+    if (( state_rules > 0 && running_postrouting_groups > 0 && running_postrouting_groups < state_rules )); then
+        if [[ "${postrouting_renderer:-none}" == "grouped" ]]; then
+            _doctor_print_check OK "Postrouting compression active" "state=${state_rules}, rendered-postrouting=${running_postrouting_groups}"
+        fi
+    fi
+    if (( state_rules > 0 && running_mss_groups > 0 && running_mss_groups < state_rules )); then
+        if [[ "${mss_renderer:-none}" == "grouped" ]]; then
+            _doctor_print_check OK "MSS compression active" "state=${state_rules}, rendered-forward-mss=${running_mss_groups}"
+        fi
     fi
 
     local fwd4 fwd6
@@ -6824,9 +7300,15 @@ cmd_status() {
     fi
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
     local flowtable_label=""
+    local dnat_renderer_label=""
+    local postrouting_renderer_label=""
+    local mss_renderer_label=""
     if _nft_table_exists; then
-        local ft_mode offload_status offload_sw offload_hw
+        local ft_mode offload_status offload_sw offload_hw dnat_renderer postrouting_renderer mss_renderer
         ft_mode=$(_nft_flowtable_mode)
+        dnat_renderer=$(_pfwd_runtime_dnat_renderer)
+        postrouting_renderer=$(_pfwd_runtime_postrouting_renderer)
+        mss_renderer=$(_pfwd_runtime_mss_renderer)
         if [[ "$ft_mode" == "offload" || "$ft_mode" == "basic" || "$ft_mode" == "counter" ]]; then
             if _nft_cached_chain forward | grep -Eq 'ct (status dnat )?ct state established flow add @ft'; then
                 IFS=$'\t' read -r offload_status offload_sw offload_hw <<< "$(_pfwd_conntrack_offload_status_tsv)"
@@ -6851,10 +7333,31 @@ cmd_status() {
         else
             flowtable_label="${DIM}disabled${NC}"
         fi
+        case "$dnat_renderer" in
+            map) dnat_renderer_label="${CYAN}map${NC}" ;;
+            legacy) dnat_renderer_label="${CYAN}legacy${NC}" ;;
+            *) dnat_renderer_label="${DIM}${dnat_renderer}${NC}" ;;
+        esac
+        case "$postrouting_renderer" in
+            grouped) postrouting_renderer_label="${CYAN}grouped${NC}" ;;
+            legacy) postrouting_renderer_label="${CYAN}legacy${NC}" ;;
+            *) postrouting_renderer_label="${DIM}${postrouting_renderer}${NC}" ;;
+        esac
+        case "$mss_renderer" in
+            grouped) mss_renderer_label="${CYAN}grouped${NC}" ;;
+            legacy) mss_renderer_label="${CYAN}legacy${NC}" ;;
+            *) mss_renderer_label="${DIM}${mss_renderer}${NC}" ;;
+        esac
     else
         flowtable_label="${DIM}inactive${NC}"
+        dnat_renderer_label="${DIM}$(_pfwd_saved_dnat_renderer)${NC}"
+        postrouting_renderer_label="${DIM}$(_pfwd_saved_postrouting_renderer)${NC}"
+        mss_renderer_label="${DIM}$(_pfwd_saved_mss_renderer)${NC}"
     fi
     echo -e "  flowtable: ${flowtable_label}"
+    echo -e "  dnat rend: ${dnat_renderer_label}"
+    echo -e "  postroute: ${postrouting_renderer_label}"
+    echo -e "  mss rend: ${mss_renderer_label}"
     if [[ -n "$PFWD_NFT_RULES" ]]; then
         local nft_mss_count=0 nft_snat_count=0
         local rule_key proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value

@@ -169,6 +169,10 @@ Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loa
 
 When `conntrack` is available, `pfwd doctor` can inspect live `[OFFLOAD]` and `[HW_OFFLOAD]` tags instead of relying on extra hot-path nft counters.
 
+For larger mixed-backend rulesets, pfwd now prefers a DNAT map renderer and falls back to the legacy per-rule renderer only when the local nftables validator rejects the generated map syntax.
+For repeated SNAT/masquerade actions, pfwd also prefers grouped postrouting rules and falls back to legacy per-rule postrouting when grouped rendering is rejected locally.
+For repeated TCP MSS handling, pfwd also prefers grouped forward rules and falls back to legacy per-backend MSS rules when grouped rendering is rejected locally.
+
 Best for: IP-based targets, maximum performance.
 
 ## Traffic Statistics
@@ -186,6 +190,9 @@ Best for: IP-based targets, maximum performance.
 |---------|-------------|
 | State-driven apply | `/var/lib/pfwd/rules.v1.tsv` is rendered into nftables atomically |
 | Flowtable fast path | Established DNAT flows are offloaded to ingress; live `[OFFLOAD]` / `[HW_OFFLOAD]` visibility comes from conntrack |
+| DNAT map renderer | Mixed-backend prerouting rules can collapse into per-proto/per-family maps with automatic legacy fallback |
+| Grouped postrouting renderer | Repeated SNAT/masquerade actions collapse into grouped `daddr . dport` rules with automatic legacy fallback |
+| Grouped MSS renderer | Repeated TCP MSS clamp/fixed actions collapse into grouped forward `daddr . tcp dport` rules with automatic legacy fallback |
 | Observer-only stats | Traffic collection avoids per-rule nft counters and hot-path helper rules |
 | Port aggregation | Same-backend rules are grouped into nft port sets / intervals where possible |
 | Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |
