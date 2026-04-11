@@ -14,7 +14,7 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 - **Collector interval control** — `pfwd stats --interval [30s|1m|5m|10m|30m|1h]`
 - **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
 - **Kernel optimization profiles** — balanced / gaming / lowmem / relay, with kernel preflight and post-apply verification
-- **Optional NIC steering** — `pfwd optimize ... --nic-steering` can live-apply RSS/RPS/XPS hints on inferred forwarding NIC queues
+- **Persistent optimize runtime state** — `pfwd optimize` now restores BQL / NIC steering / tc shaping on `refresh` and boot restore
 - **Backup/Import/Export** in JSON format (current v3 schema)
 - **Boot persistence** via systemd services
 - **`--no-color` / `--no-clear`** modes for scripting
@@ -57,7 +57,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering]
+  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate <rate>] [--ingress-rate <rate>] [--tc-iface <iface>]
   help        Show help
 ```
 
@@ -79,6 +79,9 @@ pfwd <ports> <target> [target_port]
 | `--replace` | nft only: replace an existing rule for the same local port/protocol/IP family |
 | `--mss-clamp` / `--mss <value>` | nft only: clamp to PMTU or set a fixed TCP MSS |
 | `--snat-source <addr>` / `--masquerade` | nft only: fixed SNAT source or default masquerade (`--snat-source` auto-switches `-46` to the matching family) |
+| `--nic-steering` | optimize only: persist RPS/XPS/RFS hints on inferred forwarding NICs |
+| `--egress-rate <rate>` / `--ingress-rate <rate>` | optimize only: persist tc shaping (`95mbit`, `100Mbps`, `12.5MB/s`, `95%`) |
+| `--tc-iface <iface>` | optimize only: override the default-route NIC used for tc shaping |
 | `-c, --comment` | Single-line comment (tabs/newlines rejected) |
 | `-q, --quiet` | Quiet mode |
 | `--no-color` | Disable colored output |
@@ -135,7 +138,12 @@ pfwd optimize              # balanced (default) + prints preflight/recommendatio
 pfwd optimize gaming       # low latency
 pfwd optimize lowmem       # for small VPS
 pfwd optimize relay        # relay-focused forwarding tuning
-pfwd optimize balanced --nic-steering  # live-only queue steering on inferred NICs
+pfwd optimize balanced --nic-steering  # persist queue steering on inferred NICs
+pfwd optimize balanced --egress-rate 100mbit
+pfwd optimize balanced --egress-rate 100Mbps   # common alias, normalized as bit-rate
+pfwd optimize balanced --egress-rate 12.5MB/s  # explicit byte/sec input
+pfwd optimize balanced --egress-rate 95%       # percentage of device speed
+pfwd optimize balanced --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
 
 # Export/Import
 pfwd export ~/backup.json
@@ -152,7 +160,13 @@ Notes:
 - `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
 - Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
 - `pfwd optimize` prints kernel capability preflight, skips unsupported sysctl keys, and verifies the live result.
-- `--nic-steering` is explicit opt-in, stays live-only, and currently tunes `net.core.rps_sock_flow_entries` plus queue-level `rps_cpus` / `rps_flow_cnt` / `xps_cpus` when the inferred NIC exposes those sysfs knobs.
+- `pfwd optimize` persists runtime optimize state in `/var/lib/pfwd/optimize.v1.env`, and `refresh` / boot restore reapplies BQL, NIC steering, and tc shaping after nftables rebuild.
+- `--nic-steering` is explicit opt-in and now persists queue-level `rps_cpus` / `rps_flow_cnt` / `xps_cpus` when the inferred NIC exposes those sysfs knobs.
+- tc shaping is explicit-rate only: without `--egress-rate` / `--ingress-rate`, optimize prints a visible skip message and does not attach qdiscs.
+- Rate inputs accept tc-native bit-rate values, percentages, explicit byte/sec forms, and common aliases such as `100Mbps` / `100M`; aliases are interpreted as bit-rate and normalized before persistence.
+- Use measured Internet bottleneck speed for shaping suggestions, not the NIC link speed shown by `ethtool`.
+- Suggested starting points: `egress` = about `95%` of measured uplink, `ingress` = about `92%` of measured downlink. If queueing is still obvious, try `egress=90%` and `ingress=85%-90%`.
+- The interactive menu now covers the high-frequency CLI operations as well: filtered `list`, forwarding control (`start` / `refresh` / `restart` / `stop`), and diagnostics/repair (`status`, `doctor`, `doctor --tcp-probe`, `verify`, `fix-ufw`).
 - `pfwd status` and the interactive `Kernel optimization` page now show the applied optimize profile separately from the recommended profile.
 - `pfwd` detects newer performance kernels such as XanMod, but does not install or switch kernels for you.
 - `pfwd` does not manage legacy TCP accelerator stacks such as Lotserver/ServerSpeeder.
@@ -203,7 +217,7 @@ Best for: IP-based targets, maximum performance.
 | Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |
 | nft output cache | TTL-based cache avoids redundant `nft list` calls |
 | Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
-| Optional queue steering | `pfwd optimize ... --nic-steering` can spread RX/TX queue work with RPS/XPS/RFS on multi-queue NICs without changing the nft dataplane |
+| Persistent optimize runtime | `pfwd optimize` can persist BQL, queue steering, and tc shaping so `refresh` / boot restore reapplies them after nftables rebuild |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
 | BBR + TCP tuning | Optimized congestion control and buffers |
 
@@ -220,6 +234,7 @@ Best for: IP-based targets, maximum performance.
 | `/var/lib/pfwd/traffic_stats.dat` | accumulated traffic counters |
 | `/var/lib/pfwd/traffic_flows.dat` | last collector flow snapshot for delta calculation |
 | `/etc/sysctl.d/99-pfwd.conf` | kernel optimizations |
+| `/var/lib/pfwd/optimize.v1.env` | persisted optimize runtime state for BQL / steering / tc shaping |
 | `/var/lib/pfwd/` | backup files and runtime state |
 
 ## Requirements

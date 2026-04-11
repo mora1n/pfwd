@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.4"
+readonly VERSION="2.1.5"
 
 pfwd_path() {
     local path="$1"
@@ -49,6 +49,10 @@ readonly TRAFFIC_DEFAULT_INTERVAL="1m"
 readonly TRAFFIC_DATA_VERSION="4"
 readonly TRAFFIC_FLOW_VERSION="2"
 readonly EXPORT_FORMAT_VERSION="3"
+readonly OPTIMIZE_STATE_FILE="$DATA_DIR/optimize.v1.env"
+readonly OPTIMIZE_STATE_VERSION="1"
+readonly OPTIMIZE_BQL_LIMIT_DEFAULT="65536"
+readonly OPTIMIZE_IFB_DEV="ifb4pfwd0"
 readonly TRAFFIC_STALE_MULTIPLIER="3"
 readonly REQUIREMENTS_NOTICE_VERSION="1"
 
@@ -216,6 +220,22 @@ plat_ufw_status_line() {
 
 plat_ufw_reload() {
     ufw reload >/dev/null 2>&1
+}
+
+plat_ip_output() {
+    ip "$@" 2>/dev/null
+}
+
+plat_ip_quiet() {
+    ip "$@" >/dev/null 2>&1
+}
+
+plat_tc_output() {
+    tc "$@" 2>/dev/null
+}
+
+plat_tc_quiet() {
+    tc "$@" >/dev/null 2>&1
 }
 
 plat_iptables_restore_test() {
@@ -831,6 +851,7 @@ _nft_rule_option_summary() {
 
 _pfwd_collect_state() {
     pfwd_state_ensure_initialized
+    _pfwd_optimize_state_load
     PFWD_NFT_RULES=$(pfwd_state_rules_tsv)
     PFWD_NFT_COUNT=$(pfwd_state_rule_count "$PFWD_NFT_RULES")
     PFWD_NFT_RUNNING=false
@@ -2185,7 +2206,6 @@ _pfwd_validate_rendered_nft() {
 _pfwd_apply_rendered_nft() {
     local filepath="$1"
     ensure_ip_forwarding 2>/dev/null || true
-    apply_bql_limits 65536 >/dev/null 2>&1 || true
     plat_nft_delete_table $NFT_TABLE || true
     if ! plat_nft_apply_file "$filepath"; then
         return 1
@@ -2280,6 +2300,7 @@ pfwd_apply_saved_state() {
         ufw_reload_if_enabled || return 1
         sync_managed_iptables_accept_rules "$parsed_runtime" || return 1
     fi
+    _pfwd_restore_optimize_runtime_state || return 1
     return 0
 }
 
@@ -3826,6 +3847,445 @@ get_all_nics() {
     } END { print nics }'
 }
 
+_pfwd_optimize_state_reset() {
+    PFWD_OPTIMIZE_STATE_PRESENT=false
+    PFWD_OPTIMIZE_STATE_VERSION_VALUE=""
+    PFWD_OPTIMIZE_STATE_PROFILE=""
+    PFWD_OPTIMIZE_STATE_BQL_LIMIT=""
+    PFWD_OPTIMIZE_STATE_NIC_STEERING=false
+    PFWD_OPTIMIZE_STATE_TC_ENABLED=false
+    PFWD_OPTIMIZE_STATE_TC_IFACE_MODE="auto"
+    PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE=""
+    PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE=""
+    PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE=""
+}
+
+_pfwd_optimize_state_load() {
+    _pfwd_optimize_state_reset
+    [[ -f "$OPTIMIZE_STATE_FILE" ]] || return 0
+
+    local key value
+    while IFS='=' read -r key value; do
+        [[ -n "$key" ]] || continue
+        case "$key" in
+            VERSION) PFWD_OPTIMIZE_STATE_VERSION_VALUE="$value" ;;
+            PROFILE) PFWD_OPTIMIZE_STATE_PROFILE="$value" ;;
+            BQL_LIMIT) PFWD_OPTIMIZE_STATE_BQL_LIMIT="$value" ;;
+            NIC_STEERING) [[ "$value" == "true" ]] && PFWD_OPTIMIZE_STATE_NIC_STEERING=true ;;
+            TC_ENABLED) [[ "$value" == "true" ]] && PFWD_OPTIMIZE_STATE_TC_ENABLED=true ;;
+            TC_IFACE_MODE) PFWD_OPTIMIZE_STATE_TC_IFACE_MODE="$value" ;;
+            TC_IFACE_VALUE) PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE="$value" ;;
+            TC_EGRESS_RATE) PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE="$value" ;;
+            TC_INGRESS_RATE) PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE="$value" ;;
+        esac
+    done < "$OPTIMIZE_STATE_FILE"
+
+    if [[ "$PFWD_OPTIMIZE_STATE_VERSION_VALUE" == "$OPTIMIZE_STATE_VERSION" ]]; then
+        PFWD_OPTIMIZE_STATE_PRESENT=true
+    fi
+}
+
+_pfwd_optimize_state_save() {
+    local profile="$1" bql_limit="$2" nic_steering="$3" tc_iface_mode="$4" tc_iface_value="$5" tc_egress_rate="$6" tc_ingress_rate="$7"
+    local tc_enabled="false"
+    [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]] && tc_enabled="true"
+
+    mkdir -p "$DATA_DIR"
+    local tmp_file
+    tmp_file=$(_mktemp_in_dir "$OPTIMIZE_STATE_FILE") || return 1
+    cat > "$tmp_file" <<EOF
+VERSION=$OPTIMIZE_STATE_VERSION
+PROFILE=$profile
+BQL_LIMIT=$bql_limit
+NIC_STEERING=$nic_steering
+TC_ENABLED=$tc_enabled
+TC_IFACE_MODE=$tc_iface_mode
+TC_IFACE_VALUE=$tc_iface_value
+TC_EGRESS_RATE=$tc_egress_rate
+TC_INGRESS_RATE=$tc_ingress_rate
+EOF
+    _atomic_replace_file "$tmp_file" "$OPTIMIZE_STATE_FILE" 0644
+}
+
+_pfwd_optimize_state_delete() {
+    rm -f "$OPTIMIZE_STATE_FILE" 2>/dev/null || true
+    _pfwd_optimize_state_reset
+}
+
+PFWD_TC_RATE_CANONICAL=""
+PFWD_TC_RATE_ERROR=""
+
+_pfwd_tc_rate_reset_parse() {
+    PFWD_TC_RATE_CANONICAL=""
+    PFWD_TC_RATE_ERROR=""
+}
+
+_pfwd_tc_rate_examples() {
+    echo "95mbit, 100Mbps, 100M, 12.5MB/s, 95%"
+}
+
+_pfwd_tc_rate_normalize_number() {
+    local value="$1"
+    awk -v n="$value" 'BEGIN {
+        if (n !~ /^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)$/) exit 1
+        v = n + 0
+        if (v <= 0) exit 1
+        s = sprintf("%.6f", v)
+        sub(/0+$/, "", s)
+        sub(/[.]$/, "", s)
+        print s
+    }'
+}
+
+_pfwd_tc_rate_bytes_to_canonical() {
+    local value="$1" unit="$2"
+    awk -v n="$value" -v u="$unit" 'BEGIN {
+        unit = tolower(u)
+        mult = 0
+        if (unit == "b/s" || unit == "bps") mult = 1
+        else if (unit == "kb/s" || unit == "kbps") mult = 1000
+        else if (unit == "mb/s" || unit == "mbps") mult = 1000000
+        else if (unit == "gb/s" || unit == "gbps") mult = 1000000000
+        else if (unit == "tb/s" || unit == "tbps") mult = 1000000000000
+        else if (unit == "kib/s" || unit == "kibps") mult = 1024
+        else if (unit == "mib/s" || unit == "mibps") mult = 1048576
+        else if (unit == "gib/s" || unit == "gibps") mult = 1073741824
+        else if (unit == "tib/s" || unit == "tibps") mult = 1099511627776
+        else exit 1
+
+        bits = (n + 0) * mult * 8
+        if (bits >= 1000000000000) {
+            val = bits / 1000000000000
+            out = "tbit"
+        } else if (bits >= 1000000000) {
+            val = bits / 1000000000
+            out = "gbit"
+        } else if (bits >= 1000000) {
+            val = bits / 1000000
+            out = "mbit"
+        } else if (bits >= 1000) {
+            val = bits / 1000
+            out = "kbit"
+        } else {
+            val = bits
+            out = "bit"
+        }
+
+        s = sprintf("%.6f", val)
+        sub(/0+$/, "", s)
+        sub(/[.]$/, "", s)
+        print s out
+    }'
+}
+
+_pfwd_parse_tc_rate() {
+    local raw_input="$1"
+    local raw="${raw_input//[[:space:]]/}"
+    local lower="${raw,,}"
+    local number unit normalized
+    _pfwd_tc_rate_reset_parse
+
+    [[ -n "$raw" ]] || {
+        PFWD_TC_RATE_ERROR="empty rate"
+        return 1
+    }
+
+    if [[ "$lower" =~ ^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)%$ ]]; then
+        normalized=$(_pfwd_tc_rate_normalize_number "${BASH_REMATCH[1]}") || {
+            PFWD_TC_RATE_ERROR="invalid percentage"
+            return 1
+        }
+        awk -v n="$normalized" 'BEGIN { exit((n > 0 && n <= 100) ? 0 : 1) }' || {
+            PFWD_TC_RATE_ERROR="percentage must be > 0 and <= 100"
+            return 1
+        }
+        PFWD_TC_RATE_CANONICAL="${normalized}%"
+        return 0
+    fi
+
+    if [[ "$lower" =~ ^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)(kbit|mbit|gbit|tbit|kibit|mibit|gibit|tibit|bit)$ ]]; then
+        number=$(_pfwd_tc_rate_normalize_number "${BASH_REMATCH[1]}") || {
+            PFWD_TC_RATE_ERROR="invalid numeric rate"
+            return 1
+        }
+        PFWD_TC_RATE_CANONICAL="${number}${BASH_REMATCH[3]}"
+        return 0
+    fi
+
+    if [[ "$lower" =~ ^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)(kbps|mbps|gbps|tbps)$ ]]; then
+        number=$(_pfwd_tc_rate_normalize_number "${BASH_REMATCH[1]}") || {
+            PFWD_TC_RATE_ERROR="invalid numeric rate"
+            return 1
+        }
+        unit="${BASH_REMATCH[3]}"
+        unit="${unit%ps}it"
+        PFWD_TC_RATE_CANONICAL="${number}${unit}"
+        return 0
+    fi
+
+    if [[ "$lower" =~ ^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)([kmgt])$ ]]; then
+        number=$(_pfwd_tc_rate_normalize_number "${BASH_REMATCH[1]}") || {
+            PFWD_TC_RATE_ERROR="invalid numeric rate"
+            return 1
+        }
+        PFWD_TC_RATE_CANONICAL="${number}${BASH_REMATCH[3]}bit"
+        return 0
+    fi
+
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?|[0-9]*[.][0-9]+)(([KMGT]?i?B/s)|([KMGT]?i?Bps))$ ]]; then
+        number=$(_pfwd_tc_rate_normalize_number "${BASH_REMATCH[1]}") || {
+            PFWD_TC_RATE_ERROR="invalid numeric rate"
+            return 1
+        }
+        unit="${BASH_REMATCH[3]}"
+        PFWD_TC_RATE_CANONICAL=$(_pfwd_tc_rate_bytes_to_canonical "$number" "$unit") || {
+            PFWD_TC_RATE_ERROR="unsupported byte-rate unit"
+            return 1
+        }
+        return 0
+    fi
+
+    PFWD_TC_RATE_ERROR="unsupported rate format"
+    return 1
+}
+
+_pfwd_tc_rate_help_text() {
+    echo "Accepted examples: $(_pfwd_tc_rate_examples)"
+}
+
+_pfwd_default_route_iface() {
+    plat_ip_output -o route show to default | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && (i + 1) <= NF) {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+_pfwd_iface_exists() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 1
+    plat_ip_quiet link show dev "$iface"
+}
+
+_pfwd_tc_iface_from_state() {
+    local iface_mode="${1:-auto}" iface_value="${2:-}"
+    local iface=""
+    case "$iface_mode" in
+        explicit)
+            iface="$iface_value"
+            ;;
+        auto|"")
+            iface=$(_pfwd_default_route_iface)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    [[ -n "$iface" ]] || return 1
+    _pfwd_iface_exists "$iface" || return 1
+    printf '%s\n' "$iface"
+}
+
+_pfwd_tc_qdisc_lines() {
+    local iface="$1"
+    plat_tc_output qdisc show dev "$iface" || true
+}
+
+_pfwd_tc_root_active() {
+    local iface="$1"
+    grep -Eq '(^| )root .* tbf ' <<< "$(_pfwd_tc_qdisc_lines "$iface")"
+}
+
+_pfwd_tc_ingress_active() {
+    local iface="$1"
+    grep -Eq '(^| )ingress ' <<< "$(_pfwd_tc_qdisc_lines "$iface")"
+}
+
+_pfwd_tc_ifb_ready() {
+    _pfwd_iface_exists "$OPTIMIZE_IFB_DEV"
+}
+
+_pfwd_optimize_runtime_iface_hint() {
+    local devices_csv="$(_pfwd_detect_steering_devices)"
+    local iface=""
+    if [[ -n "$devices_csv" ]]; then
+        printf '%s\n' "$devices_csv"
+        return 0
+    fi
+    if iface=$(_pfwd_tc_iface_from_state "${1:-auto}" "${2:-}" 2>/dev/null); then
+        printf '%s\n' "$iface"
+    fi
+}
+
+_pfwd_apply_bql_state() {
+    local limit="${1:-$OPTIMIZE_BQL_LIMIT_DEFAULT}"
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || {
+        msg_err "Invalid BQL limit: $limit"
+        return 1
+    }
+    apply_bql_limits "$limit"
+}
+
+_pfwd_clear_nic_steering() {
+    local devices_csv="${1:-}" iface queue_path
+    if sysctl_key_supported net.core.rps_sock_flow_entries; then
+        plat_sysctl_set net.core.rps_sock_flow_entries 0
+    fi
+
+    IFS=',' read -r -a _PFWD_CLEAR_STEERING_IFACES <<< "$devices_csv"
+    for iface in "${_PFWD_CLEAR_STEERING_IFACES[@]}"; do
+        [[ -n "$iface" ]] || continue
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            [[ -f "$queue_path/rps_cpus" ]] && echo 0 > "$queue_path/rps_cpus" 2>/dev/null || true
+            [[ -f "$queue_path/rps_flow_cnt" ]] && echo 0 > "$queue_path/rps_flow_cnt" 2>/dev/null || true
+        done < <(_pfwd_nic_queue_paths "$iface" rx)
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            [[ -f "$queue_path/xps_cpus" ]] && echo 0 > "$queue_path/xps_cpus" 2>/dev/null || true
+        done < <(_pfwd_nic_queue_paths "$iface" tx)
+    done
+}
+
+_pfwd_tc_ensure_ifb() {
+    if _pfwd_tc_ifb_ready; then
+        plat_ip_quiet link set dev "$OPTIMIZE_IFB_DEV" up
+        return 0
+    fi
+    _pfwd_module_loadable ifb && modprobe ifb 2>/dev/null || true
+    plat_ip_quiet link add "$OPTIMIZE_IFB_DEV" type ifb || true
+    _pfwd_tc_ifb_ready || {
+        msg_err "Failed to create IFB device $OPTIMIZE_IFB_DEV"
+        return 1
+    }
+    plat_ip_quiet link set dev "$OPTIMIZE_IFB_DEV" up || true
+}
+
+_pfwd_tc_apply_egress() {
+    local iface="$1" rate="$2"
+    [[ -n "$rate" ]] || return 0
+    plat_tc_quiet qdisc replace dev "$iface" root handle 1: tbf rate "$rate" burst 256kb latency 50ms || {
+        msg_err "Failed to apply egress tc shaping on $iface"
+        return 1
+    }
+    plat_tc_quiet qdisc replace dev "$iface" parent 1: handle 10: fq || {
+        msg_err "Failed to attach fq under egress tbf on $iface"
+        return 1
+    }
+}
+
+_pfwd_tc_apply_ingress() {
+    local iface="$1" rate="$2"
+    [[ -n "$rate" ]] || return 0
+    _pfwd_tc_ensure_ifb || return 1
+    plat_tc_quiet qdisc replace dev "$iface" handle ffff: ingress || {
+        msg_err "Failed to attach ingress qdisc on $iface"
+        return 1
+    }
+    plat_tc_quiet filter replace dev "$iface" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$OPTIMIZE_IFB_DEV" || {
+        msg_err "Failed to redirect ingress traffic from $iface to $OPTIMIZE_IFB_DEV"
+        return 1
+    }
+    plat_tc_quiet qdisc replace dev "$OPTIMIZE_IFB_DEV" root handle 1: tbf rate "$rate" burst 256kb latency 50ms || {
+        msg_err "Failed to apply ingress tc shaping on $OPTIMIZE_IFB_DEV"
+        return 1
+    }
+    plat_tc_quiet qdisc replace dev "$OPTIMIZE_IFB_DEV" parent 1: handle 10: fq || {
+        msg_err "Failed to attach fq under ingress tbf on $OPTIMIZE_IFB_DEV"
+        return 1
+    }
+}
+
+_pfwd_tc_clear() {
+    local iface="${1:-}"
+    if [[ -n "$iface" ]] && _pfwd_iface_exists "$iface"; then
+        plat_tc_quiet qdisc del dev "$iface" root || true
+        plat_tc_quiet qdisc del dev "$iface" ingress || true
+    fi
+    if _pfwd_tc_ifb_ready; then
+        plat_tc_quiet qdisc del dev "$OPTIMIZE_IFB_DEV" root || true
+        plat_ip_quiet link set dev "$OPTIMIZE_IFB_DEV" down || true
+        plat_ip_quiet link delete "$OPTIMIZE_IFB_DEV" type ifb || true
+    fi
+}
+
+_pfwd_tc_apply_state() {
+    local iface_mode="$1" iface_value="$2" egress_rate="$3" ingress_rate="$4"
+    [[ -n "$egress_rate" || -n "$ingress_rate" ]] || return 0
+    local iface
+    iface=$(_pfwd_tc_iface_from_state "$iface_mode" "$iface_value") || {
+        msg_err "Unable to determine tc interface"
+        return 1
+    }
+    _pfwd_tc_clear "$iface"
+    _pfwd_tc_apply_egress "$iface" "$egress_rate" || return 1
+    _pfwd_tc_apply_ingress "$iface" "$ingress_rate" || return 1
+    printf '%s\n' "$iface"
+}
+
+_pfwd_optimize_runtime_apply() {
+    local bql_limit="$1" nic_steering="$2" tc_iface_mode="$3" tc_iface_value="$4" tc_egress_rate="$5" tc_ingress_rate="$6"
+    local steering_devices_csv=""
+
+    _pfwd_apply_bql_state "$bql_limit" || return 1
+
+    if [[ "$nic_steering" == "true" ]]; then
+        steering_devices_csv=$(_pfwd_optimize_runtime_iface_hint "$tc_iface_mode" "$tc_iface_value")
+        if [[ -n "$steering_devices_csv" ]]; then
+            apply_nic_steering "$steering_devices_csv" || return 1
+        else
+            msg_warn "NIC steering skipped: no eligible interface detected"
+        fi
+    fi
+
+    if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
+        _pfwd_tc_apply_state "$tc_iface_mode" "$tc_iface_value" "$tc_egress_rate" "$tc_ingress_rate" >/dev/null || return 1
+    fi
+    return 0
+}
+
+_pfwd_restore_optimize_runtime_state() {
+    _pfwd_optimize_state_load
+    $PFWD_OPTIMIZE_STATE_PRESENT || return 0
+    _pfwd_optimize_runtime_apply \
+        "${PFWD_OPTIMIZE_STATE_BQL_LIMIT:-$OPTIMIZE_BQL_LIMIT_DEFAULT}" \
+        "$([[ "$PFWD_OPTIMIZE_STATE_NIC_STEERING" == true ]] && echo true || echo false)" \
+        "${PFWD_OPTIMIZE_STATE_TC_IFACE_MODE:-auto}" \
+        "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-}" \
+        "${PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE:-}" \
+        "${PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE:-}"
+}
+
+_pfwd_optimize_runtime_summary() {
+    _pfwd_optimize_state_load
+    if ! $PFWD_OPTIMIZE_STATE_PRESENT; then
+        echo "bql=off steering=off tc=off"
+        return 0
+    fi
+
+    local bql_label steering_label tc_label iface=""
+    bql_label="${PFWD_OPTIMIZE_STATE_BQL_LIMIT:-$OPTIMIZE_BQL_LIMIT_DEFAULT}"
+    if [[ "$PFWD_OPTIMIZE_STATE_NIC_STEERING" == true ]]; then
+        steering_label="on"
+    else
+        steering_label="off"
+    fi
+
+    if [[ "$PFWD_OPTIMIZE_STATE_TC_ENABLED" == true ]]; then
+        iface=$(_pfwd_tc_iface_from_state "${PFWD_OPTIMIZE_STATE_TC_IFACE_MODE:-auto}" "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-}" 2>/dev/null || true)
+        [[ -z "$iface" ]] && iface="${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-auto}"
+        tc_label="${iface}:egr=${PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE:-off},ingr=${PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE:-off}"
+    else
+        tc_label="off"
+    fi
+    echo "bql=${bql_label} steering=${steering_label} tc=${tc_label}"
+}
+
 # ensure_bbr_enabled - auto-enable BBR for optimal performance
 ensure_bbr_enabled() {
     local current_cc
@@ -4273,7 +4733,7 @@ _pfwd_bql_limits_state() {
 }
 
 _pfwd_print_optimize_preflight() {
-    local profile="$1" nic_steering="${2:-false}"
+    local profile="$1" nic_steering="${2:-false}" tc_egress_rate="${3:-}" tc_ingress_rate="${4:-}" tc_iface_mode="${5:-auto}" tc_iface_value="${6:-}"
 
     _pfwd_collect_state
 
@@ -4319,13 +4779,18 @@ _pfwd_print_optimize_preflight() {
         msg_dim "  Plan: apply relay-only TCP and neighbor queue tuning"
     fi
     if [[ "$nic_steering" == "true" ]]; then
-        msg_dim "  Plan: live-apply NIC queue steering (RPS/XPS plus RFS fanout when supported)"
+        msg_dim "  Plan: persist NIC queue steering (RPS/XPS plus RFS fanout when supported)"
+    fi
+    if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
+        msg_dim "  Plan: persist tc shaping on ${tc_iface_value:-default-route} (${tc_iface_mode}) egress=${tc_egress_rate:-off} ingress=${tc_ingress_rate:-off}"
+    else
+        msg_dim "  Plan: tc shaping skipped unless --egress-rate/--ingress-rate is provided"
     fi
 }
 
 _pfwd_print_optimize_verification() {
-    local profile="$1" conntrack_max="$2" ft_tcp_timeout="$3" ft_udp_timeout="$4" expect_bbr="$5" bql_limit="${6:-65536}" nic_steering="${7:-false}" devices_csv="${8:-}"
-    local cc qdisc fwd4 fwd6 route_all route_default traffic_acct current_conntrack current_ft_tcp current_ft_udp bql_state
+    local profile="$1" conntrack_max="$2" ft_tcp_timeout="$3" ft_udp_timeout="$4" expect_bbr="$5" bql_limit="${6:-65536}" nic_steering="${7:-false}" devices_csv="${8:-}" tc_iface_mode="${9:-auto}" tc_iface_value="${10:-}" tc_egress_rate="${11:-}" tc_ingress_rate="${12:-}"
+    local cc qdisc fwd4 fwd6 route_all route_default traffic_acct current_conntrack current_ft_tcp current_ft_udp bql_state tc_iface=""
 
     echo ""
     echo -e "${BOLD}Optimize Verification${NC}"
@@ -4413,6 +4878,26 @@ _pfwd_print_optimize_verification() {
         fi
     fi
 
+    if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
+        tc_iface=$(_pfwd_tc_iface_from_state "$tc_iface_mode" "$tc_iface_value" 2>/dev/null || true)
+        if [[ -z "$tc_iface" ]]; then
+            _doctor_print_check ERROR "tc shaping interface unresolved" "${tc_iface_value:-default route}"
+        else
+            if [[ -n "$tc_egress_rate" ]]; then
+                _pfwd_tc_root_active "$tc_iface" && _doctor_print_check OK "egress tc shaping active" "${tc_iface} rate=${tc_egress_rate}" || _doctor_print_check WARN "egress tc shaping missing" "${tc_iface} rate=${tc_egress_rate}"
+            fi
+            if [[ -n "$tc_ingress_rate" ]]; then
+                if _pfwd_tc_ingress_active "$tc_iface" && _pfwd_tc_ifb_ready && _pfwd_tc_root_active "$OPTIMIZE_IFB_DEV"; then
+                    _doctor_print_check OK "ingress tc shaping active" "${tc_iface} -> ${OPTIMIZE_IFB_DEV} rate=${tc_ingress_rate}"
+                else
+                    _doctor_print_check WARN "ingress tc shaping missing" "${tc_iface} -> ${OPTIMIZE_IFB_DEV} rate=${tc_ingress_rate}"
+                fi
+            fi
+        fi
+    else
+        _doctor_print_check OK "tc shaping skipped" "no --egress-rate/--ingress-rate provided"
+    fi
+
     msg_dim "  Profile ${profile}: $(_pfwd_optimize_profile_summary "$profile")"
 }
 
@@ -4429,6 +4914,11 @@ _pfwd_print_reset_verification() {
         _doctor_print_check ERROR "pfwd-managed sysctl block still present" "$SYSCTL_CONF"
     else
         _doctor_print_check OK "pfwd-managed sysctl block removed"
+    fi
+    if [[ -f "$OPTIMIZE_STATE_FILE" ]]; then
+        _doctor_print_check ERROR "optimize runtime state still present" "$OPTIMIZE_STATE_FILE"
+    else
+        _doctor_print_check OK "optimize runtime state removed"
     fi
 
     fwd4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
@@ -4661,6 +5151,10 @@ ufw_sync_loopback_dnat_rules() {
 optimize_kernel() {
     local profile="${1:-balanced}"
     local nic_steering="${2:-false}"
+    local tc_iface_mode="${3:-auto}"
+    local tc_iface_value="${4:-}"
+    local tc_egress_rate="${5:-}"
+    local tc_ingress_rate="${6:-}"
     require_root "$0 optimize $profile"
     local marker_start="# pfwd-managed-start"
     local marker_end="# pfwd-managed-end"
@@ -4698,11 +5192,11 @@ optimize_kernel() {
             max_syn_backlog=16384
             max_tw_buckets=262144
             netdev_budget=600
-            netdev_budget_usecs=4000
+            netdev_budget_usecs=8000
             optmem_max=65536
-            keepalive_time=300
-            keepalive_intvl=15
-            keepalive_probes=3
+            keepalive_time=60
+            keepalive_intvl=10
+            keepalive_probes=6
             tcp_synack_retries=2
             tcp_fin_timeout=10
             tcp_ecn=2
@@ -4732,11 +5226,11 @@ optimize_kernel() {
             max_syn_backlog=4096
             max_tw_buckets=65536
             netdev_budget=300
-            netdev_budget_usecs=3000
+            netdev_budget_usecs=8000
             optmem_max=32768
-            keepalive_time=300
-            keepalive_intvl=15
-            keepalive_probes=3
+            keepalive_time=60
+            keepalive_intvl=10
+            keepalive_probes=6
             tcp_synack_retries=2
             tcp_fin_timeout=10
             tcp_ecn=2
@@ -4766,11 +5260,11 @@ optimize_kernel() {
             max_syn_backlog=131072
             max_tw_buckets=262144
             netdev_budget=600
-            netdev_budget_usecs=5000
+            netdev_budget_usecs=8000
             optmem_max=65536
-            keepalive_time=600
-            keepalive_intvl=15
-            keepalive_probes=2
+            keepalive_time=60
+            keepalive_intvl=10
+            keepalive_probes=6
             tcp_synack_retries=1
             tcp_fin_timeout=15
             tcp_ecn=1
@@ -4792,24 +5286,24 @@ optimize_kernel() {
             conntrack_tcp_fin_wait=30
             udp_timeout=60
             udp_stream_timeout=180
-            tcp_rmem="4096 131072 33554432"
-            tcp_wmem="4096 131072 33554432"
+            tcp_rmem="4096 87380 33554432"
+            tcp_wmem="4096 65536 33554432"
             tcp_mem="32768 49152 65536"
-            backlog=4096
-            somaxconn=4096
-            file_max=6815744
+            backlog=10000
+            somaxconn=8192
+            file_max=1000000
             ft_tcp_timeout=300
             ft_udp_timeout=30
             conntrack_buckets=262144
             gro_normal_batch=8
-            max_syn_backlog=4096
+            max_syn_backlog=8192
             max_tw_buckets=262144
             netdev_budget=300
-            netdev_budget_usecs=3000
+            netdev_budget_usecs=8000
             optmem_max=65536
-            keepalive_time=300
-            keepalive_intvl=15
-            keepalive_probes=3
+            keepalive_time=60
+            keepalive_intvl=10
+            keepalive_probes=6
             tcp_synack_retries=2
             tcp_fin_timeout=10
             tcp_ecn=2
@@ -4824,7 +5318,7 @@ optimize_kernel() {
             ;;
     esac
 
-    _pfwd_print_optimize_preflight "$profile" "$nic_steering"
+    _pfwd_print_optimize_preflight "$profile" "$nic_steering" "$tc_egress_rate" "$tc_ingress_rate" "$tc_iface_mode" "$tc_iface_value"
     msg_info "Stage 1/2: writing managed sysctl profile ($profile)"
 
     if ! sysctl_cc_supported bbr; then
@@ -4894,10 +5388,9 @@ optimize_kernel() {
     _pfwd_sysctl_append_setting net.ipv4.tcp_max_syn_backlog "$max_syn_backlog"
     _pfwd_sysctl_append_setting net.ipv4.tcp_max_tw_buckets "$max_tw_buckets"
     if $enable_relay_tuning; then
-        _pfwd_sysctl_append_setting net.ipv4.tcp_fack 1
         _pfwd_sysctl_append_setting net.ipv4.neigh.default.unres_qlen 10000
     fi
-    if sysctl_key_supported net.ipv4.tcp_adv_win_scale; then
+    if ! _pfwd_kernel_version_at_least 6 6 && sysctl_key_supported net.ipv4.tcp_adv_win_scale; then
         _pfwd_sysctl_append_setting net.ipv4.tcp_adv_win_scale 1
     fi
 
@@ -4949,16 +5442,10 @@ EOF
     msg_info "Stage 2/2: applying live sysctl values and verifying result"
     plat_sysctl_apply_file "$SYSCTL_CONF"
 
-    # Cap BQL limit_max to prevent bufferbloat
-    # flowtable fast path bypasses fq_codel; without this cap the NIC TX ring
-    # buffer can grow to the kernel default (~1.75GB), causing latency spikes
-    apply_bql_limits
-
     local steering_devices_csv=""
-    if [[ "$nic_steering" == "true" ]]; then
-        steering_devices_csv=$(_pfwd_detect_steering_devices)
-        apply_nic_steering "$steering_devices_csv"
-    fi
+    steering_devices_csv=$(_pfwd_optimize_runtime_iface_hint "$tc_iface_mode" "$tc_iface_value")
+    _pfwd_optimize_runtime_apply "$OPTIMIZE_BQL_LIMIT_DEFAULT" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$tc_egress_rate" "$tc_ingress_rate" || return 1
+    _pfwd_optimize_state_save "$profile" "$OPTIMIZE_BQL_LIMIT_DEFAULT" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$tc_egress_rate" "$tc_ingress_rate" || return 1
 
     # Verify IP forwarding is actually enabled
     if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
@@ -4988,41 +5475,48 @@ EOF
     msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
     if [[ "$nic_steering" == "true" ]]; then
         if [[ -n "$steering_devices_csv" ]]; then
-            msg_dim "  NIC steering: live-only RPS/XPS attempted on ${steering_devices_csv}"
+            msg_dim "  NIC steering: persisted RPS/XPS on ${steering_devices_csv}"
         else
             msg_warn "NIC steering skipped: no eligible flowtable NIC detected from current rules"
         fi
     fi
+    if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
+        msg_dim "  tc shaping: persisted on ${tc_iface_value:-default-route} egress=${tc_egress_rate:-off} ingress=${tc_ingress_rate:-off}"
+    else
+        msg_warn "tc shaping skipped: no --egress-rate/--ingress-rate provided"
+    fi
     _pfwd_sysctl_print_skipped
-    _pfwd_print_optimize_verification "$profile" "$conntrack_max" "$ft_tcp_timeout" "$ft_udp_timeout" "$bbr_supported" "65536" "$nic_steering" "$steering_devices_csv"
+    _pfwd_print_optimize_verification "$profile" "$conntrack_max" "$ft_tcp_timeout" "$ft_udp_timeout" "$bbr_supported" "$OPTIMIZE_BQL_LIMIT_DEFAULT" "$nic_steering" "$steering_devices_csv" "$tc_iface_mode" "$tc_iface_value" "$tc_egress_rate" "$tc_ingress_rate"
 }
 
 # reset_kernel_optimization - remove pfwd-managed sysctl block and reload
 reset_kernel_optimization() {
     require_root "$0 optimize reset"
-    if [[ ! -f "$SYSCTL_CONF" ]]; then
-        msg_warn "No kernel optimization config found ($SYSCTL_CONF)"
-        return 0
-    fi
-
+    _pfwd_optimize_state_load
     local marker_start="# pfwd-managed-start"
     local marker_end="# pfwd-managed-end"
+    local cleanup_devices_csv=""
+    cleanup_devices_csv=$(_pfwd_optimize_runtime_iface_hint "${PFWD_OPTIMIZE_STATE_TC_IFACE_MODE:-auto}" "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-}")
 
-    if ! grep -q "$marker_start" "$SYSCTL_CONF" 2>/dev/null; then
-        msg_warn "No pfwd-managed optimization block found in $SYSCTL_CONF"
-        return 0
+    if [[ -f "$SYSCTL_CONF" ]] && grep -q "$marker_start" "$SYSCTL_CONF" 2>/dev/null; then
+        sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
+        plat_sysctl_apply_file "$SYSCTL_CONF"
     fi
-
-    sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
-    plat_sysctl_apply_file "$SYSCTL_CONF"
-    msg_ok "Kernel optimization removed (pfwd-managed block deleted)"
-    msg_dim "  Note: some live kernel parameters may remain until reboot"
+    _pfwd_tc_clear "$(_pfwd_tc_iface_from_state "${PFWD_OPTIMIZE_STATE_TC_IFACE_MODE:-auto}" "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-}" 2>/dev/null || true)"
+    [[ -n "$cleanup_devices_csv" ]] && _pfwd_clear_nic_steering "$cleanup_devices_csv"
+    _pfwd_optimize_state_delete
+    msg_ok "Kernel optimization removed (sysctl/runtime optimize state cleared)"
+    msg_dim "  Note: some live kernel parameters and BQL limits may remain until reboot"
     _pfwd_print_reset_verification
 }
 
 cmd_optimize() {
     local profile="balanced"
     local nic_steering=false
+    local tc_iface_mode="auto"
+    local tc_iface_value=""
+    local tc_egress_rate=""
+    local tc_ingress_rate=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -5034,9 +5528,35 @@ cmd_optimize() {
                 nic_steering=true
                 shift
                 ;;
+            --egress-rate)
+                require_option_value "$1" "$@" || return 1
+                _pfwd_parse_tc_rate "$2" || {
+                    msg_err "Invalid --egress-rate: $2 (${PFWD_TC_RATE_ERROR})"
+                    msg_dim "  $(_pfwd_tc_rate_help_text)"
+                    return 1
+                }
+                tc_egress_rate="$PFWD_TC_RATE_CANONICAL"
+                shift 2
+                ;;
+            --ingress-rate)
+                require_option_value "$1" "$@" || return 1
+                _pfwd_parse_tc_rate "$2" || {
+                    msg_err "Invalid --ingress-rate: $2 (${PFWD_TC_RATE_ERROR})"
+                    msg_dim "  $(_pfwd_tc_rate_help_text)"
+                    return 1
+                }
+                tc_ingress_rate="$PFWD_TC_RATE_CANONICAL"
+                shift 2
+                ;;
+            --tc-iface)
+                require_option_value "$1" "$@" || return 1
+                tc_iface_mode="explicit"
+                tc_iface_value="$2"
+                shift 2
+                ;;
             reset|undo)
                 shift
-                if [[ "$nic_steering" == "true" || $# -gt 0 ]]; then
+                if [[ "$nic_steering" == "true" || -n "$tc_egress_rate" || -n "$tc_ingress_rate" || "$tc_iface_mode" != "auto" || $# -gt 0 ]]; then
                     msg_err "'pfwd optimize reset' does not accept extra options"
                     return 1
                 fi
@@ -5045,13 +5565,20 @@ cmd_optimize() {
                 ;;
             *)
                 msg_err "Unknown optimize option/profile: $1"
-                msg_dim "  Example: pfwd optimize balanced --nic-steering"
+                msg_dim "  Example: pfwd optimize balanced --nic-steering --egress-rate 100mbit"
                 return 1
                 ;;
         esac
     done
 
-    optimize_kernel "$profile" "$nic_steering"
+    if [[ "$tc_iface_mode" == "explicit" ]]; then
+        _pfwd_iface_exists "$tc_iface_value" || {
+            msg_err "Unknown tc interface: $tc_iface_value"
+            return 1
+        }
+    fi
+
+    optimize_kernel "$profile" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$tc_egress_rate" "$tc_ingress_rate"
 }
 
 # apply_bql_limits - cap NIC TX byte queue limits to prevent bufferbloat
@@ -7138,7 +7665,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Run kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering]
+  optimize    Run kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate <rate>] [--ingress-rate <rate>] [--tc-iface <iface>]
   help        Show this help
 
 Quick syntax:
@@ -7199,10 +7726,14 @@ Common scenarios:
   pfwd -m nft -t 1.2.3.4 --both 80,443
   pfwd -m nft -t 127.0.0.1 33389:3389
   pfwd doctor
+  pfwd doctor --tcp-probe --probe-timeout 3
+  pfwd verify
+  pfwd fix-ufw
   pfwd import backup.json
   pfwd optimize            # prints kernel preflight + recommended profile
   pfwd optimize balanced
-  pfwd optimize balanced --nic-steering
+  pfwd optimize balanced --nic-steering --egress-rate 100mbit
+  pfwd optimize balanced --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
   pfwd optimize relay
 
 Performance tips:
@@ -7212,7 +7743,11 @@ Performance tips:
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
   - optimize prints kernel capability preflight, skips unsupported sysctl keys, and verifies live state.
-  - --nic-steering is explicit opt-in and only live-applies RSS/RPS/XPS hints to NIC queues inferred from the current ruleset.
+  - --nic-steering is explicit opt-in and is restored on refresh/start when optimize state exists.
+  - tc shaping is explicit-rate only; without --egress-rate/--ingress-rate it is skipped with a visible message.
+  - Rate inputs accept tc rates, common aliases, explicit byte/sec forms, and percentages.
+  - Egress hint: start at 95% of measured uplink. Ingress hint: start at 92% of measured downlink.
+  - Interactive menus cover filtered list, forwarding control (start/refresh/restart/stop), and diagnostics/repair (status/doctor/tcp-probe/verify/fix-ufw).
   - pfwd detects performance kernels such as XanMod, but does not install or switch kernels for you.
 
 Options:
@@ -7229,6 +7764,10 @@ Options:
   --replace                  nft only: replace an existing rule for the same port/proto/IP family
   --snat-source <addr>       nft only: use fixed SNAT source instead of masquerade (auto-switches -46 to matching family)
   --masquerade               nft only: force default masquerade mode
+  --nic-steering             optimize only: persist RSS/RPS/XPS hints on inferred forwarding NICs
+  --egress-rate <rate>       optimize only: persist tc egress shaping (e.g. 95mbit, 100Mbps, 12.5MB/s, 95%)
+  --ingress-rate <rate>      optimize only: persist tc ingress shaping via $OPTIMIZE_IFB_DEV
+  --tc-iface <iface>         optimize only: override the default-route egress NIC used for tc shaping
   -c, --comment <text>       Add single-line comment to rule
   -q, --quiet                Quiet mode
   --no-color                 Disable colored output
@@ -7241,6 +7780,12 @@ Interactive note:
   If IP version is left at dual-stack (-46), pfwd auto-switches to IPv4 or IPv6
   to match the fixed SNAT source address.
   The suggestion is informational; you still choose Off/Clamp/Fixed.
+
+Rate input note:
+  Accepted examples: $(_pfwd_tc_rate_examples)
+  Common aliases like 100Mbps / 100M are treated as bit-rate and normalized to tc-safe values.
+  Use explicit byte units only when you really mean bytes/sec, for example 12.5MB/s.
+  For shaping suggestions, use measured Internet bottleneck speed rather than NIC link speed.
 EOF
 }
 
@@ -7600,6 +8145,12 @@ cmd_doctor() {
     else
         _doctor_print_check WARN "state file missing" "$RULES_STATE_FILE"
     fi
+    if $PFWD_OPTIMIZE_STATE_PRESENT; then
+        _doctor_print_check OK "optimize runtime state present" "$OPTIMIZE_STATE_FILE"
+        _doctor_print_check OK "optimize runtime summary" "$(_pfwd_optimize_runtime_summary)"
+    else
+        _doctor_print_check OK "optimize runtime state idle" "no persisted BQL/steering/tc state"
+    fi
 
     _doctor_print_check OK "kernel release detected" "${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
     if [[ "$PFWD_KERNEL_FLAVOR" == "xanmod" || "$PFWD_KERNEL_FLAVOR" == "liquorix" ]]; then
@@ -7860,6 +8411,25 @@ cmd_doctor() {
         mismatch:*) _doctor_print_check WARN "traffic flow snapshot version mismatch" "${traffic_flow_state#mismatch:} -> v${TRAFFIC_FLOW_VERSION}; next collector run resets history" ;;
         legacy) _doctor_print_check WARN "traffic flow snapshot is legacy" "next collector run resets history" ;;
     esac
+
+    if $PFWD_OPTIMIZE_STATE_PRESENT && [[ "$PFWD_OPTIMIZE_STATE_TC_ENABLED" == true ]]; then
+        local tc_iface
+        tc_iface=$(_pfwd_tc_iface_from_state "${PFWD_OPTIMIZE_STATE_TC_IFACE_MODE:-auto}" "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-}" 2>/dev/null || true)
+        if [[ -z "$tc_iface" ]]; then
+            _doctor_print_check ERROR "tc shaping interface unresolved" "${PFWD_OPTIMIZE_STATE_TC_IFACE_VALUE:-default route}"
+        else
+            if [[ -n "$PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE" ]]; then
+                _pfwd_tc_root_active "$tc_iface" && _doctor_print_check OK "persisted egress tc active" "${tc_iface} rate=${PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE}" || _doctor_print_check WARN "persisted egress tc missing" "${tc_iface} rate=${PFWD_OPTIMIZE_STATE_TC_EGRESS_RATE}"
+            fi
+            if [[ -n "$PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE" ]]; then
+                if _pfwd_tc_ingress_active "$tc_iface" && _pfwd_tc_ifb_ready && _pfwd_tc_root_active "$OPTIMIZE_IFB_DEV"; then
+                    _doctor_print_check OK "persisted ingress tc active" "${tc_iface} -> ${OPTIMIZE_IFB_DEV} rate=${PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE}"
+                else
+                    _doctor_print_check WARN "persisted ingress tc missing" "${tc_iface} -> ${OPTIMIZE_IFB_DEV} rate=${PFWD_OPTIMIZE_STATE_TC_INGRESS_RATE}"
+                fi
+            fi
+        fi
+    fi
 
     if $PFWD_LOOPBACK_DNAT; then
         local route_all route_default
@@ -8158,6 +8728,7 @@ cmd_status() {
     echo -e "  traffic src: ${traffic_backend_label}"
     echo -e "  kernel:     ${CYAN}${PFWD_KERNEL_RELEASE}${NC} ${DIM}(${PFWD_KERNEL_FLAVOR_LABEL})${NC}"
     echo -e "  optimize:   ${optimize_applied_label} ${DIM}${PFWD_OPTIMIZE_APPLIED_REASON}${NC}"
+    echo -e "  opt runtime:${DIM} $(_pfwd_optimize_runtime_summary)${NC}"
     echo -e "  recommend:  ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} ${DIM}${PFWD_OPTIMIZE_RECOMMEND_REASON}${NC}"
 
     # kernel forwarding
@@ -8618,15 +9189,15 @@ interactive_menu() {
     while true; do
         show_header
 
-        # Determine forwarding status for menu item 4
         local _nft_running=false
         _nft_running=$PFWD_NFT_RUNNING
-        local _fwd_label
+        local _fwd_label _diag_label
         if $_nft_running; then
-            _fwd_label="${RED}Stop forwarding${NC}"
+            _fwd_label="Forwarding control ${DIM}(running)${NC}"
         else
-            _fwd_label="${GREEN}Start forwarding${NC}"
+            _fwd_label="Forwarding control ${DIM}(stopped)${NC}"
         fi
+        _diag_label="Diagnostics / repair"
 
         echo -e "  ${DIM}── Rule Management ──${NC}"
         echo -e "  ${CYAN}1)${NC} Add forwarding rules"
@@ -8636,36 +9207,30 @@ interactive_menu() {
         echo -e "  ${DIM}── Service Control ──${NC}"
         echo -e "  ${CYAN}4)${NC} ${_fwd_label}"
         echo -e "  ${CYAN}5)${NC} Traffic statistics"
-        echo -e "  ${CYAN}s)${NC} Status overview"
-        echo -e "  ${CYAN}d)${NC} Doctor / diagnostics"
         echo ""
         echo -e "  ${DIM}── Configuration ──${NC}"
         echo -e "  ${CYAN}6)${NC} Import/Export config"
         echo -e "  ${CYAN}7)${NC} Kernel optimization"
+        echo -e "  ${CYAN}d)${NC} ${_diag_label}"
         echo -e "  ${CYAN}h)${NC} Help / CLI cheatsheet"
         echo ""
         echo -e "  ${DIM}── System ──${NC}"
         echo -e "  ${CYAN}8)${NC} ${RED}Uninstall${NC}"
         echo -e "  ${CYAN}0)${NC} ${DIM}Exit${NC}"
         echo ""
-        read -rp "${CYAN}Select [0-8/s/d/h]:${NC} " choice
+        read -rp "${CYAN}Select [0-8/d/h]:${NC} " choice
 
         case "$choice" in
             1) menu_add_rule || true ;;
-            2) cmd_list; wait_for_enter ;;
+            2) menu_list_rules || true ;;
             3) menu_delete_rule || true ;;
-            4)
-                if $_nft_running; then
-                    menu_stop_forward || true
-                else
-                    menu_start_forward || true
-                fi
-                ;;
+            4) menu_forward_control || true ;;
             5) menu_traffic_stats ;;
-            s|S) cmd_status; wait_for_enter ;;
-            d|D) cmd_doctor; wait_for_enter ;;
+            d|D) menu_diagnostics_repair || true ;;
             6) menu_export_import || true ;;
             7)
+                local _opt_profile="balanced" _steer _egress_rate="" _ingress_rate="" _tc_iface=""
+                local _nic_steering=false _tc_iface_mode="auto"
                 _pfwd_collect_state
                 echo ""
                 echo -e "  ${DIM}Kernel:${NC} ${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
@@ -8682,28 +9247,65 @@ interactive_menu() {
                 read -rp "Select [0-5, default=1]: " _kp
                 case "$_kp" in
                     0) continue ;;
-                    2)
-                        read -rp "Enable live NIC steering? [y/N]: " _steer
-                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel gaming true || optimize_kernel gaming
-                        wait_for_enter
-                        ;;
-                    3)
-                        read -rp "Enable live NIC steering? [y/N]: " _steer
-                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel lowmem true || optimize_kernel lowmem
-                        wait_for_enter
-                        ;;
-                    4)
-                        read -rp "Enable live NIC steering? [y/N]: " _steer
-                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel relay true || optimize_kernel relay
-                        wait_for_enter
-                        ;;
+                    2) _opt_profile="gaming" ;;
+                    3) _opt_profile="lowmem" ;;
+                    4) _opt_profile="relay" ;;
                     5) reset_kernel_optimization; wait_for_enter ;;
-                    *)
-                        read -rp "Enable live NIC steering? [y/N]: " _steer
-                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel balanced true || optimize_kernel balanced
-                        wait_for_enter
-                        ;;
+                    *) _opt_profile="balanced" ;;
                 esac
+
+                if [[ "$_kp" != "5" ]]; then
+                    read -rp "Enable persistent NIC steering? [y/N]: " _steer
+                    [[ "$_steer" =~ ^[Yy]$ ]] && _nic_steering=true
+
+                    msg_dim "  Egress shapes measured uplink/upload."
+                    msg_dim "  Recommendation: start at 95% of measured uplink (or 90% if queueing is still obvious)."
+                    msg_dim "  Example: 20 Mbit/s uplink -> 19mbit"
+                    msg_dim "  Accepted forms: $(_pfwd_tc_rate_examples)"
+                    msg_dim "  Note: percentages use device speed; on VPS/cloud hosts prefer measured uplink values."
+                    read -rp "Egress tc rate (blank to skip): " _egress_rate
+                    _egress_rate="${_egress_rate//[[:space:]]/}"
+                    if [[ -n "$_egress_rate" ]] && ! _pfwd_parse_tc_rate "$_egress_rate"; then
+                        msg_err "Invalid egress rate: ${_egress_rate} (${PFWD_TC_RATE_ERROR})"
+                        msg_dim "  $(_pfwd_tc_rate_help_text)"
+                        wait_for_enter
+                        continue
+                    elif [[ -n "$_egress_rate" ]]; then
+                        _egress_rate="$PFWD_TC_RATE_CANONICAL"
+                    fi
+
+                    msg_dim "  Ingress shapes measured downlink/download via ${OPTIMIZE_IFB_DEV}."
+                    msg_dim "  Recommendation: start at 92% of measured downlink (or 85%-90% if queueing is still obvious)."
+                    msg_dim "  Example: 100 Mbit/s downlink -> 92mbit"
+                    msg_dim "  Accepted forms: $(_pfwd_tc_rate_examples)"
+                    msg_dim "  Note: percentages use device speed; on VPS/cloud hosts prefer measured downlink values."
+                    read -rp "Ingress tc rate (blank to skip): " _ingress_rate
+                    _ingress_rate="${_ingress_rate//[[:space:]]/}"
+                    if [[ -n "$_ingress_rate" ]] && ! _pfwd_parse_tc_rate "$_ingress_rate"; then
+                        msg_err "Invalid ingress rate: ${_ingress_rate} (${PFWD_TC_RATE_ERROR})"
+                        msg_dim "  $(_pfwd_tc_rate_help_text)"
+                        wait_for_enter
+                        continue
+                    elif [[ -n "$_ingress_rate" ]]; then
+                        _ingress_rate="$PFWD_TC_RATE_CANONICAL"
+                    fi
+
+                    if [[ -n "$_egress_rate" || -n "$_ingress_rate" ]]; then
+                        read -rp "tc interface (blank = default route NIC): " _tc_iface
+                        _tc_iface="${_tc_iface//[[:space:]]/}"
+                        if [[ -n "$_tc_iface" ]]; then
+                            _pfwd_iface_exists "$_tc_iface" || {
+                                msg_err "Unknown tc interface: ${_tc_iface}"
+                                wait_for_enter
+                                continue
+                            }
+                            _tc_iface_mode="explicit"
+                        fi
+                    fi
+
+                    optimize_kernel "$_opt_profile" "$_nic_steering" "$_tc_iface_mode" "$_tc_iface" "$_egress_rate" "$_ingress_rate"
+                    wait_for_enter
+                fi
                 ;;
             h|H) show_help; wait_for_enter ;;
             8) menu_uninstall || true ;;
@@ -9160,6 +9762,23 @@ menu_delete_rule() {
     wait_for_enter
 }
 
+menu_list_rules() {
+    echo ""
+    echo -e "${BOLD}View Forwarding Rules${NC}"
+    echo -e "${DIM}$SEP_DASH_40${NC}"
+    echo -e "${DIM}Leave empty to show all rules, or enter a filter string (port / host / comment / option).${NC}"
+    echo ""
+
+    local filter=""
+    read -rp "Filter (optional): " filter
+    if [[ -n "$filter" ]]; then
+        cmd_list -f "$filter"
+    else
+        cmd_list
+    fi
+    wait_for_enter
+}
+
 # menu_export_import - interactive import/export
 menu_export_import() {
     echo ""
@@ -9208,6 +9827,88 @@ menu_export_import() {
     esac
 
     wait_for_enter
+}
+
+menu_forward_control() {
+    while true; do
+        _pfwd_collect_state
+        echo ""
+        echo -e "${BOLD}Forwarding Control${NC}"
+        echo -e "${DIM}$SEP_DASH_40${NC}"
+        if $PFWD_NFT_RUNNING; then
+            echo -e "  ${DIM}Current state:${NC} ${GREEN}running${NC}"
+        else
+            echo -e "  ${DIM}Current state:${NC} ${RED}stopped${NC}"
+        fi
+        echo ""
+        echo "  1) Start nftables"
+        echo "  2) Refresh nftables from saved state"
+        echo "  3) Restart nftables"
+        echo "  4) Stop nftables"
+        echo "  0) Back"
+        echo ""
+        read -rp "Choice [0-4]: " fc_choice
+
+        case "$fc_choice" in
+            1) cmd_start nft; wait_for_enter ;;
+            2) cmd_refresh; wait_for_enter ;;
+            3)
+                cmd_stop nft && cmd_start nft
+                wait_for_enter
+                ;;
+            4) cmd_stop nft; wait_for_enter ;;
+            0) return ;;
+            *) msg_warn "Invalid choice" ;;
+        esac
+    done
+}
+
+menu_diagnostics_repair() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}Diagnostics / Repair${NC}"
+        echo -e "${DIM}$SEP_DASH_40${NC}"
+        echo "  1) Status overview"
+        echo "  2) Doctor diagnostics"
+        echo "  3) Doctor with TCP probe"
+        echo "  4) Verify forwarding rules"
+        if command -v ufw >/dev/null 2>&1; then
+            echo "  5) Fix UFW loopback DNAT rules"
+        else
+            echo "  5) Fix UFW loopback DNAT rules ${DIM}(ufw unavailable)${NC}"
+        fi
+        echo "  0) Back"
+        echo ""
+        read -rp "Choice [0-5]: " dr_choice
+
+        case "$dr_choice" in
+            1) cmd_status; wait_for_enter ;;
+            2) cmd_doctor; wait_for_enter ;;
+            3)
+                local probe_timeout=""
+                read -rp "Probe timeout seconds [3]: " probe_timeout
+                probe_timeout=${probe_timeout:-3}
+                [[ "$probe_timeout" =~ ^[0-9]+$ && "$probe_timeout" -ge 1 ]] || {
+                    msg_err "Probe timeout must be a positive integer (seconds)"
+                    wait_for_enter
+                    continue
+                }
+                cmd_doctor --tcp-probe --probe-timeout "$probe_timeout"
+                wait_for_enter
+                ;;
+            4) verify_forwarding_rules; wait_for_enter ;;
+            5)
+                if command -v ufw >/dev/null 2>&1; then
+                    fix_ufw_loopback_rules
+                else
+                    msg_warn "ufw is not installed; fix-ufw is unavailable"
+                fi
+                wait_for_enter
+                ;;
+            0) return ;;
+            *) msg_warn "Invalid choice" ;;
+        esac
+    done
 }
 
 # menu_stop_forward - interactive stop forwarding
