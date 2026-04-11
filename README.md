@@ -14,6 +14,7 @@ A streamlined port forwarding management tool focused on **nftables** with flowt
 - **Collector interval control** — `pfwd stats --interval [30s|1m|5m|10m|30m|1h]`
 - **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
 - **Kernel optimization profiles** — balanced / gaming / lowmem / relay, with kernel preflight and post-apply verification
+- **Optional NIC steering** — `pfwd optimize ... --nic-steering` can live-apply RSS/RPS/XPS hints on inferred forwarding NIC queues
 - **Backup/Import/Export** in JSON format (current v3 schema)
 - **Boot persistence** via systemd services
 - **`--no-color` / `--no-clear`** modes for scripting
@@ -56,7 +57,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay]
+  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering]
   help        Show help
 ```
 
@@ -134,6 +135,7 @@ pfwd optimize              # balanced (default) + prints preflight/recommendatio
 pfwd optimize gaming       # low latency
 pfwd optimize lowmem       # for small VPS
 pfwd optimize relay        # relay-focused forwarding tuning
+pfwd optimize balanced --nic-steering  # live-only queue steering on inferred NICs
 
 # Export/Import
 pfwd export ~/backup.json
@@ -150,6 +152,8 @@ Notes:
 - `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
 - Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
 - `pfwd optimize` prints kernel capability preflight, skips unsupported sysctl keys, and verifies the live result.
+- `--nic-steering` is explicit opt-in, stays live-only, and currently tunes `net.core.rps_sock_flow_entries` plus queue-level `rps_cpus` / `rps_flow_cnt` / `xps_cpus` when the inferred NIC exposes those sysfs knobs.
+- `pfwd status` and the interactive `Kernel optimization` page now show the applied optimize profile separately from the recommended profile.
 - `pfwd` detects newer performance kernels such as XanMod, but does not install or switch kernels for you.
 - `pfwd` does not manage legacy TCP accelerator stacks such as Lotserver/ServerSpeeder.
 - Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.
@@ -168,9 +172,10 @@ Kernel-level DNAT forwarding with flowtable fast path acceleration. Established 
 Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loads, and persists the module, falling back gracefully if unavailable.
 
 When `conntrack` is available, `pfwd doctor` can inspect live `[OFFLOAD]` and `[HW_OFFLOAD]` tags instead of relying on extra hot-path nft counters.
+When `ethtool` is available, `pfwd doctor` / `pfwd status` also summarize NIC RSS (`rx-hashing`) and `hw-tc-offload` readiness alongside software queue steering state.
 
 For larger mixed-backend rulesets, pfwd now prefers a DNAT map renderer and falls back to the legacy per-rule renderer only when the local nftables validator rejects the generated map syntax.
-For repeated SNAT/masquerade actions, pfwd also prefers grouped postrouting rules and falls back to legacy per-rule postrouting when grouped rendering is rejected locally.
+For repeated fixed-SNAT actions, pfwd now prefers a postrouting SNAT map renderer; masquerade entries still use grouped postrouting rules, and both paths fall back to legacy per-rule postrouting when newer rendering is rejected locally.
 For repeated TCP MSS handling, pfwd also prefers grouped forward rules and falls back to legacy per-backend MSS rules when grouped rendering is rejected locally.
 
 Best for: IP-based targets, maximum performance.
@@ -191,13 +196,14 @@ Best for: IP-based targets, maximum performance.
 | State-driven apply | `/var/lib/pfwd/rules.v1.tsv` is rendered into nftables atomically |
 | Flowtable fast path | Established DNAT flows are offloaded to ingress; live `[OFFLOAD]` / `[HW_OFFLOAD]` visibility comes from conntrack |
 | DNAT map renderer | Mixed-backend prerouting rules can collapse into per-proto/per-family maps with automatic legacy fallback |
-| Grouped postrouting renderer | Repeated SNAT/masquerade actions collapse into grouped `daddr . dport` rules with automatic legacy fallback |
+| Postrouting SNAT map renderer | Fixed-SNAT postrouting rules collapse into per-proto/per-family maps; masquerade entries still use grouped rules, all with automatic fallback |
 | Grouped MSS renderer | Repeated TCP MSS clamp/fixed actions collapse into grouped forward `daddr . tcp dport` rules with automatic legacy fallback |
 | Observer-only stats | Traffic collection avoids per-rule nft counters and hot-path helper rules |
 | Port aggregation | Same-backend rules are grouped into nft port sets / intervals where possible |
 | Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |
 | nft output cache | TTL-based cache avoids redundant `nft list` calls |
 | Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
+| Optional queue steering | `pfwd optimize ... --nic-steering` can spread RX/TX queue work with RPS/XPS/RFS on multi-queue NICs without changing the nft dataplane |
 | Pure-bash format_bytes | No awk fork for human-readable byte formatting |
 | BBR + TCP tuning | Optimized congestion control and buffers |
 

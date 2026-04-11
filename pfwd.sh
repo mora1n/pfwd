@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.3"
+readonly VERSION="2.1.4"
 
 pfwd_path() {
     local path="$1"
@@ -447,19 +447,74 @@ _nft_reset_snapshot() {
 }
 
 _nft_index_postrouting_snapshot() {
-    local line tag snat_source
+    local line tag snat_source mode family_keyword entry_blob entry target tport snapshot_key map_name
+    declare -A map_entries=()
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
+
+        if [[ "$line" =~ ^[[:space:]]*map[[:space:]]+(pfwd_snat_v[46]_(tcp|udp))[[:space:]]*\{ ]]; then
+            map_name="${BASH_REMATCH[1]}"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                [[ "$line" =~ ^[[:space:]]*\} ]] && break
+                if [[ "$line" =~ ^[[:space:]]*(.+)[[:space:]]+:[[:space:]]+(\[[^]]+\]|[^,[:space:]]+) ]]; then
+                    entry="${BASH_REMATCH[1]}"
+                    snat_source="${BASH_REMATCH[2]}"
+                    snat_source="${snat_source#[}"
+                    snat_source="${snat_source%]}"
+                    if [[ "$entry" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\.[[:space:]]+([0-9]+)$ ]]; then
+                        target="${BASH_REMATCH[1]}"
+                        tport="${BASH_REMATCH[2]}"
+                        map_entries["${map_name}|${target}|${tport}"]="$snat_source"
+                    fi
+                fi
+            done
+            continue
+        fi
+
         _extract_nft_comment "$line"
         tag="$_COMMENT"
-        [[ -n "$tag" ]] || continue
-
-        if [[ "$line" =~ snat([[:space:]]+ip6?|[[:space:]]+ip)?[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
+        if [[ -n "$tag" && "$line" =~ snat([[:space:]]+ip6?|[[:space:]]+ip)?[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
             snat_source="${BASH_REMATCH[2]}"
             snat_source="${snat_source#[}"
             snat_source="${snat_source%]}"
             _NFT_SNAPSHOT_SNAT_MODE["$tag"]="snat"
             _NFT_SNAPSHOT_SNAT_SOURCE["$tag"]="$snat_source"
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*ct\ status\ dnat[[:space:]]+snat[[:space:]]+to[[:space:]]+(ip6?)[[:space:]]+daddr[[:space:]]+\.[[:space:]]+(tcp|udp)[[:space:]]+dport[[:space:]]+map[[:space:]]+@(pfwd_snat_v[46]_(tcp|udp)) ]]; then
+            family_keyword="${BASH_REMATCH[1]}"
+            mode="${BASH_REMATCH[2]}"
+            map_name="${BASH_REMATCH[3]}"
+            for snapshot_key in "${!map_entries[@]}"; do
+                [[ "$snapshot_key" == "${map_name}|"* ]] || continue
+                target="${snapshot_key#${map_name}|}"
+                tport="${target##*|}"
+                target="${target%|*}"
+                snapshot_key=$(_pfwd_snat_snapshot_key "$mode" "$([[ "$family_keyword" == "ip6" ]] && echo 6 || echo 4)" "$target" "$tport")
+                _NFT_SNAPSHOT_SNAT_MODE["$snapshot_key"]="snat"
+                _NFT_SNAPSHOT_SNAT_SOURCE["$snapshot_key"]="${map_entries["${map_name}|${target}|${tport}"]}"
+            done
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*ct\ status\ dnat[[:space:]]+(ip6?)[[:space:]]+daddr[[:space:]]+\.[[:space:]]+(tcp|udp)[[:space:]]+dport[[:space:]]+\{[[:space:]]*(.*)[[:space:]]*\}[[:space:]]+snat[[:space:]]+to[[:space:]]+(\[[^]]+\]|[^[:space:]]+) ]]; then
+            family_keyword="${BASH_REMATCH[1]}"
+            mode="${BASH_REMATCH[2]}"
+            entry_blob="${BASH_REMATCH[3]}"
+            snat_source="${BASH_REMATCH[4]}"
+            snat_source="${snat_source#[}"
+            snat_source="${snat_source%]}"
+            while IFS= read -r entry; do
+                [[ -n "$entry" ]] || continue
+                if [[ "$entry" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\.[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
+                    target="${BASH_REMATCH[1]}"
+                    tport="${BASH_REMATCH[2]}"
+                    snapshot_key=$(_pfwd_snat_snapshot_key "$mode" "$([[ "$family_keyword" == "ip6" ]] && echo 6 || echo 4)" "$target" "$tport")
+                    _NFT_SNAPSHOT_SNAT_MODE["$snapshot_key"]="snat"
+                    _NFT_SNAPSHOT_SNAT_SOURCE["$snapshot_key"]="$snat_source"
+                fi
+            done < <(tr ',' '\n' <<< "$entry_blob" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         fi
     done <<< "$1"
 }
@@ -541,9 +596,9 @@ _nft_prepare_snapshot() {
 
     _nft_reset_snapshot
     _NFT_SNAPSHOT_CACHE_TIME=$_NFT_CACHE_TIME
-    _NFT_SNAPSHOT_PREROUTING=$(_nft_prerouting_dnat_lines)
+    _NFT_SNAPSHOT_PREROUTING=$(_nft_cached_table)
     _NFT_SNAPSHOT_PARSED=$(_parse_nft_prerouting_rules "$_NFT_SNAPSHOT_PREROUTING")
-    _NFT_SNAPSHOT_POSTROUTING=$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)
+    _NFT_SNAPSHOT_POSTROUTING=$(_nft_cached_table)
     _NFT_SNAPSHOT_FORWARD=$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)
 
     [[ -n "$_NFT_SNAPSHOT_POSTROUTING" ]] && _nft_index_postrouting_snapshot "$_NFT_SNAPSHOT_POSTROUTING"
@@ -808,6 +863,7 @@ _pfwd_collect_state() {
     PFWD_TRAFFIC_INTERVAL=$(traffic_current_interval)
     PFWD_TRAFFIC_BACKEND=$(traffic_stats_backend)
     _pfwd_kernel_collect_facts
+    _pfwd_collect_applied_optimize_state
     _pfwd_recommend_optimize_profile
 }
 
@@ -1173,10 +1229,7 @@ _pfwd_state_rules_from_nft_text() {
     local data="$1"
     [[ -n "$data" ]] || return 0
 
-    local prerouting_data="" postrouting_data="" forward_data="" chain
-    for chain in $(_pfwd_subchain_list prerouting); do
-        prerouting_data+="$(_pfwd_chain_from_text "$data" "$chain")"$'\n'
-    done
+    local postrouting_data="" forward_data="" chain
     for chain in $(_pfwd_subchain_list postrouting); do
         postrouting_data+="$(_pfwd_chain_from_text "$data" "$chain")"$'\n'
     done
@@ -1185,20 +1238,36 @@ _pfwd_state_rules_from_nft_text() {
     done
 
     _nft_reset_snapshot
-    [[ -n "$postrouting_data" ]] && _nft_index_postrouting_snapshot "$postrouting_data"
+    [[ -n "$data" ]] && _nft_index_postrouting_snapshot "$data"
     [[ -n "$forward_data" ]] && _nft_index_forward_snapshot "$forward_data"
 
     local parsed proto lport ipver target tport comment bytes
-    parsed=$(_parse_nft_prerouting_rules "$prerouting_data")
+    parsed=$(_parse_nft_prerouting_rules "$data")
     [[ -n "$parsed" ]] || return 0
 
-    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        comment="${PFWD_TSV_FIELDS[5]:-}"
+        bytes="${PFWD_TSV_FIELDS[6]:-}"
         [[ -z "$lport" ]] && continue
-        local tag mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
+        local tag snat_key mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
+        snat_key=$(_pfwd_snat_snapshot_key "$proto" "$ipver" "$target" "$tport")
         mss_key=$(_pfwd_mss_snapshot_key "$proto" "$ipver" "$target" "$tport")
-        [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]] && snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
-        [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
+        if [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]]; then
+            snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
+            [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
+        elif [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$snat_key]:-}" ]]; then
+            snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$snat_key]}"
+            [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$snat_key]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$snat_key]}"
+        fi
         if [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]]; then
             mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
             [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
@@ -1492,7 +1561,7 @@ _pfwd_dnat_render_modes() {
 }
 
 _pfwd_postrouting_render_modes() {
-    printf '%s\n' grouped legacy
+    printf '%s\n' map grouped legacy
 }
 
 _pfwd_mss_render_modes() {
@@ -1635,6 +1704,66 @@ _pfwd_dnat_renderer_mode_from_text() {
     fi
 }
 
+_pfwd_postrouting_map_name() {
+    local proto="$1" ipver="$2"
+    printf 'pfwd_snat_v%s_%s' "$ipver" "$proto"
+}
+
+_pfwd_postrouting_map_value_type() {
+    local ipver="$1"
+    case "$ipver" in
+        4) echo 'ipv4_addr' ;;
+        6) echo 'ipv6_addr' ;;
+        *) return 1 ;;
+    esac
+}
+
+_pfwd_postrouting_map_elements_tsv() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    awk -F'\t' -v want_proto="$proto" -v want_ipver="$ipver" '
+        $1 == want_proto && $3 == want_ipver && $5 != "" && $6 != "" && $8 == "snat" && $9 != "" {
+            key = $5 "\t" $6 "\t" $9
+            if (!(key in seen)) {
+                seen[key] = 1
+                print key
+            }
+        }
+    ' <<< "$runtime_rules" | sort -t $'\t' -k1,1 -k2,2n -k3,3
+}
+
+_pfwd_render_postrouting_map_block() {
+    local runtime_rules="$1" proto="$2" ipver="$3"
+    local map_name value_type entries entry_count=0 total_entries target tport snat_source
+    map_name=$(_pfwd_postrouting_map_name "$proto" "$ipver") || return 1
+    value_type=$(_pfwd_postrouting_map_value_type "$ipver") || return 1
+    entries=$(_pfwd_postrouting_map_elements_tsv "$runtime_rules" "$proto" "$ipver")
+    [[ -n "$entries" ]] || return 1
+    total_entries=$(awk 'END { print NR+0 }' <<< "$entries")
+
+    printf '    map %s {\n' "$map_name"
+    printf '        type %s . inet_service : %s;\n' "$([[ "$ipver" == "6" ]] && echo ipv6_addr || echo ipv4_addr)" "$value_type"
+    printf '        elements = {\n'
+    while IFS=$'\t' read -r target tport snat_source; do
+        [[ -n "$target" && -n "$tport" && -n "$snat_source" ]] || continue
+        ((entry_count++)) || true
+        if (( entry_count < total_entries )); then
+            printf '            %s . %s : %s,\n' "$target" "$tport" "$snat_source"
+        else
+            printf '            %s . %s : %s\n' "$target" "$tport" "$snat_source"
+        fi
+    done <<< "$entries"
+    printf '        }\n'
+    printf '    }\n\n'
+}
+
+_pfwd_render_postrouting_map_rule() {
+    local proto="$1" ipver="$2"
+    local map_name family_keyword
+    map_name=$(_pfwd_postrouting_map_name "$proto" "$ipver") || return 1
+    family_keyword=$([[ "$ipver" == "6" ]] && echo ip6 || echo ip)
+    printf '        ct status dnat snat to %s daddr . %s dport map @%s\n' "$family_keyword" "$proto" "$map_name"
+}
+
 _pfwd_runtime_dnat_renderer() {
     if ! _nft_table_exists; then
         echo "inactive"
@@ -1653,7 +1782,9 @@ _pfwd_saved_dnat_renderer() {
 
 _pfwd_postrouting_renderer_mode_from_text() {
     local text="${1:-}"
-    if grep -Eq 'ct status dnat ip6? daddr \. (tcp|udp) dport \{' <<< "$text"; then
+    if grep -Eq 'snat to ip6? daddr \. (tcp|udp) dport map @pfwd_snat_v' <<< "$text"; then
+        echo "map"
+    elif grep -Eq 'ct status dnat ip6? daddr \. (tcp|udp) dport \{' <<< "$text"; then
         echo "grouped"
     elif grep -Eq 'snat to|masquerade' <<< "$text"; then
         echo "legacy"
@@ -1676,6 +1807,11 @@ _pfwd_saved_postrouting_renderer() {
         return 0
     fi
     _pfwd_postrouting_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+}
+
+_pfwd_snat_snapshot_key() {
+    local proto="$1" ipver="$2" target="$3" tport="$4"
+    printf '%s|%s|%s|%s' "$proto" "$ipver" "$target" "$tport"
 }
 
 _pfwd_mss_renderer_mode_from_text() {
@@ -1885,6 +2021,17 @@ _pfwd_render_nft_config() {
             done
         fi
 
+        if [[ "$postrouting_renderer" == "map" ]]; then
+            local snat_map_ipver snat_map_proto snat_map_entries
+            for snat_map_ipver in 4 6; do
+                for snat_map_proto in tcp udp; do
+                    snat_map_entries=$(_pfwd_postrouting_map_elements_tsv "$runtime_rules" "$snat_map_proto" "$snat_map_ipver")
+                    [[ -n "$snat_map_entries" ]] || continue
+                    _pfwd_render_postrouting_map_block "$runtime_rules" "$snat_map_proto" "$snat_map_ipver" || return 1
+                done
+            done
+        fi
+
         printf '    chain prerouting {\n'
         printf '        type nat hook prerouting priority dstnat; policy accept;\n'
         local ipver proto match_tokens section_key
@@ -1942,7 +2089,9 @@ _pfwd_render_nft_config() {
                 printf '    chain %s {\n' "$pr_chain"
                 local key
                 if [[ "$dnat_renderer" == "map" ]]; then
-                    _pfwd_render_dnat_map_rule "$proto" "$ipver"
+                    if [[ -n "${subchain_nonempty["prerouting|${ipver}|${proto}"]:-}" ]]; then
+                        _pfwd_render_dnat_map_rule "$proto" "$ipver"
+                    fi
                 else
                     while IFS= read -r key; do
                         [[ -n "$key" ]] || continue
@@ -1962,7 +2111,17 @@ _pfwd_render_nft_config() {
                 printf '    }\n\n'
 
                 printf '    chain %s {\n' "$po_chain"
-                if [[ "$postrouting_renderer" == "grouped" ]]; then
+                if [[ "$postrouting_renderer" == "map" ]]; then
+                    local snat_map_entries="" masquerade_entries=""
+                    snat_map_entries=$(_pfwd_postrouting_map_elements_tsv "$runtime_rules" "$proto" "$ipver")
+                    if [[ -n "$snat_map_entries" ]]; then
+                        _pfwd_render_postrouting_map_rule "$proto" "$ipver"
+                    fi
+                    masquerade_entries=$(_pfwd_postrouting_group_elements_tsv "$runtime_rules" "$proto" "$ipver" masquerade '')
+                    if [[ -n "$masquerade_entries" ]]; then
+                        _pfwd_render_postrouting_grouped_rule "$runtime_rules" "$proto" "$ipver" masquerade ''
+                    fi
+                elif [[ "$postrouting_renderer" == "grouped" ]]; then
                     local snat_mode_key snat_source_key
                     while IFS=$'\t' read -r snat_mode_key snat_source_key; do
                         [[ -n "$snat_mode_key" ]] || continue
@@ -3820,6 +3979,33 @@ _pfwd_recommend_optimize_profile() {
     fi
 }
 
+_pfwd_collect_applied_optimize_state() {
+    PFWD_OPTIMIZE_APPLIED_PROFILE="none"
+    PFWD_OPTIMIZE_APPLIED_REASON="not persisted"
+
+    [[ -f "$SYSCTL_CONF" ]] || return 0
+
+    local managed_block profile_tag
+    managed_block=$(sed -n '/^# pfwd-managed-start$/,/^# pfwd-managed-end$/p' "$SYSCTL_CONF" 2>/dev/null || true)
+    [[ -n "$managed_block" ]] || return 0
+
+    profile_tag=$(sed -n 's/^# Profile: //p' <<< "$managed_block" | head -1 | tr -d '[:space:]')
+    case "$profile_tag" in
+        balanced|gaming|lowmem|relay)
+            PFWD_OPTIMIZE_APPLIED_PROFILE="$profile_tag"
+            PFWD_OPTIMIZE_APPLIED_REASON="persisted in $(basename "$SYSCTL_CONF")"
+            ;;
+        "")
+            PFWD_OPTIMIZE_APPLIED_PROFILE="custom"
+            PFWD_OPTIMIZE_APPLIED_REASON="managed block without profile tag"
+            ;;
+        *)
+            PFWD_OPTIMIZE_APPLIED_PROFILE="custom"
+            PFWD_OPTIMIZE_APPLIED_REASON="managed block profile=${profile_tag}"
+            ;;
+    esac
+}
+
 _pfwd_optimize_profile_summary() {
     case "$1" in
         balanced) echo "general forwarding baseline for most VPSes" ;;
@@ -3840,18 +4026,242 @@ _pfwd_optimize_profile_caution() {
     esac
 }
 
+_pfwd_glob_paths() {
+    local pattern="$1"
+    local -a matches=()
+    shopt -s nullglob
+    matches=($pattern)
+    shopt -u nullglob
+    printf '%s\n' "${matches[@]}"
+}
+
+_pfwd_read_trimmed_file() {
+    local filepath="$1"
+    [[ -f "$filepath" ]] || return 1
+    tr -d '[:space:]' < "$filepath" 2>/dev/null
+}
+
+_pfwd_cpu_list_from_spec() {
+    local spec="${1//[[:space:]]/}"
+    local part start end cpu
+    [[ -n "$spec" ]] || return 0
+    IFS=',' read -r -a _PFWD_CPU_PARTS <<< "$spec"
+    for part in "${_PFWD_CPU_PARTS[@]}"; do
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            for ((cpu=start; cpu<=end; cpu++)); do
+                printf '%s\n' "$cpu"
+            done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$part"
+        fi
+    done
+}
+
+_pfwd_online_cpu_list() {
+    local online_file
+    online_file=$(pfwd_path /sys/devices/system/cpu/online)
+    if [[ -f "$online_file" ]]; then
+        _pfwd_cpu_list_from_spec "$(_pfwd_read_trimmed_file "$online_file")"
+        return 0
+    fi
+
+    local cpu_count
+    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=1
+    (( cpu_count < 1 )) && cpu_count=1
+    local cpu
+    for ((cpu=0; cpu<cpu_count; cpu++)); do
+        printf '%s\n' "$cpu"
+    done
+}
+
+_pfwd_cpu_mask_for_cpu() {
+    local cpu="${1:-0}"
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+
+    local word_index=$(( cpu / 32 ))
+    local bit_index=$(( cpu % 32 ))
+    local -a words=()
+    local idx part mask=""
+    for ((idx=0; idx<=word_index; idx++)); do
+        words[idx]=0
+    done
+    words[word_index]=$(( 1 << bit_index ))
+
+    for ((idx=word_index; idx>=0; idx--)); do
+        if (( idx == word_index )); then
+            printf -v part '%x' "${words[idx]}"
+        else
+            printf -v part '%08x' "${words[idx]}"
+        fi
+        if [[ -n "$mask" ]]; then
+            mask+=",${part}"
+        else
+            mask="$part"
+        fi
+    done
+    printf '%s\n' "${mask:-0}"
+}
+
+_pfwd_cpumask_enabled() {
+    local mask="${1//,/}"
+    mask="${mask//0/}"
+    [[ -n "$mask" ]]
+}
+
+_pfwd_nic_queue_paths() {
+    local iface="$1" direction="$2"
+    _pfwd_glob_paths "$(pfwd_path "/sys/class/net/$iface/queues/${direction}-*")"
+}
+
+_pfwd_nic_queue_count() {
+    local iface="$1" direction="$2"
+    local count=0 queue_path
+    while IFS= read -r queue_path; do
+        [[ -n "$queue_path" ]] || continue
+        ((count++)) || true
+    done < <(_pfwd_nic_queue_paths "$iface" "$direction")
+    printf '%s\n' "$count"
+}
+
+_pfwd_nic_steering_rps_flow_cnt() {
+    local rx_queue_count="${1:-0}" total_entries="${2:-32768}"
+    [[ "$rx_queue_count" =~ ^[0-9]+$ ]] || rx_queue_count=0
+    [[ "$total_entries" =~ ^[0-9]+$ ]] || total_entries=32768
+    if (( rx_queue_count <= 0 )); then
+        printf '0\n'
+        return 0
+    fi
+    local per_queue=$(( total_entries / rx_queue_count ))
+    (( per_queue < 1024 )) && per_queue=1024
+    printf '%s\n' "$per_queue"
+}
+
+_pfwd_ethtool_features_text() {
+    local iface="$1"
+    command -v ethtool >/dev/null 2>&1 || return 1
+    ethtool -k "$iface" 2>/dev/null
+}
+
+_pfwd_ethtool_feature_state_from_text() {
+    local text="$1" feature="$2"
+    sed -n -E "s/^[[:space:]]*${feature}:[[:space:]]*([^[:space:]]+).*/\\1/p" <<< "$text" | head -1
+}
+
+_pfwd_nic_steering_device_state_tsv() {
+    local iface="$1"
+    local rx_queues=0 tx_queues=0 rps_queues=0 rps_flow_queues=0 xps_queues=0
+    local rss_state="unavailable" hw_tc_offload_state="unavailable" sock_entries
+    local features_text queue_path value
+
+    rx_queues=$(_pfwd_nic_queue_count "$iface" rx)
+    tx_queues=$(_pfwd_nic_queue_count "$iface" tx)
+    sock_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)
+
+    if features_text=$(_pfwd_ethtool_features_text "$iface" 2>/dev/null); then
+        value=$(_pfwd_ethtool_feature_state_from_text "$features_text" "rx-hashing")
+        [[ -n "$value" ]] && rss_state="$value"
+        value=$(_pfwd_ethtool_feature_state_from_text "$features_text" "hw-tc-offload")
+        [[ -n "$value" ]] && hw_tc_offload_state="$value"
+    fi
+
+    while IFS= read -r queue_path; do
+        [[ -n "$queue_path" ]] || continue
+        value=$(_pfwd_read_trimmed_file "$queue_path/rps_cpus" || true)
+        _pfwd_cpumask_enabled "$value" && ((rps_queues++)) || true
+        value=$(_pfwd_read_trimmed_file "$queue_path/rps_flow_cnt" || true)
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] && ((rps_flow_queues++)) || true
+    done < <(_pfwd_nic_queue_paths "$iface" rx)
+
+    while IFS= read -r queue_path; do
+        [[ -n "$queue_path" ]] || continue
+        value=$(_pfwd_read_trimmed_file "$queue_path/xps_cpus" || true)
+        _pfwd_cpumask_enabled "$value" && ((xps_queues++)) || true
+    done < <(_pfwd_nic_queue_paths "$iface" tx)
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$iface" "$rx_queues" "$tx_queues" "$rss_state" "$hw_tc_offload_state" \
+        "$rps_queues" "$rps_flow_queues" "$xps_queues" "${sock_entries:-0}"
+}
+
+_pfwd_nic_steering_summary_tsv() {
+    local devices_csv="${1:-}"
+    [[ -n "$devices_csv" ]] || {
+        printf 'inactive\tinactive\tinactive\tinactive\n'
+        return 0
+    }
+
+    local rss_state="unavailable" rps_state="off" xps_state="off" hw_state="unavailable"
+    local have_rx=false have_tx=false have_rss_capability=false have_hw_capability=false
+    local any_rss_ready=false any_rps_ready=false any_xps_ready=false any_hw_ready=false
+    local iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries
+
+    IFS=',' read -r -a _PFWD_STEERING_IFACES <<< "$devices_csv"
+    for iface in "${_PFWD_STEERING_IFACES[@]}"; do
+        [[ -n "$iface" ]] || continue
+        IFS=$'\t' read -r iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$iface")"
+        (( rx_queues > 0 )) && have_rx=true
+        (( tx_queues > 0 )) && have_tx=true
+
+        case "$rss_feature" in
+            on|fixed) have_rss_capability=true; any_rss_ready=true ;;
+            off) have_rss_capability=true ;;
+        esac
+        case "$hw_feature" in
+            on|fixed) have_hw_capability=true; any_hw_ready=true ;;
+            off) have_hw_capability=true ;;
+        esac
+
+        if (( rps_queues > 0 && rps_flow_queues > 0 && sock_entries > 0 )); then
+            any_rps_ready=true
+        fi
+        (( xps_queues > 0 )) && any_xps_ready=true
+    done
+
+    if $have_rss_capability; then
+        $any_rss_ready && rss_state="on" || rss_state="off"
+    fi
+    if $have_hw_capability; then
+        $any_hw_ready && hw_state="ready" || hw_state="off"
+    fi
+    if ! $have_rx; then
+        rps_state="inactive"
+    elif $any_rps_ready; then
+        rps_state="on"
+    fi
+    if ! $have_tx; then
+        xps_state="inactive"
+    elif $any_xps_ready; then
+        xps_state="on"
+    fi
+
+    printf '%s\t%s\t%s\t%s\n' "$rss_state" "$rps_state" "$xps_state" "$hw_state"
+}
+
+_pfwd_detect_steering_devices() {
+    local runtime_rules devices_csv
+    runtime_rules=$(_pfwd_state_runtime_rules_tsv "$PFWD_NFT_RULES" "false")
+    devices_csv=$(_pfwd_collect_flowtable_devices "$runtime_rules" || true)
+    if [[ -z "$devices_csv" && -n "$PFWD_NFT_RULES" ]]; then
+        devices_csv=$(_pfwd_collect_flowtable_devices "$PFWD_NFT_RULES" || true)
+    fi
+    printf '%s\n' "$devices_csv"
+}
+
 _pfwd_bql_limits_state() {
     local limit="${1:-65536}"
     local count=0 mismatched=0 value path sample=""
-    for path in /sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max; do
+    while IFS= read -r path; do
         [[ -f "$path" ]] || continue
         ((count++)) || true
         value=$(tr -d '[:space:]' < "$path" 2>/dev/null || true)
         if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value > limit )); then
             ((mismatched++)) || true
-            [[ -z "$sample" ]] && sample="${path#/sys/class/net/}=${value:-?}"
+            [[ -z "$sample" ]] && sample="${path#$(pfwd_path /sys/class/net)/}=${value:-?}"
         fi
-    done
+    done < <(_pfwd_glob_paths "$(pfwd_path '/sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max')")
 
     if (( count == 0 )); then
         echo "unsupported"
@@ -3863,7 +4273,7 @@ _pfwd_bql_limits_state() {
 }
 
 _pfwd_print_optimize_preflight() {
-    local profile="$1"
+    local profile="$1" nic_steering="${2:-false}"
 
     _pfwd_collect_state
 
@@ -3908,10 +4318,13 @@ _pfwd_print_optimize_preflight() {
     if [[ "$profile" == "relay" ]]; then
         msg_dim "  Plan: apply relay-only TCP and neighbor queue tuning"
     fi
+    if [[ "$nic_steering" == "true" ]]; then
+        msg_dim "  Plan: live-apply NIC queue steering (RPS/XPS plus RFS fanout when supported)"
+    fi
 }
 
 _pfwd_print_optimize_verification() {
-    local profile="$1" conntrack_max="$2" ft_tcp_timeout="$3" ft_udp_timeout="$4" expect_bbr="$5" bql_limit="${6:-65536}"
+    local profile="$1" conntrack_max="$2" ft_tcp_timeout="$3" ft_udp_timeout="$4" expect_bbr="$5" bql_limit="${6:-65536}" nic_steering="${7:-false}" devices_csv="${8:-}"
     local cc qdisc fwd4 fwd6 route_all route_default traffic_acct current_conntrack current_ft_tcp current_ft_udp bql_state
 
     echo ""
@@ -3975,6 +4388,30 @@ _pfwd_print_optimize_verification() {
             _doctor_print_check WARN "BQL limit_max unsupported" "kernel/NIC does not expose byte_queue_limits"
             ;;
     esac
+
+    if [[ "$nic_steering" == "true" ]]; then
+        local rss_state rps_state xps_state hw_state cpu_count
+        cpu_count=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_pfwd_online_cpu_list)")
+        if (( cpu_count <= 1 )); then
+            _doctor_print_check WARN "NIC steering skipped" "single-CPU host"
+        elif [[ -z "$devices_csv" ]]; then
+            _doctor_print_check WARN "NIC steering skipped" "no eligible flowtable NIC detected from current rules"
+        else
+            IFS=$'\t' read -r rss_state rps_state xps_state hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$devices_csv")"
+            [[ "$rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS steering applied" "devices=${devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS steering incomplete" "devices=${devices_csv}, summary=${rps_state}"
+            [[ "$xps_state" == "on" ]] && _doctor_print_check OK "XPS steering applied" "devices=${devices_csv}" || _doctor_print_check WARN "XPS steering incomplete" "devices=${devices_csv}, summary=${xps_state}"
+            case "$rss_state" in
+                on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${devices_csv}" ;;
+                off) _doctor_print_check WARN "NIC RSS hashing disabled" "check ethtool -k ${devices_csv%%,*}" ;;
+                *) _doctor_print_check WARN "NIC RSS hashing not observable" "install ethtool or verify driver support" ;;
+            esac
+            case "$hw_state" in
+                ready) _doctor_print_check OK "NIC hw-tc-offload ready" "hardware offload capability advertised" ;;
+                off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless driver/offload is enabled" ;;
+                *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "install ethtool or verify driver support" ;;
+            esac
+        fi
+    fi
 
     msg_dim "  Profile ${profile}: $(_pfwd_optimize_profile_summary "$profile")"
 }
@@ -4223,6 +4660,7 @@ ufw_sync_loopback_dnat_rules() {
 
 optimize_kernel() {
     local profile="${1:-balanced}"
+    local nic_steering="${2:-false}"
     require_root "$0 optimize $profile"
     local marker_start="# pfwd-managed-start"
     local marker_end="# pfwd-managed-end"
@@ -4386,7 +4824,7 @@ optimize_kernel() {
             ;;
     esac
 
-    _pfwd_print_optimize_preflight "$profile"
+    _pfwd_print_optimize_preflight "$profile" "$nic_steering"
     msg_info "Stage 1/2: writing managed sysctl profile ($profile)"
 
     if ! sysctl_cc_supported bbr; then
@@ -4516,6 +4954,12 @@ EOF
     # buffer can grow to the kernel default (~1.75GB), causing latency spikes
     apply_bql_limits
 
+    local steering_devices_csv=""
+    if [[ "$nic_steering" == "true" ]]; then
+        steering_devices_csv=$(_pfwd_detect_steering_devices)
+        apply_nic_steering "$steering_devices_csv"
+    fi
+
     # Verify IP forwarding is actually enabled
     if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
         msg_warn "sysctl failed to enable IPv4 forwarding, trying direct write..."
@@ -4542,8 +4986,15 @@ EOF
     msg_dim "  Flowtable timeout: tcp=${ft_tcp_timeout}s udp=${ft_udp_timeout}s"
     msg_dim "  Flowtable acceleration: via nftables"
     msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
+    if [[ "$nic_steering" == "true" ]]; then
+        if [[ -n "$steering_devices_csv" ]]; then
+            msg_dim "  NIC steering: live-only RPS/XPS attempted on ${steering_devices_csv}"
+        else
+            msg_warn "NIC steering skipped: no eligible flowtable NIC detected from current rules"
+        fi
+    fi
     _pfwd_sysctl_print_skipped
-    _pfwd_print_optimize_verification "$profile" "$conntrack_max" "$ft_tcp_timeout" "$ft_udp_timeout" "$bbr_supported" "65536"
+    _pfwd_print_optimize_verification "$profile" "$conntrack_max" "$ft_tcp_timeout" "$ft_udp_timeout" "$bbr_supported" "65536" "$nic_steering" "$steering_devices_csv"
 }
 
 # reset_kernel_optimization - remove pfwd-managed sysctl block and reload
@@ -4569,6 +5020,40 @@ reset_kernel_optimization() {
     _pfwd_print_reset_verification
 }
 
+cmd_optimize() {
+    local profile="balanced"
+    local nic_steering=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            balanced|gaming|lowmem|relay)
+                profile="$1"
+                shift
+                ;;
+            --nic-steering)
+                nic_steering=true
+                shift
+                ;;
+            reset|undo)
+                shift
+                if [[ "$nic_steering" == "true" || $# -gt 0 ]]; then
+                    msg_err "'pfwd optimize reset' does not accept extra options"
+                    return 1
+                fi
+                reset_kernel_optimization
+                return 0
+                ;;
+            *)
+                msg_err "Unknown optimize option/profile: $1"
+                msg_dim "  Example: pfwd optimize balanced --nic-steering"
+                return 1
+                ;;
+        esac
+    done
+
+    optimize_kernel "$profile" "$nic_steering"
+}
+
 # apply_bql_limits - cap NIC TX byte queue limits to prevent bufferbloat
 # flowtable fast path bypasses fq_codel AQM; without this cap the NIC TX ring
 # buffer can grow to the kernel default (~1.75GB on some NICs), causing latency
@@ -4577,11 +5062,71 @@ reset_kernel_optimization() {
 apply_bql_limits() {
     local limit="${1:-65536}"  # Default: 64KB
     local count=0
-    for f in /sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max; do
+    local f
+    while IFS= read -r f; do
         [[ -f "$f" ]] || continue
         echo "$limit" > "$f" 2>/dev/null && ((count++)) || true
-    done
+    done < <(_pfwd_glob_paths "$(pfwd_path '/sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max')")
     [[ $count -gt 0 ]] && msg_dim "  BQL limit_max: ${count} TX queue(s) capped at ${limit} bytes"
+    return 0
+}
+
+apply_nic_steering() {
+    local devices_csv="${1:-}" total_entries="${2:-32768}"
+    [[ -n "$devices_csv" ]] || return 0
+
+    local -a online_cpus=()
+    local cpu_count=0
+    mapfile -t online_cpus < <(_pfwd_online_cpu_list)
+    cpu_count="${#online_cpus[@]}"
+    if (( cpu_count <= 1 )); then
+        msg_warn "NIC steering skipped: single-CPU host"
+        return 0
+    fi
+
+    if sysctl_key_supported net.core.rps_sock_flow_entries; then
+        plat_sysctl_set net.core.rps_sock_flow_entries "$total_entries"
+    fi
+
+    local iface queue_path rx_queues flow_cnt queue_index cpu mask applied_rps=0 applied_xps=0
+    IFS=',' read -r -a _PFWD_STEERING_IFACES <<< "$devices_csv"
+    for iface in "${_PFWD_STEERING_IFACES[@]}"; do
+        [[ -n "$iface" ]] || continue
+        rx_queues=$(_pfwd_nic_queue_count "$iface" rx)
+        flow_cnt=$(_pfwd_nic_steering_rps_flow_cnt "$rx_queues" "$total_entries")
+        queue_index=0
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            cpu="${online_cpus[$(( queue_index % cpu_count ))]}"
+            mask=$(_pfwd_cpu_mask_for_cpu "$cpu")
+            if [[ -f "$queue_path/rps_cpus" ]]; then
+                echo "$mask" > "$queue_path/rps_cpus" 2>/dev/null && ((applied_rps++)) || true
+            fi
+            if [[ -f "$queue_path/rps_flow_cnt" ]]; then
+                echo "$flow_cnt" > "$queue_path/rps_flow_cnt" 2>/dev/null || true
+            fi
+            ((queue_index++)) || true
+        done < <(_pfwd_nic_queue_paths "$iface" rx)
+
+        queue_index=0
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            cpu="${online_cpus[$(( queue_index % cpu_count ))]}"
+            mask=$(_pfwd_cpu_mask_for_cpu "$cpu")
+            if [[ -f "$queue_path/xps_cpus" ]]; then
+                echo "$mask" > "$queue_path/xps_cpus" 2>/dev/null && ((applied_xps++)) || true
+            fi
+            ((queue_index++)) || true
+        done < <(_pfwd_nic_queue_paths "$iface" tx)
+
+        msg_dim "  NIC steering: ${iface} rx=$(_pfwd_nic_queue_count "$iface" rx) tx=$(_pfwd_nic_queue_count "$iface" tx) rps_flow_cnt=${flow_cnt}"
+    done
+
+    if (( applied_rps > 0 || applied_xps > 0 )); then
+        msg_dim "  NIC steering: applied rps=${applied_rps} queue(s), xps=${applied_xps} queue(s)"
+    else
+        msg_warn "NIC steering requested but queue sysfs knobs are unavailable"
+    fi
     return 0
 }
 
@@ -5293,6 +5838,13 @@ _nft_prerouting_dnat_lines() {
     _nft_cached_chains_concat prerouting $(_pfwd_subchain_list prerouting) | grep "dnat" || true
 }
 
+_nft_prerouting_dnat_lines_from_text() {
+    local nft_output="$1" chain
+    for chain in $(_pfwd_subchain_list prerouting); do
+        _pfwd_chain_from_text "$nft_output" "$chain"
+    done | grep "dnat" || true
+}
+
 _nft_postrouting_nat_lines() {
     _nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) | grep -E "snat to|masquerade" || true
 }
@@ -5313,72 +5865,149 @@ _parse_nft_prerouting_rules() {
     [[ -z "$nft_output" ]] && return 0
 
     echo "$nft_output" | awk '
-    /dnat/ {
+    function reset_row() {
         proto=""; ipver=""; lport=""; target=""; tport=""; comment=""; bytes="0"
+    }
 
-        if (match($0, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
-        else if (match($0, /ip protocol udp/)) { proto="udp"; ipver="4" }
-        else if (match($0, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
-        else if (match($0, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
-        else {
-            if (match($0, /tcp dport/)) proto="tcp"
-            if (match($0, /udp dport/)) proto="udp"
-            if (match($0, /ip daddr/))  ipver="4"
-            if (match($0, /ip6 daddr/)) ipver="6"
-        }
-
-        if (match($0, /dport [0-9]+/)) {
-            s = substr($0, RSTART, RLENGTH)
-            sub(/dport /, "", s)
-            lport = s
-        }
-
-        if (match($0, /dnat ip6 to /)) {
-            rest = substr($0, RSTART + RLENGTH)
-            p = index(rest, "]:")
-            if (p > 1) {
-                target = substr(rest, 2, p - 2)
-                rest2 = substr(rest, p + 2)
-                match(rest2, /[0-9]+/)
-                tport = substr(rest2, RSTART, RLENGTH)
-            }
-        } else if (match($0, /dnat ip to /)) {
-            rest = substr($0, RSTART + 11)
-            if (match(rest, /[^ ]+/)) {
-                s = substr(rest, RSTART, RLENGTH)
-                n = split(s, parts, ":")
-                target = parts[1]; tport = parts[n]
+    function extract_comment(line,    rest, escaped, i, ch, out) {
+        out=""
+        if (!match(line, /comment "/)) return out
+        rest = substr(line, RSTART + 9)
+        escaped = 0
+        for (i = 1; i <= length(rest); i++) {
+            ch = substr(rest, i, 1)
+            if (escaped) {
+                out = out ch
+                escaped = 0
+            } else if (ch == "\\") {
+                escaped = 1
+            } else if (ch == "\"") {
+                break
+            } else {
+                out = out ch
             }
         }
+        if (escaped) out = out "\\"
+        gsub(/[\t\r\n]/, " ", out)
+        return out
+    }
 
-        if (match($0, /bytes [0-9]+/)) {
-            s = substr($0, RSTART, RLENGTH)
+    function extract_bytes(line,    s) {
+        if (match(line, /bytes [0-9]+/)) {
+            s = substr(line, RSTART, RLENGTH)
             sub(/bytes /, "", s)
-            bytes = s
+            return s
+        }
+        return "0"
+    }
+
+    function emit_row(out_proto, out_lport, out_ipver, out_target, out_tport, out_comment, out_bytes) {
+        if (out_lport != "" && out_proto != "" && out_ipver != "" && out_target != "" && out_tport != "") {
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", out_proto, out_lport, out_ipver, out_target, out_tport, out_comment, out_bytes
+        }
+    }
+
+    function append_map_entry(map_name, map_lport, map_target, map_tport,    key) {
+        key = map_name SUBSEP map_lport SUBSEP map_target SUBSEP map_tport
+        if (!(key in map_entry_seen)) {
+            map_entries[map_name] = map_entries[map_name] map_lport "\t" map_target "\t" map_tport "\n"
+            map_entry_seen[key] = 1
+        }
+    }
+
+    function emit_map_rows(map_name, out_comment, out_bytes,    map_proto, map_ipver, n, i, row, fields) {
+        if (!(map_name in map_entries)) return
+        map_proto = (map_name ~ /_udp$/) ? "udp" : "tcp"
+        map_ipver = (map_name ~ /_v6_/) ? "6" : "4"
+        n = split(map_entries[map_name], row, /\n/)
+        for (i = 1; i <= n; i++) {
+            if (row[i] == "") continue
+            split(row[i], fields, /\t/)
+            emit_row(map_proto, fields[1], map_ipver, fields[2], fields[3], out_comment, out_bytes)
+        }
+    }
+
+    {
+        lines[++line_count] = $0
+
+        if (match($0, /^[[:space:]]*map[[:space:]]+pfwd_dnat_v[46]_(tcp|udp)[[:space:]]*{/)) {
+            current_map = substr($0, RSTART, RLENGTH)
+            sub(/^[[:space:]]*map[[:space:]]+/, "", current_map)
+            sub(/[[:space:]]*{$/, "", current_map)
+            in_map = 1
+            next
         }
 
-        if (match($0, /comment "/)) {
-            rest = substr($0, RSTART + 9)
-            escaped = 0
-            for (i = 1; i <= length(rest); i++) {
-                ch = substr(rest, i, 1)
-                if (escaped) {
-                    comment = comment ch
-                    escaped = 0
-                } else if (ch == "\\") {
-                    escaped = 1
-                } else if (ch == "\"") {
-                    break
-                } else {
-                    comment = comment ch
+        if (in_map) {
+            if ($0 ~ /^[[:space:]]*}/) {
+                in_map = 0
+                current_map = ""
+                next
+            }
+            if (current_map != "" && match($0, /^[[:space:]]*[0-9]+[[:space:]]*:[[:space:]]*[^[:space:],]+[[:space:]]*\.[[:space:]]*[0-9]+/)) {
+                entry = substr($0, RSTART, RLENGTH)
+                sep = index(entry, ":")
+                map_lport = substr(entry, 1, sep - 1)
+                rhs = substr(entry, sep + 1)
+                sub(/^[[:space:]]+/, "", map_lport)
+                sub(/[[:space:]]+$/, "", map_lport)
+                sub(/^[[:space:]]+/, "", rhs)
+                sub(/[[:space:]]+$/, "", rhs)
+                split(rhs, dest, /[[:space:]]+\.[[:space:]]+/)
+                append_map_entry(current_map, map_lport, dest[1], dest[2])
+            }
+        }
+    }
+
+    END {
+        for (i = 1; i <= line_count; i++) {
+            line = lines[i]
+            if (line !~ /dnat/) continue
+
+            if (match(line, /map @pfwd_dnat_v[46]_(tcp|udp)/)) {
+                map_name = substr(line, RSTART + 5, RLENGTH - 5)
+                emit_map_rows(map_name, extract_comment(line), extract_bytes(line))
+                continue
+            }
+
+            reset_row()
+            if (match(line, /ip protocol tcp/))      { proto="tcp"; ipver="4" }
+            else if (match(line, /ip protocol udp/)) { proto="udp"; ipver="4" }
+            else if (match(line, /ip6 nexthdr tcp/)) { proto="tcp"; ipver="6" }
+            else if (match(line, /ip6 nexthdr udp/)) { proto="udp"; ipver="6" }
+            else {
+                if (match(line, /tcp dport/)) proto="tcp"
+                if (match(line, /udp dport/)) proto="udp"
+                if (match(line, /ip daddr/))  ipver="4"
+                if (match(line, /ip6 daddr/)) ipver="6"
+            }
+
+            if (match(line, /dport [0-9]+/)) {
+                s = substr(line, RSTART, RLENGTH)
+                sub(/dport /, "", s)
+                lport = s
+            }
+
+            if (match(line, /dnat ip6 to /)) {
+                rest = substr(line, RSTART + RLENGTH)
+                p = index(rest, "]:")
+                if (p > 1) {
+                    target = substr(rest, 2, p - 2)
+                    rest2 = substr(rest, p + 2)
+                    match(rest2, /[0-9]+/)
+                    tport = substr(rest2, RSTART, RLENGTH)
+                }
+            } else if (match(line, /dnat ip to /)) {
+                rest = substr(line, RSTART + 11)
+                if (match(rest, /[^ ]+/)) {
+                    s = substr(rest, RSTART, RLENGTH)
+                    n = split(s, parts, ":")
+                    target = parts[1]
+                    tport = parts[n]
                 }
             }
-            if (escaped) comment = comment "\\"
-        }
-        gsub(/[\t\r\n]/, " ", comment)
 
-        if (lport != "" && proto != "") {
-            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", proto, lport, ipver, target, tport, comment, bytes
+            emit_row(proto, lport, ipver, target, tport, extract_comment(line), extract_bytes(line))
         }
     }
     '
@@ -5394,15 +6023,30 @@ _parse_nft_export_rules() {
     fi
     [[ -z "$parsed" ]] && return 0
 
-    local proto lport ipver target tport comment bytes
-    while IFS=$'\t' read -r proto lport ipver target tport comment bytes; do
+    local line proto lport ipver target tport comment bytes
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        comment="${PFWD_TSV_FIELDS[5]:-}"
+        bytes="${PFWD_TSV_FIELDS[6]:-}"
         [[ -z "$lport" ]] && continue
 
-        local tag mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
+        local tag snat_key mss_key snat_mode="masquerade" snat_source="" mss_mode="" mss_value=""
         tag=$(_pfwd_rule_tag "$lport" "$ipver" "$proto" "$target" "$tport")
+        snat_key=$(_pfwd_snat_snapshot_key "$proto" "$ipver" "$target" "$tport")
         mss_key=$(_pfwd_mss_snapshot_key "$proto" "$ipver" "$target" "$tport")
-        [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]] && snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
-        [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
+        if [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$tag]:-}" ]]; then
+            snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$tag]}"
+            [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$tag]}"
+        elif [[ -n "${_NFT_SNAPSHOT_SNAT_MODE[$snat_key]:-}" ]]; then
+            snat_mode="${_NFT_SNAPSHOT_SNAT_MODE[$snat_key]}"
+            [[ -n "${_NFT_SNAPSHOT_SNAT_SOURCE[$snat_key]:-}" ]] && snat_source="${_NFT_SNAPSHOT_SNAT_SOURCE[$snat_key]}"
+        fi
         if [[ -n "${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]:-}" ]]; then
             mss_mode="${_NFT_SNAPSHOT_MSS_MODE[${tag}:mss]}"
             [[ -n "${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]:-}" ]] && mss_value="${_NFT_SNAPSHOT_MSS_VALUE[${tag}:mss]}"
@@ -5427,8 +6071,17 @@ _parse_nft_bidirectional_traffic() {
     fi
     [[ -z "$parsed_prerouting" ]] && return 0
 
-    local proto lport ipver target tport comment in_bytes
-    while IFS=$'\t' read -r proto lport ipver target tport comment in_bytes; do
+    local line proto lport ipver target tport comment in_bytes
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        comment="${PFWD_TSV_FIELDS[5]:-}"
+        in_bytes="${PFWD_TSV_FIELDS[6]:-0}"
         [[ -z "$lport" ]] && continue
         local key="${proto}|${lport}|${ipver}"
         local out_bytes="${_NFT_SNAPSHOT_OUT_BYTES[$key]:-0}"
@@ -6485,7 +7138,7 @@ Commands:
   export      Export config to JSON
   import      Import config from JSON
   uninstall   Uninstall (nftables / all)
-  optimize    Run kernel optimization with preflight + verify [balanced|gaming|lowmem|relay]
+  optimize    Run kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering]
   help        Show this help
 
 Quick syntax:
@@ -6549,6 +7202,7 @@ Common scenarios:
   pfwd import backup.json
   pfwd optimize            # prints kernel preflight + recommended profile
   pfwd optimize balanced
+  pfwd optimize balanced --nic-steering
   pfwd optimize relay
 
 Performance tips:
@@ -6558,6 +7212,7 @@ Performance tips:
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
   - optimize prints kernel capability preflight, skips unsupported sysctl keys, and verifies live state.
+  - --nic-steering is explicit opt-in and only live-applies RSS/RPS/XPS hints to NIC queues inferred from the current ruleset.
   - pfwd detects performance kernels such as XanMod, but does not install or switch kernels for you.
 
 Options:
@@ -6702,7 +7357,7 @@ cmd_list() {
 # _nft_saved_rule_count - count persisted prerouting DNAT rules in NFT_CONFIG
 _nft_saved_rule_count() {
     [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
-    awk '/dnat ip to / || /dnat ip6 to / { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
+    awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_nft_prerouting_dnat_lines_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)")"
 }
 
 _nft_saved_postrouting_rule_count() {
@@ -6927,9 +7582,12 @@ cmd_doctor() {
     local running_groups=0 saved_groups saved_valid=false
     local running_postrouting_groups=0 saved_postrouting_groups=0
     local running_mss_groups=0 saved_mss_groups=0
+    local steering_devices_csv steering_cpu_count
     saved_groups=$(_nft_saved_rule_count)
     saved_postrouting_groups=$(_nft_saved_postrouting_rule_count)
     saved_mss_groups=$(_nft_saved_forward_mss_rule_count)
+    steering_devices_csv=$(_pfwd_detect_steering_devices)
+    steering_cpu_count=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_pfwd_online_cpu_list)")
 
     if command -v nft >/dev/null 2>&1; then
         _doctor_print_check OK "nft command available"
@@ -6967,6 +7625,41 @@ cmd_doctor() {
         fi
     else
         _doctor_print_check WARN "kernel too old for flowtable fast path" "requires Linux >= 4.16"
+    fi
+    if (( steering_cpu_count <= 1 )); then
+        _doctor_print_check WARN "NIC steering inactive" "single-CPU host"
+    elif [[ -z "$steering_devices_csv" ]]; then
+        if (( state_rules > 0 )); then
+            _doctor_print_check WARN "NIC steering devices unresolved" "could not infer eligible NICs from current rules"
+        else
+            _doctor_print_check OK "NIC steering inactive" "no forwarding devices inferred yet"
+        fi
+    else
+        local steering_rss_state steering_rps_state steering_xps_state steering_hw_state
+        IFS=$'\t' read -r steering_rss_state steering_rps_state steering_xps_state steering_hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
+        [[ "$steering_rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS queue steering active" "devices=${steering_devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS queue steering inactive" "devices=${steering_devices_csv}, rerun 'pfwd optimize ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} --nic-steering'"
+        [[ "$steering_xps_state" == "on" ]] && _doctor_print_check OK "XPS queue steering active" "devices=${steering_devices_csv}" || _doctor_print_check WARN "XPS queue steering inactive" "devices=${steering_devices_csv}"
+        case "$steering_rss_state" in
+            on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${steering_devices_csv}" ;;
+            off) _doctor_print_check WARN "NIC RSS hashing disabled" "software steering can help, but NIC RSS is off" ;;
+            *) _doctor_print_check WARN "NIC RSS hashing not observable" "install ethtool or verify driver support" ;;
+        esac
+        case "$steering_hw_state" in
+            ready) _doctor_print_check OK "NIC hw-tc-offload ready" "driver advertises hardware tc offload" ;;
+            off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless the driver/offload setting changes" ;;
+            *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "install ethtool or verify driver support" ;;
+        esac
+
+        local steering_iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries
+        IFS=',' read -r -a _PFWD_DOCTOR_STEERING_IFACES <<< "$steering_devices_csv"
+        for steering_iface in "${_PFWD_DOCTOR_STEERING_IFACES[@]}"; do
+            [[ -n "$steering_iface" ]] || continue
+            IFS=$'\t' read -r steering_iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$steering_iface")"
+            _doctor_print_check OK "NIC queue layout ${steering_iface}" "rx=${rx_queues}, tx=${tx_queues}, rss=${rss_feature}, rps=${rps_queues}/${rx_queues}, xps=${xps_queues}/${tx_queues}"
+            if (( rx_queues > 1 && rps_queues == 0 && xps_queues == 0 )) && [[ "$rss_feature" != "on" && "$rss_feature" != "fixed" ]]; then
+                _doctor_print_check WARN "multi-queue NIC has no steering" "${steering_iface} lacks RSS and software queue steering"
+            fi
+        done
     fi
 
     local unresolved_count=0
@@ -7058,6 +7751,9 @@ cmd_doctor() {
                 ;;
         esac
         case "$postrouting_renderer" in
+            map)
+                _doctor_print_check OK "Postrouting renderer active" "map"
+                ;;
             grouped)
                 _doctor_print_check OK "Postrouting renderer active" "grouped"
                 ;;
@@ -7114,7 +7810,9 @@ cmd_doctor() {
         fi
     fi
     if (( state_rules > 0 && running_postrouting_groups > 0 && running_postrouting_groups < state_rules )); then
-        if [[ "${postrouting_renderer:-none}" == "grouped" ]]; then
+        if [[ "${postrouting_renderer:-none}" == "map" ]]; then
+            _doctor_print_check OK "Postrouting map compression active" "state=${state_rules}, rendered-postrouting=${running_postrouting_groups}"
+        elif [[ "${postrouting_renderer:-none}" == "grouped" ]]; then
             _doctor_print_check OK "Postrouting compression active" "state=${state_rules}, rendered-postrouting=${running_postrouting_groups}"
         fi
     fi
@@ -7300,15 +7998,18 @@ cmd_status() {
     fi
     echo -e "  nftables:  $nft_status  ($PFWD_NFT_COUNT rules)"
     local flowtable_label=""
+    local steering_label=""
     local dnat_renderer_label=""
     local postrouting_renderer_label=""
     local mss_renderer_label=""
+    local steering_devices_csv steering_rss_state steering_rps_state steering_xps_state steering_hw_state
     if _nft_table_exists; then
         local ft_mode offload_status offload_sw offload_hw dnat_renderer postrouting_renderer mss_renderer
         ft_mode=$(_nft_flowtable_mode)
         dnat_renderer=$(_pfwd_runtime_dnat_renderer)
         postrouting_renderer=$(_pfwd_runtime_postrouting_renderer)
         mss_renderer=$(_pfwd_runtime_mss_renderer)
+        steering_devices_csv=$(_pfwd_detect_steering_devices)
         if [[ "$ft_mode" == "offload" || "$ft_mode" == "basic" || "$ft_mode" == "counter" ]]; then
             if _nft_cached_chain forward | grep -Eq 'ct (status dnat )?ct state established flow add @ft'; then
                 IFS=$'\t' read -r offload_status offload_sw offload_hw <<< "$(_pfwd_conntrack_offload_status_tsv)"
@@ -7339,6 +8040,7 @@ cmd_status() {
             *) dnat_renderer_label="${DIM}${dnat_renderer}${NC}" ;;
         esac
         case "$postrouting_renderer" in
+            map) postrouting_renderer_label="${CYAN}map${NC}" ;;
             grouped) postrouting_renderer_label="${CYAN}grouped${NC}" ;;
             legacy) postrouting_renderer_label="${CYAN}legacy${NC}" ;;
             *) postrouting_renderer_label="${DIM}${postrouting_renderer}${NC}" ;;
@@ -7353,8 +8055,40 @@ cmd_status() {
         dnat_renderer_label="${DIM}$(_pfwd_saved_dnat_renderer)${NC}"
         postrouting_renderer_label="${DIM}$(_pfwd_saved_postrouting_renderer)${NC}"
         mss_renderer_label="${DIM}$(_pfwd_saved_mss_renderer)${NC}"
+        steering_devices_csv=$(_pfwd_detect_steering_devices)
+    fi
+    if [[ -n "$steering_devices_csv" ]]; then
+        IFS=$'\t' read -r steering_rss_state steering_rps_state steering_xps_state steering_hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
+        case "$steering_rss_state" in
+            on) steering_rss_state="${GREEN}on${NC}" ;;
+            off) steering_rss_state="${YELLOW}off${NC}" ;;
+            unavailable) steering_rss_state="${DIM}n/a${NC}" ;;
+            *) steering_rss_state="${DIM}${steering_rss_state}${NC}" ;;
+        esac
+        case "$steering_rps_state" in
+            on) steering_rps_state="${GREEN}on${NC}" ;;
+            off) steering_rps_state="${YELLOW}off${NC}" ;;
+            inactive) steering_rps_state="${DIM}inactive${NC}" ;;
+            *) steering_rps_state="${DIM}${steering_rps_state}${NC}" ;;
+        esac
+        case "$steering_xps_state" in
+            on) steering_xps_state="${GREEN}on${NC}" ;;
+            off) steering_xps_state="${YELLOW}off${NC}" ;;
+            inactive) steering_xps_state="${DIM}inactive${NC}" ;;
+            *) steering_xps_state="${DIM}${steering_xps_state}${NC}" ;;
+        esac
+        case "$steering_hw_state" in
+            ready) steering_hw_state="${GREEN}ready${NC}" ;;
+            off) steering_hw_state="${YELLOW}off${NC}" ;;
+            unavailable) steering_hw_state="${DIM}n/a${NC}" ;;
+            *) steering_hw_state="${DIM}${steering_hw_state}${NC}" ;;
+        esac
+        steering_label="rss=${steering_rss_state} rps=${steering_rps_state} xps=${steering_xps_state} hw-offload=${steering_hw_state}"
+    else
+        steering_label="${DIM}inactive${NC}"
     fi
     echo -e "  flowtable: ${flowtable_label}"
+    echo -e "  steering: ${steering_label}"
     echo -e "  dnat rend: ${dnat_renderer_label}"
     echo -e "  postroute: ${postrouting_renderer_label}"
     echo -e "  mss rend: ${mss_renderer_label}"
@@ -7409,15 +8143,22 @@ cmd_status() {
 
     echo -e "  traffic int: ${CYAN}${PFWD_TRAFFIC_INTERVAL}${NC}"
     local traffic_backend_label
+    local optimize_applied_label
     case "$PFWD_TRAFFIC_BACKEND" in
         conntrack) traffic_backend_label="${GREEN}${PFWD_TRAFFIC_BACKEND}${NC}" ;;
         proc) traffic_backend_label="${GREEN}${PFWD_TRAFFIC_BACKEND}${NC}" ;;
         conntrack\(root\)) traffic_backend_label="${YELLOW}${PFWD_TRAFFIC_BACKEND}${NC}" ;;
         *) traffic_backend_label="${RED}${PFWD_TRAFFIC_BACKEND}${NC}" ;;
     esac
+    case "$PFWD_OPTIMIZE_APPLIED_PROFILE" in
+        balanced|gaming|lowmem|relay) optimize_applied_label="${CYAN}${PFWD_OPTIMIZE_APPLIED_PROFILE}${NC}" ;;
+        none) optimize_applied_label="${DIM}${PFWD_OPTIMIZE_APPLIED_PROFILE}${NC}" ;;
+        *) optimize_applied_label="${YELLOW}${PFWD_OPTIMIZE_APPLIED_PROFILE}${NC}" ;;
+    esac
     echo -e "  traffic src: ${traffic_backend_label}"
     echo -e "  kernel:     ${CYAN}${PFWD_KERNEL_RELEASE}${NC} ${DIM}(${PFWD_KERNEL_FLAVOR_LABEL})${NC}"
-    echo -e "  optimize:   ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} ${DIM}${PFWD_OPTIMIZE_RECOMMEND_REASON}${NC}"
+    echo -e "  optimize:   ${optimize_applied_label} ${DIM}${PFWD_OPTIMIZE_APPLIED_REASON}${NC}"
+    echo -e "  recommend:  ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} ${DIM}${PFWD_OPTIMIZE_RECOMMEND_REASON}${NC}"
 
     # kernel forwarding
     local fwd4 fwd6
@@ -7708,10 +8449,7 @@ parse_cli_args() {
             ;;
         optimize)
             shift
-            case "${1:-balanced}" in
-                reset|undo) reset_kernel_optimization ;;
-                *) optimize_kernel "${1:-balanced}" ;;
-            esac
+            cmd_optimize "$@"
             ;;
         help|--help|-h)
             show_help
@@ -7931,6 +8669,7 @@ interactive_menu() {
                 _pfwd_collect_state
                 echo ""
                 echo -e "  ${DIM}Kernel:${NC} ${PFWD_KERNEL_RELEASE} (${PFWD_KERNEL_FLAVOR_LABEL})"
+                echo -e "  ${DIM}Applied:${NC} ${CYAN}${PFWD_OPTIMIZE_APPLIED_PROFILE}${NC} (${PFWD_OPTIMIZE_APPLIED_REASON})"
                 echo -e "  ${DIM}Recommended:${NC} ${CYAN}${PFWD_OPTIMIZE_RECOMMENDED_PROFILE}${NC} (${PFWD_OPTIMIZE_RECOMMEND_REASON})"
                 echo ""
                 echo -e "  ${CYAN}1)${NC} balanced  (recommended general forwarding baseline)"
@@ -7943,11 +8682,27 @@ interactive_menu() {
                 read -rp "Select [0-5, default=1]: " _kp
                 case "$_kp" in
                     0) continue ;;
-                    2) optimize_kernel gaming; wait_for_enter ;;
-                    3) optimize_kernel lowmem; wait_for_enter ;;
-                    4) optimize_kernel relay; wait_for_enter ;;
+                    2)
+                        read -rp "Enable live NIC steering? [y/N]: " _steer
+                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel gaming true || optimize_kernel gaming
+                        wait_for_enter
+                        ;;
+                    3)
+                        read -rp "Enable live NIC steering? [y/N]: " _steer
+                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel lowmem true || optimize_kernel lowmem
+                        wait_for_enter
+                        ;;
+                    4)
+                        read -rp "Enable live NIC steering? [y/N]: " _steer
+                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel relay true || optimize_kernel relay
+                        wait_for_enter
+                        ;;
                     5) reset_kernel_optimization; wait_for_enter ;;
-                    *) optimize_kernel balanced; wait_for_enter ;;
+                    *)
+                        read -rp "Enable live NIC steering? [y/N]: " _steer
+                        [[ "$_steer" =~ ^[Yy]$ ]] && optimize_kernel balanced true || optimize_kernel balanced
+                        wait_for_enter
+                        ;;
                 esac
                 ;;
             h|H) show_help; wait_for_enter ;;
