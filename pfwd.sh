@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.5"
+readonly VERSION="2.1.6"
 
 pfwd_path() {
     local path="$1"
@@ -4610,6 +4610,27 @@ _pfwd_ethtool_feature_state_from_text() {
     sed -n -E "s/^[[:space:]]*${feature}:[[:space:]]*([^[:space:]]+).*/\\1/p" <<< "$text" | head -1
 }
 
+_pfwd_ethtool_feature_observable() {
+    local iface="$1" feature="$2"
+    local text value
+    text=$(_pfwd_ethtool_features_text "$iface" 2>/dev/null) || return 1
+    value=$(_pfwd_ethtool_feature_state_from_text "$text" "$feature")
+    [[ -n "$value" ]]
+}
+
+_pfwd_nic_feature_warning_detail() {
+    local iface="$1" feature="$2"
+    if ! command -v ethtool >/dev/null 2>&1; then
+        echo "install ethtool to inspect ${feature}"
+        return 0
+    fi
+    if _pfwd_ethtool_feature_observable "$iface" "$feature"; then
+        echo "verify driver support"
+    else
+        echo "ethtool/driver does not expose ${feature} on ${iface}"
+    fi
+}
+
 _pfwd_nic_steering_device_state_tsv() {
     local iface="$1"
     local rx_queues=0 tx_queues=0 rps_queues=0 rps_flow_queues=0 xps_queues=0
@@ -4868,12 +4889,12 @@ _pfwd_print_optimize_verification() {
             case "$rss_state" in
                 on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${devices_csv}" ;;
                 off) _doctor_print_check WARN "NIC RSS hashing disabled" "check ethtool -k ${devices_csv%%,*}" ;;
-                *) _doctor_print_check WARN "NIC RSS hashing not observable" "install ethtool or verify driver support" ;;
+                *) _doctor_print_check WARN "NIC RSS hashing not observable" "$(_pfwd_nic_feature_warning_detail "${devices_csv%%,*}" "rx-hashing")" ;;
             esac
             case "$hw_state" in
                 ready) _doctor_print_check OK "NIC hw-tc-offload ready" "hardware offload capability advertised" ;;
                 off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless driver/offload is enabled" ;;
-                *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "install ethtool or verify driver support" ;;
+                *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "$(_pfwd_nic_feature_warning_detail "${devices_csv%%,*}" "hw-tc-offload")" ;;
             esac
         fi
     fi
@@ -8193,12 +8214,12 @@ cmd_doctor() {
         case "$steering_rss_state" in
             on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${steering_devices_csv}" ;;
             off) _doctor_print_check WARN "NIC RSS hashing disabled" "software steering can help, but NIC RSS is off" ;;
-            *) _doctor_print_check WARN "NIC RSS hashing not observable" "install ethtool or verify driver support" ;;
+            *) _doctor_print_check WARN "NIC RSS hashing not observable" "$(_pfwd_nic_feature_warning_detail "${steering_devices_csv%%,*}" "rx-hashing")" ;;
         esac
         case "$steering_hw_state" in
             ready) _doctor_print_check OK "NIC hw-tc-offload ready" "driver advertises hardware tc offload" ;;
             off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless the driver/offload setting changes" ;;
-            *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "install ethtool or verify driver support" ;;
+            *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "$(_pfwd_nic_feature_warning_detail "${steering_devices_csv%%,*}" "hw-tc-offload")" ;;
         esac
 
         local steering_iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries
