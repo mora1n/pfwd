@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.6"
+readonly VERSION="2.1.7"
 
 pfwd_path() {
     local path="$1"
@@ -6664,10 +6664,22 @@ nft_list_rules() {
 
     local idx=0
     local -a detail_lines=()
-    local snat_mode snat_source mss_mode mss_value bytes
-    while IFS=$'\t' read -r proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value bytes; do
+    local line proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value bytes
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        comment="${PFWD_TSV_FIELDS[5]:-}"
+        snat_mode="${PFWD_TSV_FIELDS[6]:-}"
+        snat_source="${PFWD_TSV_FIELDS[7]:-}"
+        mss_mode="${PFWD_TSV_FIELDS[8]:-}"
+        mss_value="${PFWD_TSV_FIELDS[9]:-}"
+        bytes="${PFWD_TSV_FIELDS[10]:-0}"
         [[ -z "$lport" ]] && continue
-        bytes="${bytes:-0}"
         local target_label
         target_label=$(_pfwd_state_target_label "$target" "$ipver")
         # Apply filter if specified
