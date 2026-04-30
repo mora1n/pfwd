@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.7"
+readonly VERSION="2.1.8"
 
 pfwd_path() {
     local path="$1"
@@ -34,18 +34,17 @@ pfwd_path() {
 
 # Paths
 readonly DATA_DIR="$(pfwd_path /var/lib/pfwd)"
-readonly RULES_STATE_FILE="$DATA_DIR/rules.v1.tsv"
-readonly NFT_CONFIG="$(pfwd_path /etc/nftables.d/port_forward.nft)"
-readonly NFT_BACKUP_DIR="$(pfwd_path /root/.pfwd_backup)"
-readonly NFT_RESTORE_SERVICE="$(pfwd_path /etc/systemd/system/pfwd-nft-restore.service)"
+readonly RULES_STATE_FILE="$DATA_DIR/forward-rules.tsv"
+readonly NFT_RENDER_TMP_TARGET="$DATA_DIR/rendered.nft"
+readonly PFWD_SERVICE="$(pfwd_path /etc/systemd/system/pfwd.service)"
+readonly PFWD_TIMER="$(pfwd_path /etc/systemd/system/pfwd.timer)"
 readonly SYSCTL_CONF="$(pfwd_path /etc/sysctl.d/99-pfwd.conf)"
 readonly UFW_BEFORE_RULES="$(pfwd_path /etc/ufw/before.rules)"
 readonly UFW_BEFORE6_RULES="$(pfwd_path /etc/ufw/before6.rules)"
 readonly TRAFFIC_DATA="$DATA_DIR/traffic_stats.dat"
 readonly TRAFFIC_FLOW_DATA="$DATA_DIR/traffic_flows.dat"
-readonly TRAFFIC_SAVE_SERVICE="$(pfwd_path /etc/systemd/system/pfwd-traffic-save.service)"
-readonly TRAFFIC_SAVE_TIMER="$(pfwd_path /etc/systemd/system/pfwd-traffic-save.timer)"
 readonly TRAFFIC_DEFAULT_INTERVAL="1m"
+readonly MAINTENANCE_DEFAULT_INTERVAL="$TRAFFIC_DEFAULT_INTERVAL"
 readonly TRAFFIC_DATA_VERSION="4"
 readonly TRAFFIC_FLOW_VERSION="2"
 readonly EXPORT_FORMAT_VERSION="3"
@@ -191,6 +190,16 @@ plat_systemctl_disable() {
 plat_systemctl_stop() {
     local unit="$1"
     systemctl stop "$unit" >/dev/null 2>&1 || true
+}
+
+plat_systemctl_is_active() {
+    local unit="$1"
+    systemctl is-active --quiet "$unit" >/dev/null 2>&1
+}
+
+plat_systemctl_is_enabled() {
+    local unit="$1"
+    systemctl is-enabled --quiet "$unit" >/dev/null 2>&1
 }
 
 plat_sysctl_get() {
@@ -418,9 +427,8 @@ _nft_flowtable_mode() {
 
 _pfwd_conntrack_offload_counts_from_text() {
     awk '
-        /\[HW_OFFLOAD\]/ { hw++ }
         /\[OFFLOAD\]/ { sw++ }
-        END { printf "%d\t%d\n", sw+0, hw+0 }
+        END { printf "%d\t0\n", sw+0 }
     '
 }
 
@@ -1241,6 +1249,163 @@ _pfwd_state_target_label() {
     printf '%s' "$target_input"
 }
 
+_pfwd_is_static_hostname_target() {
+    local target="${1,,}"
+    case "$target" in
+        localhost|localhost.localdomain|ip6-localhost|ip6-loopback|ip6-allnodes|ip6-allrouters)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_pfwd_domain_rules_tsv() {
+    local rules="${1:-}"
+    if [[ -z "$rules" ]]; then
+        rules=$(pfwd_state_rules_tsv)
+    fi
+    [[ -n "$rules" ]] || return 0
+
+    local line proto lport ipver target tport comment snat_mode snat_source mss_mode mss_value resolved_host target_type
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        target="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        comment="${PFWD_TSV_FIELDS[5]:-}"
+        snat_mode="${PFWD_TSV_FIELDS[6]:-}"
+        snat_source="${PFWD_TSV_FIELDS[7]:-}"
+        mss_mode="${PFWD_TSV_FIELDS[8]:-}"
+        mss_value="${PFWD_TSV_FIELDS[9]:-}"
+        [[ -n "$lport" ]] || continue
+        target_type=$(detect_ip_type "$target")
+        [[ "$target_type" == "domain" ]] || continue
+        _pfwd_is_static_hostname_target "$target" && continue
+        resolved_host=$(_pfwd_state_resolved_target "$target" "$ipver" 2>/dev/null || true)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$proto" "$lport" "$ipver" "$target" "$tport" "$comment" \
+            "$snat_mode" "$snat_source" "$mss_mode" "$mss_value" "$resolved_host"
+    done <<< "$rules"
+}
+
+_pfwd_domain_counts_tsv() {
+    local rules="${1:-}" domains unresolved
+    domains=$(_pfwd_domain_rules_tsv "$rules")
+    if [[ -z "$domains" ]]; then
+        printf '0\t0\n'
+        return 0
+    fi
+    unresolved=$(awk -F'\t' '($11 == "") { count++ } END { print count+0 }' <<< "$domains")
+    printf '%s\t%s\n' "$(awk 'END { print NR+0 }' <<< "$domains")" "$unresolved"
+}
+
+_pfwd_maintenance_timer_state() {
+    [[ -f "$PFWD_TIMER" ]] || {
+        echo "missing"
+        return 0
+    }
+    if plat_systemctl_is_active pfwd.timer; then
+        echo "active"
+    elif plat_systemctl_is_enabled pfwd.timer; then
+        echo "enabled"
+    else
+        echo "disabled"
+    fi
+}
+
+_pfwd_running_target_for_rule() {
+    local proto="$1" lport="$2" ipver="$3"
+    local parsed line row_proto row_lport row_ipver row_target
+    parsed=$(_parse_nft_export_rules 2>/dev/null || true)
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        row_proto="${PFWD_TSV_FIELDS[0]:-}"
+        row_lport="${PFWD_TSV_FIELDS[1]:-}"
+        row_ipver="${PFWD_TSV_FIELDS[2]:-}"
+        row_target="${PFWD_TSV_FIELDS[3]:-}"
+        [[ "$row_proto" == "$proto" && "$row_lport" == "$lport" && "$row_ipver" == "$ipver" ]] || continue
+        printf '%s\n' "$row_target"
+        return 0
+    done <<< "$parsed"
+    return 1
+}
+
+show_domain_rules() {
+    local domains
+    domains=$(_pfwd_domain_rules_tsv)
+    echo -e "${BOLD}Domain Forwarding Rules${NC}"
+    echo -e "${DIM}$SEP_EQ${NC}"
+    echo -e "  ${DIM}Maintenance interval: ${CYAN}$(maintenance_current_interval)${NC}${DIM} (domain refresh + traffic stats)${NC}"
+    echo ""
+    if [[ -z "$domains" ]]; then
+        msg_dim "  No domain forwarding rules"
+        return 0
+    fi
+
+    printf "  ${BOLD}%-8s %-6s %-6s %-28s %-22s %-22s${NC}\n" "L.Port" "Proto" "IPver" "Domain" "Current DNS" "Runtime"
+    local line proto lport ipver domain tport comment snat_mode snat_source mss_mode mss_value resolved runtime
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _pfwd_tsv_split_line "$line"
+        proto="${PFWD_TSV_FIELDS[0]:-}"
+        lport="${PFWD_TSV_FIELDS[1]:-}"
+        ipver="${PFWD_TSV_FIELDS[2]:-}"
+        domain="${PFWD_TSV_FIELDS[3]:-}"
+        tport="${PFWD_TSV_FIELDS[4]:-}"
+        resolved="${PFWD_TSV_FIELDS[10]:-}"
+        runtime=$(_pfwd_running_target_for_rule "$proto" "$lport" "$ipver" 2>/dev/null || true)
+        [[ -n "$resolved" ]] || resolved="unresolved"
+        [[ -n "$runtime" ]] || runtime="-"
+        printf "  %-8s %-6s %-6s %-28s %-22s %-22s\n" ":$lport" "$proto" "IPv$ipver" "${domain}:${tport}" "$resolved" "$runtime"
+    done <<< "$domains"
+}
+
+cmd_domains() {
+    local action="${1:-list}"
+    case "$action" in
+        list)
+            show_domain_rules
+            ;;
+        update|refresh)
+            require_root "$0 domains update"
+            cmd_refresh
+            ;;
+        interval)
+            if [[ -n "${2:-}" ]]; then
+                maintenance_configure_interval "$2"
+            else
+                echo -e "${BOLD}Domain Refresh / Maintenance Interval${NC}"
+                echo -e "${DIM}$SEP_EQ${NC}"
+                echo -e "  Current interval: ${CYAN}$(maintenance_current_interval)${NC}"
+                echo -e "  Allowed values : ${DIM}30s, 1m, 5m, 10m, 30m, 1h${NC}"
+                echo -e "  ${DIM}The same timer refreshes domain targets and persists traffic stats.${NC}"
+            fi
+            ;;
+        status)
+            _pfwd_collect_state
+            local total unresolved timer_state
+            IFS=$'\t' read -r total unresolved <<< "$(_pfwd_domain_counts_tsv "$PFWD_NFT_RULES")"
+            timer_state=$(_pfwd_maintenance_timer_state)
+            echo -e "${BOLD}Domain Refresh Status${NC}"
+            echo -e "${DIM}$SEP_EQ${NC}"
+            echo -e "  domains:    ${CYAN}${total}${NC} total, ${CYAN}${unresolved}${NC} unresolved"
+            echo -e "  interval:   ${CYAN}$(maintenance_current_interval)${NC}"
+            echo -e "  timer:      ${timer_state}"
+            echo -e "  service:    $([[ -f "$PFWD_SERVICE" ]] && echo present || echo missing)"
+            ;;
+        *)
+            msg_err "Usage: pfwd domains [list|update|interval [30s|1m|5m|10m|30m|1h]|status]"
+            return 1
+            ;;
+    esac
+}
+
 _pfwd_chain_from_text() {
     local data="$1" chain="$2"
     awk -v c="$chain" '$0 ~ "chain " c " [{]",/^[[:space:]]*}/' <<< "$data"
@@ -1303,22 +1468,7 @@ _pfwd_state_rules_from_nft_text() {
 }
 
 pfwd_state_ensure_initialized() {
-    if [[ -f "$RULES_STATE_FILE" ]]; then
-        return 0
-    fi
-
-    local migrated_rules=""
-    if _nft_table_exists; then
-        migrated_rules=$(_parse_nft_export_rules || true)
-    elif [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
-        migrated_rules=$(_pfwd_state_rules_from_nft_text "$(cat "$NFT_CONFIG")" || true)
-    fi
-
-    [[ -n "$migrated_rules" ]] || return 0
-
-    mkdir -p "$DATA_DIR"
-    printf '%s\n' "$migrated_rules" | _pfwd_state_write_rules "$RULES_STATE_FILE"
-    msg_info "Migrated existing nftables rules into $RULES_STATE_FILE"
+    return 0
 }
 
 pfwd_state_add_rule() {
@@ -1563,18 +1713,15 @@ _pfwd_collect_flowtable_devices() {
 
 _pfwd_flowtable_modes() {
     local devices_csv="${1:-}"
-    local kver major minor
     [[ -n "$devices_csv" ]] || {
         echo "disabled"
         return 0
     }
-    kver=$(uname -r | awk -F'[.-]' '{print $1"."$2}')
-    IFS='.' read -r major minor <<< "$kver"
-    if (( major < 4 || (major == 4 && minor < 16) )); then
+    if ! _pfwd_kernel_version_at_least 4 16; then
         echo "disabled"
         return 0
     fi
-    printf '%s\n' offload basic disabled
+    printf '%s\n' basic disabled
 }
 
 _pfwd_dnat_render_modes() {
@@ -1794,11 +1941,7 @@ _pfwd_runtime_dnat_renderer() {
 }
 
 _pfwd_saved_dnat_renderer() {
-    if [[ ! -f "$NFT_CONFIG" ]]; then
-        echo "missing"
-        return 0
-    fi
-    _pfwd_dnat_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+    echo "none"
 }
 
 _pfwd_postrouting_renderer_mode_from_text() {
@@ -1823,11 +1966,7 @@ _pfwd_runtime_postrouting_renderer() {
 }
 
 _pfwd_saved_postrouting_renderer() {
-    if [[ ! -f "$NFT_CONFIG" ]]; then
-        echo "missing"
-        return 0
-    fi
-    _pfwd_postrouting_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+    echo "none"
 }
 
 _pfwd_snat_snapshot_key() {
@@ -1855,11 +1994,7 @@ _pfwd_runtime_mss_renderer() {
 }
 
 _pfwd_saved_mss_renderer() {
-    if [[ ! -f "$NFT_CONFIG" ]]; then
-        echo "missing"
-        return 0
-    fi
-    _pfwd_mss_renderer_mode_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)"
+    echo "none"
 }
 
 _pfwd_postrouting_group_keys_tsv() {
@@ -2025,9 +2160,6 @@ _pfwd_render_nft_config() {
             printf '    flowtable ft {\n'
             printf '        hook ingress priority 0;\n'
             printf '        devices = { %s };\n' "${devices_csv//,/\, }"
-            case "$flow_mode" in
-                offload) printf '        flags offload;\n' ;;
-            esac
             printf '    }\n\n'
         fi
 
@@ -2229,7 +2361,7 @@ pfwd_apply_saved_state() {
     if [[ -z "$rules" ]]; then
         plat_nft_delete_table $NFT_TABLE || true
         _nft_invalidate_cache
-        rm -f "$NFT_CONFIG"
+        rm -f "$NFT_RENDER_TMP_TARGET"
         sync_managed_firewall_state "" || return 1
         ufw_reload_if_enabled || true
         return 0
@@ -2248,7 +2380,7 @@ pfwd_apply_saved_state() {
         for dnat_renderer in $(_pfwd_dnat_render_modes); do
             for postrouting_renderer in $(_pfwd_postrouting_render_modes); do
                 for mss_renderer in $(_pfwd_mss_render_modes); do
-                    candidate_file=$(_mktemp_in_dir "$NFT_CONFIG") || return 1
+                    candidate_file=$(_mktemp_in_dir "$NFT_RENDER_TMP_TARGET") || return 1
                     if ! _pfwd_render_nft_config "$runtime_rules" "$candidate_file" "$flow_mode" "$devices_csv" "$dnat_renderer" "$postrouting_renderer" "$mss_renderer"; then
                         rm -f "$candidate_file" 2>/dev/null || true
                         continue
@@ -2269,10 +2401,7 @@ pfwd_apply_saved_state() {
                     msg_dim "  DNAT renderer: $dnat_renderer"
                     msg_dim "  Postrouting renderer: $postrouting_renderer"
                     msg_dim "  MSS renderer: $mss_renderer"
-                    if [[ "$_NFT_BACKUP_NEEDED" == true ]]; then
-                        _backup_nft_config
-                    fi
-                    _atomic_replace_file "$candidate_file" "$NFT_CONFIG" 0644
+                    rm -f "$candidate_file" 2>/dev/null || true
                     generated_ok=true
                     break
                 done
@@ -2289,6 +2418,7 @@ pfwd_apply_saved_state() {
     }
 
     _NFT_BACKUP_NEEDED=false
+    rm -f "$NFT_RENDER_TMP_TARGET" 2>/dev/null || true
     _nft_invalidate_cache
     if awk -F'\t' '$4 ~ /^127\./ || $4 == "::1" { found=1 } END { exit(found ? 0 : 1) }' <<< "$rules"; then
         ensure_route_localnet
@@ -2304,37 +2434,45 @@ pfwd_apply_saved_state() {
     return 0
 }
 
-traffic_validate_interval() {
+maintenance_validate_interval() {
     case "${1:-}" in
         30s|1m|5m|10m|30m|1h) return 0 ;;
         *) return 1 ;;
     esac
 }
 
-traffic_current_interval() {
+traffic_validate_interval() {
+    maintenance_validate_interval "$@"
+}
+
+maintenance_current_interval() {
     local interval=""
-    if [[ -f "$TRAFFIC_SAVE_TIMER" ]]; then
-        interval=$(awk -F'=' '/^OnUnitActiveSec=/{print $2; exit}' "$TRAFFIC_SAVE_TIMER" 2>/dev/null || true)
+    if [[ -f "$PFWD_TIMER" ]]; then
+        interval=$(awk -F'=' '/^OnUnitActiveSec=/{print $2; exit}' "$PFWD_TIMER" 2>/dev/null || true)
     fi
-    if traffic_validate_interval "$interval"; then
+    if maintenance_validate_interval "$interval"; then
         echo "$interval"
     else
-        echo "$TRAFFIC_DEFAULT_INTERVAL"
+        echo "$MAINTENANCE_DEFAULT_INTERVAL"
     fi
 }
 
-traffic_write_timer_unit() {
-    local interval="${1:-$(traffic_current_interval)}"
-    traffic_validate_interval "$interval" || {
-        msg_err "Invalid traffic interval: $interval"
+traffic_current_interval() {
+    maintenance_current_interval
+}
+
+maintenance_write_timer_unit() {
+    local interval="${1:-$(maintenance_current_interval)}"
+    maintenance_validate_interval "$interval" || {
+        msg_err "Invalid maintenance interval: $interval"
         return 1
     }
 
     local timer_tmp
-    timer_tmp=$(_mktemp_in_dir "$TRAFFIC_SAVE_TIMER") || return 1
+    timer_tmp=$(_mktemp_in_dir "$PFWD_TIMER") || return 1
     cat > "$timer_tmp" << EOF
 [Unit]
-Description=Periodically save pfwd traffic statistics
+Description=Run pfwd maintenance for domain refresh and traffic statistics
 
 [Timer]
 OnBootSec=$interval
@@ -2344,23 +2482,32 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
-    _atomic_replace_file "$timer_tmp" "$TRAFFIC_SAVE_TIMER" 0644
+    _atomic_replace_file "$timer_tmp" "$PFWD_TIMER" 0644
 }
 
-traffic_configure_interval() {
+traffic_write_timer_unit() {
+    maintenance_write_timer_unit "$@"
+}
+
+maintenance_configure_interval() {
     local interval="$1"
-    require_root "$0 stats --interval $interval"
-    traffic_validate_interval "$interval" || {
+    require_root "$0 domains interval $interval"
+    maintenance_validate_interval "$interval" || {
         msg_err "Unsupported interval: $interval"
         msg_err "Use one of: 30s, 1m, 5m, 10m, 30m, 1h"
         return 1
     }
-    traffic_write_timer_unit "$interval" || return 1
+    maintenance_write_timer_unit "$interval" || return 1
     plat_systemctl_daemon_reload
-    if [[ -f "$TRAFFIC_SAVE_SERVICE" ]]; then
-        plat_systemctl_enable_now pfwd-traffic-save.timer
+    if ! _pfwd_sync_maintenance_timer; then
+        _reset_change_flags
+        return 1
     fi
-    msg_ok "Traffic collector interval set to $interval"
+    msg_ok "Maintenance interval set to $interval"
+}
+
+traffic_configure_interval() {
+    maintenance_configure_interval "$@"
 }
 
 _traffic_delete_records() {
@@ -2401,24 +2548,22 @@ _traffic_delete_records() {
     done
 }
 
-_backup_nft_config() {
-    [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]] || return 0
-    mkdir -p "$NFT_BACKUP_DIR"
-    cp "$NFT_CONFIG" "$NFT_BACKUP_DIR/nftables_$(date +%Y%m%d_%H%M%S).nft" 2>/dev/null || true
+_pfwd_safe_remove_installed_script() {
+    [[ -f "$INSTALLED_SCRIPT" ]] || return 0
 
-    local -a backups=()
-    local backup_path
-    shopt -s nullglob
-    backups=("$NFT_BACKUP_DIR"/nftables_*.nft)
-    shopt -u nullglob
-    (( ${#backups[@]} > 5 )) || return 0
+    local current_path installed_path
+    current_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || true)
+    installed_path=$(realpath "$INSTALLED_SCRIPT" 2>/dev/null || readlink -f "$INSTALLED_SCRIPT" 2>/dev/null || true)
+    if [[ -n "$current_path" && -n "$installed_path" && "$current_path" == "$installed_path" ]]; then
+        msg_warn "Keeping currently running script: $INSTALLED_SCRIPT"
+        return 0
+    fi
 
-    mapfile -t backups < <(printf '%s\n' "${backups[@]}" | sort)
-    while (( ${#backups[@]} > 5 )); do
-        backup_path="${backups[0]}"
-        rm -f -- "$backup_path" 2>/dev/null || true
-        backups=("${backups[@]:1}")
-    done
+    if head -n 5 "$INSTALLED_SCRIPT" 2>/dev/null | grep -q 'pfwd - Port Forwarding Tool'; then
+        rm -f "$INSTALLED_SCRIPT" 2>/dev/null || true
+    else
+        msg_warn "Keeping non-pfwd installed script: $INSTALLED_SCRIPT"
+    fi
 }
 
 # nft batch file for atomic operations (Phase 2)
@@ -2536,7 +2681,7 @@ cli_requires_root() {
     fi
 
     case "${1:-}" in
-        help|--help|-h|--version|-v|list|ls|status|doctor|diagnose|verify|export)
+        help|--help|-h|--version|-v|list|ls|status|doctor|diagnose|verify|export|domains|domain)
             return 1
             ;;
         stats|traffic)
@@ -3773,7 +3918,7 @@ _pfwd_skip_requirements_notice() {
         -q|--quiet)
             return 0
             ;;
-        help|--help|-h|--version|-v|__restore-nft|__traffic-collector)
+        help|--help|-h|--version|-v|__maintenance)
             return 0
             ;;
         *)
@@ -4123,12 +4268,12 @@ _pfwd_optimize_runtime_iface_hint() {
 }
 
 _pfwd_apply_bql_state() {
-    local limit="${1:-$OPTIMIZE_BQL_LIMIT_DEFAULT}"
+    local limit="${1:-$OPTIMIZE_BQL_LIMIT_DEFAULT}" devices_csv="${2:-}"
     [[ "$limit" =~ ^[1-9][0-9]*$ ]] || {
         msg_err "Invalid BQL limit: $limit"
         return 1
     }
-    apply_bql_limits "$limit"
+    apply_bql_limits "$limit" "$devices_csv"
 }
 
 _pfwd_clear_nic_steering() {
@@ -4231,15 +4376,17 @@ _pfwd_tc_apply_state() {
 _pfwd_optimize_runtime_apply() {
     local bql_limit="$1" nic_steering="$2" tc_iface_mode="$3" tc_iface_value="$4" tc_egress_rate="$5" tc_ingress_rate="$6"
     local steering_devices_csv=""
+    local bql_devices_csv=""
 
-    _pfwd_apply_bql_state "$bql_limit" || return 1
+    bql_devices_csv=$(_pfwd_optimize_runtime_iface_hint "$tc_iface_mode" "$tc_iface_value")
+    _pfwd_apply_bql_state "$bql_limit" "$bql_devices_csv" || return 1
 
     if [[ "$nic_steering" == "true" ]]; then
-        steering_devices_csv=$(_pfwd_optimize_runtime_iface_hint "$tc_iface_mode" "$tc_iface_value")
+        steering_devices_csv="${bql_devices_csv:-$(_pfwd_optimize_runtime_iface_hint "$tc_iface_mode" "$tc_iface_value")}"
         if [[ -n "$steering_devices_csv" ]]; then
             apply_nic_steering "$steering_devices_csv" || return 1
         else
-            msg_warn "NIC steering skipped: no eligible interface detected"
+            msg_warn "Software steering skipped: no eligible interface detected"
         fi
     fi
 
@@ -4599,54 +4746,15 @@ _pfwd_nic_steering_rps_flow_cnt() {
     printf '%s\n' "$per_queue"
 }
 
-_pfwd_ethtool_features_text() {
-    local iface="$1"
-    command -v ethtool >/dev/null 2>&1 || return 1
-    ethtool -k "$iface" 2>/dev/null
-}
-
-_pfwd_ethtool_feature_state_from_text() {
-    local text="$1" feature="$2"
-    sed -n -E "s/^[[:space:]]*${feature}:[[:space:]]*([^[:space:]]+).*/\\1/p" <<< "$text" | head -1
-}
-
-_pfwd_ethtool_feature_observable() {
-    local iface="$1" feature="$2"
-    local text value
-    text=$(_pfwd_ethtool_features_text "$iface" 2>/dev/null) || return 1
-    value=$(_pfwd_ethtool_feature_state_from_text "$text" "$feature")
-    [[ -n "$value" ]]
-}
-
-_pfwd_nic_feature_warning_detail() {
-    local iface="$1" feature="$2"
-    if ! command -v ethtool >/dev/null 2>&1; then
-        echo "install ethtool to inspect ${feature}"
-        return 0
-    fi
-    if _pfwd_ethtool_feature_observable "$iface" "$feature"; then
-        echo "verify driver support"
-    else
-        echo "ethtool/driver does not expose ${feature} on ${iface}"
-    fi
-}
-
 _pfwd_nic_steering_device_state_tsv() {
     local iface="$1"
     local rx_queues=0 tx_queues=0 rps_queues=0 rps_flow_queues=0 xps_queues=0
-    local rss_state="unavailable" hw_tc_offload_state="unavailable" sock_entries
-    local features_text queue_path value
+    local sock_entries
+    local queue_path value
 
     rx_queues=$(_pfwd_nic_queue_count "$iface" rx)
     tx_queues=$(_pfwd_nic_queue_count "$iface" tx)
     sock_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)
-
-    if features_text=$(_pfwd_ethtool_features_text "$iface" 2>/dev/null); then
-        value=$(_pfwd_ethtool_feature_state_from_text "$features_text" "rx-hashing")
-        [[ -n "$value" ]] && rss_state="$value"
-        value=$(_pfwd_ethtool_feature_state_from_text "$features_text" "hw-tc-offload")
-        [[ -n "$value" ]] && hw_tc_offload_state="$value"
-    fi
 
     while IFS= read -r queue_path; do
         [[ -n "$queue_path" ]] || continue
@@ -4662,38 +4770,28 @@ _pfwd_nic_steering_device_state_tsv() {
         _pfwd_cpumask_enabled "$value" && ((xps_queues++)) || true
     done < <(_pfwd_nic_queue_paths "$iface" tx)
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$iface" "$rx_queues" "$tx_queues" "$rss_state" "$hw_tc_offload_state" \
-        "$rps_queues" "$rps_flow_queues" "$xps_queues" "${sock_entries:-0}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$iface" "$rx_queues" "$tx_queues" "$rps_queues" "$rps_flow_queues" "$xps_queues" "${sock_entries:-0}"
 }
 
 _pfwd_nic_steering_summary_tsv() {
     local devices_csv="${1:-}"
     [[ -n "$devices_csv" ]] || {
-        printf 'inactive\tinactive\tinactive\tinactive\n'
+        printf 'inactive\tinactive\n'
         return 0
     }
 
-    local rss_state="unavailable" rps_state="off" xps_state="off" hw_state="unavailable"
-    local have_rx=false have_tx=false have_rss_capability=false have_hw_capability=false
-    local any_rss_ready=false any_rps_ready=false any_xps_ready=false any_hw_ready=false
-    local iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries
+    local rps_state="off" xps_state="off"
+    local have_rx=false have_tx=false
+    local any_rps_ready=false any_xps_ready=false
+    local iface rx_queues tx_queues rps_queues rps_flow_queues xps_queues sock_entries
 
     IFS=',' read -r -a _PFWD_STEERING_IFACES <<< "$devices_csv"
     for iface in "${_PFWD_STEERING_IFACES[@]}"; do
         [[ -n "$iface" ]] || continue
-        IFS=$'\t' read -r iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$iface")"
+        IFS=$'\t' read -r iface rx_queues tx_queues rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$iface")"
         (( rx_queues > 0 )) && have_rx=true
         (( tx_queues > 0 )) && have_tx=true
-
-        case "$rss_feature" in
-            on|fixed) have_rss_capability=true; any_rss_ready=true ;;
-            off) have_rss_capability=true ;;
-        esac
-        case "$hw_feature" in
-            on|fixed) have_hw_capability=true; any_hw_ready=true ;;
-            off) have_hw_capability=true ;;
-        esac
 
         if (( rps_queues > 0 && rps_flow_queues > 0 && sock_entries > 0 )); then
             any_rps_ready=true
@@ -4701,12 +4799,6 @@ _pfwd_nic_steering_summary_tsv() {
         (( xps_queues > 0 )) && any_xps_ready=true
     done
 
-    if $have_rss_capability; then
-        $any_rss_ready && rss_state="on" || rss_state="off"
-    fi
-    if $have_hw_capability; then
-        $any_hw_ready && hw_state="ready" || hw_state="off"
-    fi
     if ! $have_rx; then
         rps_state="inactive"
     elif $any_rps_ready; then
@@ -4718,7 +4810,7 @@ _pfwd_nic_steering_summary_tsv() {
         xps_state="on"
     fi
 
-    printf '%s\t%s\t%s\t%s\n' "$rss_state" "$rps_state" "$xps_state" "$hw_state"
+    printf '%s\t%s\n' "$rps_state" "$xps_state"
 }
 
 _pfwd_detect_steering_devices() {
@@ -4732,17 +4824,33 @@ _pfwd_detect_steering_devices() {
 }
 
 _pfwd_bql_limits_state() {
-    local limit="${1:-65536}"
+    local limit="${1:-65536}" devices_csv="${2:-}"
     local count=0 mismatched=0 value path sample=""
-    while IFS= read -r path; do
-        [[ -f "$path" ]] || continue
-        ((count++)) || true
-        value=$(tr -d '[:space:]' < "$path" 2>/dev/null || true)
-        if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value > limit )); then
-            ((mismatched++)) || true
-            [[ -z "$sample" ]] && sample="${path#$(pfwd_path /sys/class/net)/}=${value:-?}"
-        fi
-    done < <(_pfwd_glob_paths "$(pfwd_path '/sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max')")
+    local iface queue_path
+
+    if [[ -z "$devices_csv" ]]; then
+        devices_csv=$(_pfwd_optimize_runtime_iface_hint auto "")
+    fi
+    [[ -n "$devices_csv" ]] || {
+        echo "unsupported"
+        return 0
+    }
+
+    IFS=',' read -r -a _PFWD_BQL_STATE_IFACES <<< "$devices_csv"
+    for iface in "${_PFWD_BQL_STATE_IFACES[@]}"; do
+        [[ -n "$iface" ]] || continue
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            path="$queue_path/byte_queue_limits/limit_max"
+            [[ -f "$path" ]] || continue
+            ((count++)) || true
+            value=$(tr -d '[:space:]' < "$path" 2>/dev/null || true)
+            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value > limit )); then
+                ((mismatched++)) || true
+                [[ -z "$sample" ]] && sample="${path#$(pfwd_path /sys/class/net)/}=${value:-?}"
+            fi
+        done < <(_pfwd_nic_queue_paths "$iface" tx)
+    done
 
     if (( count == 0 )); then
         echo "unsupported"
@@ -4789,6 +4897,7 @@ _pfwd_print_optimize_preflight() {
 
     msg_dim "  Profile goal: $(_pfwd_optimize_profile_summary "$profile")"
     msg_dim "  Profile note: $(_pfwd_optimize_profile_caution "$profile")"
+    msg_dim "  Selected profile: ${profile}"
     if [[ "$profile" == "$PFWD_OPTIMIZE_RECOMMENDED_PROFILE" ]]; then
         msg_dim "  Recommended profile: ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} (${PFWD_OPTIMIZE_RECOMMEND_REASON})"
     else
@@ -4800,7 +4909,7 @@ _pfwd_print_optimize_preflight() {
         msg_dim "  Plan: apply relay-only TCP and neighbor queue tuning"
     fi
     if [[ "$nic_steering" == "true" ]]; then
-        msg_dim "  Plan: persist NIC queue steering (RPS/XPS plus RFS fanout when supported)"
+        msg_dim "  Plan: persist software queue steering (RPS/XPS plus RFS fanout when supported)"
     fi
     if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
         msg_dim "  Plan: persist tc shaping on ${tc_iface_value:-default-route} (${tc_iface_mode}) egress=${tc_egress_rate:-off} ingress=${tc_ingress_rate:-off}"
@@ -4862,7 +4971,7 @@ _pfwd_print_optimize_verification() {
         _doctor_print_check WARN "flowtable UDP timeout unsupported on this kernel"
     fi
 
-    bql_state=$(_pfwd_bql_limits_state "$bql_limit")
+    bql_state=$(_pfwd_bql_limits_state "$bql_limit" "$devices_csv")
     case "$bql_state" in
         ok:*)
             _doctor_print_check OK "BQL limit_max cap applied" "${bql_state#ok:} TX queue(s) at <= ${bql_limit} bytes"
@@ -4876,26 +4985,16 @@ _pfwd_print_optimize_verification() {
     esac
 
     if [[ "$nic_steering" == "true" ]]; then
-        local rss_state rps_state xps_state hw_state cpu_count
+        local rps_state xps_state cpu_count
         cpu_count=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_pfwd_online_cpu_list)")
         if (( cpu_count <= 1 )); then
-            _doctor_print_check WARN "NIC steering skipped" "single-CPU host"
+            _doctor_print_check WARN "software steering skipped" "single-CPU host"
         elif [[ -z "$devices_csv" ]]; then
-            _doctor_print_check WARN "NIC steering skipped" "no eligible flowtable NIC detected from current rules"
+            _doctor_print_check WARN "software steering skipped" "no eligible flowtable NIC detected from current rules"
         else
-            IFS=$'\t' read -r rss_state rps_state xps_state hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$devices_csv")"
-            [[ "$rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS steering applied" "devices=${devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS steering incomplete" "devices=${devices_csv}, summary=${rps_state}"
-            [[ "$xps_state" == "on" ]] && _doctor_print_check OK "XPS steering applied" "devices=${devices_csv}" || _doctor_print_check WARN "XPS steering incomplete" "devices=${devices_csv}, summary=${xps_state}"
-            case "$rss_state" in
-                on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${devices_csv}" ;;
-                off) _doctor_print_check WARN "NIC RSS hashing disabled" "check ethtool -k ${devices_csv%%,*}" ;;
-                *) _doctor_print_check WARN "NIC RSS hashing not observable" "$(_pfwd_nic_feature_warning_detail "${devices_csv%%,*}" "rx-hashing")" ;;
-            esac
-            case "$hw_state" in
-                ready) _doctor_print_check OK "NIC hw-tc-offload ready" "hardware offload capability advertised" ;;
-                off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless driver/offload is enabled" ;;
-                *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "$(_pfwd_nic_feature_warning_detail "${devices_csv%%,*}" "hw-tc-offload")" ;;
-            esac
+            IFS=$'\t' read -r rps_state xps_state <<< "$(_pfwd_nic_steering_summary_tsv "$devices_csv")"
+            [[ "$rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS software steering applied" "devices=${devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS software steering incomplete" "devices=${devices_csv}, summary=${rps_state}"
+            [[ "$xps_state" == "on" ]] && _doctor_print_check OK "XPS software steering applied" "devices=${devices_csv}" || _doctor_print_check WARN "XPS software steering incomplete" "devices=${devices_csv}, summary=${xps_state}"
         fi
     fi
 
@@ -5496,9 +5595,9 @@ EOF
     msg_dim "  BQL limit_max: capped at 64KB (anti-bufferbloat)"
     if [[ "$nic_steering" == "true" ]]; then
         if [[ -n "$steering_devices_csv" ]]; then
-            msg_dim "  NIC steering: persisted RPS/XPS on ${steering_devices_csv}"
+            msg_dim "  Software steering: persisted RPS/XPS on ${steering_devices_csv}"
         else
-            msg_warn "NIC steering skipped: no eligible flowtable NIC detected from current rules"
+            msg_warn "Software steering skipped: no eligible flowtable NIC detected from current rules"
         fi
     fi
     if [[ -n "$tc_egress_rate" || -n "$tc_ingress_rate" ]]; then
@@ -5609,13 +5708,34 @@ cmd_optimize() {
 # 64KB cap: at 1Gbps drains in ~0.5ms; at 100Mbps ~5ms — acceptable for relay.
 apply_bql_limits() {
     local limit="${1:-65536}"  # Default: 64KB
+    local devices_csv="${2:-}"
     local count=0
-    local f
-    while IFS= read -r f; do
-        [[ -f "$f" ]] || continue
-        echo "$limit" > "$f" 2>/dev/null && ((count++)) || true
-    done < <(_pfwd_glob_paths "$(pfwd_path '/sys/class/net/*/queues/tx-*/byte_queue_limits/limit_max')")
-    [[ $count -gt 0 ]] && msg_dim "  BQL limit_max: ${count} TX queue(s) capped at ${limit} bytes"
+    local iface queue_path f
+
+    if [[ -z "$devices_csv" ]]; then
+        devices_csv=$(_pfwd_optimize_runtime_iface_hint auto "")
+    fi
+    [[ -n "$devices_csv" ]] || {
+        msg_warn "BQL limit_max skipped: no forwarding/default NIC detected"
+        return 0
+    }
+
+    IFS=',' read -r -a _PFWD_BQL_IFACES <<< "$devices_csv"
+    for iface in "${_PFWD_BQL_IFACES[@]}"; do
+        [[ -n "$iface" ]] || continue
+        while IFS= read -r queue_path; do
+            [[ -n "$queue_path" ]] || continue
+            f="$queue_path/byte_queue_limits/limit_max"
+            [[ -f "$f" ]] || continue
+            echo "$limit" > "$f" 2>/dev/null && ((count++)) || true
+        done < <(_pfwd_nic_queue_paths "$iface" tx)
+    done
+
+    if [[ $count -gt 0 ]]; then
+        msg_dim "  BQL limit_max: ${count} TX queue(s) capped at ${limit} bytes on ${devices_csv}"
+    else
+        msg_warn "BQL limit_max skipped: no byte_queue_limits knob on ${devices_csv}"
+    fi
     return 0
 }
 
@@ -5628,7 +5748,7 @@ apply_nic_steering() {
     mapfile -t online_cpus < <(_pfwd_online_cpu_list)
     cpu_count="${#online_cpus[@]}"
     if (( cpu_count <= 1 )); then
-        msg_warn "NIC steering skipped: single-CPU host"
+        msg_warn "Software steering skipped: single-CPU host"
         return 0
     fi
 
@@ -5667,13 +5787,13 @@ apply_nic_steering() {
             ((queue_index++)) || true
         done < <(_pfwd_nic_queue_paths "$iface" tx)
 
-        msg_dim "  NIC steering: ${iface} rx=$(_pfwd_nic_queue_count "$iface" rx) tx=$(_pfwd_nic_queue_count "$iface" tx) rps_flow_cnt=${flow_cnt}"
+        msg_dim "  Software steering: ${iface} rx=$(_pfwd_nic_queue_count "$iface" rx) tx=$(_pfwd_nic_queue_count "$iface" tx) rps_flow_cnt=${flow_cnt}"
     done
 
     if (( applied_rps > 0 || applied_xps > 0 )); then
-        msg_dim "  NIC steering: applied rps=${applied_rps} queue(s), xps=${applied_xps} queue(s)"
+        msg_dim "  Software steering: applied rps=${applied_rps} queue(s), xps=${applied_xps} queue(s)"
     else
-        msg_warn "NIC steering requested but queue sysfs knobs are unavailable"
+        msg_warn "Software steering requested but queue sysfs knobs are unavailable"
     fi
     return 0
 }
@@ -5820,10 +5940,17 @@ _batch_finalize() {
             _pfwd_state_discard_batch
             return 1
         fi
+        if _pfwd_has_active_forwarding_rules && ! _pfwd_enforce_runtime_health; then
+            _pfwd_state_discard_batch
+            return 1
+        fi
         if [[ -n "$PFWD_STATE_BATCH_FILE" ]]; then
             _pfwd_state_commit_batch || return 1
         fi
-        nft_setup_persistence
+        if ! _pfwd_sync_maintenance_timer; then
+            _reset_change_flags
+            return 1
+        fi
         _reset_change_flags
     elif $_DIRTY_UFW_SYNC; then
         ufw_sync_loopback_dnat_rules || return 1
@@ -6089,12 +6216,10 @@ nft_ensure_table() {
             fi
         fi
 
-        # Try to create flowtable (three-level fallback)
+        # Try to create a software flowtable. NIC-specific acceleration is not
+        # the default path for VPS/cloud hosts and only adds noisy diagnostics.
         local ft_err
-        if ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; flags offload; }"); then
-            flowtable_ok=true
-            msg_dim "  Flowtable: hardware offload enabled"
-        elif ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }"); then
+        if ft_err=$(plat_nft_capture add flowtable $NFT_TABLE ft "{ hook ingress priority 0; devices = { $nics }; }"); then
             flowtable_ok=true
             msg_dim "  Flowtable: software fast path enabled"
         else
@@ -6107,11 +6232,11 @@ nft_ensure_table() {
     plat_nft_quiet add chain $NFT_TABLE prerouting '{ type nat hook prerouting priority dstnat; policy accept; }'
     plat_nft_quiet add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
 
-    # Forward chain with optional flowtable offload
+    # Forward chain with optional software flowtable fast path
     plat_nft_quiet add chain $NFT_TABLE forward '{ type filter hook forward priority 0; policy accept; }'
     if $flowtable_ok; then
         plat_nft_quiet add rule $NFT_TABLE forward ct status dnat ct state established flow add @ft || \
-            msg_dim "  Flowtable offload rule skipped"
+            msg_dim "  Flowtable fast-path rule skipped"
     fi
     plat_nft_quiet add rule $NFT_TABLE forward ct state established,related accept
 
@@ -6727,39 +6852,6 @@ nft_list_rules() {
     fi
 }
 
-# nft_save - persist rules to file
-nft_save() {
-    local mode="${1:-auto}"
-    mkdir -p "$(dirname "$NFT_CONFIG")"
-    local tmp_file
-    tmp_file=$(_mktemp_in_dir "$NFT_CONFIG") || return 1
-
-    if [[ "$mode" == "backup" || "$mode" == "explicit" || $_NFT_BACKUP_NEEDED == true ]]; then
-        _backup_nft_config
-    fi
-
-    if ! plat_nft_list_table $NFT_TABLE > "$tmp_file"; then
-        rm -f "$tmp_file" 2>/dev/null || true
-        msg_warn "Failed to export nftables rules to $NFT_CONFIG"
-        return 1
-    fi
-    if [[ ! -s "$tmp_file" ]]; then
-        rm -f "$tmp_file" 2>/dev/null || true
-        msg_warn "Exported nftables rules were empty; keeping existing $NFT_CONFIG"
-        return 1
-    fi
-    if ! _atomic_replace_file "$tmp_file" "$NFT_CONFIG" 0644; then
-        rm -f "$tmp_file" 2>/dev/null || true
-        msg_warn "Failed to atomically replace $NFT_CONFIG"
-        return 1
-    fi
-    _NFT_BACKUP_NEEDED=false
-
-    msg_dim "  Rules saved to $NFT_CONFIG"
-    _DIRTY_NFT=false
-    _nft_invalidate_cache
-}
-
 # ufw_reload_if_enabled - reload ufw if it's enabled to apply nftables changes
 ufw_reload_if_enabled() {
     if ! $_DIRTY_UFW_RELOAD; then
@@ -6831,33 +6923,29 @@ nft_flush_all() {
     sync_managed_iptables_accept_rules ""
     ufw_sync_loopback_dnat_rules
     ufw_reload_if_enabled
-    rm -f "$NFT_CONFIG"
-    if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
-        plat_systemctl_disable pfwd-nft-restore
-        rm -f "$NFT_RESTORE_SERVICE"
-    fi
+    rm -f "$NFT_RENDER_TMP_TARGET"
     _traffic_delete_records nft_all
 
-    # Clean up traffic collector timer/service/script/data
-    plat_systemctl_stop pfwd-traffic-save.timer
-    plat_systemctl_disable pfwd-traffic-save.timer
-    rm -f "$TRAFFIC_SAVE_SERVICE" "$TRAFFIC_SAVE_TIMER"
+    plat_systemctl_stop pfwd.timer
+    plat_systemctl_disable pfwd.timer
+    rm -f "$PFWD_SERVICE" "$PFWD_TIMER"
     rm -f "$TRAFFIC_DATA" "$TRAFFIC_FLOW_DATA" "$RULES_STATE_FILE"
     _pfwd_state_discard_batch
     plat_systemctl_daemon_reload
     msg_ok "nftables rules and persistence removed"
 }
 
-# nft_setup_persistence - create systemd units that call hidden pfwd entrypoints
+_pfwd_has_active_forwarding_rules() {
+    local parsed
+    _nft_table_exists || return 1
+    parsed=$(_parse_nft_export_rules 2>/dev/null || true)
+    [[ -n "$parsed" ]]
+}
+
+# nft_setup_persistence - write systemd units that call hidden pfwd entrypoints
 nft_setup_persistence() {
     require_root "$0 start nft"
     mkdir -p "$DATA_DIR"
-    mkdir -p "$(dirname "$NFT_CONFIG")"
-
-    # nft_save already exports rules to NFT_CONFIG, only re-export if file missing
-    if [[ ! -f "$NFT_CONFIG" || ! -s "$NFT_CONFIG" ]]; then
-        nft_save "auto" >/dev/null 2>&1 || true
-    fi
 
     detect_script_path
     if [[ -z "$SCRIPT_PATH" || ! -x "$SCRIPT_PATH" ]]; then
@@ -6869,55 +6957,53 @@ nft_setup_persistence() {
     local script_path service_tmp
     script_path="$SCRIPT_PATH"
 
-    # Create systemd service (with ExecStop to save traffic on shutdown)
-    service_tmp=$(_mktemp_in_dir "$NFT_RESTORE_SERVICE") || return 1
+    # Create one maintenance service. It refreshes domain targets from saved state
+    # and persists traffic stats without a separate domain daemon/config.
+    service_tmp=$(_mktemp_in_dir "$PFWD_SERVICE") || return 1
     cat > "$service_tmp" << EOF
 [Unit]
-Description=pfwd nftables rules restore
+Description=pfwd maintenance (domain refresh and traffic statistics)
 After=network-online.target nftables.service systemd-sysctl.service ufw.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$script_path __restore-nft
-ExecStop=$script_path __traffic-collector
-RemainAfterExit=yes
+ExecStart=$script_path __maintenance
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    _atomic_replace_file "$service_tmp" "$NFT_RESTORE_SERVICE" 0644
+    _atomic_replace_file "$service_tmp" "$PFWD_SERVICE" 0644
 
-    # Create traffic save timer
-    service_tmp=$(_mktemp_in_dir "$TRAFFIC_SAVE_SERVICE") || return 1
-    cat > "$service_tmp" << EOF
-[Unit]
-Description=pfwd traffic data collector
-After=pfwd-nft-restore.service
-
-[Service]
-Type=oneshot
-ExecStart=$script_path __traffic-collector
-EOF
-    _atomic_replace_file "$service_tmp" "$TRAFFIC_SAVE_SERVICE" 0644
-
-    traffic_write_timer_unit "$(traffic_current_interval)" || return 1
+    maintenance_write_timer_unit "$(maintenance_current_interval)" || return 1
 
     plat_systemctl_daemon_reload
-    plat_systemctl_enable pfwd-nft-restore
-    plat_systemctl_enable_now pfwd-traffic-save.timer
+    plat_systemctl_disable pfwd.service
+}
+
+_pfwd_sync_maintenance_timer() {
+    if _pfwd_has_active_forwarding_rules; then
+        nft_setup_persistence || return 1
+        plat_systemctl_enable_now pfwd.timer
+        msg_dim "  Maintenance timer enabled (active forwarding rules present)"
+    else
+        plat_systemctl_stop pfwd.timer
+        plat_systemctl_disable pfwd.timer
+        plat_systemctl_disable pfwd.service
+        msg_dim "  Maintenance timer disabled (no active forwarding rules)"
+    fi
 }
 #===============================================================================
 #  Section 5: Traffic & Service Use Cases
 #===============================================================================
 
-cmd_internal_restore_nft() {
-    require_root "$0 __restore-nft"
+_pfwd_restore_saved_state() {
     _reset_change_flags
     pfwd_state_ensure_initialized
 
     if [[ -z "$(pfwd_state_rules_tsv)" ]]; then
         msg_warn "No saved pfwd state found"
+        _pfwd_sync_maintenance_timer || return 1
         return 0
     fi
 
@@ -6925,14 +7011,62 @@ cmd_internal_restore_nft() {
         return 1
     fi
 
-    nft_setup_persistence
     if ! _pfwd_enforce_runtime_health; then
+        _reset_change_flags
+        return 1
+    fi
+    if ! _pfwd_sync_maintenance_timer; then
         _reset_change_flags
         return 1
     fi
     _pfwd_collect_state
     _reset_change_flags
     return 0
+}
+
+cmd_internal_maintenance() {
+    _reset_change_flags
+    pfwd_state_ensure_initialized
+
+    if [[ -z "$(pfwd_state_rules_tsv)" ]]; then
+        _pfwd_sync_maintenance_timer || return 1
+        return 0
+    fi
+    pfwd_apply_saved_state || return 1
+    _pfwd_enforce_runtime_health || return 1
+    if ! _pfwd_has_active_forwarding_rules; then
+        _pfwd_sync_maintenance_timer || return 1
+        return 0
+    fi
+
+    _traffic_collect_snapshot
+    local merged_rows="$_TRAFFIC_SNAPSHOT_RULES"
+    [[ -n "$merged_rows" ]] && merged_rows=$(_traffic_rule_totals_tsv merged "$_TRAFFIC_SNAPSHOT_RULES" "$_TRAFFIC_SNAPSHOT_FLOWS")
+
+    local traffic_tmp flow_tmp current_in current_out
+    traffic_tmp=$(_mktemp_in_dir "$TRAFFIC_DATA") || return 1
+    flow_tmp=$(_mktemp_in_dir "$TRAFFIC_FLOW_DATA") || return 1
+    : > "$flow_tmp"
+
+    local flow_id rule_key proto lport ipver target tport comment total_bytes
+    while IFS=$'\t' read -r flow_id rule_key current_in current_out; do
+        [[ -z "$flow_id" || -z "$rule_key" ]] && continue
+        IFS='|' read -r proto lport ipver target tport <<< "$rule_key"
+        printf 'v%s|nft_flow|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$TRAFFIC_FLOW_VERSION" "$proto" "$lport" "$ipver" "$target" "$tport" "$flow_id" "$current_in" "$current_out" >> "$flow_tmp"
+    done <<< "$_TRAFFIC_SNAPSHOT_FLOWS"
+
+    : > "$traffic_tmp"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        _parse_rule_key_totals_tsv "$line"
+        [[ -n "$RULETOTAL_ROW_KEY" ]] || continue
+        printf 'v%s|nft_rule|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$TRAFFIC_DATA_VERSION" "$RULETOTAL_ROW_PROTO" "$RULETOTAL_ROW_LPORT" "$RULETOTAL_ROW_IPVER" "$RULETOTAL_ROW_TARGET" "$RULETOTAL_ROW_TPORT" "$RULETOTAL_ROW_IN" "$RULETOTAL_ROW_OUT" >> "$traffic_tmp"
+    done <<< "$merged_rows"
+
+    _atomic_replace_file "$traffic_tmp" "$TRAFFIC_DATA" 0644
+    _atomic_replace_file "$flow_tmp" "$TRAFFIC_FLOW_DATA" 0644
 }
 
 _traffic_warn_incompatible_file() {
@@ -7354,38 +7488,6 @@ _nft_rules_for_display() {
     done <<< "$rule_rows"
 }
 
-cmd_internal_traffic_collector() {
-    require_root "$0 __traffic-collector"
-    _traffic_collect_snapshot
-    local merged_rows="$_TRAFFIC_SNAPSHOT_RULES"
-    [[ -n "$merged_rows" ]] && merged_rows=$(_traffic_rule_totals_tsv merged "$_TRAFFIC_SNAPSHOT_RULES" "$_TRAFFIC_SNAPSHOT_FLOWS")
-
-    local traffic_tmp flow_tmp current_in current_out
-    traffic_tmp=$(_mktemp_in_dir "$TRAFFIC_DATA") || return 1
-    flow_tmp=$(_mktemp_in_dir "$TRAFFIC_FLOW_DATA") || return 1
-    : > "$flow_tmp"
-
-    local flow_id rule_key proto lport ipver target tport comment total_bytes
-    while IFS=$'\t' read -r flow_id rule_key current_in current_out; do
-        [[ -z "$flow_id" || -z "$rule_key" ]] && continue
-        IFS='|' read -r proto lport ipver target tport <<< "$rule_key"
-        printf 'v%s|nft_flow|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$TRAFFIC_FLOW_VERSION" "$proto" "$lport" "$ipver" "$target" "$tport" "$flow_id" "$current_in" "$current_out" >> "$flow_tmp"
-    done <<< "$_TRAFFIC_SNAPSHOT_FLOWS"
-
-    : > "$traffic_tmp"
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        _parse_rule_key_totals_tsv "$line"
-        [[ -n "$RULETOTAL_ROW_KEY" ]] || continue
-        printf 'v%s|nft_rule|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$TRAFFIC_DATA_VERSION" "$RULETOTAL_ROW_PROTO" "$RULETOTAL_ROW_LPORT" "$RULETOTAL_ROW_IPVER" "$RULETOTAL_ROW_TARGET" "$RULETOTAL_ROW_TPORT" "$RULETOTAL_ROW_IN" "$RULETOTAL_ROW_OUT" >> "$traffic_tmp"
-    done <<< "$merged_rows"
-
-    _atomic_replace_file "$traffic_tmp" "$TRAFFIC_DATA" 0644
-    _atomic_replace_file "$flow_tmp" "$TRAFFIC_FLOW_DATA" 0644
-}
-
 show_traffic_stats() {
     echo -e "${BOLD}Traffic Statistics${NC}"
     echo -e "${DIM}$SEP_EQ${NC}"
@@ -7482,11 +7584,12 @@ show_traffic_rate() {
 
 show_traffic_interval() {
     local interval
-    interval=$(traffic_current_interval)
-    echo -e "${BOLD}Traffic Collector Interval${NC}"
+    interval=$(maintenance_current_interval)
+    echo -e "${BOLD}Maintenance Interval${NC}"
     echo -e "${DIM}$SEP_EQ${NC}"
     echo -e "  Current interval: ${CYAN}${interval}${NC}"
     echo -e "  Allowed values : ${DIM}30s, 1m, 5m, 10m, 30m, 1h${NC}"
+    echo -e "  ${DIM}This shared timer refreshes domain targets and persists traffic stats.${NC}"
 }
 
 menu_traffic_stats() {
@@ -7496,8 +7599,8 @@ menu_traffic_stats() {
         echo -e "${DIM}$SEP_DASH_40${NC}"
         echo "  1) View accumulated traffic"
         echo "  2) View traffic rate"
-        echo "  3) Show collector interval"
-        echo "  4) Set collector interval"
+        echo "  3) Show maintenance interval"
+        echo "  4) Set maintenance interval"
         echo "  0) Back"
         echo ""
         read -rp "Select [0-4]: " traffic_choice
@@ -7514,6 +7617,39 @@ menu_traffic_stats() {
                 traffic_configure_interval "$new_interval"
                 wait_for_enter
                 ;;
+            0) return ;;
+            *) msg_warn "Invalid choice" ;;
+        esac
+    done
+}
+
+menu_domain_refresh() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}Domain Refresh${NC}"
+        echo -e "${DIM}$SEP_DASH_40${NC}"
+        echo "  1) List domain forwarding rules"
+        echo "  2) Refresh domain IPs now"
+        echo "  3) Show refresh interval"
+        echo "  4) Set refresh interval"
+        echo "  5) Domain refresh status"
+        echo "  0) Back"
+        echo ""
+        read -rp "Select [0-5]: " domain_choice
+
+        case "$domain_choice" in
+            1) cmd_domains list; wait_for_enter ;;
+            2) cmd_domains update; wait_for_enter ;;
+            3) cmd_domains interval; wait_for_enter ;;
+            4)
+                echo ""
+                echo "  Allowed values: 30s, 1m, 5m, 10m, 30m, 1h"
+                read -rp "New interval: " new_interval
+                [[ -z "$new_interval" ]] && { msg_info "Cancelled"; continue; }
+                cmd_domains interval "$new_interval"
+                wait_for_enter
+                ;;
+            5) cmd_domains status; wait_for_enter ;;
             0) return ;;
             *) msg_warn "Invalid choice" ;;
         esac
@@ -7670,7 +7806,8 @@ cmd_import() {
 
 # Persistence is intentionally kept inside the main script:
 # nft_setup_persistence() writes lightweight systemd units that call the hidden
-# CLI entrypoints below, instead of generating extra helper scripts on disk.
+# CLI entrypoints below. The timer is only enabled after forwarding rules are
+# active, instead of generating extra helper scripts on disk.
 
 #===============================================================================
 #  Section 8: CLI Entry Points
@@ -7689,6 +7826,7 @@ Commands:
   status      Show running status and rule counts
   doctor      Run forwarding diagnostics
   verify      Verify forwarding rules validity
+  domains     Manage domain forwarding refresh [list|update|interval|status]
   fix-ufw     Fix UFW loopback DNAT rules
   start       Start forwarding (nft / all)
   stop        Stop forwarding (nft / all)
@@ -7732,6 +7870,11 @@ Traffic / diagnosis:
   pfwd doctor --tcp-probe
   pfwd doctor --tcp-probe --probe-timeout 5
   pfwd refresh
+  pfwd domains list
+  pfwd domains update
+  pfwd domains interval
+  pfwd domains interval 5m
+  pfwd domains status
   pfwd stats
   pfwd stats --rate
   pfwd stats --interval
@@ -7771,16 +7914,18 @@ Common scenarios:
 
 Performance tips:
   - pfwd now treats $RULES_STATE_FILE as the source of truth.
-  - refresh/start rebuild nftables atomically from saved state.
+  - refresh/start rebuild nftables atomically from saved state; rendered nft files are temporary.
+  - domain targets stay as hostnames in state and are re-resolved by refresh/start/maintenance.
+  - pfwd.timer runs shared maintenance only while active rules exist: domain refresh plus traffic stats.
   - nft is the fastest path for fixed IP targets.
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
   - If using loopback DNAT (127.0.0.1 / ::1), verify UFW loopback exceptions stay synced.
   - optimize prints kernel capability preflight, skips unsupported sysctl keys, and verifies live state.
-  - --nic-steering is explicit opt-in and is restored on refresh/start when optimize state exists.
+  - --nic-steering is explicit software RPS/RFS/XPS tuning and is restored on refresh/start when optimize state exists.
   - tc shaping is explicit-rate only; without --egress-rate/--ingress-rate it is skipped with a visible message.
   - Rate inputs accept tc rates, common aliases, explicit byte/sec forms, and percentages.
   - Egress hint: start at 95% of measured uplink. Ingress hint: start at 92% of measured downlink.
-  - Interactive menus cover filtered list, forwarding control (start/refresh/restart/stop), and diagnostics/repair (status/doctor/tcp-probe/verify/fix-ufw).
+  - Interactive menus show all rules first, then offer display-only filtering, domain refresh, forwarding control (start/refresh/restart/stop), and diagnostics/repair (status/doctor/tcp-probe/verify/fix-ufw).
   - pfwd detects performance kernels such as XanMod, but does not install or switch kernels for you.
 
 Options:
@@ -7797,7 +7942,7 @@ Options:
   --replace                  nft only: replace an existing rule for the same port/proto/IP family
   --snat-source <addr>       nft only: use fixed SNAT source instead of masquerade (auto-switches -46 to matching family)
   --masquerade               nft only: force default masquerade mode
-  --nic-steering             optimize only: persist RSS/RPS/XPS hints on inferred forwarding NICs
+  --nic-steering             optimize only: persist software RPS/RFS/XPS steering on inferred forwarding NICs
   --egress-rate <rate>       optimize only: persist tc egress shaping (e.g. 95mbit, 100Mbps, 12.5MB/s, 95%)
   --ingress-rate <rate>      optimize only: persist tc ingress shaping via $OPTIMIZE_IFB_DEV
   --tc-iface <iface>         optimize only: override the default-route egress NIC used for tc shaping
@@ -7818,7 +7963,7 @@ Rate input note:
   Accepted examples: $(_pfwd_tc_rate_examples)
   Common aliases like 100Mbps / 100M are treated as bit-rate and normalized to tc-safe values.
   Use explicit byte units only when you really mean bytes/sec, for example 12.5MB/s.
-  For shaping suggestions, use measured Internet bottleneck speed rather than NIC link speed.
+  For shaping suggestions, use measured Internet bottleneck speed rather than link speed.
 EOF
 }
 
@@ -7930,22 +8075,6 @@ cmd_list() {
     [[ -n "$filter" ]] && echo -e "  ${DIM}Filter: $filter${NC}"
     echo ""
     nft_list_rules "$filter" "$(_nft_rules_for_display)"
-}
-
-# _nft_saved_rule_count - count persisted prerouting DNAT rules in NFT_CONFIG
-_nft_saved_rule_count() {
-    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
-    awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_nft_prerouting_dnat_lines_from_text "$(cat "$NFT_CONFIG" 2>/dev/null || true)")"
-}
-
-_nft_saved_postrouting_rule_count() {
-    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
-    awk '/snat to / || /masquerade/ { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
-}
-
-_nft_saved_forward_mss_rule_count() {
-    [[ -f "$NFT_CONFIG" ]] || { echo 0; return; }
-    awk '/tcp option maxseg size set / { count++ } END { print count+0 }' "$NFT_CONFIG" 2>/dev/null
 }
 
 _doctor_print_check() {
@@ -8157,13 +8286,10 @@ cmd_doctor() {
     echo -e "${DIM}$SEP_EQ${NC}"
 
     local state_rules="$PFWD_NFT_COUNT"
-    local running_groups=0 saved_groups saved_valid=false
-    local running_postrouting_groups=0 saved_postrouting_groups=0
-    local running_mss_groups=0 saved_mss_groups=0
+    local running_groups=0
+    local running_postrouting_groups=0
+    local running_mss_groups=0
     local steering_devices_csv steering_cpu_count
-    saved_groups=$(_nft_saved_rule_count)
-    saved_postrouting_groups=$(_nft_saved_postrouting_rule_count)
-    saved_mss_groups=$(_nft_saved_forward_mss_rule_count)
     steering_devices_csv=$(_pfwd_detect_steering_devices)
     steering_cpu_count=$(awk 'NF > 0 { count++ } END { print count+0 }' <<< "$(_pfwd_online_cpu_list)")
 
@@ -8211,37 +8337,27 @@ cmd_doctor() {
         _doctor_print_check WARN "kernel too old for flowtable fast path" "requires Linux >= 4.16"
     fi
     if (( steering_cpu_count <= 1 )); then
-        _doctor_print_check WARN "NIC steering inactive" "single-CPU host"
+        _doctor_print_check WARN "software steering inactive" "single-CPU host"
     elif [[ -z "$steering_devices_csv" ]]; then
         if (( state_rules > 0 )); then
-            _doctor_print_check WARN "NIC steering devices unresolved" "could not infer eligible NICs from current rules"
+            _doctor_print_check WARN "software steering devices unresolved" "could not infer eligible NICs from current rules"
         else
-            _doctor_print_check OK "NIC steering inactive" "no forwarding devices inferred yet"
+            _doctor_print_check OK "software steering inactive" "no forwarding devices inferred yet"
         fi
     else
-        local steering_rss_state steering_rps_state steering_xps_state steering_hw_state
-        IFS=$'\t' read -r steering_rss_state steering_rps_state steering_xps_state steering_hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
-        [[ "$steering_rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS queue steering active" "devices=${steering_devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS queue steering inactive" "devices=${steering_devices_csv}, rerun 'pfwd optimize ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} --nic-steering'"
-        [[ "$steering_xps_state" == "on" ]] && _doctor_print_check OK "XPS queue steering active" "devices=${steering_devices_csv}" || _doctor_print_check WARN "XPS queue steering inactive" "devices=${steering_devices_csv}"
-        case "$steering_rss_state" in
-            on) _doctor_print_check OK "NIC RSS hashing ready" "devices=${steering_devices_csv}" ;;
-            off) _doctor_print_check WARN "NIC RSS hashing disabled" "software steering can help, but NIC RSS is off" ;;
-            *) _doctor_print_check WARN "NIC RSS hashing not observable" "$(_pfwd_nic_feature_warning_detail "${steering_devices_csv%%,*}" "rx-hashing")" ;;
-        esac
-        case "$steering_hw_state" in
-            ready) _doctor_print_check OK "NIC hw-tc-offload ready" "driver advertises hardware tc offload" ;;
-            off) _doctor_print_check WARN "NIC hw-tc-offload disabled" "flowtable stays software-only unless the driver/offload setting changes" ;;
-            *) _doctor_print_check WARN "NIC hw-tc-offload not observable" "$(_pfwd_nic_feature_warning_detail "${steering_devices_csv%%,*}" "hw-tc-offload")" ;;
-        esac
+        local steering_rps_state steering_xps_state
+        IFS=$'\t' read -r steering_rps_state steering_xps_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
+        [[ "$steering_rps_state" == "on" ]] && _doctor_print_check OK "RPS/RFS software steering active" "devices=${steering_devices_csv}, net.core.rps_sock_flow_entries=$(plat_sysctl_get net.core.rps_sock_flow_entries 0)" || _doctor_print_check WARN "RPS/RFS software steering inactive" "devices=${steering_devices_csv}, rerun 'pfwd optimize ${PFWD_OPTIMIZE_RECOMMENDED_PROFILE} --nic-steering'"
+        [[ "$steering_xps_state" == "on" ]] && _doctor_print_check OK "XPS software steering active" "devices=${steering_devices_csv}" || _doctor_print_check WARN "XPS software steering inactive" "devices=${steering_devices_csv}"
 
-        local steering_iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries
+        local steering_iface rx_queues tx_queues rps_queues rps_flow_queues xps_queues sock_entries
         IFS=',' read -r -a _PFWD_DOCTOR_STEERING_IFACES <<< "$steering_devices_csv"
         for steering_iface in "${_PFWD_DOCTOR_STEERING_IFACES[@]}"; do
             [[ -n "$steering_iface" ]] || continue
-            IFS=$'\t' read -r steering_iface rx_queues tx_queues rss_feature hw_feature rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$steering_iface")"
-            _doctor_print_check OK "NIC queue layout ${steering_iface}" "rx=${rx_queues}, tx=${tx_queues}, rss=${rss_feature}, rps=${rps_queues}/${rx_queues}, xps=${xps_queues}/${tx_queues}"
-            if (( rx_queues > 1 && rps_queues == 0 && xps_queues == 0 )) && [[ "$rss_feature" != "on" && "$rss_feature" != "fixed" ]]; then
-                _doctor_print_check WARN "multi-queue NIC has no steering" "${steering_iface} lacks RSS and software queue steering"
+            IFS=$'\t' read -r steering_iface rx_queues tx_queues rps_queues rps_flow_queues xps_queues sock_entries <<< "$(_pfwd_nic_steering_device_state_tsv "$steering_iface")"
+            _doctor_print_check OK "NIC queue layout ${steering_iface}" "rx=${rx_queues}, tx=${tx_queues}, rps=${rps_queues}/${rx_queues}, xps=${xps_queues}/${tx_queues}"
+            if (( rx_queues > 1 && rps_queues == 0 && xps_queues == 0 )); then
+                _doctor_print_check WARN "multi-queue NIC software steering inactive" "${steering_iface} has multiple queues but no RPS/XPS"
             fi
         done
     fi
@@ -8300,19 +8416,12 @@ cmd_doctor() {
                             else
                                 _doctor_print_check WARN "software flow offload not observed yet" "no live [OFFLOAD] conntrack entries"
                             fi
-                            if [[ "$ft_mode" == "offload" ]]; then
-                                if (( offload_hw > 0 )); then
-                                    _doctor_print_check OK "hardware flow offload live" "${offload_hw} conntrack entr$( (( offload_hw == 1 )) && echo y || echo ies ) tagged [HW_OFFLOAD]"
-                                else
-                                    _doctor_print_check WARN "hardware flow offload not observed yet" "no live [HW_OFFLOAD] conntrack entries"
-                                fi
-                            fi
                             ;;
                         needs-root)
-                            _doctor_print_check WARN "flow offload observability requires root" "run doctor as root to inspect conntrack [OFFLOAD]/[HW_OFFLOAD] tags"
+                            _doctor_print_check WARN "flow offload observability requires root" "run doctor as root to inspect conntrack [OFFLOAD] tags"
                             ;;
                         missing)
-                            _doctor_print_check WARN "flow offload observability unavailable" "install conntrack-tools to inspect [OFFLOAD]/[HW_OFFLOAD] tags"
+                            _doctor_print_check WARN "flow offload observability unavailable" "install conntrack-tools to inspect [OFFLOAD] tags"
                             ;;
                     esac
                 else
@@ -8368,23 +8477,8 @@ cmd_doctor() {
         _doctor_print_check WARN "no active nft forwarding table"
     fi
 
-    if [[ -f "$NFT_CONFIG" && -s "$NFT_CONFIG" ]]; then
-        if command -v nft >/dev/null 2>&1 && _pfwd_validate_rendered_nft "$NFT_CONFIG"; then
-            saved_valid=true
-            _doctor_print_check OK "persisted nft config is valid" "$saved_groups rendered DNAT group(s), $saved_postrouting_groups rendered postrouting rule(s), $saved_mss_groups rendered MSS rule(s) saved"
-        else
-            _doctor_print_check ERROR "persisted nft config failed validation" "$NFT_CONFIG"
-        fi
-    else
-        _doctor_print_check WARN "persisted nft config missing" "$NFT_CONFIG"
-    fi
-
     if (( state_rules > 0 && running_groups == 0 )) && ! _nft_table_exists; then
         _doctor_print_check WARN "rules are saved but not running" "use 'pfwd start nft' or 'pfwd refresh'"
-    elif (( running_groups > 0 && saved_groups == 0 )); then
-        _doctor_print_check WARN "rules are running but not saved" "use 'pfwd refresh'"
-    elif (( running_groups > 0 && running_groups != saved_groups )); then
-        _doctor_print_check WARN "saved/runtime rendered group counts differ" "saved=${saved_groups}, running=${running_groups}"
     fi
 
     if (( state_rules > 0 && running_groups > 0 && running_groups < state_rules )); then
@@ -8411,9 +8505,19 @@ cmd_doctor() {
     fwd6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo "0")
     [[ "$fwd4" == "1" ]] && _doctor_print_check OK "IPv4 forwarding enabled" || _doctor_print_check ERROR "IPv4 forwarding disabled" "run 'pfwd optimize balanced' or enable net.ipv4.ip_forward=1"
     [[ "$fwd6" == "1" ]] && _doctor_print_check OK "IPv6 forwarding enabled" || _doctor_print_check WARN "IPv6 forwarding disabled"
-    local traffic_interval
-    traffic_interval=$(traffic_current_interval)
-    _doctor_print_check OK "traffic collector interval" "$traffic_interval"
+    local traffic_interval domain_total domain_unresolved
+    traffic_interval=$(maintenance_current_interval)
+    IFS=$'\t' read -r domain_total domain_unresolved <<< "$(_pfwd_domain_counts_tsv "$PFWD_NFT_RULES")"
+    _doctor_print_check OK "maintenance interval" "$traffic_interval"
+    if (( domain_total > 0 )); then
+        if (( domain_unresolved > 0 )); then
+            _doctor_print_check WARN "domain refresh rules" "${domain_total} domain rule(s), ${domain_unresolved} unresolved"
+        else
+            _doctor_print_check OK "domain refresh rules" "${domain_total} domain rule(s), all resolvable"
+        fi
+    else
+        _doctor_print_check OK "domain refresh idle" "no domain forwarding rules"
+    fi
     local traffic_backend traffic_acct
     traffic_backend=$(traffic_stats_backend)
     traffic_acct=$(plat_sysctl_get net.netfilter.nf_conntrack_acct 0)
@@ -8552,14 +8656,16 @@ cmd_doctor() {
         missing) _doctor_print_check ERROR "ip6tables INPUT loopback DNAT exception missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
     esac
 
-    if [[ -f "$NFT_RESTORE_SERVICE" ]]; then
-        _doctor_print_check OK "boot restore service present" "$NFT_RESTORE_SERVICE"
+    if [[ -f "$PFWD_SERVICE" ]]; then
+        _doctor_print_check OK "maintenance service present" "$PFWD_SERVICE"
     else
-        _doctor_print_check WARN "boot restore service missing" "rules may not survive reboot"
+        _doctor_print_check WARN "maintenance service missing" "run 'pfwd refresh' or 'pfwd start nft'"
     fi
 
-    if [[ -f "$TRAFFIC_SAVE_TIMER" ]]; then
-        _doctor_print_check OK "traffic collector timer present" "interval=$(traffic_current_interval)"
+    local maintenance_timer_state
+    maintenance_timer_state=$(_pfwd_maintenance_timer_state)
+    if [[ "$maintenance_timer_state" == "active" || "$maintenance_timer_state" == "enabled" ]]; then
+        _doctor_print_check OK "maintenance timer ${maintenance_timer_state}" "interval=$(maintenance_current_interval)"
         local interval_seconds stale_after traffic_age
         interval_seconds=$(traffic_interval_seconds "$traffic_interval")
         stale_after=$(( interval_seconds * TRAFFIC_STALE_MULTIPLIER ))
@@ -8571,8 +8677,10 @@ cmd_doctor() {
                 _doctor_print_check OK "traffic collector freshness" "last update ${traffic_age}s ago"
             fi
         fi
+    elif [[ "$maintenance_timer_state" == "disabled" ]]; then
+        _doctor_print_check WARN "maintenance timer disabled" "it starts automatically after forwarding rules are active"
     else
-        _doctor_print_check WARN "traffic collector timer missing" "background traffic stats will not persist"
+        _doctor_print_check WARN "maintenance timer missing" "domain refresh and background stats will not run"
     fi
 
     if $tcp_probe; then
@@ -8605,7 +8713,7 @@ cmd_status() {
     local dnat_renderer_label=""
     local postrouting_renderer_label=""
     local mss_renderer_label=""
-    local steering_devices_csv steering_rss_state steering_rps_state steering_xps_state steering_hw_state
+    local steering_devices_csv steering_rps_state steering_xps_state
     if _nft_table_exists; then
         local ft_mode offload_status offload_sw offload_hw dnat_renderer postrouting_renderer mss_renderer
         ft_mode=$(_nft_flowtable_mode)
@@ -8618,11 +8726,7 @@ cmd_status() {
                 IFS=$'\t' read -r offload_status offload_sw offload_hw <<< "$(_pfwd_conntrack_offload_status_tsv)"
                 case "$offload_status" in
                     ok)
-                        if [[ "$ft_mode" == "offload" ]]; then
-                            flowtable_label="mode=${CYAN}${ft_mode}${NC} sw=${CYAN}${offload_sw}${NC} hw=${CYAN}${offload_hw}${NC}"
-                        else
-                            flowtable_label="mode=${CYAN}${ft_mode}${NC} sw=${CYAN}${offload_sw}${NC}"
-                        fi
+                        flowtable_label="mode=${CYAN}${ft_mode}${NC} sw=${CYAN}${offload_sw}${NC}"
                         ;;
                     needs-root)
                         flowtable_label="mode=${CYAN}${ft_mode}${NC} ${DIM}(root for live offload stats)${NC}"
@@ -8661,13 +8765,7 @@ cmd_status() {
         steering_devices_csv=$(_pfwd_detect_steering_devices)
     fi
     if [[ -n "$steering_devices_csv" ]]; then
-        IFS=$'\t' read -r steering_rss_state steering_rps_state steering_xps_state steering_hw_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
-        case "$steering_rss_state" in
-            on) steering_rss_state="${GREEN}on${NC}" ;;
-            off) steering_rss_state="${YELLOW}off${NC}" ;;
-            unavailable) steering_rss_state="${DIM}n/a${NC}" ;;
-            *) steering_rss_state="${DIM}${steering_rss_state}${NC}" ;;
-        esac
+        IFS=$'\t' read -r steering_rps_state steering_xps_state <<< "$(_pfwd_nic_steering_summary_tsv "$steering_devices_csv")"
         case "$steering_rps_state" in
             on) steering_rps_state="${GREEN}on${NC}" ;;
             off) steering_rps_state="${YELLOW}off${NC}" ;;
@@ -8680,13 +8778,7 @@ cmd_status() {
             inactive) steering_xps_state="${DIM}inactive${NC}" ;;
             *) steering_xps_state="${DIM}${steering_xps_state}${NC}" ;;
         esac
-        case "$steering_hw_state" in
-            ready) steering_hw_state="${GREEN}ready${NC}" ;;
-            off) steering_hw_state="${YELLOW}off${NC}" ;;
-            unavailable) steering_hw_state="${DIM}n/a${NC}" ;;
-            *) steering_hw_state="${DIM}${steering_hw_state}${NC}" ;;
-        esac
-        steering_label="rss=${steering_rss_state} rps=${steering_rps_state} xps=${steering_xps_state} hw-offload=${steering_hw_state}"
+        steering_label="rps=${steering_rps_state} xps=${steering_xps_state}"
     else
         steering_label="${DIM}inactive${NC}"
     fi
@@ -8759,6 +8851,10 @@ cmd_status() {
         *) optimize_applied_label="${YELLOW}${PFWD_OPTIMIZE_APPLIED_PROFILE}${NC}" ;;
     esac
     echo -e "  traffic src: ${traffic_backend_label}"
+    local domain_total domain_unresolved
+    IFS=$'\t' read -r domain_total domain_unresolved <<< "$(_pfwd_domain_counts_tsv "$PFWD_NFT_RULES")"
+    echo -e "  domains:    ${CYAN}${domain_total}${NC} total, ${CYAN}${domain_unresolved}${NC} unresolved"
+    echo -e "  maint int:  ${CYAN}$(maintenance_current_interval)${NC} ${DIM}timer=$(_pfwd_maintenance_timer_state)${NC}"
     echo -e "  kernel:     ${CYAN}${PFWD_KERNEL_RELEASE}${NC} ${DIM}(${PFWD_KERNEL_FLAVOR_LABEL})${NC}"
     echo -e "  optimize:   ${optimize_applied_label} ${DIM}${PFWD_OPTIMIZE_APPLIED_REASON}${NC}"
     echo -e "  opt runtime:${DIM} $(_pfwd_optimize_runtime_summary)${NC}"
@@ -8797,12 +8893,13 @@ cmd_stop() {
     case "$target" in
         nft|nftables)
             if _nft_table_exists; then
-                nft_setup_persistence
                 plat_nft_delete_table $NFT_TABLE || true
                 _nft_invalidate_cache
+                _pfwd_sync_maintenance_timer || return 1
                 msg_ok "nftables forwarding stopped (config saved)"
             else
                 msg_warn "nftables forwarding is not running"
+                _pfwd_sync_maintenance_timer || return 1
             fi
             ;;
         all)
@@ -8827,10 +8924,11 @@ cmd_start() {
                     msg_err "nftables forwarding is running but degraded"
                     return 1
                 fi
+                _pfwd_sync_maintenance_timer || return 1
                 msg_ok "nftables forwarding already running and healthy"
                 return 0
             fi
-            if cmd_internal_restore_nft; then
+            if _pfwd_restore_saved_state; then
                 _pfwd_collect_state
                 if $PFWD_RUNTIME_HEALTH_DEGRADED; then
                     msg_err "nftables forwarding started but guard validation is degraded"
@@ -8858,15 +8956,19 @@ cmd_refresh() {
     pfwd_state_ensure_initialized
     if [[ -z "$(pfwd_state_rules_tsv)" ]]; then
         msg_warn "No saved pfwd state found"
+        _pfwd_sync_maintenance_timer || return 1
         return 0
     fi
     if ! pfwd_apply_saved_state; then
         return 1
     fi
-    nft_setup_persistence
     if ! _pfwd_enforce_runtime_health; then
         _reset_change_flags
         msg_err "pfwd state refreshed but guard validation failed"
+        return 1
+    fi
+    if ! _pfwd_sync_maintenance_timer; then
+        _reset_change_flags
         return 1
     fi
     _pfwd_collect_state
@@ -8878,6 +8980,8 @@ cmd_refresh() {
 cmd_uninstall() {
     require_root "$0 uninstall"
     local target="${1:-}"
+    local marker_start="# pfwd-managed-start"
+    local marker_end="# pfwd-managed-end"
 
     case "$target" in
         nft|nftables)
@@ -8885,14 +8989,17 @@ cmd_uninstall() {
             ;;
         all)
             nft_flush_all
-            # Remove sysctl config
             if [[ -f "$SYSCTL_CONF" ]]; then
-                local marker_start="# pfwd-managed-start"
-                local marker_end="# pfwd-managed-end"
                 sed -i "/$marker_start/,/$marker_end/d" "$SYSCTL_CONF"
-                plat_sysctl_apply_file "$SYSCTL_CONF"
+                sed -i '/^net\.ipv4\.conf\.\(all\|default\)\.route_localnet *= *1$/d' "$SYSCTL_CONF"
+                if [[ -s "$SYSCTL_CONF" ]]; then
+                    plat_sysctl_apply_file "$SYSCTL_CONF"
+                else
+                    rm -f "$SYSCTL_CONF"
+                fi
             fi
-            rm -f "$SHORTCUT_LINK"
+            rm -f "$SHORTCUT_LINK" "$NF_FLOW_TABLE_MODULES_CONF"
+            _pfwd_safe_remove_installed_script
             rm -rf "$DATA_DIR"
             msg_ok "All pfwd components removed"
             ;;
@@ -9011,6 +9118,10 @@ parse_cli_args() {
         refresh)
             cmd_refresh
             ;;
+        domains|domain)
+            shift
+            cmd_domains "$@"
+            ;;
         stats|traffic)
             shift
             if [[ "${1:-}" == "--rate" ]]; then
@@ -9061,13 +9172,9 @@ parse_cli_args() {
         --version|-v)
             echo "pfwd v$VERSION"
             ;;
-        __restore-nft)
+        __maintenance)
             QUIET=true
-            cmd_internal_restore_nft
-            ;;
-        __traffic-collector)
-            QUIET=true
-            cmd_internal_traffic_collector
+            cmd_internal_maintenance
             ;;
         -q|--quiet)
             QUIET=true
@@ -9240,18 +9347,19 @@ interactive_menu() {
         echo -e "  ${DIM}── Service Control ──${NC}"
         echo -e "  ${CYAN}4)${NC} ${_fwd_label}"
         echo -e "  ${CYAN}5)${NC} Traffic statistics"
+        echo -e "  ${CYAN}6)${NC} Domain refresh"
         echo ""
         echo -e "  ${DIM}── Configuration ──${NC}"
-        echo -e "  ${CYAN}6)${NC} Import/Export config"
-        echo -e "  ${CYAN}7)${NC} Kernel optimization"
+        echo -e "  ${CYAN}7)${NC} Import/Export config"
+        echo -e "  ${CYAN}8)${NC} Kernel optimization"
         echo -e "  ${CYAN}d)${NC} ${_diag_label}"
         echo -e "  ${CYAN}h)${NC} Help / CLI cheatsheet"
         echo ""
         echo -e "  ${DIM}── System ──${NC}"
-        echo -e "  ${CYAN}8)${NC} ${RED}Uninstall${NC}"
+        echo -e "  ${CYAN}9)${NC} ${RED}Uninstall${NC}"
         echo -e "  ${CYAN}0)${NC} ${DIM}Exit${NC}"
         echo ""
-        read -rp "${CYAN}Select [0-8/d/h]:${NC} " choice
+        read -rp "${CYAN}Select [0-9/d/h]:${NC} " choice
 
         case "$choice" in
             1) menu_add_rule || true ;;
@@ -9259,9 +9367,10 @@ interactive_menu() {
             3) menu_delete_rule || true ;;
             4) menu_forward_control || true ;;
             5) menu_traffic_stats ;;
+            6) menu_domain_refresh || true ;;
             d|D) menu_diagnostics_repair || true ;;
-            6) menu_export_import || true ;;
-            7)
+            7) menu_export_import || true ;;
+            8)
                 local _opt_profile="balanced" _steer _egress_rate="" _ingress_rate="" _tc_iface=""
                 local _nic_steering=false _tc_iface_mode="auto"
                 _pfwd_collect_state
@@ -9288,7 +9397,7 @@ interactive_menu() {
                 esac
 
                 if [[ "$_kp" != "5" ]]; then
-                    read -rp "Enable persistent NIC steering? [y/N]: " _steer
+                    read -rp "Enable persistent software steering (RPS/XPS)? [y/N]: " _steer
                     [[ "$_steer" =~ ^[Yy]$ ]] && _nic_steering=true
 
                     msg_dim "  Egress shapes measured uplink/upload."
@@ -9341,7 +9450,7 @@ interactive_menu() {
                 fi
                 ;;
             h|H) show_help; wait_for_enter ;;
-            8) menu_uninstall || true ;;
+            9) menu_uninstall || true ;;
             0) echo "Bye."; exit 0 ;;
             *) msg_warn "Invalid choice"; sleep 1.5 ;;
         esac
@@ -9609,7 +9718,7 @@ menu_add_rule() {
         echo -e "    ${DIM}... and $(( ${#EXPANDED_RULES[@]} - 8 )) more${NC}"
     fi
     if [[ "$method" == "nft" && "$target_type" == "domain" ]]; then
-        echo -e "  ${DIM}nft will resolve the domain once during add/import.${NC}"
+        echo -e "  ${DIM}Domain stays in saved state and is re-resolved on refresh/start/maintenance.${NC}"
     fi
     if [[ "$method" == "nft" ]]; then
         if _nft_collect_add_conflicts "$target" "$ip_ver" "$proto" && (( ${#NFT_ADD_CONFLICTS[@]} > 0 )); then
@@ -9796,20 +9905,38 @@ menu_delete_rule() {
 }
 
 menu_list_rules() {
-    echo ""
-    echo -e "${BOLD}View Forwarding Rules${NC}"
-    echo -e "${DIM}$SEP_DASH_40${NC}"
-    echo -e "${DIM}Leave empty to show all rules, or enter a filter string (port / host / comment / option).${NC}"
-    echo ""
+    local parsed filter action
+    parsed=$(_nft_rules_for_display)
 
-    local filter=""
-    read -rp "Filter (optional): " filter
-    if [[ -n "$filter" ]]; then
-        cmd_list -f "$filter"
-    else
-        cmd_list
-    fi
-    wait_for_enter
+    while true; do
+        echo ""
+        echo -e "${BOLD}View Forwarding Rules${NC}"
+        echo -e "${DIM}$SEP_DASH_40${NC}"
+        echo ""
+        nft_list_rules "" "$parsed"
+        echo ""
+        echo -e "${DIM}Filter is display-only and does not change saved rules.${NC}"
+        read -rp "Action: [f]ilter, [r]efresh, [Enter] back: " action
+        action="${action,,}"
+        case "$action" in
+            f|filter)
+                read -rp "Filter (port / host / comment / option): " filter
+                [[ -z "$filter" ]] && continue
+                echo ""
+                nft_list_rules "$filter" "$parsed"
+                wait_for_enter
+                ;;
+            r|refresh)
+                parsed=$(_nft_rules_for_display)
+                ;;
+            "")
+                return
+                ;;
+            *)
+                msg_warn "Invalid choice"
+                ;;
+        esac
+    done
 }
 
 # menu_export_import - interactive import/export

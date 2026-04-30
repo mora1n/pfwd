@@ -1,263 +1,154 @@
-# pfwd - Port Forwarding Tool
+# pfwd
 
-A streamlined port forwarding management tool focused on **nftables** with flowtable fast path acceleration.
+VPS-friendly port forwarding with **nftables**, domain targets, traffic stats,
+and practical kernel tuning helpers.
 
-## Features
+`pfwd` is a single Bash script for quickly creating and maintaining DNAT
+forwarding rules. It keeps the rule state in one local file, rebuilds nftables
+from that state, and provides an interactive menu for common operations.
 
-- **nftables forwarding** with flowtable fast path offloading for minimal CPU overhead
-- **Shortcut syntax** — `pfwd 8080 1.2.3.4` just works
-- **Safe conflict handling** — duplicate nft port/protocol/IP-family rules are rejected unless you pass `--replace`
-- **Flexible port syntax** — single ports, ranges, mappings, mixed formats
-- **Manual IPv4/IPv6 control** (`-4`, `-6`, `-46`)
-- **CLI + Interactive menu** with numbered rules and color coding
-- **Rule filtering and traffic stats** — `pfwd list -f <pattern>`, `pfwd stats`, `pfwd stats --rate`
-- **Collector interval control** — `pfwd stats --interval [30s|1m|5m|10m|30m|1h]`
-- **First-run shortcut install** — running from a persistent path as root auto-creates `/usr/local/bin/pfwd`
-- **Kernel optimization profiles** — balanced / gaming / lowmem / relay, with kernel preflight and post-apply verification
-- **Persistent optimize runtime state** — `pfwd optimize` now restores BQL / NIC steering / tc shaping on `refresh` and boot restore
-- **Backup/Import/Export** in JSON format (current v3 schema)
-- **Boot persistence** via systemd services
-- **`--no-color` / `--no-clear`** modes for scripting
+## Overview
+
+- nftables DNAT forwarding with software flowtable fast path where supported.
+- Simple shortcut syntax: `pfwd 8080 1.2.3.4 80`.
+- TCP, UDP, dual-stack, port ranges, port mappings, comments, MSS, and SNAT.
+- Domain forwarding rules that re-resolve on refresh/start/maintenance.
+- Rule-level traffic statistics from conntrack state.
+- Import/export with JSON backups.
+- Optional kernel optimization profiles for VPS forwarding workloads.
+
+## Install
+
+```bash
+curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd.sh
+chmod +x /usr/local/bin/pfwd.sh
+
+# First root run installs the shortcut: /usr/local/bin/pfwd
+/usr/local/bin/pfwd.sh
+```
+
+After that, use:
+
+```bash
+pfwd
+```
 
 ## Quick Start
 
 ```bash
-# Install from a persistent path
-curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd.sh && chmod +x /usr/local/bin/pfwd.sh
-
-# First root run will auto-create /usr/local/bin/pfwd -> /usr/local/bin/pfwd.sh
-/usr/local/bin/pfwd.sh
-
-# Interactive mode
-pfwd
-
-# Shortcut (auto nft)
+# Forward local 8080 to 1.2.3.4:8080
 pfwd 8080 1.2.3.4
+
+# Forward local 8080 to 1.2.3.4:80
+pfwd 8080 1.2.3.4 80
+
+# Forward multiple ports
 pfwd 80,443 1.2.3.4
+
+# Forward a domain target
+pfwd 443 example.com
+
+# Replace an existing rule for the same port/protocol/IP family
 pfwd 8080 1.2.3.4 --replace
 
-# Full syntax
-pfwd -m nft -t 1.2.3.4 80,443,8080-8090
+# Open the interactive menu
+pfwd
 ```
 
-## Usage
+## Common Commands
 
-```
-pfwd [command] [options] [rules...]
+| Task | Command |
+|------|---------|
+| Add full-syntax rule | `pfwd -m nft -t 1.2.3.4 80,443` |
+| Add TCP + UDP | `pfwd -m nft -t 1.2.3.4 --both 443` |
+| Add IPv4-only rule | `pfwd -m nft -4 -t 1.2.3.4 443` |
+| Map local to remote port | `pfwd 33389 1.2.3.4 3389` |
+| List rules | `pfwd list` |
+| Filter displayed rules | `pfwd list -f 8080` |
+| Delete rule | `pfwd del -m nft 8080` |
+| Rebuild from saved state | `pfwd refresh` |
+| Start / stop forwarding | `pfwd start` / `pfwd stop` |
+| Show status | `pfwd status` |
+| Run diagnostics | `pfwd doctor` |
+| Probe TCP backends | `pfwd doctor --tcp-probe` |
+| Show traffic totals | `pfwd stats` |
+| Show traffic rate | `pfwd stats --rate` |
+| Export backup | `pfwd export backup.json` |
+| Import backup | `pfwd import backup.json` |
+| Uninstall nft state | `pfwd uninstall nft` |
 
-Commands:
-  (none/add)  Add forwarding rules (default)
-  del         Delete forwarding rules
-  list        List all forwarding rules
-  status      Show running status and rule counts
-  doctor      Run forwarding diagnostics
-  refresh     Re-resolve targets and rebuild nftables from saved state
-  start/stop/restart  Control forwarding (nft / all)
-  stats       Traffic statistics
-  export      Export config to JSON
-  import      Import config from JSON
-  uninstall   Uninstall (nftables / all)
-  optimize    Kernel optimization with preflight + verify [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate <rate>] [--ingress-rate <rate>] [--tc-iface <iface>]
-  help        Show help
-```
+Run `pfwd help` for the full CLI reference.
 
-### Add Rules
+## Port Formats
+
+| Format | Example |
+|--------|---------|
+| Single port | `80` |
+| Multiple ports | `80,443` |
+| Port range | `8080-8090` |
+| Port mapping | `33389:3389` |
+| Range mapping | `8080-8090:3080-3090` |
+| Mixed | `80,443,8080-8090,33389:3389` |
+
+## Advanced Usage
 
 ```bash
-pfwd -m nft -t <target> [options] <ports>
+# Domain rules stay as hostnames in state and are re-resolved on refresh/start.
+pfwd domains list
+pfwd domains update
+pfwd domains interval 5m
+pfwd domains status
 
-# Or shortcut (defaults to nft):
-pfwd <ports> <target> [target_port]
-```
+# MSS / SNAT options
+pfwd -m nft -t 10.0.0.2 --mss-clamp 443
+pfwd -m nft -4 -t 10.0.0.2 --snat-source 192.168.1.2 9443:443
 
-| Option | Description |
-|--------|-------------|
-| `-m, --method` | `nft` only (required) |
-| `-t, --target` | Target IP or domain (required) |
-| `-4` / `-6` / `-46` | IPv4 only / IPv6 only / Dual-stack (default) |
-| `--tcp` / `--udp` / `--both` | Protocol selection (default: tcp) |
-| `--replace` | nft only: replace an existing rule for the same local port/protocol/IP family |
-| `--mss-clamp` / `--mss <value>` | nft only: clamp to PMTU or set a fixed TCP MSS |
-| `--snat-source <addr>` / `--masquerade` | nft only: fixed SNAT source or default masquerade (`--snat-source` auto-switches `-46` to the matching family) |
-| `--nic-steering` | optimize only: persist RPS/XPS/RFS hints on inferred forwarding NICs |
-| `--egress-rate <rate>` / `--ingress-rate <rate>` | optimize only: persist tc shaping (`95mbit`, `100Mbps`, `12.5MB/s`, `95%`) |
-| `--tc-iface <iface>` | optimize only: override the default-route NIC used for tc shaping |
-| `-c, --comment` | Single-line comment (tabs/newlines rejected) |
-| `-q, --quiet` | Quiet mode |
-| `--no-color` | Disable colored output |
-| `--no-clear` | Don't clear screen in interactive menu |
-
-Interactive mode note:
-
-- Fixed SNAT is single-stack; if you leave IP version at `-46`, `pfwd` auto-switches to IPv4 or IPv6 based on the SNAT source address.
-- After you choose fixed SNAT, `pfwd` prefers route `advmss`, then route MTU, then link MTU when suggesting a fixed MSS from the smaller source-side/backend-side path.
-- The suggestion remains informational; you still choose `Off`, `Clamp to PMTU`, or `Fixed MSS`.
-
-### Port Formats
-
-| Format | Example | Description |
-|--------|---------|-------------|
-| Single port | `80` | Forward port 80 |
-| Multiple ports | `80,443` | Forward ports 80 and 443 |
-| Port range | `8080-8090` | Forward ports 8080 through 8090 |
-| Port mapping | `33389:3389` | Forward local 33389 to remote 3389 |
-| Range mapping | `8080-8090:3080-3090` | Map local range to remote range |
-| Mixed | `80,443,8080-8090,33389:3389` | Combine any formats |
-
-### Examples
-
-```bash
-# Add
-pfwd 8080 1.2.3.4 80
-pfwd -m nft -t 1.2.3.4 -4 --both 80 443 8080-8090
-pfwd -m nft -t 2.2.2.2 --replace 33389:3389
-pfwd -m nft -4 -t 2.2.2.2 --snat-source 192.168.1.2 9443:443
-
-# Delete
-pfwd del -m nft 3389
-pfwd del -m nft 80,443,8080-8082
-
-# List / Filter
-pfwd list
-pfwd list -f 8080
-
-# Fixed SNAT rules show `snat:<source>` in the Options column
-
-# Traffic
-pfwd doctor
-pfwd doctor --tcp-probe
-pfwd doctor --tcp-probe --probe-timeout 5
-pfwd refresh
-pfwd stats
-pfwd stats --rate
-pfwd stats --interval
-pfwd stats --interval 1m
-
-# Kernel optimization
-pfwd optimize              # balanced (default) + prints preflight/recommendation
-pfwd optimize gaming       # low latency
-pfwd optimize lowmem       # for small VPS
-pfwd optimize relay        # relay-focused forwarding tuning
-pfwd optimize balanced --nic-steering  # persist queue steering on inferred NICs
-pfwd optimize balanced --egress-rate 100mbit
-pfwd optimize balanced --egress-rate 100Mbps   # common alias, normalized as bit-rate
-pfwd optimize balanced --egress-rate 12.5MB/s  # explicit byte/sec input
-pfwd optimize balanced --egress-rate 95%       # percentage of device speed
+# Kernel tuning profiles
+pfwd optimize
+pfwd optimize lowmem
+pfwd optimize relay
+pfwd optimize balanced --nic-steering
 pfwd optimize balanced --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
-
-# Export/Import
-pfwd export ~/backup.json
-pfwd import ~/backup.json
 ```
 
 Notes:
 
-- Import/export use the current v3 JSON schema with `forward_rules` for nft rules.
-- `pfwd import` only accepts local JSON files; download remote backups first if needed.
-- `pfwd import` rejects backups that contain non-nft rule kinds.
-- Exported rules keep SNAT/MSS/comment data in `options`, and also write flat compatibility fields such as `snat_mode` / `snat_source`.
-- `pfwd` now treats `/var/lib/pfwd/rules.v1.tsv` as the source of truth; `refresh`/`start` rebuild nftables from saved state.
-- `start` / `restart` / `refresh` now re-check managed iptables/UFW guard state after rebuild and fail fast if automatic repair cannot make it healthy.
-- Domain targets stay in saved state as hostnames and are re-resolved on `refresh`, `start`, and each ruleset change.
-- `pfwd optimize` prints kernel capability preflight, skips unsupported sysctl keys, and verifies the live result.
-- `pfwd optimize` persists runtime optimize state in `/var/lib/pfwd/optimize.v1.env`, and `refresh` / boot restore reapplies BQL, NIC steering, and tc shaping after nftables rebuild.
-- `--nic-steering` is explicit opt-in and now persists queue-level `rps_cpus` / `rps_flow_cnt` / `xps_cpus` when the inferred NIC exposes those sysfs knobs.
-- tc shaping is explicit-rate only: without `--egress-rate` / `--ingress-rate`, optimize prints a visible skip message and does not attach qdiscs.
-- Rate inputs accept tc-native bit-rate values, percentages, explicit byte/sec forms, and common aliases such as `100Mbps` / `100M`; aliases are interpreted as bit-rate and normalized before persistence.
-- Use measured Internet bottleneck speed for shaping suggestions, not the NIC link speed shown by `ethtool`.
-- Suggested starting points: `egress` = about `95%` of measured uplink, `ingress` = about `92%` of measured downlink. If queueing is still obvious, try `egress=90%` and `ingress=85%-90%`.
-- The interactive menu now covers the high-frequency CLI operations as well: filtered `list`, forwarding control (`start` / `refresh` / `restart` / `stop`), and diagnostics/repair (`status`, `doctor`, `doctor --tcp-probe`, `verify`, `fix-ufw`).
-- `pfwd status` and the interactive `Kernel optimization` page now show the applied optimize profile separately from the recommended profile.
-- `pfwd` detects newer performance kernels such as XanMod, but does not install or switch kernels for you.
-- `pfwd` does not manage legacy TCP accelerator stacks such as Lotserver/ServerSpeeder.
-- Legacy traffic cache records are ignored; the next collector run rewrites state in the current format if needed.
-- `pfwd list` shows fixed SNAT rules in the `Options` column and keeps a detailed SNAT section for long addresses.
-- `pfwd status` shows degraded runtime guard state directly, including managed FORWARD exceptions and UFW persistence.
-- `pfwd doctor --tcp-probe` adds active TCP backend probes so you can distinguish `connect ok`, `connection refused`, and `timeout`.
-- Rule comments must be single-line text, and `jq` is required for import/export.
-- For tests, set `PFWD_ROOT_PREFIX` to redirect managed `/etc`, `/var/lib`, `/root`, and `/usr/local/bin` paths into a temporary tree.
-
-## Method
-
-### nftables (with flowtable)
-
-Kernel-level DNAT forwarding with flowtable fast path acceleration. Established connections are offloaded to the ingress hook, bypassing the entire netfilter stack.
-
-Requires Linux kernel >= 4.16 and `nf_flow_table` module. pfwd auto-detects, loads, and persists the module, falling back gracefully if unavailable.
-
-When `conntrack` is available, `pfwd doctor` can inspect live `[OFFLOAD]` and `[HW_OFFLOAD]` tags instead of relying on extra hot-path nft counters.
-When `ethtool` is available, `pfwd doctor` / `pfwd status` also summarize NIC RSS (`rx-hashing`) and `hw-tc-offload` readiness alongside software queue steering state.
-
-For larger mixed-backend rulesets, pfwd now prefers a DNAT map renderer and falls back to the legacy per-rule renderer only when the local nftables validator rejects the generated map syntax.
-For repeated fixed-SNAT actions, pfwd now prefers a postrouting SNAT map renderer; masquerade entries still use grouped postrouting rules, and both paths fall back to legacy per-rule postrouting when newer rendering is rejected locally.
-For repeated TCP MSS handling, pfwd also prefers grouped forward rules and falls back to legacy per-backend MSS rules when grouped rendering is rejected locally.
-
-Best for: IP-based targets, maximum performance.
-
-## Traffic Statistics
-
-- Statistics are collected out of band from conntrack state, not from per-rule nft counters.
-- When `conntrack` is unavailable, pfwd falls back to `/proc/net/nf_conntrack`.
-- The collector stores accumulated per-rule inbound / outbound totals and a lightweight flow snapshot for delta calculation.
-- Traffic history is keyed by full rule identity (`proto/ipver/lport/target/tport`), so reusing a local port for a new backend does not inherit old counters.
-- Flowtable-accelerated connections remain visible through conntrack accounting, so stats keep working without putting counters back on the forwarding path.
-- `pfwd doctor` prefers conntrack offload tags over nft hot-path counters for flowtable observability.
-
-## Performance
-
-| Feature | Description |
-|---------|-------------|
-| State-driven apply | `/var/lib/pfwd/rules.v1.tsv` is rendered into nftables atomically |
-| Flowtable fast path | Established DNAT flows are offloaded to ingress; live `[OFFLOAD]` / `[HW_OFFLOAD]` visibility comes from conntrack |
-| DNAT map renderer | Mixed-backend prerouting rules can collapse into per-proto/per-family maps with automatic legacy fallback |
-| Postrouting SNAT map renderer | Fixed-SNAT postrouting rules collapse into per-proto/per-family maps; masquerade entries still use grouped rules, all with automatic fallback |
-| Grouped MSS renderer | Repeated TCP MSS clamp/fixed actions collapse into grouped forward `daddr . tcp dport` rules with automatic legacy fallback |
-| Observer-only stats | Traffic collection avoids per-rule nft counters and hot-path helper rules |
-| Port aggregation | Same-backend rules are grouped into nft port sets / intervals where possible |
-| Atomic apply + batch mode | Saved config is replaced atomically, and bulk add/delete defers rebuild and reload to end |
-| nft output cache | TTL-based cache avoids redundant `nft list` calls |
-| Protocol/IP sharding | Per-protocol and per-IP-version subchains reduce hot-path scans |
-| Persistent optimize runtime | `pfwd optimize` can persist BQL, queue steering, and tc shaping so `refresh` / boot restore reapplies them after nftables rebuild |
-| Pure-bash format_bytes | No awk fork for human-readable byte formatting |
-| BBR + TCP tuning | Optimized congestion control and buffers |
+- Saved forwarding rules live in `/var/lib/pfwd/forward-rules.tsv`.
+- `refresh`, `start`, and periodic maintenance rebuild nftables from saved state.
+- The maintenance timer starts automatically only after forwarding rules are active.
+- Domain rules do not use a separate database or daemon.
+- Dynamic domain commands ignore localhost-style static hostnames.
+- Traffic stats are collected out of band from conntrack, not nft hot-path counters.
+- Import/export uses the current JSON v3 schema with `forward_rules`.
+- Current versions only read the active runtime state file.
+- Hardware NIC offload is not required; the default target is portable VPS/cloud forwarding.
 
 ## File Locations
 
 | File | Purpose |
 |------|---------|
-| `/var/lib/pfwd/rules.v1.tsv` | pfwd source-of-truth state file |
-| `/etc/nftables.d/port_forward.nft` | nftables persistent rules |
-| `/root/.pfwd_backup/nftables_*.nft` | nftables rule backups (last 5) |
-| `/etc/systemd/system/pfwd-nft-restore.service` | nftables boot restore service (calls `pfwd __restore-nft`) |
-| `/etc/systemd/system/pfwd-traffic-save.service` | traffic collector service |
-| `/etc/systemd/system/pfwd-traffic-save.timer` | traffic collector timer |
-| `/var/lib/pfwd/traffic_stats.dat` | accumulated traffic counters |
-| `/var/lib/pfwd/traffic_flows.dat` | last collector flow snapshot for delta calculation |
-| `/etc/sysctl.d/99-pfwd.conf` | kernel optimizations |
-| `/var/lib/pfwd/optimize.v1.env` | persisted optimize runtime state for BQL / steering / tc shaping |
-| `/var/lib/pfwd/` | backup files and runtime state |
+| `/usr/local/bin/pfwd.sh` | installed script |
+| `/usr/local/bin/pfwd` | shortcut command |
+| `/var/lib/pfwd/forward-rules.tsv` | forwarding rules |
+| `/etc/systemd/system/pfwd.service` / `pfwd.timer` | maintenance service and timer |
+| `/etc/sysctl.d/99-pfwd.conf` | pfwd-managed sysctl tuning |
 
 ## Requirements
 
-- Linux with root access
-- Core forwarding tools:
-  - `nftables` (`nft`)
-  - `iproute2` / `iproute` (`ip`)
-- Feature-specific tool:
-  - `jq` (required for import/export)
-- Recommended tool:
-  - `conntrack` / `conntrack-tools` (preferred traffic stats backend; otherwise pfwd falls back to `/proc/net/nf_conntrack`)
-- Linux kernel >= 4.16 (for flowtable; older kernels fall back to standard forwarding)
+- Linux with root access.
+- `nftables` (`nft`)
+- `iproute2` / `iproute` (`ip`)
+- `jq` for import/export.
+- `conntrack` / `conntrack-tools` recommended for traffic stats.
+- Linux kernel >= 4.16 recommended for flowtable acceleration.
 
-On the first non-internal run, `pfwd` checks the tools above once and prints a distro-matched install hint if any are missing.
-
-Common package install commands:
+Package examples:
 
 | Distro | Command |
 |--------|---------|
 | Debian / Ubuntu | `apt-get install -y nftables iproute2 jq conntrack` |
 | Fedora / Rocky / Alma / Amazon Linux / Oracle Linux | `dnf install -y nftables iproute jq conntrack-tools` |
-| CentOS / RHEL (legacy) | `yum install -y nftables iproute jq conntrack-tools` |
+| CentOS / RHEL | `yum install -y nftables iproute jq conntrack-tools` |
 | openSUSE / SUSE | `zypper install -y nftables iproute2 jq conntrack-tools` |
 | Arch Linux | `pacman -Sy --needed nftables iproute2 jq conntrack-tools` |
 | Alpine | `apk add nftables iproute2 jq conntrack-tools` |
