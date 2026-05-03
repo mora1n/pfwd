@@ -15,7 +15,7 @@ set -euo pipefail
 #  Section 1: Constants, Platform Adapters & Serialization
 #===============================================================================
 
-readonly VERSION="2.1.8"
+readonly VERSION="2.1.9"
 
 pfwd_path() {
     local path="$1"
@@ -35,18 +35,16 @@ pfwd_path() {
 # Paths
 readonly DATA_DIR="$(pfwd_path /var/lib/pfwd)"
 readonly RULES_STATE_FILE="$DATA_DIR/forward-rules.tsv"
-readonly NFT_RENDER_TMP_TARGET="$DATA_DIR/rendered.nft"
+readonly PFWD_TMP_ANCHOR="$DATA_DIR/.tmp"
 readonly PFWD_SERVICE="$(pfwd_path /etc/systemd/system/pfwd.service)"
 readonly PFWD_TIMER="$(pfwd_path /etc/systemd/system/pfwd.timer)"
 readonly SYSCTL_CONF="$(pfwd_path /etc/sysctl.d/99-pfwd.conf)"
 readonly UFW_BEFORE_RULES="$(pfwd_path /etc/ufw/before.rules)"
 readonly UFW_BEFORE6_RULES="$(pfwd_path /etc/ufw/before6.rules)"
-readonly TRAFFIC_DATA="$DATA_DIR/traffic_stats.dat"
-readonly TRAFFIC_FLOW_DATA="$DATA_DIR/traffic_flows.dat"
+readonly TRAFFIC_STATE_FILE="$DATA_DIR/traffic.state"
 readonly TRAFFIC_DEFAULT_INTERVAL="1m"
 readonly MAINTENANCE_DEFAULT_INTERVAL="$TRAFFIC_DEFAULT_INTERVAL"
-readonly TRAFFIC_DATA_VERSION="4"
-readonly TRAFFIC_FLOW_VERSION="2"
+readonly TRAFFIC_STATE_VERSION="5"
 readonly EXPORT_FORMAT_VERSION="3"
 readonly OPTIMIZE_STATE_FILE="$DATA_DIR/optimize.v1.env"
 readonly OPTIMIZE_STATE_VERSION="1"
@@ -889,7 +887,7 @@ _pfwd_collect_state() {
         fi
     fi
 
-    PFWD_TRAFFIC_INTERVAL=$(traffic_current_interval)
+    PFWD_TRAFFIC_INTERVAL=$(maintenance_current_interval)
     PFWD_TRAFFIC_BACKEND=$(traffic_stats_backend)
     _pfwd_kernel_collect_facts
     _pfwd_collect_applied_optimize_state
@@ -1304,18 +1302,27 @@ _pfwd_domain_counts_tsv() {
     printf '%s\t%s\n' "$(awk 'END { print NR+0 }' <<< "$domains")" "$unresolved"
 }
 
-_pfwd_maintenance_timer_state() {
-    [[ -f "$PFWD_TIMER" ]] || {
+_pfwd_systemd_unit_state() {
+    local unit="$1" unit_file="$2"
+    [[ -f "$unit_file" ]] || {
         echo "missing"
         return 0
     }
-    if plat_systemctl_is_active pfwd.timer; then
+    if plat_systemctl_is_active "$unit"; then
         echo "active"
-    elif plat_systemctl_is_enabled pfwd.timer; then
+    elif plat_systemctl_is_enabled "$unit"; then
         echo "enabled"
     else
         echo "disabled"
     fi
+}
+
+_pfwd_maintenance_timer_state() {
+    _pfwd_systemd_unit_state pfwd.timer "$PFWD_TIMER"
+}
+
+_pfwd_boot_service_state() {
+    _pfwd_systemd_unit_state pfwd.service "$PFWD_SERVICE"
 }
 
 _pfwd_running_target_for_rule() {
@@ -1397,7 +1404,7 @@ cmd_domains() {
             echo -e "  domains:    ${CYAN}${total}${NC} total, ${CYAN}${unresolved}${NC} unresolved"
             echo -e "  interval:   ${CYAN}$(maintenance_current_interval)${NC}"
             echo -e "  timer:      ${timer_state}"
-            echo -e "  service:    $([[ -f "$PFWD_SERVICE" ]] && echo present || echo missing)"
+            echo -e "  service:    $(_pfwd_boot_service_state)"
             ;;
         *)
             msg_err "Usage: pfwd domains [list|update|interval [30s|1m|5m|10m|30m|1h]|status]"
@@ -1940,10 +1947,6 @@ _pfwd_runtime_dnat_renderer() {
     _pfwd_dnat_renderer_mode_from_text "$(_nft_cached_chains_concat prerouting $(_pfwd_subchain_list prerouting) || true)"
 }
 
-_pfwd_saved_dnat_renderer() {
-    echo "none"
-}
-
 _pfwd_postrouting_renderer_mode_from_text() {
     local text="${1:-}"
     if grep -Eq 'snat to ip6? daddr \. (tcp|udp) dport map @pfwd_snat_v' <<< "$text"; then
@@ -1963,10 +1966,6 @@ _pfwd_runtime_postrouting_renderer() {
         return 0
     fi
     _pfwd_postrouting_renderer_mode_from_text "$(_nft_cached_chains_concat postrouting $(_pfwd_subchain_list postrouting) || true)"
-}
-
-_pfwd_saved_postrouting_renderer() {
-    echo "none"
 }
 
 _pfwd_snat_snapshot_key() {
@@ -1991,10 +1990,6 @@ _pfwd_runtime_mss_renderer() {
         return 0
     fi
     _pfwd_mss_renderer_mode_from_text "$(_nft_cached_chains_concat forward $(_pfwd_subchain_list forward) || true)"
-}
-
-_pfwd_saved_mss_renderer() {
-    echo "none"
 }
 
 _pfwd_postrouting_group_keys_tsv() {
@@ -2361,7 +2356,7 @@ pfwd_apply_saved_state() {
     if [[ -z "$rules" ]]; then
         plat_nft_delete_table $NFT_TABLE || true
         _nft_invalidate_cache
-        rm -f "$NFT_RENDER_TMP_TARGET"
+        rm -f "$PFWD_TMP_ANCHOR"
         sync_managed_firewall_state "" || return 1
         ufw_reload_if_enabled || true
         return 0
@@ -2380,7 +2375,7 @@ pfwd_apply_saved_state() {
         for dnat_renderer in $(_pfwd_dnat_render_modes); do
             for postrouting_renderer in $(_pfwd_postrouting_render_modes); do
                 for mss_renderer in $(_pfwd_mss_render_modes); do
-                    candidate_file=$(_mktemp_in_dir "$NFT_RENDER_TMP_TARGET") || return 1
+                    candidate_file=$(_mktemp_in_dir "$PFWD_TMP_ANCHOR") || return 1
                     if ! _pfwd_render_nft_config "$runtime_rules" "$candidate_file" "$flow_mode" "$devices_csv" "$dnat_renderer" "$postrouting_renderer" "$mss_renderer"; then
                         rm -f "$candidate_file" 2>/dev/null || true
                         continue
@@ -2418,7 +2413,7 @@ pfwd_apply_saved_state() {
     }
 
     _NFT_BACKUP_NEEDED=false
-    rm -f "$NFT_RENDER_TMP_TARGET" 2>/dev/null || true
+    rm -f "$PFWD_TMP_ANCHOR" 2>/dev/null || true
     _nft_invalidate_cache
     if awk -F'\t' '$4 ~ /^127\./ || $4 == "::1" { found=1 } END { exit(found ? 0 : 1) }' <<< "$rules"; then
         ensure_route_localnet
@@ -2441,10 +2436,6 @@ maintenance_validate_interval() {
     esac
 }
 
-traffic_validate_interval() {
-    maintenance_validate_interval "$@"
-}
-
 maintenance_current_interval() {
     local interval=""
     if [[ -f "$PFWD_TIMER" ]]; then
@@ -2455,10 +2446,6 @@ maintenance_current_interval() {
     else
         echo "$MAINTENANCE_DEFAULT_INTERVAL"
     fi
-}
-
-traffic_current_interval() {
-    maintenance_current_interval
 }
 
 maintenance_write_timer_unit() {
@@ -2485,10 +2472,6 @@ EOF
     _atomic_replace_file "$timer_tmp" "$PFWD_TIMER" 0644
 }
 
-traffic_write_timer_unit() {
-    maintenance_write_timer_unit "$@"
-}
-
 maintenance_configure_interval() {
     local interval="$1"
     require_root "$0 domains interval $interval"
@@ -2506,46 +2489,35 @@ maintenance_configure_interval() {
     msg_ok "Maintenance interval set to $interval"
 }
 
-traffic_configure_interval() {
-    maintenance_configure_interval "$@"
-}
-
 _traffic_delete_records() {
     local scope="$1" key1="${2:-}" key2="${3:-}" key3="${4:-}" key4="${5:-}" key5="${6:-}"
-    local filepath tmp_file
-    for filepath in "$TRAFFIC_DATA" "$TRAFFIC_FLOW_DATA"; do
-        [[ -f "$filepath" ]] || continue
-        tmp_file=$(_mktemp_in_dir "$filepath") || return 1
+    local tmp_file
+    [[ -f "$TRAFFIC_STATE_FILE" ]] || return 0
+    tmp_file=$(_mktemp_in_dir "$TRAFFIC_STATE_FILE") || return 1
 
-        awk -F'|' -v scope="$scope" -v key1="$key1" -v key2="$key2" -v key3="$key3" -v key4="$key4" -v key5="$key5" '
-            function keep_line() {
-                print $0
-            }
-            scope == "nft_rule" {
-                if (($2 == "nft_rule" || $2 == "nft_flow") && $3 == key1 && $4 == key2 && $5 == key3) {
-                    if (($1 == "v4" || $1 == "v2") && $6 == key4 && $7 == key5) next
-                    if ($1 != "v4" && $1 != "v2") next
-                }
-                if ($1 == key1 && $2 == key2 && $3 == key3 && (NF == 7 || NF == 9)) next
-                keep_line()
-                next
-            }
-            scope == "nft_port" {
-                if (($2 == "nft_rule" || $2 == "nft_flow") && $4 == key1 && (key2 == "both" || $3 == key2)) next
-                if ((NF == 7 || NF == 9) && $2 == key1 && (key2 == "both" || $1 == key2)) next
-                keep_line()
-                next
-            }
-            scope == "nft_all" {
-                if ($2 == "nft_rule" || $2 == "nft_flow" || NF == 7 || NF == 9) next
-                keep_line()
-                next
-            }
-            { keep_line() }
-        ' "$filepath" > "$tmp_file"
+    awk -F'|' -v scope="$scope" -v key1="$key1" -v key2="$key2" -v key3="$key3" -v key4="$key4" -v key5="$key5" '
+        function keep_line() {
+            print $0
+        }
+        scope == "nft_rule" {
+            if (($2 == "nft_rule" || $2 == "nft_flow") && $3 == key1 && $4 == key2 && $5 == key3 && $6 == key4 && $7 == key5) next
+            keep_line()
+            next
+        }
+        scope == "nft_port" {
+            if (($2 == "nft_rule" || $2 == "nft_flow") && $4 == key1 && (key2 == "both" || $3 == key2)) next
+            keep_line()
+            next
+        }
+        scope == "nft_all" {
+            if ($2 == "nft_rule" || $2 == "nft_flow") next
+            keep_line()
+            next
+        }
+        { keep_line() }
+    ' "$TRAFFIC_STATE_FILE" > "$tmp_file"
 
-        _atomic_replace_file "$tmp_file" "$filepath" 0644
-    done
+    _atomic_replace_file "$tmp_file" "$TRAFFIC_STATE_FILE" 0644
 }
 
 _pfwd_safe_remove_installed_script() {
@@ -2623,8 +2595,7 @@ PFWD_UFW_PERSISTENCE_STATE="n/a"
 PFWD_RUNTIME_HEALTH_DEGRADED=false
 _TRAFFIC_SNAPSHOT_RULES=""
 _TRAFFIC_SNAPSHOT_FLOWS=""
-_TRAFFIC_DATA_WARNED=false
-_TRAFFIC_FLOW_WARNED=false
+_TRAFFIC_STATE_WARNED=false
 
 # Network detection cache
 _NET_CACHE_TIME=0
@@ -6923,13 +6894,13 @@ nft_flush_all() {
     sync_managed_iptables_accept_rules ""
     ufw_sync_loopback_dnat_rules
     ufw_reload_if_enabled
-    rm -f "$NFT_RENDER_TMP_TARGET"
+    rm -f "$PFWD_TMP_ANCHOR"
     _traffic_delete_records nft_all
 
     plat_systemctl_stop pfwd.timer
     plat_systemctl_disable pfwd.timer
     rm -f "$PFWD_SERVICE" "$PFWD_TIMER"
-    rm -f "$TRAFFIC_DATA" "$TRAFFIC_FLOW_DATA" "$RULES_STATE_FILE"
+    rm -f "$TRAFFIC_STATE_FILE" "$RULES_STATE_FILE"
     _pfwd_state_discard_batch
     plat_systemctl_daemon_reload
     msg_ok "nftables rules and persistence removed"
@@ -6957,12 +6928,12 @@ nft_setup_persistence() {
     local script_path service_tmp
     script_path="$SCRIPT_PATH"
 
-    # Create one maintenance service. It refreshes domain targets from saved state
-    # and persists traffic stats without a separate domain daemon/config.
+    # The service restores saved rules at boot and is also triggered by the
+    # timer for periodic domain refresh and traffic snapshots.
     service_tmp=$(_mktemp_in_dir "$PFWD_SERVICE") || return 1
     cat > "$service_tmp" << EOF
 [Unit]
-Description=pfwd maintenance (domain refresh and traffic statistics)
+Description=pfwd boot restore and maintenance
 After=network-online.target nftables.service systemd-sysctl.service ufw.service
 Wants=network-online.target
 
@@ -6978,19 +6949,19 @@ EOF
     maintenance_write_timer_unit "$(maintenance_current_interval)" || return 1
 
     plat_systemctl_daemon_reload
-    plat_systemctl_disable pfwd.service
 }
 
 _pfwd_sync_maintenance_timer() {
     if _pfwd_has_active_forwarding_rules; then
         nft_setup_persistence || return 1
+        plat_systemctl_enable pfwd.service
         plat_systemctl_enable_now pfwd.timer
-        msg_dim "  Maintenance timer enabled (active forwarding rules present)"
+        msg_dim "  Boot restore service and maintenance timer enabled (active forwarding rules present)"
     else
         plat_systemctl_stop pfwd.timer
         plat_systemctl_disable pfwd.timer
         plat_systemctl_disable pfwd.service
-        msg_dim "  Maintenance timer disabled (no active forwarding rules)"
+        msg_dim "  Boot restore service and maintenance timer disabled (no active forwarding rules)"
     fi
 }
 #===============================================================================
@@ -7043,30 +7014,31 @@ cmd_internal_maintenance() {
     local merged_rows="$_TRAFFIC_SNAPSHOT_RULES"
     [[ -n "$merged_rows" ]] && merged_rows=$(_traffic_rule_totals_tsv merged "$_TRAFFIC_SNAPSHOT_RULES" "$_TRAFFIC_SNAPSHOT_FLOWS")
 
-    local traffic_tmp flow_tmp current_in current_out
-    traffic_tmp=$(_mktemp_in_dir "$TRAFFIC_DATA") || return 1
-    flow_tmp=$(_mktemp_in_dir "$TRAFFIC_FLOW_DATA") || return 1
-    : > "$flow_tmp"
+    _pfwd_write_traffic_state "$merged_rows" "$_TRAFFIC_SNAPSHOT_FLOWS"
+}
 
-    local flow_id rule_key proto lport ipver target tport comment total_bytes
-    while IFS=$'\t' read -r flow_id rule_key current_in current_out; do
-        [[ -z "$flow_id" || -z "$rule_key" ]] && continue
-        IFS='|' read -r proto lport ipver target tport <<< "$rule_key"
-        printf 'v%s|nft_flow|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$TRAFFIC_FLOW_VERSION" "$proto" "$lport" "$ipver" "$target" "$tport" "$flow_id" "$current_in" "$current_out" >> "$flow_tmp"
-    done <<< "$_TRAFFIC_SNAPSHOT_FLOWS"
+_pfwd_write_traffic_state() {
+    local rule_rows="$1" flow_rows="$2"
+    local tmp_file current_in current_out flow_id rule_key proto lport ipver target tport
+    tmp_file=$(_mktemp_in_dir "$TRAFFIC_STATE_FILE") || return 1
+    : > "$tmp_file"
 
-    : > "$traffic_tmp"
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         _parse_rule_key_totals_tsv "$line"
         [[ -n "$RULETOTAL_ROW_KEY" ]] || continue
         printf 'v%s|nft_rule|%s|%s|%s|%s|%s|%s|%s\n' \
-            "$TRAFFIC_DATA_VERSION" "$RULETOTAL_ROW_PROTO" "$RULETOTAL_ROW_LPORT" "$RULETOTAL_ROW_IPVER" "$RULETOTAL_ROW_TARGET" "$RULETOTAL_ROW_TPORT" "$RULETOTAL_ROW_IN" "$RULETOTAL_ROW_OUT" >> "$traffic_tmp"
-    done <<< "$merged_rows"
+            "$TRAFFIC_STATE_VERSION" "$RULETOTAL_ROW_PROTO" "$RULETOTAL_ROW_LPORT" "$RULETOTAL_ROW_IPVER" "$RULETOTAL_ROW_TARGET" "$RULETOTAL_ROW_TPORT" "$RULETOTAL_ROW_IN" "$RULETOTAL_ROW_OUT" >> "$tmp_file"
+    done <<< "$rule_rows"
 
-    _atomic_replace_file "$traffic_tmp" "$TRAFFIC_DATA" 0644
-    _atomic_replace_file "$flow_tmp" "$TRAFFIC_FLOW_DATA" 0644
+    while IFS=$'\t' read -r flow_id rule_key current_in current_out; do
+        [[ -z "$flow_id" || -z "$rule_key" ]] && continue
+        IFS='|' read -r proto lport ipver target tport <<< "$rule_key"
+        printf 'v%s|nft_flow|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$TRAFFIC_STATE_VERSION" "$proto" "$lport" "$ipver" "$target" "$tport" "$current_in" "$current_out" "$flow_id" >> "$tmp_file"
+    done <<< "$flow_rows"
+
+    _atomic_replace_file "$tmp_file" "$TRAFFIC_STATE_FILE" 0644
 }
 
 _traffic_warn_incompatible_file() {
@@ -7210,35 +7182,38 @@ _traffic_collect_snapshot() {
     fi
 }
 
-_traffic_saved_records_tsv() {
-    [[ -f "$TRAFFIC_DATA" ]] || return 0
-    while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 _rest; do
+_pfwd_read_traffic_state() {
+    local row_type="$1"
+    local flow_id
+    [[ -f "$TRAFFIC_STATE_FILE" ]] || return 0
+    while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 _rest; do
         [[ -z "${f1:-}" ]] && continue
-        if [[ "$f1" == "v${TRAFFIC_DATA_VERSION}" && "$f2" == "nft_rule" ]]; then
-            printf '%s\t%s\t%s\n' \
+        if [[ "$f1" != "v${TRAFFIC_STATE_VERSION}" ]]; then
+            _traffic_warn_incompatible_file "_TRAFFIC_STATE_WARNED" "$TRAFFIC_STATE_FILE" "$TRAFFIC_STATE_VERSION"
+            return 0
+        fi
+        [[ "$f2" == "$row_type" ]] || continue
+        if [[ "$row_type" == "nft_flow" ]]; then
+            flow_id="${f10:-}"
+            [[ -n "${_rest:-}" ]] && flow_id="${flow_id}|${_rest}"
+            printf '%s\t%s\t%s\t%s\n' \
+                "$flow_id" \
                 "$(_traffic_rule_key "${f3:-}" "${f4:-}" "${f5:-}" "${f6:-}" "${f7:-}")" \
                 "${f8:-0}" "${f9:-0}"
         else
-            _traffic_warn_incompatible_file "_TRAFFIC_DATA_WARNED" "$TRAFFIC_DATA" "$TRAFFIC_DATA_VERSION"
-            return 0
+            printf '%s\t%s\t%s\n' \
+                "$(_traffic_rule_key "${f3:-}" "${f4:-}" "${f5:-}" "${f6:-}" "${f7:-}")" \
+                "${f8:-0}" "${f9:-0}"
         fi
-    done < "$TRAFFIC_DATA"
+    done < "$TRAFFIC_STATE_FILE"
+}
+
+_traffic_saved_records_tsv() {
+    _pfwd_read_traffic_state nft_rule
 }
 
 _traffic_saved_flow_records_tsv() {
-    [[ -f "$TRAFFIC_FLOW_DATA" ]] || return 0
-    while IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 _rest; do
-        [[ -z "${f1:-}" ]] && continue
-        if [[ "$f1" == "v${TRAFFIC_FLOW_VERSION}" && "$f2" == "nft_flow" ]]; then
-            printf '%s\t%s\t%s\t%s\n' \
-                "${f8:-}" \
-                "$(_traffic_rule_key "${f3:-}" "${f4:-}" "${f5:-}" "${f6:-}" "${f7:-}")" \
-                "${f9:-0}" "${f10:-0}"
-        else
-            _traffic_warn_incompatible_file "_TRAFFIC_FLOW_WARNED" "$TRAFFIC_FLOW_DATA" "$TRAFFIC_FLOW_VERSION"
-            return 0
-        fi
-    done < "$TRAFFIC_FLOW_DATA"
+    _pfwd_read_traffic_state nft_flow
 }
 
 _traffic_conntrack_dump() {
@@ -7614,7 +7589,7 @@ menu_traffic_stats() {
                 echo "  Allowed values: 30s, 1m, 5m, 10m, 30m, 1h"
                 read -rp "New interval: " new_interval
                 [[ -z "$new_interval" ]] && { msg_info "Cancelled"; continue; }
-                traffic_configure_interval "$new_interval"
+                maintenance_configure_interval "$new_interval"
                 wait_for_enter
                 ;;
             0) return ;;
@@ -7806,8 +7781,8 @@ cmd_import() {
 
 # Persistence is intentionally kept inside the main script:
 # nft_setup_persistence() writes lightweight systemd units that call the hidden
-# CLI entrypoints below. The timer is only enabled after forwarding rules are
-# active, instead of generating extra helper scripts on disk.
+# CLI entrypoints below. The service is enabled for boot restore only after
+# forwarding rules are active, and the timer follows the same condition.
 
 #===============================================================================
 #  Section 8: CLI Entry Points
@@ -7914,8 +7889,9 @@ Common scenarios:
 
 Performance tips:
   - pfwd now treats $RULES_STATE_FILE as the source of truth.
-  - refresh/start rebuild nftables atomically from saved state; rendered nft files are temporary.
+  - refresh/start rebuild nftables atomically from saved state.
   - domain targets stay as hostnames in state and are re-resolved by refresh/start/maintenance.
+  - pfwd.service restores saved forwarding rules after reboot while active rules exist.
   - pfwd.timer runs shared maintenance only while active rules exist: domain refresh plus traffic stats.
   - nft is the fastest path for fixed IP targets.
   - First root run from a persistent script path auto-installs /usr/local/bin/pfwd.
@@ -8533,20 +8509,13 @@ cmd_doctor() {
         _doctor_print_check WARN "nf_conntrack_acct disabled" "traffic stats may stay at zero until enabled"
     fi
 
-    local traffic_data_state traffic_flow_state
-    traffic_data_state=$(_traffic_file_format_state "$TRAFFIC_DATA" "$TRAFFIC_DATA_VERSION")
-    traffic_flow_state=$(_traffic_file_format_state "$TRAFFIC_FLOW_DATA" "$TRAFFIC_FLOW_VERSION")
-    case "$traffic_data_state" in
-        ok) _doctor_print_check OK "traffic totals state format" "v${TRAFFIC_DATA_VERSION}" ;;
-        missing|empty) _doctor_print_check WARN "traffic totals state missing" "collector will recreate $TRAFFIC_DATA" ;;
-        mismatch:*) _doctor_print_check WARN "traffic totals state version mismatch" "${traffic_data_state#mismatch:} -> v${TRAFFIC_DATA_VERSION}; next collector run resets history" ;;
-        legacy) _doctor_print_check WARN "traffic totals state is legacy" "next collector run resets history" ;;
-    esac
-    case "$traffic_flow_state" in
-        ok) _doctor_print_check OK "traffic flow snapshot format" "v${TRAFFIC_FLOW_VERSION}" ;;
-        missing|empty) _doctor_print_check WARN "traffic flow snapshot missing" "collector will recreate $TRAFFIC_FLOW_DATA" ;;
-        mismatch:*) _doctor_print_check WARN "traffic flow snapshot version mismatch" "${traffic_flow_state#mismatch:} -> v${TRAFFIC_FLOW_VERSION}; next collector run resets history" ;;
-        legacy) _doctor_print_check WARN "traffic flow snapshot is legacy" "next collector run resets history" ;;
+    local traffic_state
+    traffic_state=$(_traffic_file_format_state "$TRAFFIC_STATE_FILE" "$TRAFFIC_STATE_VERSION")
+    case "$traffic_state" in
+        ok) _doctor_print_check OK "traffic state format" "v${TRAFFIC_STATE_VERSION}" ;;
+        missing|empty) _doctor_print_check WARN "traffic state missing" "collector will recreate $TRAFFIC_STATE_FILE" ;;
+        mismatch:*) _doctor_print_check WARN "traffic state version mismatch" "${traffic_state#mismatch:} -> v${TRAFFIC_STATE_VERSION}; next collector run resets history" ;;
+        legacy) _doctor_print_check WARN "traffic state is legacy" "next collector run resets history" ;;
     esac
 
     if $PFWD_OPTIMIZE_STATE_PRESENT && [[ "$PFWD_OPTIMIZE_STATE_TC_ENABLED" == true ]]; then
@@ -8656,10 +8625,14 @@ cmd_doctor() {
         missing) _doctor_print_check ERROR "ip6tables INPUT loopback DNAT exception missing" "run 'pfwd refresh' or 'pfwd start nft'" ;;
     esac
 
-    if [[ -f "$PFWD_SERVICE" ]]; then
-        _doctor_print_check OK "maintenance service present" "$PFWD_SERVICE"
+    local boot_service_state
+    boot_service_state=$(_pfwd_boot_service_state)
+    if [[ "$boot_service_state" == "active" || "$boot_service_state" == "enabled" ]]; then
+        _doctor_print_check OK "boot restore service ${boot_service_state}" "$PFWD_SERVICE"
+    elif [[ "$boot_service_state" == "disabled" ]]; then
+        _doctor_print_check WARN "boot restore service disabled" "it is enabled automatically after forwarding rules are active"
     else
-        _doctor_print_check WARN "maintenance service missing" "run 'pfwd refresh' or 'pfwd start nft'"
+        _doctor_print_check WARN "boot restore service missing" "run 'pfwd refresh' or 'pfwd start nft'"
     fi
 
     local maintenance_timer_state
@@ -8669,7 +8642,7 @@ cmd_doctor() {
         local interval_seconds stale_after traffic_age
         interval_seconds=$(traffic_interval_seconds "$traffic_interval")
         stale_after=$(( interval_seconds * TRAFFIC_STALE_MULTIPLIER ))
-        traffic_age=$(_traffic_file_age_seconds "$TRAFFIC_DATA")
+        traffic_age=$(_traffic_file_age_seconds "$TRAFFIC_STATE_FILE")
         if (( interval_seconds > 0 && traffic_age >= 0 )); then
             if (( traffic_age > stale_after )); then
                 _doctor_print_check WARN "traffic collector data looks stale" "last update ${traffic_age}s ago"
@@ -8759,9 +8732,9 @@ cmd_status() {
         esac
     else
         flowtable_label="${DIM}inactive${NC}"
-        dnat_renderer_label="${DIM}$(_pfwd_saved_dnat_renderer)${NC}"
-        postrouting_renderer_label="${DIM}$(_pfwd_saved_postrouting_renderer)${NC}"
-        mss_renderer_label="${DIM}$(_pfwd_saved_mss_renderer)${NC}"
+        dnat_renderer_label="${DIM}none${NC}"
+        postrouting_renderer_label="${DIM}none${NC}"
+        mss_renderer_label="${DIM}none${NC}"
         steering_devices_csv=$(_pfwd_detect_steering_devices)
     fi
     if [[ -n "$steering_devices_csv" ]]; then
@@ -8854,6 +8827,7 @@ cmd_status() {
     local domain_total domain_unresolved
     IFS=$'\t' read -r domain_total domain_unresolved <<< "$(_pfwd_domain_counts_tsv "$PFWD_NFT_RULES")"
     echo -e "  domains:    ${CYAN}${domain_total}${NC} total, ${CYAN}${domain_unresolved}${NC} unresolved"
+    echo -e "  boot svc:   ${CYAN}$(_pfwd_boot_service_state)${NC}"
     echo -e "  maint int:  ${CYAN}$(maintenance_current_interval)${NC} ${DIM}timer=$(_pfwd_maintenance_timer_state)${NC}"
     echo -e "  kernel:     ${CYAN}${PFWD_KERNEL_RELEASE}${NC} ${DIM}(${PFWD_KERNEL_FLAVOR_LABEL})${NC}"
     echo -e "  optimize:   ${optimize_applied_label} ${DIM}${PFWD_OPTIMIZE_APPLIED_REASON}${NC}"
@@ -9128,7 +9102,7 @@ parse_cli_args() {
                 show_traffic_rate
             elif [[ "${1:-}" == "--interval" ]]; then
                 if [[ -n "${2:-}" ]]; then
-                    traffic_configure_interval "$2"
+                    maintenance_configure_interval "$2"
                 else
                     show_traffic_interval
                 fi

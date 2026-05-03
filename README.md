@@ -115,6 +115,7 @@ Notes:
 
 - Saved forwarding rules live in `/var/lib/pfwd/forward-rules.tsv`.
 - `refresh`, `start`, and periodic maintenance rebuild nftables from saved state.
+- `pfwd.service` restores saved forwarding rules after reboot while active rules exist.
 - The maintenance timer starts automatically only after forwarding rules are active.
 - Domain rules do not use a separate database or daemon.
 - Dynamic domain commands ignore localhost-style static hostnames.
@@ -129,8 +130,8 @@ Notes:
 |------|---------|
 | `/usr/local/bin/pfwd.sh` | installed script |
 | `/usr/local/bin/pfwd` | shortcut command |
-| `/var/lib/pfwd/forward-rules.tsv` | forwarding rules |
-| `/etc/systemd/system/pfwd.service` / `pfwd.timer` | maintenance service and timer |
+| `/var/lib/pfwd/` | rules and traffic state |
+| `/etc/systemd/system/pfwd.service` / `pfwd.timer` | boot restore and maintenance units |
 | `/etc/sysctl.d/99-pfwd.conf` | pfwd-managed sysctl tuning |
 
 ## Requirements
