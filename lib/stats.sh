@@ -82,6 +82,9 @@ stats_rollup_counters() {
       def usage($mode; $in_delta; $out_delta):
         # 双向延续监听端口收发总和语义；单向取上下行较大值。
         if $mode == "one-way" then ([ $in_delta, $out_delta ] | max) else ($in_delta + $out_delta) end;
+      def user_forward_sum($state; $user_id):
+        [ $cfg[0].forwards[]? | select(.user_id == $user_id) | ($state.forwards[.id].billing_used_bytes // 0) ]
+        | add // 0;
 
       . as $state
       | reduce $snap[0][] as $f (.;
@@ -104,6 +107,7 @@ stats_rollup_counters() {
           ($group[0].user_id) as $user_id |
           ($state.users[$user_id] // {
             billing_used_bytes: 0,
+            billing_offset_bytes: 0,
             input_base_bytes: 0,
             output_base_bytes: 0,
             reset_day: null,
@@ -111,9 +115,11 @@ stats_rollup_counters() {
           }) as $old |
           ($group | map(.input_bytes) | add // 0) as $input |
           ($group | map(.output_bytes) | add // 0) as $output |
-          ([ $cfg[0].forwards[]? | select(.user_id == $user_id) | ($state.forwards[.id].billing_used_bytes // 0) ] | add // 0) as $used |
+          (user_forward_sum(.; $user_id)) as $forward_used |
+          ($old.billing_offset_bytes // 0) as $offset |
           .users[$user_id] = ($old + {
-            billing_used_bytes: $used,
+            billing_offset_bytes: $offset,
+            billing_used_bytes: (($forward_used + $offset) | if . < 0 then 0 else . end),
             input_base_bytes: $input,
             output_base_bytes: $output
           })
@@ -149,71 +155,11 @@ stats_set_user_used() {
       ($snap[0] | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
       ($snap[0] | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
       ([ $snap[0][] | select(.user_id == $id) | .id ]) as $forward_ids |
-      ($forward_ids | length) as $forward_count |
-      (
-        [ $forward_ids[] as $fid |
-          { id: $fid, used: (.forwards[$fid].billing_used_bytes // 0) }
-        ]
-      ) as $current_forwards |
-      ($current_forwards | map(.used) | add // 0) as $current_total |
+      ([ $forward_ids[] as $fid | (.forwards[$fid].billing_used_bytes // 0) ] | add // 0) as $forward_used |
       (.users[$id] // {}) as $old |
-      ($used | if $forward_count == 0 then 0 else . end) as $normalized_used |
-      (
-        if $forward_count == 0 then
-          []
-        elif $forward_count == 1 then
-          [{ id: $current_forwards[0].id, used: $normalized_used }]
-        elif $current_total > 0 then
-          [ range(0; $forward_count) as $i |
-            ($current_forwards[$i]) as $item |
-            if $i < ($forward_count - 1) then
-              {
-                id: $item.id,
-                used: (($normalized_used * $item.used / $current_total) | floor)
-              }
-            else
-              {
-                id: $item.id,
-                used: ($normalized_used - (
-                  [ range(0; $i) as $j |
-                    (($normalized_used * $current_forwards[$j].used / $current_total) | floor)
-                  ] | add // 0
-                ))
-              }
-            end
-          ]
-        else
-          [ range(0; $forward_count) as $i |
-            ($current_forwards[$i]) as $item |
-            if $i < ($forward_count - 1) then
-              {
-                id: $item.id,
-                used: (($normalized_used / $forward_count) | floor)
-              }
-            else
-              {
-                id: $item.id,
-                used: ($normalized_used - (
-                  [ range(0; $i) |
-                    (($normalized_used / $forward_count) | floor)
-                  ] | add // 0
-                ))
-              }
-            end
-          ]
-        end
-      ) as $target_forwards |
-      .forwards |= (
-        . as $forwards_state
-        | reduce $target_forwards[] as $item ($forwards_state;
-            .[$item.id] = ((.[$item.id] // {}) + {
-              billing_used_bytes: $item.used
-            })
-          )
-      ) |
       .users[$id] = ($old + {
-        billing_used_bytes: $normalized_used,
-        billing_offset_bytes: 0,
+        billing_used_bytes: $used,
+        billing_offset_bytes: ($used - $forward_used),
         input_base_bytes: $input,
         output_base_bytes: $output
       })
@@ -237,6 +183,37 @@ stats_set_forward_used() {
         input_base_bytes: ($f.input_bytes // 0),
         output_base_bytes: ($f.output_bytes // 0)
       })
+    '
+    rm -f "$tmp"
+}
+
+stats_reset_user_cycle() {
+    local user_id snapshot tmp
+    user_id="$(normalize_user_id "$1")"
+    validate_user_id "$user_id"
+    config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    snapshot="$(stats_current_snapshot)"
+    tmp="$(mktemp "${PFWD_RUN_DIR}/stats-user-reset.XXXXXX")"
+    printf '%s\n' "$snapshot" > "$tmp"
+    stats_update --arg id "$user_id" --slurpfile snap "$tmp" '
+      [ $snap[0][] | select(.user_id == $id) ] as $rows |
+      .forwards |= (
+        . as $forwards_state
+        | reduce $rows[] as $row ($forwards_state;
+            .[$row.id] = ((.[$row.id] // {}) + {
+              billing_used_bytes: 0,
+              input_base_bytes: ($row.input_bytes // 0),
+              output_base_bytes: ($row.output_bytes // 0)
+            })
+          )
+      )
+      | (.users[$id] // {}) as $old
+      | .users[$id] = ($old + {
+          billing_used_bytes: 0,
+          billing_offset_bytes: 0,
+          input_base_bytes: ($rows | map(.input_bytes) | add // 0),
+          output_base_bytes: ($rows | map(.output_bytes) | add // 0)
+        })
     '
     rm -f "$tmp"
 }
@@ -283,33 +260,7 @@ stats_apply_due_resets() {
     while IFS=$'\t' read -r kind id reset_day last_month; do
         [ -n "$kind" ] || continue
         case "$kind" in
-            user)
-                local user_snapshot user_tmp
-                user_snapshot="$(stats_current_snapshot)"
-                user_tmp="$(mktemp "${PFWD_RUN_DIR}/stats-user-reset.XXXXXX")"
-                printf '%s\n' "$user_snapshot" > "$user_tmp"
-                stats_update --arg id "$id" --slurpfile snap "$user_tmp" '
-                  [ $snap[0][] | select(.user_id == $id) ] as $rows |
-                  .forwards |= (
-                    . as $forwards_state
-                    | reduce $rows[] as $row ($forwards_state;
-                        .[$row.id] = ((.[$row.id] // {}) + {
-                          billing_used_bytes: 0,
-                          input_base_bytes: ($row.input_bytes // 0),
-                          output_base_bytes: ($row.output_bytes // 0)
-                        })
-                      )
-                  )
-                  | (.users[$id] // {}) as $old
-                  | .users[$id] = ($old + {
-                      billing_used_bytes: 0,
-                      billing_offset_bytes: 0,
-                      input_base_bytes: ($rows | map(.input_bytes) | add // 0),
-                      output_base_bytes: ($rows | map(.output_bytes) | add // 0)
-                    })
-                '
-                rm -f "$user_tmp"
-                ;;
+            user) stats_reset_user_cycle "$id" ;;
             forward) stats_set_forward_used "$id" 0 ;;
         esac
         stats_update --arg kind "$kind" --arg id "$id" --arg month "$month" '

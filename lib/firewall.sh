@@ -272,10 +272,13 @@ fw_read_counters() {
         [
           $cfg[0].forwards[] |
           select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
-          forward_billing(.)
+          usage(($mode // "two-way"); (snap_forward(.id).input_bytes // 0); (snap_forward(.id).output_bytes // 0))
         ] | add // 0;
       def user_billing($u):
-        [ $cfg[0].forwards[] | select(.user_id == $u.id) | current_forward_billing(.) ] | add // 0;
+        (ustate($u.id)) as $s |
+        ([ $cfg[0].forwards[] | select(.user_id == $u.id) | current_forward_billing(.) ] | add // 0) as $forward_used |
+        ($s.billing_offset_bytes // 0) as $offset |
+        (($forward_used + $offset) | if . < 0 then 0 else . end);
       {
         forwards: [
           $cfg[0].forwards[] |
@@ -307,7 +310,7 @@ fw_read_counters() {
             output_bytes: $c.output_bytes,
             one_way_bytes: $one_way_used,
             two_way_bytes: $two_way_used,
-            billing_used_bytes: ($one_way_used + $two_way_used),
+            billing_used_bytes: user_billing($u),
             reset_day: (ustate($u.id).reset_day // null)
           }
         ]

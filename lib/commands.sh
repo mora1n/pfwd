@@ -639,7 +639,7 @@ cmd_traffic() {
                 esac
             done
             if [ -n "$user_id" ] && [ -z "$forward_id" ]; then
-                stats_set_user_used "$user_id" 0
+                stats_reset_user_cycle "$user_id"
                 echo "用户流量已重置：$(normalize_user_id "$user_id")"
             elif [ -n "$forward_id" ] && [ -z "$user_id" ]; then
                 stats_set_forward_used "$forward_id" 0
