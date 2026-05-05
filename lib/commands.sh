@@ -1,0 +1,797 @@
+#!/usr/bin/env bash
+
+cmd_init() {
+    config_init
+    echo "已初始化：$PFWD_CONFIG_FILE"
+}
+
+cmd_refresh_after_change() {
+    cmd_refresh
+}
+
+cmd_export() {
+    [ "$#" -le 1 ] || pfwd_die "用法：pfwd export [file]"
+    local file_path="${1:-$(pfwd_default_export_path)}"
+    file_path="$(pfwd_expand_path "$file_path")"
+
+    stats_rollup_current
+    mkdir -p "$(dirname "$file_path")"
+    config_export_bundle | pfwd_write_atomic "$file_path"
+    echo "配置已导出：$file_path"
+}
+
+cmd_import() {
+    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd import <file>"
+    local file_path="$1"
+    file_path="$(pfwd_expand_path "$file_path")"
+
+    config_import_bundle "$file_path"
+    echo "配置已导入：$file_path"
+    cmd_apply_runtime
+}
+
+cmd_update_check() {
+    local work_dir="$1"
+    local staged_dir="$work_dir/staged"
+    local local_version remote_version local_digest remote_digest cmp
+
+    local_version="$(service_installed_version 2>/dev/null || echo "$PFWD_VERSION")"
+    remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
+    [ -n "$remote_version" ] || pfwd_die "无法解析远端版本号"
+
+    local_digest="$(service_update_bundle_digest "$PFWD_INSTALL_DIR")"
+    remote_digest="$(service_update_bundle_digest "$staged_dir")"
+    cmp="$(pfwd_version_compare "$remote_version" "$local_version")"
+
+    echo "当前版本：$local_version"
+    echo "远端版本：$remote_version"
+    echo "更新源：$PFWD_REPO_RAW_URL"
+
+    if [ "$cmp" -lt 0 ]; then
+        echo "远端版本低于当前版本，已跳过"
+        return 10
+    fi
+    if [ "$cmp" -eq 0 ] && [ "$local_digest" = "$remote_digest" ]; then
+        echo "已是最新版本"
+        return 10
+    fi
+
+    return 0
+}
+
+cmd_update_finalize_recover() {
+    local work_dir="$1"
+    local forwarder_enabled="$2"
+    local timer_enabled="$3"
+    local bbr_enabled="$4"
+    local error_message="$5"
+
+    service_update_rollback "$work_dir" || true
+    service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" || true
+    pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
+}
+
+cmd_update_finalize() {
+    local work_dir="" forwarder_enabled="" timer_enabled="" bbr_enabled="" from_version="" to_version=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --work-dir) work_dir="${2:-}"; shift 2 ;;
+            --forwarder-enabled) forwarder_enabled="${2:-}"; shift 2 ;;
+            --timer-enabled) timer_enabled="${2:-}"; shift 2 ;;
+            --bbr-enabled) bbr_enabled="${2:-}"; shift 2 ;;
+            --from-version) from_version="${2:-}"; shift 2 ;;
+            --to-version) to_version="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+
+    [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
+
+    if ! service_install_files; then
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "更新收尾失败"
+    fi
+    if ! service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" "$bbr_enabled"; then
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "恢复服务启用状态失败"
+    fi
+    if ! cmd_apply_runtime; then
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "应用更新后的运行态失败"
+    fi
+
+    if ! service_update_cleanup "$work_dir"; then
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "更新已完成，但清理临时文件失败"
+    fi
+
+    echo "更新完成：$from_version -> $to_version"
+}
+
+cmd_update() {
+    local check_only="false"
+    local auto_yes="false"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --check) check_only="true"; shift ;;
+            --yes) auto_yes="true"; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+
+    service_installation_present || pfwd_die "未检测到已安装的 pfwd，请先执行 pfwd install"
+    local work_dir staged_dir local_version remote_version forwarder_enabled timer_enabled bbr_enabled
+    work_dir="$(service_update_create_workdir)"
+    staged_dir="$work_dir/staged"
+
+    if ! service_update_download_bundle "$work_dir"; then
+        pfwd_die "下载更新包失败；临时目录保留：$work_dir"
+    fi
+    if ! service_update_validate_bundle "$staged_dir"; then
+        pfwd_die "更新包校验失败；临时目录保留：$work_dir"
+    fi
+    if ! cmd_update_check "$work_dir"; then
+        local check_status="$?"
+        if [ "$check_status" = "10" ]; then
+            service_update_cleanup "$work_dir" >/dev/null 2>&1 || true
+            return 0
+        fi
+        pfwd_die "更新检查失败"
+    fi
+
+    if [ "$check_only" = "true" ]; then
+        service_update_cleanup "$work_dir" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if [ "$auto_yes" != "true" ]; then
+        if [ ! -t 0 ]; then
+            pfwd_die "非交互环境请使用 pfwd update --yes"
+        fi
+        if ! ui_yes "检测到新版本，是否立即更新？"; then
+            service_update_cleanup "$work_dir" >/dev/null 2>&1 || true
+            echo "已取消"
+            return 0
+        fi
+    fi
+
+    local_version="$(service_installed_version)"
+    remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
+    forwarder_enabled="$(service_update_capture_enabled_state pfwd-forward.service)"
+    timer_enabled="$(service_update_capture_enabled_state pfwd.timer)"
+    bbr_enabled="$(service_update_capture_enabled_state pfwd-bbr.service)"
+
+    service_update_backup_current "$work_dir"
+    if ! service_update_apply_staged "$work_dir"; then
+        service_update_rollback "$work_dir" || true
+        pfwd_die "更新失败，已回滚；临时目录保留：$work_dir"
+    fi
+
+    if ! exec "$PFWD_INSTALL_DIR/pfwd.sh" __update_finalize \
+        --work-dir "$work_dir" \
+        --forwarder-enabled "$forwarder_enabled" \
+        --timer-enabled "$timer_enabled" \
+        --bbr-enabled "$bbr_enabled" \
+        --from-version "$local_version" \
+        --to-version "$remote_version"; then
+        service_update_rollback "$work_dir" || true
+        pfwd_die "更新收尾启动失败，已回滚；临时目录保留：$work_dir"
+    fi
+}
+
+cmd_user() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        add)
+            [ "$#" -eq 1 ] || pfwd_die "用法：pfwd user add <username>"
+            local user_id
+            user_id="$(normalize_user_id "$1")"
+            config_add_user "$user_id"
+            echo "用户已添加：$user_id"
+            ;;
+        list)
+            config_init >/dev/null
+            jq -r '.users[]?.id' "$PFWD_CONFIG_FILE"
+            ;;
+        delete)
+            [ "$#" -eq 1 ] || pfwd_die "用法：pfwd user delete <username>"
+            local user_id
+            user_id="$(normalize_user_id "$1")"
+            config_delete_user "$user_id"
+            echo "用户已删除：$user_id"
+            ;;
+        telegram)
+            cmd_user_telegram "$@"
+            ;;
+        *) pfwd_die "用法：pfwd user add|list|delete|telegram" ;;
+    esac
+}
+
+cmd_user_telegram() {
+    local user_id="${1:-}"
+    local token="" chat_id="" server_name="" enabled="true" has_server_name="false"
+    local apply_all="false"
+    if [ "$user_id" = "--all" ]; then
+        apply_all="true"
+        user_id=""
+    else
+        shift || true
+        user_id="$(normalize_user_id "$user_id")"
+        [ -n "$user_id" ] || pfwd_die "用法：pfwd user telegram <username>|--all --bot-token TOKEN --chat-id CHAT_ID"
+    fi
+    if [ "$apply_all" = "true" ]; then
+        shift || true
+    fi
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --bot-token) token="${2:-}"; shift 2 ;;
+            --chat-id) chat_id="${2:-}"; shift 2 ;;
+            --server-name) server_name="${2:-}"; has_server_name="true"; shift 2 ;;
+            --enabled) enabled="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    [ -n "$token" ] || pfwd_die "必须提供 --bot-token"
+    [ -n "$chat_id" ] || pfwd_die "必须提供 --chat-id"
+    if [ "$has_server_name" != "true" ]; then
+        server_name="$(hostname 2>/dev/null || echo pfwd)"
+    fi
+    if [ "$apply_all" = "true" ]; then
+        config_set_all_users_telegram "$token" "$chat_id" "$server_name" "__KEEP__"
+        echo "Telegram 配置已批量更新：全部用户"
+    else
+        config_set_user_telegram "$user_id" "$token" "$chat_id" "$server_name" "$enabled"
+        echo "Telegram 配置已更新：$user_id"
+    fi
+}
+
+cmd_notify_schedule() {
+    local user_id="" interval_minutes="__KEEP__" daily_time="__KEEP__"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --interval-minutes) interval_minutes="${2:-}"; shift 2 ;;
+            --daily-time) daily_time="${2:-}"; shift 2 ;;
+            --clear-interval) interval_minutes=""; shift ;;
+            --clear-daily) daily_time=""; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    user_id="$(normalize_user_id "$user_id")"
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    if [ "$interval_minutes" = "__KEEP__" ] && [ "$daily_time" = "__KEEP__" ]; then
+        pfwd_die "至少提供一个定时发送设置"
+    fi
+    config_set_user_telegram_schedule "$user_id" "$interval_minutes" "$daily_time"
+    if { [ "$interval_minutes" != "__KEEP__" ] && [ -n "$interval_minutes" ]; } || { [ "$daily_time" != "__KEEP__" ] && [ -n "$daily_time" ]; }; then
+        config_enable_user_telegram "$user_id"
+    fi
+    echo "Telegram 定时发送已更新：$user_id"
+}
+
+cmd_notify_enable() {
+    local user_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    user_id="$(normalize_user_id "$user_id")"
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    config_enable_user_telegram "$user_id"
+    echo "Telegram 通知已启用：$user_id"
+}
+
+cmd_notify_disable() {
+    local user_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    user_id="$(normalize_user_id "$user_id")"
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    config_disable_user_telegram "$user_id"
+    echo "Telegram 通知已停用：$user_id"
+}
+
+cmd_notify_delete() {
+    local user_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    user_id="$(normalize_user_id "$user_id")"
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    config_delete_user_telegram "$user_id"
+    echo "Telegram 配置已删除：$user_id"
+}
+
+cmd_add() {
+    local user_id="" remote="" listen_ip="" listen_port="" random_range="" stop_at="" protocol="tcp_udp" traffic_mode="two-way"
+    local comment="" mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
+    config_init >/dev/null
+    listen_ip="$(jq -r '.settings.default_listen_ip // "::"' "$PFWD_CONFIG_FILE")"
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --remote) remote="${2:-}"; shift 2 ;;
+            --listen-ip) listen_ip="${2:-}"; shift 2 ;;
+            --listen-port) listen_port="${2:-}"; shift 2 ;;
+            --random-port) random_range="${2:-}"; shift 2 ;;
+            --stop-at) stop_at="${2:-}"; shift 2 ;;
+            --protocol) protocol="${2:-}"; shift 2 ;;
+            --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            --comment) comment="${2:-}"; shift 2 ;;
+            --mss-clamp) mss_mode="clamp"; mss_value=""; shift ;;
+            --mss) mss_mode="set"; mss_value="${2:-}"; shift 2 ;;
+            --snat-source) snat_mode="snat"; snat_source="${2:-}"; shift 2 ;;
+            --masquerade) snat_mode="masquerade"; snat_source=""; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    [ -n "$remote" ] || pfwd_die "必须提供 --remote"
+
+    local parsed remote_host remote_ports listen_ports reserved="" port forward_ids count
+    parsed="$(parse_host_port_spec "$remote")"
+    remote_host="${parsed%	*}"
+    remote_ports="$(expand_port_spec "${parsed##*	}")"
+
+    if [ -z "$listen_port" ]; then
+        [ -n "$random_range" ] || pfwd_die "必须提供 --listen-port 或 --random-port"
+        validate_port_range "$random_range"
+        listen_ports=""
+        while IFS= read -r port; do
+            [ -n "$port" ] || continue
+            local picked
+            picked="$(pfwd_pick_random_port "$random_range" "$reserved")"
+            reserved="$reserved $picked"
+            listen_ports="${listen_ports}${picked}"$'\n'
+        done <<< "$remote_ports"
+        listen_ports="${listen_ports%$'\n'}"
+    else
+        listen_ports="$(expand_port_spec "$listen_port")"
+    fi
+
+    forward_ids="$(config_add_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source")"
+    count="$(printf '%s\n' "$forward_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
+    echo "转发已添加：$count 条"
+    printf '%s\n' "$forward_ids" | sed '/^$/d' | sed 's/^/  /'
+    cmd_refresh_after_change
+}
+
+cmd_list() {
+    local user_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    config_init >/dev/null
+    if [ -n "$user_id" ]; then
+        jq -r --arg id "$user_id" '
+          def hostport($host; $port):
+            if ($host | contains(":")) then "[" + $host + "]:" + ($port | tostring)
+            else $host + ":" + ($port | tostring)
+            end;
+          .forwards[]?
+          | select(.user_id == $id)
+          | (.nft.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode, (.nft.mss_mode // "-"), (if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | @tsv
+        ' "$PFWD_CONFIG_FILE"
+    else
+        jq -r '
+          def hostport($host; $port):
+            if ($host | contains(":")) then "[" + $host + "]:" + ($port | tostring)
+            else $host + ":" + ($port | tostring)
+            end;
+          .forwards[]?
+          | (.nft.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode, (.nft.mss_mode // "-"), (if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | @tsv
+        ' "$PFWD_CONFIG_FILE"
+    fi
+}
+
+cmd_toggle_forward() {
+    local enabled="$1"
+    shift
+    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd start|stop <forward_id>"
+    config_set_forward_enabled "$1" "$enabled"
+    echo "转发状态已更新：$1 enabled=$enabled"
+    cmd_refresh_after_change
+}
+
+cmd_delete() {
+    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd delete <forward_id>"
+    config_delete_forward "$1"
+    echo "转发已删除：$1"
+    cmd_refresh_after_change
+}
+
+cmd_expire() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        set)
+            local id="${1:-}" stop_at=""
+            shift || true
+            [ -n "$id" ] || pfwd_die "必须提供转发 id"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --stop-at) stop_at="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$stop_at" ] || pfwd_die "必须提供 --stop-at"
+            config_set_forward_expire "$id" "$stop_at"
+            stop_at="$(jq -r --arg id "$id" '.forwards[] | select(.id == $id) | .stop_at' "$PFWD_CONFIG_FILE")"
+            echo "转发到期时间已更新：$id stop_at=$stop_at"
+            cmd_refresh_after_change
+            ;;
+        clear)
+            local id="${1:-}"
+            [ -n "$id" ] || pfwd_die "必须提供转发 id"
+            config_clear_forward_expire "$id"
+            echo "转发到期时间已清空：$id"
+            cmd_refresh_after_change
+            ;;
+        user-set)
+            local user_id="" stop_at=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --user-id) user_id="${2:-}"; shift 2 ;;
+                    --stop-at) stop_at="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+            [ -n "$stop_at" ] || pfwd_die "必须提供 --stop-at"
+            config_set_user_forwards_expire "$user_id" "$stop_at"
+            echo "用户全部转发到期时间已更新：$(normalize_user_id "$user_id")"
+            cmd_refresh_after_change
+            ;;
+        user-clear)
+            local user_id=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --user-id) user_id="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+            config_clear_user_forwards_expire "$user_id"
+            echo "用户全部转发到期时间已清空：$(normalize_user_id "$user_id")"
+            cmd_refresh_after_change
+            ;;
+        *)
+            pfwd_die "用法：pfwd expire set|clear|user-set|user-clear"
+            ;;
+    esac
+}
+
+cmd_limit() {
+    local sub="${1:-}"
+    shift || true
+    [ "$sub" = "set" ] || pfwd_die "用法：pfwd limit set --forward-id ID|--user-id ID"
+    local forward_id="" user_id="" traffic="" rate="" mode=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --forward-id) forward_id="${2:-}"; shift 2 ;;
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --traffic) traffic="${2:-}"; shift 2 ;;
+            --rate) rate="${2:-}"; shift 2 ;;
+            --traffic-mode) mode="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    local traffic_bytes="__KEEP__" normalized_rate="__KEEP__"
+    [ -z "$traffic" ] || traffic_bytes="$(parse_size_bytes "$traffic")"
+    [ -z "$rate" ] || normalized_rate="$(normalize_rate "$rate")"
+    if [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+        config_set_forward_limit "$forward_id" "$traffic_bytes" "$normalized_rate" "$mode"
+        echo "转发限制已更新：$forward_id"
+        cmd_refresh_after_change
+    elif [ -n "$user_id" ] && [ -z "$forward_id" ]; then
+        config_set_user_limit "$user_id" "$traffic_bytes" "$normalized_rate" "$mode"
+        echo "用户限制已更新：$user_id"
+        cmd_refresh_after_change
+    else
+        pfwd_die "只能设置 --forward-id 或 --user-id 其中一个"
+    fi
+}
+
+cmd_forward_update() {
+    local forward_id=""
+    local listen_ip="__KEEP__" listen_port="__KEEP__" remote_host="__KEEP__" remote_port="__KEEP__"
+    local stop_at="__KEEP__" protocol="__KEEP__" traffic_mode="__KEEP__"
+    local comment="__KEEP__" mss_mode="__KEEP__" mss_value="__KEEP__" snat_mode="__KEEP__" snat_source="__KEEP__"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --forward-id) forward_id="${2:-}"; shift 2 ;;
+            --listen-ip) listen_ip="${2:-}"; shift 2 ;;
+            --listen-port) listen_port="${2:-}"; shift 2 ;;
+            --remote-host) remote_host="${2:-}"; shift 2 ;;
+            --remote-port) remote_port="${2:-}"; shift 2 ;;
+            --stop-at) stop_at="${2:-}"; shift 2 ;;
+            --clear-stop-at) stop_at="__CLEAR__"; shift ;;
+            --protocol) protocol="${2:-}"; shift 2 ;;
+            --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            --comment) comment="${2:-}"; shift 2 ;;
+            --clear-comment) comment="__CLEAR__"; shift ;;
+            --mss-clamp) mss_mode="clamp"; mss_value="__CLEAR__"; shift ;;
+            --mss) mss_mode="set"; mss_value="${2:-}"; shift 2 ;;
+            --clear-mss) mss_mode="__CLEAR__"; mss_value="__CLEAR__"; shift ;;
+            --snat-source) snat_mode="snat"; snat_source="${2:-}"; shift 2 ;;
+            --masquerade) snat_mode="masquerade"; snat_source="__CLEAR__"; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    [ -n "$forward_id" ] || pfwd_die "必须提供 --forward-id"
+    config_update_forward "$forward_id" "$listen_ip" "$listen_port" "$remote_host" "$remote_port" "$stop_at" "$protocol" "$traffic_mode" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
+    echo "转发已更新：$forward_id"
+    cmd_refresh_after_change
+}
+
+cmd_user_forwards_traffic_mode() {
+    local user_id="" traffic_mode=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    [ -n "$traffic_mode" ] || pfwd_die "必须提供 --traffic-mode"
+    config_set_user_forwards_traffic_mode "$user_id" "$traffic_mode"
+    echo "用户全部转发流量模式已更新：$(normalize_user_id "$user_id") mode=$traffic_mode"
+    cmd_refresh_after_change
+}
+
+cmd_user_forwards_limit() {
+    local user_id="" traffic="__KEEP__" rate="__KEEP__" mode="__KEEP__"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --traffic) traffic="${2:-}"; shift 2 ;;
+            --rate) rate="${2:-}"; shift 2 ;;
+            --traffic-mode) mode="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    user_id="$(normalize_user_id "$user_id")"
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+
+    local traffic_bytes="__KEEP__" normalized_rate="__KEEP__"
+    [ "$traffic" = "__KEEP__" ] || traffic_bytes="$(parse_size_bytes "$traffic")"
+    [ "$rate" = "__KEEP__" ] || normalized_rate="$(normalize_rate "$rate")"
+
+    config_set_user_forward_limits "$user_id" "$traffic_bytes" "$normalized_rate" "$mode"
+    echo "用户全部转发限制已更新：$user_id"
+    cmd_refresh_after_change
+}
+
+cmd_traffic() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        used)
+            local scope="${1:-}"
+            shift || true
+            [ "$scope" = "set" ] || pfwd_die "用法：pfwd traffic used set --user-id ID|--forward-id ID --used 100GB"
+            local user_id="" forward_id="" used=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --user-id) user_id="${2:-}"; shift 2 ;;
+                    --forward-id) forward_id="${2:-}"; shift 2 ;;
+                    --used) used="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$used" ] || pfwd_die "必须提供 --used"
+            local used_bytes
+            used_bytes="$(parse_size_bytes "$used")"
+            if [ -n "$user_id" ] && [ -z "$forward_id" ]; then
+                stats_set_user_used "$user_id" "$used_bytes"
+                echo "用户已用流量已更新：$(normalize_user_id "$user_id")"
+            elif [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+                stats_set_forward_used "$forward_id" "$used_bytes"
+                echo "转发已用流量已更新：$forward_id"
+            else
+                pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
+            fi
+            cmd_refresh_after_change
+            ;;
+        reset-day)
+            local scope="${1:-}"
+            shift || true
+            [ "$scope" = "set" ] || pfwd_die "用法：pfwd traffic reset-day set --user-id ID|--forward-id ID --day 1"
+            local user_id="" forward_id="" day=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --user-id) user_id="${2:-}"; shift 2 ;;
+                    --forward-id) forward_id="${2:-}"; shift 2 ;;
+                    --day) day="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$day" ] || pfwd_die "必须提供 --day"
+            if [ -n "$user_id" ] && [ -z "$forward_id" ]; then
+                stats_set_user_reset_day "$user_id" "$day"
+                echo "用户流量重置日已更新：$(normalize_user_id "$user_id") day=$day"
+            elif [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+                stats_set_forward_reset_day "$forward_id" "$day"
+                echo "转发流量重置日已更新：$forward_id day=$day"
+            else
+                pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
+            fi
+            ;;
+        reset-now)
+            local user_id="" forward_id=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --user-id) user_id="${2:-}"; shift 2 ;;
+                    --forward-id) forward_id="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            if [ -n "$user_id" ] && [ -z "$forward_id" ]; then
+                stats_set_user_used "$user_id" 0
+                echo "用户流量已重置：$(normalize_user_id "$user_id")"
+            elif [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+                stats_set_forward_used "$forward_id" 0
+                echo "转发流量已重置：$forward_id"
+            else
+                pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
+            fi
+            cmd_refresh_after_change
+            ;;
+        *) pfwd_die "用法：pfwd traffic used|reset-day|reset-now" ;;
+    esac
+}
+
+stats_json() {
+    local user_id="$1"
+    local forward_id="$2"
+    local counters
+    counters="$(fw_read_counters)"
+    jq --arg user "$user_id" --arg fwd "$forward_id" '
+      .forwards |= map(select(($user == "" or .user_id == $user) and ($fwd == "" or .id == $fwd)))
+      | .total_bytes = ([.forwards[].total_bytes] | add // 0)
+    ' <<< "$counters"
+}
+
+cmd_stats() {
+    local user_id="" forward_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            --forward-id) forward_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    stats_json "$user_id" "$forward_id" | jq '.'
+}
+
+cmd_render() {
+    local target="${1:-forwarder}"
+    case "$target" in
+        forwarder) forwarder_render_config ;;
+        nft) fw_render_nft ;;
+        tc) fw_render_tc ;;
+        units)
+            echo "# pfwd-forward.service"
+            forwarder_service_unit
+            echo "# pfwd.service"
+            service_manager_unit
+            echo "# pfwd.timer"
+            service_timer_unit
+            echo "# pfwd-bbr.service"
+            bbr_service_unit
+            ;;
+        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|units]" ;;
+    esac
+}
+
+cmd_apply_runtime() {
+    config_init >/dev/null
+    forwarder_validate_config
+    if ! service_runtime_installed; then
+        echo "配置已保存；未检测到已安装运行态，跳过应用，请先执行 pfwd install"
+        return 0
+    fi
+    forwarder_apply_runtime
+    fw_apply_nft
+    fw_apply_tc
+    echo "已刷新"
+}
+
+cmd_refresh() {
+    config_init >/dev/null
+    stats_rollup_current
+    cmd_apply_runtime
+}
+
+cmd_reconcile() {
+    config_init >/dev/null
+    local before after today need_refresh=true sent
+    if stats_apply_due_resets; then
+        need_refresh=true
+    fi
+    today="$(pfwd_today)"
+    before="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
+    config_disable_expired "$today"
+    config_disable_telegram_for_expired_users "$today"
+    after="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
+    if [ "$before" != "$after" ]; then
+        need_refresh=true
+    fi
+    if [ "$need_refresh" = "true" ]; then
+        cmd_refresh
+    fi
+    sent="$(notify_reconcile_schedules)"
+    echo "已同步：active_before=$before active_after=$after notify_sent=$sent"
+}
+
+cmd_notify_test() {
+    local user_id=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --user-id) user_id="${2:-}"; shift 2 ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
+    notify_send_telegram "$user_id" "$(notify_status_message "$user_id")"
+    echo "通知已发送：$user_id"
+}
+
+cmd_doctor() {
+    config_init >/dev/null
+    echo "配置文件：$PFWD_CONFIG_FILE"
+    jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
+    echo "转发表：inet $(forwarder_table)"
+    echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
+    if command -v nft >/dev/null 2>&1; then echo "nft：$(command -v nft)"; else echo "nft：缺失"; fi
+    if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
+    if command -v systemctl >/dev/null 2>&1; then echo "systemctl：正常"; else echo "systemctl：缺失"; fi
+    echo "运行态安装：$(service_runtime_status_label)"
+    if service_unit_exists pfwd-forward.service; then echo "pfwd-forward.service：已安装"; else echo "pfwd-forward.service：未安装"; fi
+    if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
+    echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
+    echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
+}
+
+cmd_install() {
+    config_init
+    service_install_files
+    service_enable
+    cmd_apply_runtime
+    echo "已安装：$PFWD_BIN_PATH"
+}
+
+cmd_forward_boot() {
+    config_init >/dev/null
+    forwarder_validate_config
+    forwarder_apply_runtime
+    fw_apply_nft
+    fw_apply_tc
+    echo "boot restore complete"
+}
+
+cmd_uninstall() {
+    while [ "$#" -gt 0 ]; do
+        pfwd_die "未知选项：$1"
+    done
+    service_uninstall_files
+    service_purge_state
+    service_verify_removed
+    echo "已卸载"
+}

@@ -1,159 +1,247 @@
 # pfwd
 
-VPS-friendly port forwarding with **nftables**, domain targets, traffic stats,
-and practical kernel tuning helpers.
-
-`pfwd` is a single Bash script for quickly creating and maintaining DNAT
-forwarding rules. It keeps the rule state in one local file, rebuilds nftables
-from that state, and provides an interactive menu for common operations.
+`pfwd` 是一个基于 `nftables` 的轻量端口转发管理脚本。  
+`pfwd` 负责用户、转发规则、到期停转、流量统计、限速限量、Telegram 通知和 systemd 同步；`nftables` 负责实际转发。  
+内核调优能力独立为 `bbr.sh`，和转发管理解耦。
 
 ## Overview
 
-- nftables DNAT forwarding with software flowtable fast path where supported.
-- Simple shortcut syntax: `pfwd 8080 1.2.3.4 80`.
-- TCP, UDP, dual-stack, port ranges, port mappings, comments, MSS, and SNAT.
-- Domain forwarding rules that re-resolve on refresh/start/maintenance.
-- Rule-level traffic statistics from conntrack state.
-- Import/export with JSON backups.
-- Optional kernel optimization profiles for VPS forwarding workloads.
+| Item | Description |
+|------|-------------|
+| Interface | 交互式终端 UI，直接执行 `pfwd` 进入 |
+| Forwarding | 支持单端口、端口列表、端口范围、随机端口 |
+| Protocol | 支持 `TCP`、`UDP`、`TCP+UDP`，默认 `TCP+UDP` |
+| nft Options | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
+| Traffic | 支持到期日、流量统计、总流量限制、速率限制 |
+| Notify | 支持 Telegram 通知与定时发送 |
+| Ops | 支持安装、更新、刷新、排查、导出、导入、卸载 |
+| Tuning | `bbr.sh` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
+
+## Requirements
+
+| Dependency | Purpose |
+|------------|---------|
+| Linux | 运行环境 |
+| `bash` | 脚本执行入口 |
+| `jq` | 配置与状态 JSON 处理 |
+| `nftables` / `nft` | 端口转发、流量统计、限额控制 |
+| `iproute2` / `ip` / `tc` | 路由探测与速率限制 |
+| `systemd` / `systemctl` | 服务管理与定时同步 |
+| `getent` | 域名解析 |
 
 ## Install
 
 ```bash
-curl -fsSL <url>/pfwd.sh -o /usr/local/bin/pfwd.sh
-chmod +x /usr/local/bin/pfwd.sh
-
-# First root run installs the shortcut: /usr/local/bin/pfwd
-/usr/local/bin/pfwd.sh
+wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
 ```
 
-After that, use:
+安装完成后(root权限下)直接运行：
 
 ```bash
 pfwd
+```
+
+### Offline Install
+
+适用于目标机器无法直接访问 GitHub 的场景。可以先在本地打包 `pfwd.sh`、`bbr.sh` 和 `lib/`，再拷贝到目标机器离线安装。
+
+离线安装完成后，系统文件结构如下：
+
+```text
+系统文件
+├── /usr/local/bin/
+│   ├── pfwd                    # 管理脚本快捷入口
+│   └── bbr.sh                  # BBR / optimize 管理脚本快捷入口
+│
+├── /usr/local/lib/pfwd/
+│   ├── pfwd.sh                 # pfwd 主脚本
+│   ├── bbr.sh                  # BBR / optimize 主脚本
+│   └── lib/
+│       ├── core.sh             # 核心路径、通用工具、文件写入
+│       ├── config.sh           # 配置读写、导入导出、规则持久化
+│       ├── validate.sh         # 参数校验、端口/地址/速率解析
+│       ├── forwarder.sh        # nft 转发表运行态解析与渲染
+│       ├── firewall.sh         # 流量统计、限额、tc 渲染
+│       ├── stats.sh            # 流量状态快照与汇总
+│       ├── notify.sh           # Telegram 通知
+│       ├── service.sh          # 安装、更新、systemd 管理
+│       ├── commands.sh         # CLI 命令实现
+│       └── ui.sh               # 交互菜单与状态显示
+│
+├── /etc/pfwd/
+│   └── config.json             # 主配置文件（`pfwd init` 或 `pfwd install` 后生成）
+│
+├── /var/lib/pfwd/
+│   ├── stats.json              # 流量统计状态文件
+│   └── bbr-state.env           # BBR / optimize 状态文件
+│
+├── /run/pfwd/
+│   ├── runtime.json            # 当前解析后的运行态
+│   └── forwarder.nft           # 当前渲染出的 nft 转发表
+│
+└── /etc/systemd/system/
+    ├── pfwd-forward.service    # 开机恢复转发运行态
+    ├── pfwd.service            # 到期停转、通知、状态同步
+    ├── pfwd.timer              # 定时触发 pfwd.service
+    └── pfwd-bbr.service        # 开机恢复 BBR / optimize 运行态
+```
+
+建议的离线安装步骤：
+
+1. 在可联网机器准备离线包：
+
+```bash
+tar czf pfwd-offline.tar.gz pfwd.sh bbr.sh lib/
+```
+
+2. 把 `pfwd-offline.tar.gz` 拷贝到目标机器并解压：
+
+```bash
+tar xzf pfwd-offline.tar.gz
+```
+
+3. 安装脚本和模块文件：
+
+```bash
+install -d /usr/local/lib/pfwd/lib /usr/local/bin
+install -m 755 pfwd.sh /usr/local/lib/pfwd/pfwd.sh
+install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
+install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
+ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
+ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/bbr.sh
+```
+
+4. 生成 systemd unit、初始化目录并启用服务：
+
+```bash
+/usr/local/bin/pfwd install
+```
+
+5. 完成后可先检查：
+
+```bash
+pfwd doctor
+bbr.sh status
 ```
 
 ## Quick Start
 
 ```bash
-# Forward local 8080 to 1.2.3.4:8080
-pfwd 8080 1.2.3.4
+pfwd init
+pfwd user add alice
 
-# Forward local 8080 to 1.2.3.4:80
-pfwd 8080 1.2.3.4 80
+pfwd add \
+  --user-id alice \
+  --remote example.com:443 \
+  --listen-port 25001 \
+  --protocol tcp \
+  --mss-clamp
 
-# Forward multiple ports
-pfwd 80,443 1.2.3.4
-
-# Forward a domain target
-pfwd 443 example.com
-
-# Replace an existing rule for the same port/protocol/IP family
-pfwd 8080 1.2.3.4 --replace
-
-# Open the interactive menu
-pfwd
+pfwd list
+pfwd stats --user-id alice
 ```
 
 ## Common Commands
 
-| Task | Command |
-|------|---------|
-| Add full-syntax rule | `pfwd -m nft -t 1.2.3.4 80,443` |
-| Add TCP + UDP | `pfwd -m nft -t 1.2.3.4 --both 443` |
-| Add IPv4-only rule | `pfwd -m nft -4 -t 1.2.3.4 443` |
-| Map local to remote port | `pfwd 33389 1.2.3.4 3389` |
-| List rules | `pfwd list` |
-| Filter displayed rules | `pfwd list -f 8080` |
-| Delete rule | `pfwd del -m nft 8080` |
-| Rebuild from saved state | `pfwd refresh` |
-| Start / stop forwarding | `pfwd start` / `pfwd stop` |
-| Show status | `pfwd status` |
-| Run diagnostics | `pfwd doctor` |
-| Probe TCP backends | `pfwd doctor --tcp-probe` |
-| Show traffic totals | `pfwd stats` |
-| Show traffic rate | `pfwd stats --rate` |
-| Export backup | `pfwd export backup.json` |
-| Import backup | `pfwd import backup.json` |
-| Uninstall nft state | `pfwd uninstall nft` |
+| Task | Command | Notes |
+|------|---------|-------|
+| Start UI | `pfwd` | 无参数默认进入交互界面 |
+| Init config | `pfwd init` | 初始化 `/etc/pfwd/config.json` |
+| Add user | `pfwd user add alice` | 用户名支持中文和空格 |
+| Add forward | `pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol tcp` | 协议可选 `tcp` / `udp` / `tcp_udp` |
+| Random port | `pfwd add --user-id alice --remote example.com:443 --random-port 20000-30000` | 按远端端口数量自动分配监听端口 |
+| List forwards | `pfwd list` | 查看所有转发 |
+| User traffic | `pfwd stats --user-id alice` | 查看用户统计 |
+| Set expire date | `pfwd expire user-set --user-id alice --stop-at +30` | 支持 `YYYYMMDD`、`+7`、`7d` |
+| Set port limit | `pfwd limit set --forward-id <forward_id> --traffic 100GB --rate 50Mbps` | 端口级限额和速率 |
+| Set user total limit | `pfwd limit set --user-id alice --traffic 1TB` | 用户总流量限制 |
+| Set user port defaults | `pfwd user-forwards-limit --user-id alice --rate 50Mbps --traffic-mode one-way` | 批量设置用户下全部端口 |
+| Pause forward | `pfwd stop <forward_id>` | 暂停单条转发 |
+| Resume forward | `pfwd start <forward_id>` | 恢复单条转发 |
+| Delete forward | `pfwd delete <forward_id>` | 删除单条转发 |
+| Configure Telegram | `pfwd user telegram alice --bot-token '123456789:AA_example_token_value_replace_me' --chat-id '-1001234567890' --server-name 'relay-1'` | 配置单个用户通知 |
+| Refresh runtime | `pfwd refresh` | 重新解析配置、渲染并应用 nft 运行态 |
+| Reconcile state | `pfwd reconcile` | 到期停转、重置日、定时通知 |
+| Diagnose | `pfwd doctor` | 检查依赖、服务、配置状态 |
+| Render forward table | `pfwd render forwarder` | 查看当前端口转发表 |
+| Render quota table | `pfwd render nft` | 查看统计/限额表 |
+| Check update | `pfwd update --check` | 检查远端更新 |
+| Update now | `pfwd update --yes` | 直接更新到最新版本 |
+| Export config | `pfwd export ~/pfwd-export.json` | 导出配置和状态 |
+| Import config | `pfwd import ~/pfwd-export.json` | 导入配置和状态 |
 
-Run `pfwd help` for the full CLI reference.
+## Examples
 
-## Port Formats
-
-| Format | Example |
-|--------|---------|
-| Single port | `80` |
-| Multiple ports | `80,443` |
-| Port range | `8080-8090` |
-| Port mapping | `33389:3389` |
-| Range mapping | `8080-8090:3080-3090` |
-| Mixed | `80,443,8080-8090,33389:3389` |
-
-## Advanced Usage
+### Port Ranges and Multi-Port
 
 ```bash
-# Domain rules stay as hostnames in state and are re-resolved on refresh/start.
-pfwd domains list
-pfwd domains update
-pfwd domains interval 5m
-pfwd domains status
-
-# MSS / SNAT options
-pfwd -m nft -t 10.0.0.2 --mss-clamp 443
-pfwd -m nft -4 -t 10.0.0.2 --snat-source 192.168.1.2 9443:443
-
-# Kernel tuning profiles
-pfwd optimize
-pfwd optimize lowmem
-pfwd optimize relay
-pfwd optimize balanced --nic-steering
-pfwd optimize balanced --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
+pfwd add --user-id alice --remote example.com:443,553 --listen-port 25001,25002
+pfwd add --user-id alice --remote example.com:443-445 --listen-port 25001-25003
 ```
 
-Notes:
+### Split TCP and UDP on the Same Port
 
-- Saved forwarding rules live in `/var/lib/pfwd/forward-rules.tsv`.
-- `refresh`, `start`, and periodic maintenance rebuild nftables from saved state.
-- `pfwd.service` restores saved forwarding rules after reboot while active rules exist.
-- The maintenance timer starts automatically only after forwarding rules are active.
-- Domain rules do not use a separate database or daemon.
-- Dynamic domain commands ignore localhost-style static hostnames.
-- Traffic stats are collected out of band from conntrack, not nft hot-path counters.
-- Import/export uses the current JSON v3 schema with `forward_rules`.
-- Current versions only read the active runtime state file.
-- Hardware NIC offload is not required; the default target is portable VPS/cloud forwarding.
+```bash
+pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol tcp
+pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol udp
+```
 
-## File Locations
+同一监听端口可拆成一条 `TCP` 和一条 `UDP` 转发；默认协议为 `tcp_udp`，不能与拆分后的同端口规则共存。
 
-| File | Purpose |
+### nft Options
+
+```bash
+pfwd add \
+  --user-id alice \
+  --remote 203.0.113.10:8443 \
+  --listen-port 25001 \
+  --protocol tcp \
+  --mss 1360 \
+  --snat-source 198.51.100.10
+```
+
+这些字段会持久化在 `.forwards[].nft` 下，并参与运行态渲染。
+
+### Address Notes
+
+- 目标地址支持域名、IPv4、`[IPv6]:PORT` 和 `localhost`
+- 监听 IP 默认使用 `::` 双栈监听
+- 当前运行态只支持通配监听地址 `::` / `0.0.0.0`
+- `localhost` 会渲染为本地 IPv4 / IPv6 双栈目标
+
+## bbr.sh
+
+```bash
+bbr.sh status
+bbr.sh optimize balanced
+bbr.sh optimize relay --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
+bbr.sh optimize gaming --nic-steering
+bbr.sh reset
+```
+
+`bbr.sh` 会独立维护：
+
+- BBR / sysctl 配置
+- tc egress / ingress shaping
+- BQL 限制
+- RPS / XPS 网卡 steering
+- `pfwd-bbr.service` 开机恢复
+
+## Paths
+
+| Path | Purpose |
 |------|---------|
-| `/usr/local/bin/pfwd.sh` | installed script |
-| `/usr/local/bin/pfwd` | shortcut command |
-| `/var/lib/pfwd/` | rules and traffic state |
-| `/etc/systemd/system/pfwd.service` / `pfwd.timer` | boot restore and maintenance units |
-| `/etc/sysctl.d/99-pfwd.conf` | pfwd-managed sysctl tuning |
+| `/etc/pfwd/config.json` | 主配置 |
+| `/usr/local/bin/pfwd` | 命令入口 |
+| `/usr/local/bin/bbr.sh` | 调优入口 |
+| `/usr/local/lib/pfwd` | 安装目录 |
+| `/var/lib/pfwd/stats.json` | 流量状态 |
+| `/var/lib/pfwd/bbr-state.env` | BBR / optimize 状态 |
+| `/run/pfwd/runtime.json` | 当前解析后的运行态 |
+| `/run/pfwd/forwarder.nft` | 当前渲染出的转发表 |
 
-## Requirements
+## Uninstall
 
-- Linux with root access.
-- `nftables` (`nft`)
-- `iproute2` / `iproute` (`ip`)
-- `jq` for import/export.
-- `conntrack` / `conntrack-tools` recommended for traffic stats.
-- Linux kernel >= 4.16 recommended for flowtable acceleration.
-
-Package examples:
-
-| Distro | Command |
-|--------|---------|
-| Debian / Ubuntu | `apt-get install -y nftables iproute2 jq conntrack` |
-| Fedora / Rocky / Alma / Amazon Linux / Oracle Linux | `dnf install -y nftables iproute jq conntrack-tools` |
-| CentOS / RHEL | `yum install -y nftables iproute jq conntrack-tools` |
-| openSUSE / SUSE | `zypper install -y nftables iproute2 jq conntrack-tools` |
-| Arch Linux | `pacman -Sy --needed nftables iproute2 jq conntrack-tools` |
-| Alpine | `apk add nftables iproute2 jq conntrack-tools` |
-
-## License
-
-MIT
+```bash
+pfwd uninstall
+```
