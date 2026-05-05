@@ -58,6 +58,9 @@ PFWD_BBR_BIN_PATH="${PFWD_BBR_BIN_PATH:-$(pfwd_path usr/local/bin/bbr.sh)}"
 PFWD_BBR_ALIAS_BIN_PATH="${PFWD_BBR_ALIAS_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd-bbr)}"
 PFWD_BBR_ENTRY_NAME="${PFWD_BBR_ENTRY_NAME:-pfwd-bbr}"
 BBR_UI_REPLY=""
+BBR_UI_NOTICE=""
+BBR_UI_NOTICE_LEVEL=""
+BBR_APPLY_SKIPPED_SYSCTLS=""
 
 bbr_die() {
     echo "错误：$*" >&2
@@ -66,6 +69,16 @@ bbr_die() {
 
 bbr_info() {
     echo "$*"
+}
+
+bbr_ui_set_notice() {
+    BBR_UI_NOTICE_LEVEL="${1:-info}"
+    BBR_UI_NOTICE="${2:-}"
+}
+
+bbr_ui_clear_notice() {
+    BBR_UI_NOTICE_LEVEL=""
+    BBR_UI_NOTICE=""
 }
 
 bbr_now_iso() {
@@ -162,6 +175,11 @@ bbr_is_tty() {
     [ -t 0 ] && [ -t 1 ]
 }
 
+bbr_clear_screen() {
+    [ -t 1 ] || return 0
+    printf '\033[H\033[2J'
+}
+
 bbr_pause() {
     [ -t 0 ] || return 0
     printf '按回车继续...'
@@ -203,8 +221,7 @@ bbr_default_iface_prompt() {
 }
 
 bbr_menu_status() {
-    bbr_status
-    bbr_pause
+    bbr_ui_set_notice info "状态已刷新"
 }
 
 bbr_menu_choose_profile() {
@@ -299,51 +316,99 @@ bbr_menu_optimize() {
     ingress_rate="$BBR_UI_REPLY"
 
     if [ -z "$egress_rate" ] && [ -z "$ingress_rate" ]; then
-        bbr_info "提示：本次不会启用 tc shaping。"
+        bbr_ui_set_notice info "提示：本次不会启用 tc shaping。"
     fi
 
     bbr_optimize_apply "$profile" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
     bbr_enable_service
-    bbr_info "优化已应用：profile=$profile"
-    bbr_pause
+    if [ -n "$BBR_APPLY_SKIPPED_SYSCTLS" ]; then
+        bbr_ui_set_notice warn "优化已应用：profile=$profile；已跳过当前内核不支持的 sysctl: $BBR_APPLY_SKIPPED_SYSCTLS"
+    else
+        bbr_ui_set_notice success "优化已应用：profile=$profile"
+    fi
 }
 
 bbr_menu_reset() {
     if bbr_confirm_text "reset" "输入 reset 确认重置优化"; then
         bbr_reset
         bbr_disable_service
-        bbr_info "优化已重置"
+        bbr_ui_set_notice success "优化已重置"
     else
-        bbr_info "已取消"
+        bbr_ui_set_notice warn "已取消"
     fi
-    bbr_pause
 }
 
 bbr_menu_install() {
     bbr_install
-    bbr_info "pfwd-bbr 已安装"
-    bbr_pause
+    bbr_ui_set_notice success "pfwd-bbr 已安装"
 }
 
 bbr_menu_uninstall() {
     if bbr_confirm_text "uninstall" "输入 uninstall 确认卸载 pfwd-bbr"; then
         bbr_uninstall
-        bbr_info "pfwd-bbr 已卸载"
+        bbr_ui_set_notice success "pfwd-bbr 已卸载"
     else
-        bbr_info "已取消"
+        bbr_ui_set_notice warn "已取消"
     fi
-    bbr_pause
+}
+
+bbr_ui_notice_prefix() {
+    case "${1:-}" in
+        success) printf '[OK]' ;;
+        warn) printf '[WARN]' ;;
+        error) printf '[ERR]' ;;
+        *) printf '[INFO]' ;;
+    esac
+}
+
+bbr_ui_print_notice() {
+    [ -n "$BBR_UI_NOTICE" ] || return 0
+    printf '%s %s\n' "$(bbr_ui_notice_prefix "$BBR_UI_NOTICE_LEVEL")" "$BBR_UI_NOTICE"
+}
+
+bbr_status_summary() {
+    bbr_state_load
+    local cc qdisc release state_iface
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    release="$(uname -r 2>/dev/null || echo unknown)"
+    state_iface=""
+    if [ "$BBR_STATE_PRESENT" = "true" ]; then
+        state_iface="$(bbr_resolve_iface "$BBR_STATE_TC_IFACE_MODE" "$BBR_STATE_TC_IFACE_VALUE" 2>/dev/null || true)"
+    fi
+    cat <<EOF
+kernel_release=$release
+congestion_control=$cc
+qdisc=$qdisc
+bbr_available=$(bbr_sysctl_cc_available && echo true || echo false)
+bbr_active=$([ "$cc" = "bbr" ] && echo true || echo false)
+applied_profile=${BBR_STATE_PROFILE:-none}
+nic_steering=${BBR_STATE_NIC_STEERING:-false}
+tc_iface_resolved=${state_iface:-}
+egress_rate=${BBR_STATE_EGRESS_RATE:-}
+ingress_rate=${BBR_STATE_INGRESS_RATE:-}
+applied_at=${BBR_STATE_APPLIED_AT:-}
+EOF
+}
+
+bbr_menu_render() {
+    bbr_clear_screen
+    printf '== pfwd-bbr ==\n'
+    printf '%s\n' "$(bbr_status_summary)"
+    echo
+    bbr_ui_print_notice
+    echo "1) 查看状态"
+    echo "2) 应用优化"
+    echo "3) 重置优化"
+    echo "4) 安装开机恢复服务"
+    echo "5) 卸载 pfwd-bbr"
+    echo "0) 退出"
 }
 
 bbr_menu() {
+    bbr_ui_clear_notice
     while true; do
-        printf '\n== pfwd-bbr ==\n'
-        echo "1) 查看状态"
-        echo "2) 应用优化"
-        echo "3) 重置优化"
-        echo "4) 安装开机恢复服务"
-        echo "5) 卸载 pfwd-bbr"
-        echo "0) 退出"
+        bbr_menu_render
         bbr_read "选择" || return 0
         case "$BBR_UI_REPLY" in
             1) bbr_menu_status ;;
@@ -352,7 +417,7 @@ bbr_menu() {
             4) bbr_menu_install ;;
             5) bbr_menu_uninstall ;;
             0) return 0 ;;
-            *) bbr_info "无效选择"; bbr_pause ;;
+            *) bbr_ui_set_notice warn "无效选择" ;;
         esac
     done
 }
@@ -475,6 +540,42 @@ bbr_try_load_cc() {
     bbr_sysctl_cc_available && return 0
     bbr_run modprobe tcp_bbr >/dev/null 2>&1 || true
     bbr_sysctl_cc_available
+}
+
+bbr_sysctl_key_supported() {
+    local key="$1"
+    local proc_path="/proc/sys/${key//./\/}"
+    [ -e "$proc_path" ]
+}
+
+bbr_sysctl_filter_supported() {
+    local line key value filtered="" skipped=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            \#*)
+                filtered+="$line"$'\n'
+                continue
+                ;;
+        esac
+        if [[ "$line" != *" = "* ]]; then
+            filtered+="$line"$'\n'
+            continue
+        fi
+        key="${line%% = *}"
+        value="${line#* = }"
+        if bbr_sysctl_key_supported "$key"; then
+            filtered+="$key = $value"$'\n'
+        else
+            if [ -z "$skipped" ]; then
+                skipped="$key"
+            else
+                skipped="$skipped, $key"
+            fi
+        fi
+    done
+    BBR_APPLY_SKIPPED_SYSCTLS="$skipped"
+    printf '%s' "$filtered"
 }
 
 bbr_profile_prepare() {
@@ -701,11 +802,14 @@ bbr_apply_sysctl_profile() {
     local profile="$1"
     bbr_profile_prepare "$profile"
     bbr_mkdir_p "$(dirname "$PFWD_BBR_SYSCTL_CONF")"
+    BBR_APPLY_SKIPPED_SYSCTLS=""
     local enable_bbr="false"
+    local rendered=""
     if bbr_try_load_cc; then
         enable_bbr="true"
     fi
-    bbr_render_sysctl_conf "$enable_bbr" | bbr_write_atomic "$PFWD_BBR_SYSCTL_CONF"
+    rendered="$(bbr_render_sysctl_conf "$enable_bbr" | bbr_sysctl_filter_supported)"
+    printf '%s' "$rendered" | bbr_write_atomic "$PFWD_BBR_SYSCTL_CONF"
     bbr_run sysctl -p "$PFWD_BBR_SYSCTL_CONF" >/dev/null
 }
 
@@ -860,31 +964,15 @@ bbr_apply_runtime_state() {
 }
 
 bbr_status() {
-    bbr_state_load
-    local cc qdisc release state_iface
-    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-    release="$(uname -r 2>/dev/null || echo unknown)"
-    state_iface=""
-    if [ "$BBR_STATE_PRESENT" = "true" ]; then
-        state_iface="$(bbr_resolve_iface "$BBR_STATE_TC_IFACE_MODE" "$BBR_STATE_TC_IFACE_VALUE" 2>/dev/null || true)"
-    fi
     echo "bbr status"
-    echo "  kernel_release=$release"
-    echo "  congestion_control=$cc"
-    echo "  qdisc=$qdisc"
-    echo "  bbr_available=$(bbr_sysctl_cc_available && echo true || echo false)"
-    echo "  bbr_active=$([ "$cc" = "bbr" ] && echo true || echo false)"
+    while IFS= read -r line; do
+        printf '  %s\n' "$line"
+    done <<< "$(bbr_status_summary)"
+    bbr_state_load
     echo "  state_present=$BBR_STATE_PRESENT"
-    echo "  applied_profile=${BBR_STATE_PROFILE:-none}"
-    echo "  nic_steering=${BBR_STATE_NIC_STEERING:-false}"
     echo "  bql_limit=${BBR_STATE_BQL_LIMIT:-65536}"
     echo "  tc_iface_mode=${BBR_STATE_TC_IFACE_MODE:-auto}"
     echo "  tc_iface_value=${BBR_STATE_TC_IFACE_VALUE:-}"
-    echo "  tc_iface_resolved=${state_iface:-}"
-    echo "  egress_rate=${BBR_STATE_EGRESS_RATE:-}"
-    echo "  ingress_rate=${BBR_STATE_INGRESS_RATE:-}"
-    echo "  applied_at=${BBR_STATE_APPLIED_AT:-}"
     echo "  sysctl_conf=$PFWD_BBR_SYSCTL_CONF"
     echo "  service_file=$PFWD_BBR_SERVICE_FILE"
 }
@@ -917,7 +1005,8 @@ bbr_restore() {
     bbr_require_mutation_context
     bbr_state_load
     [ "$BBR_STATE_PRESENT" = "true" ] || return 0
-    [ -f "$PFWD_BBR_SYSCTL_CONF" ] && bbr_run sysctl -p "$PFWD_BBR_SYSCTL_CONF" >/dev/null
+    [ -n "$BBR_STATE_PROFILE" ] || bbr_die "无法恢复：state file 缺少 PROFILE"
+    bbr_apply_sysctl_profile "$BBR_STATE_PROFILE"
     bbr_apply_runtime_state \
         "$BBR_STATE_NIC_STEERING" \
         "$BBR_STATE_BQL_LIMIT" \
@@ -1011,8 +1100,9 @@ $cmd - pfwd BBR / optimize manager
   $cmd uninstall
 
 说明：
-  - 无参数且在交互终端运行时，会进入交互式菜单。
+  - 无参数且在交互终端运行时，会进入交互式菜单并原位刷新状态。
   - optimize 会写入 /etc/sysctl.d/99-pfwd-bbr.conf，并按需要应用 BQL、RPS/XPS 与 tc shaping。
+  - 当前内核不支持的 sysctl 项会自动跳过。
   - 若已安装 pfwd-bbr.service，成功的 optimize 会自动启用该 unit 以便开机恢复。
 EOF
 }

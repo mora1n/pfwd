@@ -231,7 +231,8 @@ pfwd-bbr uninstall
 ```
 
 `pfwd-bbr` 独立维护 BBR / sysctl / tc / BQL / RPS/XPS，并通过 `pfwd-bbr.service` 恢复运行态。
-直接执行 `pfwd-bbr` 会进入交互式菜单；也可以继续使用原有 CLI。
+直接执行 `pfwd-bbr` 会进入交互式菜单并原位刷新状态；也可以继续使用原有 CLI。
+当前内核不支持的 sysctl 项会自动跳过。
 
 ## Paths
 
