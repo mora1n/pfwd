@@ -203,6 +203,13 @@ pfwd add \
 
 这些字段会持久化在 `.forwards[].nft` 下，并参与运行态渲染。
 
+交互界面添加/修改转发时也可以直接设置 `MSS` 和 `SNAT`。
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `MSS` | 不设置 | 常规公网转发一般不需要；`MSS clamp` 适合 PPPoE、VPN、隧道、跨境链路；固定 `MSS` 适合已知 MTU 或上游有统一要求时 |
+| `SNAT` | `masquerade` | 普通单出口、动态公网 IP 直接用默认值；固定 `SNAT` 适合本机有额外内网 IP、多地址出口或后端只接受特定来源 IP |
+
 ### Address Notes
 
 - 目标地址支持域名、IPv4、`[IPv6]:PORT` 和 `localhost`
@@ -213,6 +220,7 @@ pfwd add \
 ## pfwd-bbr
 
 ```bash
+pfwd-bbr
 pfwd-bbr status
 pfwd-bbr optimize balanced
 pfwd-bbr optimize relay --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
@@ -223,6 +231,7 @@ pfwd-bbr uninstall
 ```
 
 `pfwd-bbr` 独立维护 BBR / sysctl / tc / BQL / RPS/XPS，并通过 `pfwd-bbr.service` 恢复运行态。
+直接执行 `pfwd-bbr` 会进入交互式菜单；也可以继续使用原有 CLI。
 
 ## Paths
 

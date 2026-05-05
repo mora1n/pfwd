@@ -225,6 +225,7 @@ pfwd - nft 端口转发管理脚本
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
 MSS 和固定 SNAT 通过 `.forwards[].nft` 字段持久化。
+MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
 内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
 EOF
 }

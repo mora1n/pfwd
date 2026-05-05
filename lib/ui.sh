@@ -9,6 +9,12 @@ UI_TERM_WIDTH_CACHE=""
 UI_WIDTH_RESULT=0
 UI_TEXT_RESULT=""
 UI_CELL_COLOR=""
+UI_MSS_MODE=""
+UI_MSS_VALUE=""
+UI_SNAT_MODE="masquerade"
+UI_SNAT_SOURCE=""
+UI_MSS_RECOMMENDED=""
+UI_MSS_RECOMMEND_SOURCE=""
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
@@ -510,6 +516,300 @@ ui_yes() {
     esac
 }
 
+ui_is_ipv4_literal() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+ui_is_ipv6_literal() {
+    local value="$1"
+    [[ "$value" == *:* ]]
+}
+
+ui_probe_route_mtu() {
+    local family="$1"
+    local target="$2"
+    local route_cmd_output="" mtu="" iface=""
+
+    if [ "$family" = "6" ]; then
+        route_cmd_output="$(ip -6 route get "$target" 2>/dev/null | head -n1 || true)"
+    else
+        route_cmd_output="$(ip route get "$target" 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ "$route_cmd_output" =~ [[:space:]]mtu[[:space:]]+([0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$route_cmd_output" =~ [[:space:]]dev[[:space:]]+([^[:space:]]+) ]]; then
+        iface="${BASH_REMATCH[1]}"
+        if [ -n "$iface" ] && [ -r "/sys/class/net/$iface/mtu" ]; then
+            mtu="$(tr -d '[:space:]' < "/sys/class/net/$iface/mtu" 2>/dev/null || true)"
+            if [[ "$mtu" =~ ^[0-9]+$ ]]; then
+                printf '%s\n' "$mtu"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+ui_recommended_mss_value() {
+    local remote_host="$1"
+    local rows="" family ipver resolved_ip candidate mtu mss best="" fallback="1460"
+    UI_MSS_RECOMMENDED=""
+    UI_MSS_RECOMMEND_SOURCE=""
+
+    if ui_is_ipv4_literal "$remote_host"; then
+        rows="ip|4|$remote_host"
+    elif ui_is_ipv6_literal "$remote_host"; then
+        rows="ip6|6|$remote_host"
+        fallback="1440"
+    else
+        rows="$(forwarder_resolve_targets "$remote_host" "46" || true)"
+    fi
+
+    if [ -z "$rows" ]; then
+        UI_MSS_RECOMMENDED="$fallback"
+        UI_MSS_RECOMMEND_SOURCE="fallback"
+        return 0
+    fi
+
+    while IFS='|' read -r family ipver resolved_ip; do
+        [ -n "$resolved_ip" ] || continue
+        if mtu="$(ui_probe_route_mtu "$ipver" "$resolved_ip" 2>/dev/null)"; then
+            if [ "$ipver" = "6" ]; then
+                mss=$((mtu - 60))
+            else
+                mss=$((mtu - 40))
+            fi
+            if [ "$mss" -lt 536 ]; then
+                mss=536
+            fi
+            if [ -z "$best" ] || [ "$mss" -lt "$best" ]; then
+                best="$mss"
+            fi
+        elif [ "$ipver" = "6" ] && [ "$fallback" -gt 1440 ]; then
+            fallback="1440"
+        fi
+    done <<< "$rows"
+
+    if [ -n "$best" ]; then
+        UI_MSS_RECOMMENDED="$best"
+        UI_MSS_RECOMMEND_SOURCE="probed"
+        return 0
+    fi
+
+    UI_MSS_RECOMMENDED="$fallback"
+    UI_MSS_RECOMMEND_SOURCE="fallback"
+}
+
+ui_select_mss_mode() {
+    local prompt="$1"
+    local remote_host="${2:-}"
+    local recommended=""
+    local source="fallback"
+
+    UI_MSS_MODE=""
+    UI_MSS_VALUE=""
+
+    if [ -n "$remote_host" ]; then
+        ui_recommended_mss_value "$remote_host"
+        recommended="$UI_MSS_RECOMMENDED"
+        source="$UI_MSS_RECOMMEND_SOURCE"
+    fi
+
+    echo "1) 不设置"
+    echo "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。"
+    echo "2) MSS Clamp"
+    echo "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。"
+    echo "3) 固定 MSS"
+    echo "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。"
+    ui_read "$prompt" "1" || return 1
+    case "$UI_REPLY" in
+        1|"")
+            UI_MSS_MODE=""
+            UI_MSS_VALUE=""
+            ;;
+        2)
+            UI_MSS_MODE="clamp"
+            UI_MSS_VALUE=""
+            ;;
+        3)
+            UI_MSS_MODE="set"
+            if [ -n "$recommended" ]; then
+                if [ "$source" = "fallback" ]; then
+                    ui_warn "未探测到链路 MTU，已使用通用推荐值：$recommended"
+                else
+                    ui_print_line "固定 MSS 推荐值：$recommended" "36"
+                fi
+            fi
+            ui_read "固定 MSS 值" "$recommended" || return 1
+            [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
+            validate_mss_value "$UI_REPLY"
+            UI_MSS_VALUE="$UI_REPLY"
+            ;;
+        *)
+            ui_warn "无效选择，已使用不设置"
+            UI_MSS_MODE=""
+            UI_MSS_VALUE=""
+            ;;
+    esac
+}
+
+ui_select_mss_mode_edit() {
+    local prompt="$1"
+    local current_mode="$2"
+    local current_value="$3"
+    local remote_host="${4:-}"
+    local recommended="" source="fallback" fixed_default=""
+
+    UI_MSS_MODE=""
+    UI_MSS_VALUE=""
+    UI_EDIT_ABORTED=0
+
+    ui_recommended_mss_value "$remote_host"
+    recommended="$UI_MSS_RECOMMENDED"
+    source="$UI_MSS_RECOMMEND_SOURCE"
+
+    echo "1) 不设置"
+    echo "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。"
+    echo "2) MSS Clamp"
+    echo "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。"
+    echo "3) 固定 MSS"
+    echo "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。"
+    case "$current_mode" in
+        clamp) ui_read "$prompt" "2" || return 1 ;;
+        set) ui_read "$prompt" "3" || return 1 ;;
+        *) ui_read "$prompt" "1" || return 1 ;;
+    esac
+
+    case "$UI_REPLY" in
+        0)
+            UI_EDIT_ABORTED=1
+            return 0
+            ;;
+        "")
+            UI_MSS_MODE=""
+            UI_MSS_VALUE=""
+            return 0
+            ;;
+        1)
+            UI_MSS_MODE="__CLEAR__"
+            UI_MSS_VALUE="__CLEAR__"
+            ;;
+        2)
+            UI_MSS_MODE="clamp"
+            UI_MSS_VALUE="__CLEAR__"
+            ;;
+        3)
+            UI_MSS_MODE="set"
+            if [ -n "$current_value" ]; then
+                fixed_default="$current_value"
+                if [ -n "$recommended" ] && [ "$recommended" != "$current_value" ]; then
+                    ui_print_line "当前固定 MSS：$current_value；推荐值：$recommended" "36"
+                fi
+            else
+                fixed_default="$recommended"
+                if [ -n "$recommended" ]; then
+                    if [ "$source" = "fallback" ]; then
+                        ui_warn "未探测到链路 MTU，已使用通用推荐值：$recommended"
+                    else
+                        ui_print_line "固定 MSS 推荐值：$recommended" "36"
+                    fi
+                fi
+            fi
+            ui_edit_read "固定 MSS 值" "$fixed_default" || return 1
+            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
+            validate_mss_value "$UI_REPLY"
+            UI_MSS_VALUE="$UI_REPLY"
+            ;;
+        *)
+            ui_warn "无效选择"
+            return 1
+            ;;
+    esac
+}
+
+ui_select_snat_mode() {
+    local prompt="$1"
+    UI_SNAT_MODE="masquerade"
+    UI_SNAT_SOURCE=""
+
+    echo "1) Masquerade"
+    echo "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。"
+    echo "2) 固定 SNAT 源地址"
+    echo "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。"
+    ui_read "$prompt" "1" || return 1
+    case "$UI_REPLY" in
+        1|"")
+            UI_SNAT_MODE="masquerade"
+            UI_SNAT_SOURCE=""
+            ;;
+        2)
+            UI_SNAT_MODE="snat"
+            ui_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
+            [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
+            validate_ip_literal "$UI_REPLY"
+            UI_SNAT_SOURCE="$UI_REPLY"
+            ;;
+        *)
+            ui_warn "无效选择，已使用 masquerade"
+            UI_SNAT_MODE="masquerade"
+            UI_SNAT_SOURCE=""
+            ;;
+    esac
+}
+
+ui_select_snat_mode_edit() {
+    local prompt="$1"
+    local current_mode="$2"
+    local current_source="$3"
+
+    UI_SNAT_MODE=""
+    UI_SNAT_SOURCE=""
+    UI_EDIT_ABORTED=0
+
+    echo "1) Masquerade"
+    echo "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。"
+    echo "2) 固定 SNAT 源地址"
+    echo "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。"
+    case "$current_mode" in
+        snat) ui_read "$prompt" "2" || return 1 ;;
+        *) ui_read "$prompt" "1" || return 1 ;;
+    esac
+    case "$UI_REPLY" in
+        0)
+            UI_EDIT_ABORTED=1
+            return 0
+            ;;
+        "")
+            UI_SNAT_MODE=""
+            UI_SNAT_SOURCE=""
+            return 0
+            ;;
+        1)
+            UI_SNAT_MODE="masquerade"
+            UI_SNAT_SOURCE="__CLEAR__"
+            ;;
+        2)
+            UI_SNAT_MODE="snat"
+            ui_edit_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" "$current_source" || return 1
+            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
+            validate_ip_literal "$UI_REPLY"
+            UI_SNAT_SOURCE="$UI_REPLY"
+            ;;
+        *)
+            ui_warn "无效选择"
+            return 1
+            ;;
+    esac
+}
+
 ui_config_value() {
     local filter="$1"
     config_init >/dev/null
@@ -908,7 +1208,7 @@ ui_print_forward_list() {
         echo "暂无转发"
         return
     fi
-    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode; do
+    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display; do
         local listen remote state
         listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         remote="$(ui_format_remote "$remote_host" "$remote_port")"
@@ -917,7 +1217,7 @@ ui_print_forward_list() {
         else
             state="$(ui_forward_state_text false)"
         fi
-        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\n'
+        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\n'
     done < <(jq -r '
       .forwards
       | to_entries[]
@@ -931,12 +1231,28 @@ ui_print_forward_list() {
           (.value.remote_port | tostring),
           (.value.protocol // "tcp_udp"),
           (.value.stop_at // "-"),
-          (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end)
+          (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
+          (
+            if (.value.nft.mss_mode // "") == "set" then
+              ((.value.nft.mss_value // "-") | tostring)
+            elif (.value.nft.mss_mode // "") == "clamp" then
+              "clamp"
+            else
+              "-"
+            end
+          ),
+          (
+            if (.value.nft.snat_mode // "masquerade") == "snat" and (.value.nft.snat_source // "") != "" then
+              .value.nft.snat_source
+            else
+              "masquerade"
+            end
+          )
         ]
       | @tsv
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
-    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式' "$rows" "4,2,7,8,3"
+    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT' "$rows" "4,2,7,8,10,3"
 }
 
 ui_print_user_list() {
@@ -1247,6 +1563,8 @@ ui_menu_add_forward() {
     protocol="$UI_REPLY"
     ui_select_traffic_mode "流量模式" || return 0
     traffic_mode="$UI_TRAFFIC_MODE"
+    ui_select_mss_mode "MSS 处理方式" "$remote_host" || return 0
+    ui_select_snat_mode "SNAT 处理方式" || return 0
 
     args=(--user-id "$user_id" --remote "$remote" --listen-ip "$listen_ip" --protocol "$protocol" --traffic-mode "$traffic_mode")
     if [ -n "$listen_port" ]; then
@@ -1255,6 +1573,15 @@ ui_menu_add_forward() {
         args+=(--random-port "$random_range")
     fi
     [ -z "$stop_at" ] || args+=(--stop-at "$stop_at")
+    case "$UI_MSS_MODE" in
+        clamp) args+=(--mss-clamp) ;;
+        set) args+=(--mss "$UI_MSS_VALUE") ;;
+    esac
+    if [ "$UI_SNAT_MODE" = "snat" ]; then
+        args+=(--snat-source "$UI_SNAT_SOURCE")
+    else
+        args+=(--masquerade)
+    fi
 
     ui_run cmd_add "${args[@]}"
 }
@@ -1281,6 +1608,7 @@ ui_menu_forwards() {
                 ui_select_forward true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode=""
+                local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
                 local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" args=()
                 current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
                 current_listen_ip="$(jq -r '.listen_ip // "::"' <<< "$current")"
@@ -1290,6 +1618,10 @@ ui_menu_forwards() {
                 current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
                 current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
                 current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
+                current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$current")"
+                current_mss_value="$(jq -r '.nft.mss_value // ""' <<< "$current")"
+                current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
+                current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$current")"
 
                 ui_clear_screen
                 ui_header "修改转发"
@@ -1322,6 +1654,10 @@ ui_menu_forwards() {
                 ui_select_traffic_mode_edit "流量模式" "$current_mode" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 traffic_mode="$UI_TRAFFIC_MODE"
+                ui_select_mss_mode_edit "MSS 处理方式" "$current_mss_mode" "$current_mss_value" "$remote_host" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                ui_select_snat_mode_edit "SNAT 处理方式" "$current_snat_mode" "$current_snat_source" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
 
                 args=(--forward-id "$forward_id")
                 [ "$listen_ip" = "$current_listen_ip" ] || args+=(--listen-ip "$listen_ip")
@@ -1335,6 +1671,35 @@ ui_menu_forwards() {
                 fi
                 [ -z "$protocol" ] || [ "$protocol" = "$current_protocol" ] || args+=(--protocol "$protocol")
                 [ -z "$traffic_mode" ] || [ "$traffic_mode" = "$current_mode" ] || args+=(--traffic-mode "$traffic_mode")
+                case "$UI_MSS_MODE" in
+                    clamp)
+                        if [ "$current_mss_mode" != "clamp" ]; then
+                            args+=(--mss-clamp)
+                        fi
+                        ;;
+                    set)
+                        if [ "$current_mss_mode" != "set" ] || [ "$UI_MSS_VALUE" != "$current_mss_value" ]; then
+                            args+=(--mss "$UI_MSS_VALUE")
+                        fi
+                        ;;
+                    __CLEAR__)
+                        if [ -n "$current_mss_mode" ] || [ -n "$current_mss_value" ]; then
+                            args+=(--clear-mss)
+                        fi
+                        ;;
+                esac
+                case "$UI_SNAT_MODE" in
+                    snat)
+                        if [ "$current_snat_mode" != "snat" ] || [ "$UI_SNAT_SOURCE" != "$current_snat_source" ]; then
+                            args+=(--snat-source "$UI_SNAT_SOURCE")
+                        fi
+                        ;;
+                    masquerade)
+                        if [ "$current_snat_mode" != "masquerade" ] || [ -n "$current_snat_source" ]; then
+                            args+=(--masquerade)
+                        fi
+                        ;;
+                esac
 
                 if [ "${#args[@]}" -eq 2 ]; then
                     ui_warn "未修改"

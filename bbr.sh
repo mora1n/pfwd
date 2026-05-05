@@ -57,10 +57,15 @@ PFWD_BBR_INSTALL_DIR="${PFWD_BBR_INSTALL_DIR:-$(pfwd_path usr/local/lib/pfwd)}"
 PFWD_BBR_BIN_PATH="${PFWD_BBR_BIN_PATH:-$(pfwd_path usr/local/bin/bbr.sh)}"
 PFWD_BBR_ALIAS_BIN_PATH="${PFWD_BBR_ALIAS_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd-bbr)}"
 PFWD_BBR_ENTRY_NAME="${PFWD_BBR_ENTRY_NAME:-pfwd-bbr}"
+BBR_UI_REPLY=""
 
 bbr_die() {
     echo "错误：$*" >&2
     exit 1
+}
+
+bbr_info() {
+    echo "$*"
 }
 
 bbr_now_iso() {
@@ -81,6 +86,16 @@ bbr_run() {
     "$@"
 }
 
+bbr_mkdir_p() {
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
+        printf 'DRY-RUN: mkdir -p'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    mkdir -p "$@"
+}
+
 bbr_write_value() {
     local path="$1"
     local value="$2"
@@ -93,6 +108,11 @@ bbr_write_value() {
 
 bbr_write_atomic() {
     local target="$1"
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
+        printf 'DRY-RUN: write file %q\n' "$target"
+        cat >/dev/null
+        return 0
+    fi
     local tmp
     tmp="$(mktemp "${target}.tmp.XXXXXX")"
     cat > "$tmp"
@@ -138,13 +158,212 @@ bbr_preferred_command_name() {
     printf '%s\n' "$PFWD_BBR_ENTRY_NAME"
 }
 
+bbr_is_tty() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+bbr_pause() {
+    [ -t 0 ] || return 0
+    printf '按回车继续...'
+    IFS= read -r _ || true
+}
+
+bbr_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    BBR_UI_REPLY=""
+    if [ -n "$default" ]; then
+        printf '%s [%s]: ' "$prompt" "$default"
+    else
+        printf '%s: ' "$prompt"
+    fi
+    if ! IFS= read -r BBR_UI_REPLY; then
+        BBR_UI_REPLY=""
+        return 1
+    fi
+    [ -n "$BBR_UI_REPLY" ] || BBR_UI_REPLY="$default"
+    return 0
+}
+
+bbr_confirm_text() {
+    local expected="$1"
+    local prompt="$2"
+    bbr_read "$prompt" || return 1
+    [ "$BBR_UI_REPLY" = "$expected" ]
+}
+
+bbr_default_iface_prompt() {
+    local iface
+    iface="$(bbr_default_route_iface)"
+    if [ -n "$iface" ]; then
+        printf '默认路由网卡（当前：%s）\n' "$iface"
+    else
+        printf '默认路由网卡（当前未探测到）\n'
+    fi
+}
+
+bbr_menu_status() {
+    bbr_status
+    bbr_pause
+}
+
+bbr_menu_choose_profile() {
+    echo "1) balanced"
+    echo "   通用平衡档，适合大多数中转和公网主机。"
+    echo "2) gaming"
+    echo "   偏低延迟，适合对交互响应更敏感的链路。"
+    echo "3) lowmem"
+    echo "   偏保守内存占用，适合小内存主机。"
+    echo "4) relay"
+    echo "   偏中转吞吐和连接数，适合高并发转发节点。"
+    bbr_read "优化档位" "1" || return 1
+    case "$BBR_UI_REPLY" in
+        1|"") BBR_UI_REPLY="balanced" ;;
+        2) BBR_UI_REPLY="gaming" ;;
+        3) BBR_UI_REPLY="lowmem" ;;
+        4) BBR_UI_REPLY="relay" ;;
+        *) bbr_die "无效优化档位：$BBR_UI_REPLY" ;;
+    esac
+}
+
+bbr_menu_choose_nic_steering() {
+    echo "1) 关闭"
+    echo "   保持当前网卡队列分发默认状态。"
+    echo "2) 开启"
+    echo "   启用 RPS/XPS；适合多核主机、并发流量较大时。"
+    bbr_read "NIC steering" "1" || return 1
+    case "$BBR_UI_REPLY" in
+        1|"") BBR_UI_REPLY="false" ;;
+        2) BBR_UI_REPLY="true" ;;
+        *) bbr_die "无效选择：$BBR_UI_REPLY" ;;
+    esac
+}
+
+bbr_menu_choose_iface_mode() {
+    echo "1) 使用默认路由网卡"
+    echo "   适合单出口主机，自动沿系统默认路由选择网卡。"
+    echo "2) 手动指定网卡"
+    echo "   适合多网卡、多出口或默认路由不等于目标出口时。"
+    bbr_default_iface_prompt
+    bbr_read "网卡选择" "1" || return 1
+    case "$BBR_UI_REPLY" in
+        1|"")
+            BBR_UI_REPLY="auto|"
+            ;;
+        2)
+            local iface=""
+            bbr_read "网卡名，例如 eth0" || return 1
+            iface="$BBR_UI_REPLY"
+            [ -n "$iface" ] || bbr_die "必须提供网卡名"
+            BBR_UI_REPLY="explicit|$iface"
+            ;;
+        *)
+            bbr_die "无效选择：$BBR_UI_REPLY"
+            ;;
+    esac
+}
+
+bbr_menu_rate_prompt() {
+    local label="$1"
+    echo "留空表示不设置。支持 100mbit / 100M / 1gbit。"
+    bbr_read "$label" "" || return 1
+    if [ -n "$BBR_UI_REPLY" ]; then
+        BBR_UI_REPLY="$(bbr_normalize_rate "$BBR_UI_REPLY")"
+    fi
+}
+
+bbr_menu_optimize() {
+    local profile="balanced"
+    local nic_steering="false"
+    local tc_iface_mode="auto"
+    local tc_iface_value=""
+    local egress_rate=""
+    local ingress_rate=""
+    local iface_spec=""
+
+    bbr_menu_choose_profile || return 1
+    profile="$BBR_UI_REPLY"
+
+    bbr_menu_choose_nic_steering || return 1
+    nic_steering="$BBR_UI_REPLY"
+
+    bbr_menu_choose_iface_mode || return 1
+    iface_spec="$BBR_UI_REPLY"
+    tc_iface_mode="${iface_spec%%|*}"
+    tc_iface_value="${iface_spec#*|}"
+
+    bbr_menu_rate_prompt "出口限速 egress rate" || return 1
+    egress_rate="$BBR_UI_REPLY"
+
+    bbr_menu_rate_prompt "入口限速 ingress rate" || return 1
+    ingress_rate="$BBR_UI_REPLY"
+
+    if [ -z "$egress_rate" ] && [ -z "$ingress_rate" ]; then
+        bbr_info "提示：本次不会启用 tc shaping。"
+    fi
+
+    bbr_optimize_apply "$profile" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
+    bbr_enable_service
+    bbr_info "优化已应用：profile=$profile"
+    bbr_pause
+}
+
+bbr_menu_reset() {
+    if bbr_confirm_text "reset" "输入 reset 确认重置优化"; then
+        bbr_reset
+        bbr_disable_service
+        bbr_info "优化已重置"
+    else
+        bbr_info "已取消"
+    fi
+    bbr_pause
+}
+
+bbr_menu_install() {
+    bbr_install
+    bbr_info "pfwd-bbr 已安装"
+    bbr_pause
+}
+
+bbr_menu_uninstall() {
+    if bbr_confirm_text "uninstall" "输入 uninstall 确认卸载 pfwd-bbr"; then
+        bbr_uninstall
+        bbr_info "pfwd-bbr 已卸载"
+    else
+        bbr_info "已取消"
+    fi
+    bbr_pause
+}
+
+bbr_menu() {
+    while true; do
+        printf '\n== pfwd-bbr ==\n'
+        echo "1) 查看状态"
+        echo "2) 应用优化"
+        echo "3) 重置优化"
+        echo "4) 安装开机恢复服务"
+        echo "5) 卸载 pfwd-bbr"
+        echo "0) 退出"
+        bbr_read "选择" || return 0
+        case "$BBR_UI_REPLY" in
+            1) bbr_menu_status ;;
+            2) bbr_menu_optimize ;;
+            3) bbr_menu_reset ;;
+            4) bbr_menu_install ;;
+            5) bbr_menu_uninstall ;;
+            0) return 0 ;;
+            *) bbr_info "无效选择"; bbr_pause ;;
+        esac
+    done
+}
+
 bbr_ensure_shortcuts() {
     [ -n "$SCRIPT_PATH" ] || return 0
     [ -z "${PFWD_ROOT_PREFIX:-}" ] || return 0
     [ "${PFWD_DRY_RUN:-0}" != "1" ] || return 0
     [ "${EUID:-$(id -u)}" -eq 0 ] || return 0
 
-    mkdir -p "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
+    bbr_mkdir_p "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
     ln -sf "$SCRIPT_PATH" "$PFWD_BBR_BIN_PATH"
     ln -sf "$SCRIPT_PATH" "$PFWD_BBR_ALIAS_BIN_PATH"
 }
@@ -229,7 +448,7 @@ bbr_state_load() {
 }
 
 bbr_state_save() {
-    mkdir -p "$PFWD_STATE_DIR"
+    bbr_mkdir_p "$PFWD_STATE_DIR"
     cat <<EOF | bbr_write_atomic "$PFWD_BBR_STATE_FILE"
 PROFILE=$1
 NIC_STEERING=$2
@@ -481,7 +700,7 @@ EOF
 bbr_apply_sysctl_profile() {
     local profile="$1"
     bbr_profile_prepare "$profile"
-    mkdir -p "$(dirname "$PFWD_BBR_SYSCTL_CONF")"
+    bbr_mkdir_p "$(dirname "$PFWD_BBR_SYSCTL_CONF")"
     local enable_bbr="false"
     if bbr_try_load_cc; then
         enable_bbr="true"
@@ -683,7 +902,7 @@ bbr_optimize_apply() {
     bbr_clear_previous_runtime
     bbr_apply_sysctl_profile "$profile"
     bbr_apply_runtime_state "$nic_steering" "$bql_limit" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
-    mkdir -p "$PFWD_STATE_DIR"
+    bbr_mkdir_p "$PFWD_STATE_DIR"
     bbr_state_save "$profile" "$nic_steering" "$bql_limit" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
 }
 
@@ -750,7 +969,7 @@ bbr_install() {
     bbr_require_mutation_context
     [ -n "$SCRIPT_DIR" ] || bbr_die "无法定位 bbr.sh 源目录"
 
-    mkdir -p "$PFWD_BBR_INSTALL_DIR" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_BBR_SERVICE_FILE")"
+    bbr_mkdir_p "$PFWD_BBR_INSTALL_DIR" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_BBR_SERVICE_FILE")"
     if [ "$SCRIPT_PATH" != "$PFWD_BBR_INSTALL_DIR/bbr.sh" ]; then
         cp "$SCRIPT_DIR/bbr.sh" "$PFWD_BBR_INSTALL_DIR/bbr.sh"
     fi
@@ -783,6 +1002,7 @@ bbr_help() {
 $cmd - pfwd BBR / optimize manager
 
 用法：
+  $cmd
   $cmd status
   $cmd optimize [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate RATE] [--ingress-rate RATE] [--tc-iface IFACE]
   $cmd optimize reset
@@ -791,14 +1011,23 @@ $cmd - pfwd BBR / optimize manager
   $cmd uninstall
 
 说明：
-  - `optimize` 会写入 `/etc/sysctl.d/99-pfwd-bbr.conf`，并按需要应用 BQL、RPS/XPS 与 tc shaping。
-  - 若已安装 `pfwd-bbr.service`，成功的 optimize 会自动启用该 unit 以便开机恢复。
+  - 无参数且在交互终端运行时，会进入交互式菜单。
+  - optimize 会写入 /etc/sysctl.d/99-pfwd-bbr.conf，并按需要应用 BQL、RPS/XPS 与 tc shaping。
+  - 若已安装 pfwd-bbr.service，成功的 optimize 会自动启用该 unit 以便开机恢复。
 EOF
 }
 
 main() {
     bbr_ensure_shortcuts
-    local cmd="${1:-help}"
+    local cmd="${1:-}"
+
+    if [ -z "$cmd" ]; then
+        if bbr_is_tty; then
+            bbr_menu
+            return 0
+        fi
+        cmd="help"
+    fi
 
     case "$cmd" in
         help|-h|--help)
