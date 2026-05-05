@@ -78,6 +78,8 @@ pfwd_bootstrap_install() {
     mkdir -p "$lib_dir" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
+    chmod +x "$install_dir/bbr.sh"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do

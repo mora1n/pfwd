@@ -57,6 +57,8 @@ EOF
 service_install_files() {
     pfwd_mkdirs
     mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
+    [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
+    [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
     if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
         cp "$PFWD_SCRIPT_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     fi
