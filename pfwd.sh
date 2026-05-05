@@ -189,6 +189,7 @@ pfwd - nft 端口转发管理脚本
   pfwd start <forward_id>
   pfwd stop <forward_id>
   pfwd delete <forward_id>
+  pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]
   pfwd expire set <forward_id> --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d
   pfwd expire clear <forward_id>
   pfwd expire user-set --user-id ID --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d

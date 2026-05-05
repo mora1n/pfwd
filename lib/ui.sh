@@ -1166,12 +1166,12 @@ ui_print_main_forward_summary() {
         return
     fi
 
-    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at; do
+    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at comment; do
         local remote_text listen_text state
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         state="$(ui_forward_state_text "$enabled")"
-        rows+="$state"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\n'
+        rows+="$state"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
       .forwards[]?
       | [
@@ -1183,12 +1183,13 @@ ui_print_main_forward_summary() {
           (.remote_port | tostring),
           (.input_bytes // "0"),
           (.output_bytes // "0"),
-          (.stop_at // "-")
+          (.stop_at // "-"),
+          (if (.comment // "") == "" then "-" else .comment end)
         ]
       | @tsv
     ' <<< "$data")
     rows="${rows%$'\n'}"
-    ui_table_render $'状态\t用户\t监听\t目标\t上行\t下行\t到期' "$rows" "4,2,7,3"
+    ui_table_render $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注' "$rows" "4,8,2,7,3"
 }
 
 ui_print_main_forwards() {
@@ -1208,7 +1209,7 @@ ui_print_forward_list() {
         echo "暂无转发"
         return
     fi
-    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display; do
+    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display comment; do
         local listen remote state
         listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         remote="$(ui_format_remote "$remote_host" "$remote_port")"
@@ -1217,7 +1218,7 @@ ui_print_forward_list() {
         else
             state="$(ui_forward_state_text false)"
         fi
-        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\n'
+        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
       .forwards
       | to_entries[]
@@ -1247,12 +1248,13 @@ ui_print_forward_list() {
             else
               "masquerade"
             end
-          )
+          ),
+          (if (.value.comment // "") == "" then "-" else .value.comment end)
         ]
       | @tsv
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
-    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT' "$rows" "4,2,7,8,10,3"
+    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "$rows" "4,11,2,7,8,10,3"
 }
 
 ui_print_user_list() {
@@ -1535,7 +1537,7 @@ ui_menu_users() {
 }
 
 ui_menu_add_forward() {
-    local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode args=()
+    local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode comment args=()
     ui_clear_screen
     ui_header "添加转发"
     echo "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
@@ -1563,6 +1565,8 @@ ui_menu_add_forward() {
     protocol="$UI_REPLY"
     ui_select_traffic_mode "流量模式" || return 0
     traffic_mode="$UI_TRAFFIC_MODE"
+    ui_read "备注，留空不设置" || return 0
+    comment="$UI_REPLY"
     ui_select_mss_mode "MSS 处理方式" "$remote_host" || return 0
     ui_select_snat_mode "SNAT 处理方式" || return 0
 
@@ -1582,6 +1586,7 @@ ui_menu_add_forward() {
     else
         args+=(--masquerade)
     fi
+    [ -z "$comment" ] || args+=(--comment "$comment")
 
     ui_run cmd_add "${args[@]}"
 }
@@ -1607,9 +1612,9 @@ ui_menu_forwards() {
             2)
                 ui_select_forward true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode=""
+                local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_comment=""
                 local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
-                local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" args=()
+                local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" comment="" args=()
                 current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
                 current_listen_ip="$(jq -r '.listen_ip // "::"' <<< "$current")"
                 current_listen_port="$(jq -r '.listen_port' <<< "$current")"
@@ -1618,6 +1623,7 @@ ui_menu_forwards() {
                 current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
                 current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
                 current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
+                current_comment="$(jq -r '.comment // ""' <<< "$current")"
                 current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$current")"
                 current_mss_value="$(jq -r '.nft.mss_value // ""' <<< "$current")"
                 current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
@@ -1625,7 +1631,7 @@ ui_menu_forwards() {
 
                 ui_clear_screen
                 ui_header "修改转发"
-                echo "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期。"
+                echo "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
 
                 ui_edit_read "监听 IP" "$current_listen_ip" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
@@ -1654,6 +1660,11 @@ ui_menu_forwards() {
                 ui_select_traffic_mode_edit "流量模式" "$current_mode" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 traffic_mode="$UI_TRAFFIC_MODE"
+
+                ui_edit_read "备注" "$current_comment" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                comment="$UI_REPLY"
+
                 ui_select_mss_mode_edit "MSS 处理方式" "$current_mss_mode" "$current_mss_value" "$remote_host" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 ui_select_snat_mode_edit "SNAT 处理方式" "$current_snat_mode" "$current_snat_source" || { ui_pause; continue; }
@@ -1671,6 +1682,11 @@ ui_menu_forwards() {
                 fi
                 [ -z "$protocol" ] || [ "$protocol" = "$current_protocol" ] || args+=(--protocol "$protocol")
                 [ -z "$traffic_mode" ] || [ "$traffic_mode" = "$current_mode" ] || args+=(--traffic-mode "$traffic_mode")
+                if [ "$comment" = "-" ]; then
+                    [ -n "$current_comment" ] && args+=(--clear-comment)
+                elif [ "$comment" != "$current_comment" ]; then
+                    args+=(--comment "$comment")
+                fi
                 case "$UI_MSS_MODE" in
                     clamp)
                         if [ "$current_mss_mode" != "clamp" ]; then
