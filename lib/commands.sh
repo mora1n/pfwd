@@ -63,22 +63,20 @@ cmd_update_finalize_recover() {
     local work_dir="$1"
     local forwarder_enabled="$2"
     local timer_enabled="$3"
-    local bbr_enabled="$4"
-    local error_message="$5"
+    local error_message="$4"
 
     service_update_rollback "$work_dir" || true
-    service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" || true
+    service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" || true
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
 
 cmd_update_finalize() {
-    local work_dir="" forwarder_enabled="" timer_enabled="" bbr_enabled="" from_version="" to_version=""
+    local work_dir="" forwarder_enabled="" timer_enabled="" from_version="" to_version=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
             --forwarder-enabled) forwarder_enabled="${2:-}"; shift 2 ;;
             --timer-enabled) timer_enabled="${2:-}"; shift 2 ;;
-            --bbr-enabled) bbr_enabled="${2:-}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
@@ -88,17 +86,17 @@ cmd_update_finalize() {
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
     if ! service_install_files; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "更新收尾失败"
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "更新收尾失败"
     fi
-    if ! service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" "$bbr_enabled"; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "恢复服务启用状态失败"
+    if ! service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled"; then
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "恢复服务启用状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "$bbr_enabled" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
@@ -116,7 +114,7 @@ cmd_update() {
     done
 
     service_installation_present || pfwd_die "未检测到已安装的 pfwd，请先执行 pfwd install"
-    local work_dir staged_dir local_version remote_version forwarder_enabled timer_enabled bbr_enabled
+    local work_dir staged_dir local_version remote_version forwarder_enabled timer_enabled
     work_dir="$(service_update_create_workdir)"
     staged_dir="$work_dir/staged"
 
@@ -155,7 +153,6 @@ cmd_update() {
     remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
     forwarder_enabled="$(service_update_capture_enabled_state pfwd-forward.service)"
     timer_enabled="$(service_update_capture_enabled_state pfwd.timer)"
-    bbr_enabled="$(service_update_capture_enabled_state pfwd-bbr.service)"
 
     service_update_backup_current "$work_dir"
     if ! service_update_apply_staged "$work_dir"; then
@@ -167,7 +164,6 @@ cmd_update() {
         --work-dir "$work_dir" \
         --forwarder-enabled "$forwarder_enabled" \
         --timer-enabled "$timer_enabled" \
-        --bbr-enabled "$bbr_enabled" \
         --from-version "$local_version" \
         --to-version "$remote_version"; then
         service_update_rollback "$work_dir" || true
@@ -765,6 +761,7 @@ cmd_doctor() {
     echo "运行态安装：$(service_runtime_status_label)"
     if service_unit_exists pfwd-forward.service; then echo "pfwd-forward.service：已安装"; else echo "pfwd-forward.service：未安装"; fi
     if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
+    if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
 }
@@ -775,6 +772,7 @@ cmd_install() {
     service_enable
     cmd_apply_runtime
     echo "已安装：$PFWD_BIN_PATH"
+    echo "BBR 管理入口：$PFWD_BBR_ALIAS_BIN_PATH"
 }
 
 cmd_forward_boot() {
@@ -793,5 +791,5 @@ cmd_uninstall() {
     service_uninstall_files
     service_purge_state
     service_verify_removed
-    echo "已卸载"
+    echo "已卸载 pfwd；若需卸载 BBR 调优，请另外执行：$PFWD_BBR_ALIAS_BIN_PATH uninstall"
 }

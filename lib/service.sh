@@ -56,7 +56,7 @@ EOF
 
 service_install_files() {
     pfwd_mkdirs
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
     [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
     if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
@@ -72,6 +72,7 @@ service_install_files() {
     chmod +x "$PFWD_INSTALL_DIR/bbr.sh"
     ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
+    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
     forwarder_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-forward.service"
     service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
     service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
@@ -94,9 +95,6 @@ service_enable() {
     command -v systemctl >/dev/null 2>&1 || pfwd_die "需要 systemctl"
     pfwd_run systemctl daemon-reload
     pfwd_run systemctl enable pfwd-forward.service pfwd.timer
-    if [ -f "$PFWD_BBR_STATE_FILE" ]; then
-        pfwd_run systemctl enable pfwd-bbr.service
-    fi
     pfwd_run systemctl start pfwd.timer
 }
 
@@ -120,8 +118,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd-bbr.service pfwd.timer pfwd.service pfwd-forward.service || true
-        pfwd_run systemctl disable pfwd-bbr.service pfwd.timer pfwd.service pfwd-forward.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -134,25 +132,66 @@ service_disable_forwarder() {
     fi
 }
 
-service_uninstall_files() {
-    local family table iface
-    family="$(jq -r '.settings.nft_family // "inet"' "$PFWD_CONFIG_FILE" 2>/dev/null || echo inet)"
-    table="$(jq -r '.settings.nft_table // "pfwd"' "$PFWD_CONFIG_FILE" 2>/dev/null || echo pfwd)"
-    iface="$(fw_tc_interface 2>/dev/null || true)"
+service_config_value_or_default() {
+    local filter="$1"
+    local default_value="$2"
+    local value=""
+    value="$(jq -r "$filter // empty" "$PFWD_CONFIG_FILE" 2>/dev/null || true)"
+    if [ -n "$value" ] && [ "$value" != "null" ]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$default_value"
+    fi
+}
 
+service_forward_table_name() {
+    service_config_value_or_default '.settings.forward_table' "port_forward"
+}
+
+service_firewall_family() {
+    service_config_value_or_default '.settings.nft_family' "inet"
+}
+
+service_firewall_table_name() {
+    service_config_value_or_default '.settings.nft_table' "pfwd"
+}
+
+service_delete_nft_table() {
+    local family="$1"
+    local table="$2"
+    [ -n "$table" ] || return 0
+    pfwd_run nft delete table "$family" "$table" 2>/dev/null || true
+}
+
+service_cleanup_nft_tables() {
+    local forward_table firewall_family firewall_table
+    forward_table="$(service_forward_table_name)"
+    firewall_family="$(service_firewall_family)"
+    firewall_table="$(service_firewall_table_name)"
+
+    command -v nft >/dev/null 2>&1 || return 0
+    service_delete_nft_table "inet" "$forward_table"
+    service_delete_nft_table "$firewall_family" "$firewall_table"
+}
+
+service_cleanup_pfwd_tc() {
+    local iface
+    iface="$(fw_tc_interface 2>/dev/null || true)"
+    command -v tc >/dev/null 2>&1 || return 0
+    [ -n "$iface" ] || return 0
+    pfwd_run tc qdisc del dev "$iface" root 2>/dev/null || true
+}
+
+service_uninstall_files() {
     service_disable
-    if command -v nft >/dev/null 2>&1; then
-        forwarder_stop_runtime || pfwd_run nft delete table "$family" "$table" 2>/dev/null || true
-    fi
-    if command -v tc >/dev/null 2>&1 && [ -n "$iface" ]; then
-        pfwd_run tc qdisc del dev "$iface" root 2>/dev/null || true
-    fi
+    service_cleanup_nft_tables
+    service_cleanup_pfwd_tc
     rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd-bbr.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.timer"
-    rm -f "$PFWD_BIN_PATH" "$PFWD_BBR_BIN_PATH"
-    rm -rf "$PFWD_INSTALL_DIR"
+    rm -f "$PFWD_BIN_PATH"
+    rm -f "$PFWD_INSTALL_DIR/pfwd.sh"
+    rm -rf "$PFWD_INSTALL_DIR/lib"
 }
 
 service_purge_state() {
@@ -161,9 +200,8 @@ service_purge_state() {
 
 service_verify_removed() {
     local leftovers=()
-    for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR" "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
-        "$PFWD_BBR_BIN_PATH" \
-        "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd-bbr.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer"; do
+    for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/lib" "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
+        "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer"; do
         [ ! -e "$path" ] || leftovers+=("$path")
     done
     if [ "${#leftovers[@]}" -gt 0 ]; then
@@ -252,7 +290,6 @@ service_update_capture_enabled_state() {
 service_update_restore_enabled_state() {
     local forwarder_enabled="$1"
     local timer_enabled="$2"
-    local bbr_enabled="${3:-false}"
 
     if ! command -v systemctl >/dev/null 2>&1; then
         return 0
@@ -271,11 +308,6 @@ service_update_restore_enabled_state() {
         pfwd_run systemctl stop pfwd.timer || true
         pfwd_run systemctl disable pfwd.timer || true
     fi
-    if [ "$bbr_enabled" = "true" ]; then
-        pfwd_run systemctl enable pfwd-bbr.service
-    else
-        pfwd_run systemctl disable pfwd-bbr.service || true
-    fi
 }
 
 service_update_backup_current() {
@@ -291,7 +323,10 @@ service_update_backup_current() {
     if [ -e "$PFWD_BBR_BIN_PATH" ]; then
         cp -a "$PFWD_BBR_BIN_PATH" "$backup_dir/bin/bbr.sh"
     fi
-    for unit in pfwd-forward.service pfwd-bbr.service pfwd.service pfwd.timer; do
+    if [ -e "$PFWD_BBR_ALIAS_BIN_PATH" ]; then
+        cp -a "$PFWD_BBR_ALIAS_BIN_PATH" "$backup_dir/bin/pfwd-bbr"
+    fi
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service; do
         if [ -e "$PFWD_SYSTEMD_DIR/$unit" ]; then
             cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/systemd/$unit"
         fi
@@ -303,7 +338,7 @@ service_update_apply_staged() {
     local staged_dir="$work_dir/staged"
     local lib
 
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
     install -m 0755 "$staged_dir/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     install -m 0755 "$staged_dir/bbr.sh" "$PFWD_INSTALL_DIR/bbr.sh"
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -311,6 +346,7 @@ service_update_apply_staged() {
     done
     ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
+    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
 }
 
 service_update_rollback() {
@@ -334,13 +370,17 @@ service_update_rollback() {
         rm -f "$PFWD_BBR_BIN_PATH"
         cp -a "$backup_dir/bin/bbr.sh" "$PFWD_BBR_BIN_PATH"
     fi
+    if [ -e "$backup_dir/bin/pfwd-bbr" ]; then
+        mkdir -p "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
+        rm -f "$PFWD_BBR_ALIAS_BIN_PATH"
+        cp -a "$backup_dir/bin/pfwd-bbr" "$PFWD_BBR_ALIAS_BIN_PATH"
+    fi
 
     mkdir -p "$PFWD_SYSTEMD_DIR"
     rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd-bbr.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.timer"
-    for unit in pfwd-forward.service pfwd-bbr.service pfwd.service pfwd.timer; do
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service; do
         if [ -e "$backup_dir/systemd/$unit" ]; then
             cp -a "$backup_dir/systemd/$unit" "$PFWD_SYSTEMD_DIR/$unit"
         fi

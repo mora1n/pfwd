@@ -113,37 +113,37 @@ fw_render_prerouting_chain() {
         read -r in_counter _ < <(fw_counter_names "$id")
         case "${protocol:-tcp_udp}" in
             tcp)
-                echo "    tcp dport $port counter name $in_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction original meta l4proto tcp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
                 ;;
             udp)
-                echo "    udp dport $port counter name $in_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction original meta l4proto udp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
                 ;;
             *)
-                echo "    tcp dport $port counter name $in_counter jump fwd_${id//-/_}_limit"
-                echo "    udp dport $port counter name $in_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction original meta l4proto tcp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction original meta l4proto udp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
                 ;;
         esac
     done
     echo "  }"
 }
 
-fw_render_output_chain() {
-    echo "  chain output_count {"
-    echo "    type filter hook output priority -10; policy accept;"
+fw_render_postrouting_chain() {
+    echo "  chain postrouting_count {"
+    echo "    type filter hook postrouting priority -10; policy accept;"
     fw_active_forwards_tsv '["id","listen_port","protocol"]' |
     while IFS=$'\t' read -r id port protocol; do
         local out_counter
         read -r _ out_counter < <(fw_counter_names "$id")
         case "${protocol:-tcp_udp}" in
             tcp)
-                echo "    tcp sport $port counter name $out_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction reply meta l4proto tcp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
                 ;;
             udp)
-                echo "    udp sport $port counter name $out_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction reply meta l4proto udp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
                 ;;
             *)
-                echo "    tcp sport $port counter name $out_counter jump fwd_${id//-/_}_limit"
-                echo "    udp sport $port counter name $out_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction reply meta l4proto tcp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
+                echo "    ct status dnat ct direction reply meta l4proto udp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
                 ;;
         esac
     done
@@ -159,7 +159,7 @@ fw_render_nft() {
     echo "table $family $table {"
     fw_render_nft_objects
     fw_render_prerouting_chain
-    fw_render_output_chain
+    fw_render_postrouting_chain
     echo "}"
 }
 
@@ -268,12 +268,11 @@ fw_read_counters() {
           input_bytes: ($items | map(.input_bytes) | add // 0),
           output_bytes: ($items | map(.output_bytes) | add // 0)
         };
-      def user_mode_usage($user_id; $mode):
+      def user_mode_billing($user_id; $mode):
         [
           $cfg[0].forwards[] |
           select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
-          (snap_forward(.id)) as $c |
-          usage((.traffic_mode // "two-way"); $c.input_bytes; $c.output_bytes)
+          forward_billing(.)
         ] | add // 0;
       def user_billing($u):
         (ustate($u.id)) as $s |
@@ -301,13 +300,12 @@ fw_read_counters() {
           . + {
             input_bytes: $c.input_bytes,
             output_bytes: $c.output_bytes,
-            one_way_bytes: user_mode_usage($u.id; "one-way"),
+            one_way_bytes: user_mode_billing($u.id; "one-way"),
             two_way_bytes: (
               [
                 $cfg[0].forwards[] |
                 select(.user_id == $u.id and ((.traffic_mode // "two-way") != "one-way")) |
-                (snap_forward(.id)) as $fwd_counter |
-                usage((.traffic_mode // "two-way"); $fwd_counter.input_bytes; $fwd_counter.output_bytes)
+                forward_billing(.)
               ] | add // 0
             ),
             billing_used_bytes: user_billing($u),

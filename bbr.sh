@@ -53,6 +53,10 @@ PFWD_STATE_DIR="${PFWD_STATE_DIR:-$(pfwd_path var/lib/pfwd)}"
 PFWD_BBR_STATE_FILE="${PFWD_BBR_STATE_FILE:-$PFWD_STATE_DIR/bbr-state.env}"
 PFWD_BBR_SYSCTL_CONF="${PFWD_BBR_SYSCTL_CONF:-$(pfwd_path etc/sysctl.d/99-pfwd-bbr.conf)}"
 PFWD_BBR_SERVICE_FILE="${PFWD_BBR_SERVICE_FILE:-$(pfwd_path etc/systemd/system/pfwd-bbr.service)}"
+PFWD_BBR_INSTALL_DIR="${PFWD_BBR_INSTALL_DIR:-$(pfwd_path usr/local/lib/pfwd)}"
+PFWD_BBR_BIN_PATH="${PFWD_BBR_BIN_PATH:-$(pfwd_path usr/local/bin/bbr.sh)}"
+PFWD_BBR_ALIAS_BIN_PATH="${PFWD_BBR_ALIAS_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd-bbr)}"
+PFWD_BBR_ENTRY_NAME="${PFWD_BBR_ENTRY_NAME:-pfwd-bbr}"
 
 bbr_die() {
     echo "错误：$*" >&2
@@ -104,14 +108,45 @@ bbr_remove_path() {
     rm -f "$path"
 }
 
-bbr_require_mutation_context() {
-    if ! bbr_root_prefix_real && [ "${PFWD_DRY_RUN:-0}" != "1" ]; then
-        bbr_die "设置 PFWD_ROOT_PREFIX 时，仅支持配合 PFWD_DRY_RUN=1 进行演练"
+bbr_remove_tree() {
+    local path="$1"
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
+        printf 'DRY-RUN: rm -rf %q\n' "$path"
+        return 0
     fi
+    rm -rf "$path"
+}
+
+bbr_require_mutation_context() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
         return 0
     fi
     [ "${EUID:-$(id -u)}" -eq 0 ] || bbr_die "需要 root 权限"
+}
+
+bbr_command_name() {
+    if [ -n "${0:-}" ] && [ "${0:-}" != "bash" ] && [ "${0:-}" != "-bash" ]; then
+        basename "$0"
+    elif [ -n "$SCRIPT_PATH" ]; then
+        basename "$SCRIPT_PATH"
+    else
+        printf '%s\n' "$PFWD_BBR_ENTRY_NAME"
+    fi
+}
+
+bbr_preferred_command_name() {
+    printf '%s\n' "$PFWD_BBR_ENTRY_NAME"
+}
+
+bbr_ensure_shortcuts() {
+    [ -n "$SCRIPT_PATH" ] || return 0
+    [ -z "${PFWD_ROOT_PREFIX:-}" ] || return 0
+    [ "${PFWD_DRY_RUN:-0}" != "1" ] || return 0
+    [ "${EUID:-$(id -u)}" -eq 0 ] || return 0
+
+    mkdir -p "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
+    ln -sf "$SCRIPT_PATH" "$PFWD_BBR_BIN_PATH"
+    ln -sf "$SCRIPT_PATH" "$PFWD_BBR_ALIAS_BIN_PATH"
 }
 
 bbr_normalize_rate() {
@@ -576,6 +611,7 @@ bbr_clear_previous_runtime() {
             bbr_clear_nic_steering "$iface"
         fi
     fi
+    return 0
 }
 
 bbr_apply_runtime_state() {
@@ -694,15 +730,65 @@ bbr_disable_service() {
     systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+bbr_service_unit() {
+    cat <<EOF
+[Unit]
+Description=pfwd bbr runtime restore
+After=network-online.target systemd-sysctl.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$PFWD_BBR_ALIAS_BIN_PATH __restore
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+bbr_install() {
+    bbr_require_mutation_context
+    [ -n "$SCRIPT_DIR" ] || bbr_die "无法定位 bbr.sh 源目录"
+
+    mkdir -p "$PFWD_BBR_INSTALL_DIR" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_BBR_SERVICE_FILE")"
+    if [ "$SCRIPT_PATH" != "$PFWD_BBR_INSTALL_DIR/bbr.sh" ]; then
+        cp "$SCRIPT_DIR/bbr.sh" "$PFWD_BBR_INSTALL_DIR/bbr.sh"
+    fi
+    chmod +x "$PFWD_BBR_INSTALL_DIR/bbr.sh"
+    ln -sf "$PFWD_BBR_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
+    ln -sf "$PFWD_BBR_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
+    bbr_service_unit > "$PFWD_BBR_SERVICE_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ -f "$PFWD_BBR_STATE_FILE" ]; then
+            systemctl enable pfwd-bbr.service >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+bbr_uninstall() {
+    bbr_require_mutation_context
+    bbr_reset
+    bbr_disable_service
+    bbr_remove_path "$PFWD_BBR_SERVICE_FILE"
+    bbr_remove_path "$PFWD_BBR_BIN_PATH"
+    bbr_remove_path "$PFWD_BBR_ALIAS_BIN_PATH"
+    bbr_remove_path "$PFWD_BBR_INSTALL_DIR/bbr.sh"
+}
+
 bbr_help() {
-    cat <<'EOF'
-bbr.sh - pfwd BBR / optimize manager
+    local cmd
+    cmd="$(bbr_preferred_command_name)"
+    cat <<EOF
+$cmd - pfwd BBR / optimize manager
 
 用法：
-  bbr.sh status
-  bbr.sh optimize [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate RATE] [--ingress-rate RATE] [--tc-iface IFACE]
-  bbr.sh optimize reset
-  bbr.sh reset
+  $cmd status
+  $cmd optimize [balanced|gaming|lowmem|relay] [--nic-steering] [--egress-rate RATE] [--ingress-rate RATE] [--tc-iface IFACE]
+  $cmd optimize reset
+  $cmd reset
+  $cmd install
+  $cmd uninstall
 
 说明：
   - `optimize` 会写入 `/etc/sysctl.d/99-pfwd-bbr.conf`，并按需要应用 BQL、RPS/XPS 与 tc shaping。
@@ -711,6 +797,7 @@ EOF
 }
 
 main() {
+    bbr_ensure_shortcuts
     local cmd="${1:-help}"
 
     case "$cmd" in
@@ -718,11 +805,21 @@ main() {
             bbr_help
             ;;
         version|--version)
-            echo "bbr.sh $BBR_VERSION"
+            echo "$(bbr_command_name) $BBR_VERSION"
             ;;
         status)
             shift
             bbr_status "$@"
+            ;;
+        install)
+            shift
+            [ "$#" -eq 0 ] || bbr_die "$(bbr_command_name) install 不接受额外参数"
+            bbr_install
+            ;;
+        uninstall)
+            shift
+            [ "$#" -eq 0 ] || bbr_die "$(bbr_command_name) uninstall 不接受额外参数"
+            bbr_uninstall
             ;;
         optimize)
             shift
@@ -759,7 +856,7 @@ main() {
                         ;;
                     reset)
                         shift
-                        [ "$#" -eq 0 ] || bbr_die "bbr.sh optimize reset 不接受额外参数"
+                        [ "$#" -eq 0 ] || bbr_die "$(bbr_command_name) optimize reset 不接受额外参数"
                         bbr_reset
                         bbr_disable_service
                         return 0
@@ -775,13 +872,13 @@ main() {
             ;;
         reset)
             shift
-            [ "$#" -eq 0 ] || bbr_die "bbr.sh reset 不接受额外参数"
+            [ "$#" -eq 0 ] || bbr_die "$(bbr_command_name) reset 不接受额外参数"
             bbr_reset
             bbr_disable_service
             ;;
         __restore)
             shift
-            [ "$#" -eq 0 ] || bbr_die "bbr.sh __restore 不接受额外参数"
+            [ "$#" -eq 0 ] || bbr_die "$(bbr_command_name) __restore 不接受额外参数"
             bbr_restore
             ;;
         *)

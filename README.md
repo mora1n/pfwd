@@ -2,7 +2,6 @@
 
 `pfwd` 是一个基于 `nftables` 的轻量端口转发管理脚本。  
 `pfwd` 负责用户、转发规则、到期停转、流量统计、限速限量、Telegram 通知和 systemd 同步；`nftables` 负责实际转发。  
-内核调优能力独立为 `bbr.sh`，和转发管理解耦。
 
 ## Overview
 
@@ -15,7 +14,7 @@
 | Traffic | 支持到期日、流量统计、总流量限制、速率限制 |
 | Notify | 支持 Telegram 通知与定时发送 |
 | Ops | 支持安装、更新、刷新、排查、导出、导入、卸载 |
-| Tuning | `bbr.sh` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
+| Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
 ## Requirements
 
@@ -51,7 +50,8 @@ pfwd
 系统文件
 ├── /usr/local/bin/
 │   ├── pfwd                    # 管理脚本快捷入口
-│   └── bbr.sh                  # BBR / optimize 管理脚本快捷入口
+│   ├── bbr.sh                  # 兼容快捷入口
+│   └── pfwd-bbr                # BBR / optimize 管理脚本快捷入口
 │
 ├── /usr/local/lib/pfwd/
 │   ├── pfwd.sh                 # pfwd 主脚本
@@ -109,6 +109,7 @@ install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/bbr.sh
+ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
 ```
 
 4. 生成 systemd unit、初始化目录并启用服务：
@@ -121,7 +122,7 @@ ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/bbr.sh
 
 ```bash
 pfwd doctor
-bbr.sh status
+pfwd-bbr status
 ```
 
 ## Quick Start
@@ -209,23 +210,19 @@ pfwd add \
 - 当前运行态只支持通配监听地址 `::` / `0.0.0.0`
 - `localhost` 会渲染为本地 IPv4 / IPv6 双栈目标
 
-## bbr.sh
+## pfwd-bbr
 
 ```bash
-bbr.sh status
-bbr.sh optimize balanced
-bbr.sh optimize relay --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
-bbr.sh optimize gaming --nic-steering
-bbr.sh reset
+pfwd-bbr status
+pfwd-bbr optimize balanced
+pfwd-bbr optimize relay --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
+pfwd-bbr optimize gaming --nic-steering
+pfwd-bbr reset
+pfwd-bbr install
+pfwd-bbr uninstall
 ```
 
-`bbr.sh` 会独立维护：
-
-- BBR / sysctl 配置
-- tc egress / ingress shaping
-- BQL 限制
-- RPS / XPS 网卡 steering
-- `pfwd-bbr.service` 开机恢复
+`pfwd-bbr` 独立维护 BBR / sysctl / tc / BQL / RPS/XPS，并通过 `pfwd-bbr.service` 恢复运行态。
 
 ## Paths
 
@@ -233,7 +230,8 @@ bbr.sh reset
 |------|---------|
 | `/etc/pfwd/config.json` | 主配置 |
 | `/usr/local/bin/pfwd` | 命令入口 |
-| `/usr/local/bin/bbr.sh` | 调优入口 |
+| `/usr/local/bin/bbr.sh` | 兼容调优入口 |
+| `/usr/local/bin/pfwd-bbr` | 主调优入口 |
 | `/usr/local/lib/pfwd` | 安装目录 |
 | `/var/lib/pfwd/stats.json` | 流量状态 |
 | `/var/lib/pfwd/bbr-state.env` | BBR / optimize 状态 |
@@ -245,3 +243,21 @@ bbr.sh reset
 ```bash
 pfwd uninstall
 ```
+
+该命令只卸载 `pfwd` 本体及其转发运行态，不会删除 BBR 调优。
+
+如需一并清理 BBR / sysctl / tc / `pfwd-bbr.service`，再执行：
+
+```bash
+pfwd-bbr uninstall
+```
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=mora1n%2Fpfwd&type=date&logscale=&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&theme=dark&logscale&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&logscale&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&logscale&legend=top-left" />
+ </picture>
+</a>

@@ -1694,7 +1694,7 @@ ui_menu_uninstall() {
         ui_warn "已跳过停用 pfwd-forward.service"
     fi
     echo
-    echo "步骤 2：完整卸载 pfwd 管理脚本、timer、nft/tc、配置和状态。"
+    echo "步骤 2：完整卸载 pfwd 脚本、systemd、nftables、配置和状态。"
     if ui_confirm_text "uninstall" "输入 uninstall 确认完整卸载"; then
         ui_run cmd_uninstall
     else
