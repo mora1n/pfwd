@@ -940,11 +940,15 @@ ui_print_forward_list() {
 }
 
 ui_print_user_list() {
+    local allow_zero="${1:-false}"
     config_init >/dev/null
     local rows="" index=1 user_id
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         echo "暂无用户"
         return
+    fi
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\n'
     fi
     while IFS= read -r user_id; do
         rows+="$index"$'\t'"$user_id"$'\n'
@@ -955,13 +959,19 @@ ui_print_user_list() {
 }
 
 ui_select_user() {
+    local allow_zero="${1:-false}"
+    UI_EDIT_ABORTED=0
     config_init >/dev/null
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_warn "暂无用户，请先添加用户"
         return 1
     fi
-    ui_print_user_list
+    ui_print_user_list "$allow_zero"
     ui_read "选择用户序号" || return 1
+    if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
+        UI_EDIT_ABORTED=1
+        return 0
+    fi
     [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; return 1; }
     local user_id
     user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
@@ -1060,6 +1070,9 @@ ui_select_forward() {
         ui_warn "暂无转发，请先添加转发"
         return 1
     fi
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\t-\t-\t-\t-\t-\n'
+    fi
     while IFS=$'\t' read -r index user listen_port remote_host remote_port protocol enabled stop_at; do
         local remote_text state
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
@@ -1107,6 +1120,9 @@ ui_select_user_forward() {
     if ! jq -e --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_warn "该用户暂无转发"
         return 1
+    fi
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\t-\t-\t-\t-\n'
     fi
     while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
         local remote_text state
@@ -1186,7 +1202,8 @@ ui_menu_users() {
                 ui_pause
                 ;;
             2)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local user_id="$UI_REPLY"
                 if ui_confirm_text "$user_id" "输入用户名确认删除"; then
                     ui_run cmd_user delete "$user_id"
@@ -1206,7 +1223,8 @@ ui_menu_add_forward() {
     ui_clear_screen
     ui_header "添加转发"
     echo "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
-    ui_select_user || return 0
+    ui_select_user true || return 0
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
     user_id="$UI_REPLY"
     ui_read "目标 IP/域名" || return 0
     remote_host="$UI_REPLY"
@@ -1355,7 +1373,8 @@ ui_menu_expire_limit() {
     while true; do
         ui_clear_screen
         ui_header "流量管理"
-        ui_select_user || { ui_pause; return 0; }
+        ui_select_user true || { ui_pause; return 0; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
         local user_id="$UI_REPLY"
         while true; do
             ui_clear_screen
@@ -1583,7 +1602,8 @@ ui_menu_telegram() {
                 ui_pause
                 ;;
             2)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local schedule_user="$UI_REPLY" interval_choice="" interval_value="" daily_time=""
                 echo "留空表示不修改；输入 0 可清除对应定时。"
                 ui_read "间隔发送，单位分钟；例如 60" || continue
@@ -1604,22 +1624,26 @@ ui_menu_telegram() {
                 ui_pause
                 ;;
             3)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_notify_test --user-id "$UI_REPLY"
                 ui_pause
                 ;;
             4)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_notify_enable --user-id "$UI_REPLY"
                 ui_pause
                 ;;
             5)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_notify_disable --user-id "$UI_REPLY"
                 ui_pause
                 ;;
             6)
-                ui_select_user || { ui_pause; continue; }
+                ui_select_user true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_notify_delete --user-id "$UI_REPLY"
                 ui_pause
                 ;;
