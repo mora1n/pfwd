@@ -29,6 +29,7 @@ UI_WHEEL_STEP="${UI_WHEEL_STEP:-4}"
 UI_FORM_TITLE=""
 UI_FORM_HINT=""
 declare -ag UI_FORM_LINES=()
+declare -ag UI_FORM_OPTION_LINES=()
 declare -ag UI_PAGE_LINES=()
 
 ui_main_status_title() {
@@ -959,6 +960,7 @@ ui_form_reset() {
     UI_FORM_TITLE=""
     UI_FORM_HINT=""
     UI_FORM_LINES=()
+    UI_FORM_OPTION_LINES=()
 }
 
 ui_form_set() {
@@ -967,6 +969,7 @@ ui_form_set() {
     UI_FORM_TITLE="$title"
     UI_FORM_HINT="$hint"
     UI_FORM_LINES=()
+    UI_FORM_OPTION_LINES=()
 }
 
 ui_form_add_line() {
@@ -985,11 +988,15 @@ ui_render_form_page() {
     shift 2 || true
     ui_header "$title"
     [ -n "$hint" ] && ui_print_line "$hint" "2;37"
-    if [ -n "$hint" ] && [ "${#UI_FORM_LINES[@]}" -gt 0 ]; then
+    if [ -n "$hint" ] && { [ "${#UI_FORM_LINES[@]}" -gt 0 ] || [ "${#UI_FORM_OPTION_LINES[@]}" -gt 0 ]; }; then
         printf '\n'
     fi
     if [ "${#UI_FORM_LINES[@]}" -gt 0 ]; then
         printf '%s\n' "${UI_FORM_LINES[@]}"
+    fi
+    if [ "${#UI_FORM_OPTION_LINES[@]}" -gt 0 ]; then
+        [ "${#UI_FORM_LINES[@]}" -eq 0 ] || printf '\n'
+        printf '%s\n' "${UI_FORM_OPTION_LINES[@]}"
     fi
 }
 
@@ -1019,11 +1026,16 @@ ui_form_edit_read() {
 ui_form_select_read() {
     local prompt="$1"
     local default="${2:-}"
+    local status=0
     shift 2 || true
     local options=("$@")
     local line
     if [ -n "$UI_FORM_TITLE" ]; then
+        UI_FORM_OPTION_LINES=("${options[@]}")
         ui_form_refresh
+        ui_read "$prompt" "$default" || status=$?
+        UI_FORM_OPTION_LINES=()
+        return "$status"
     fi
     for line in "${options[@]}"; do
         printf '%s\n' "$line"
@@ -1393,12 +1405,12 @@ ui_protocol_label() {
 ui_select_protocol() {
     local prompt="$1"
     UI_REPLY=""
-    ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) 全转发" || return 1
+    ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) TCP+UDP" || return 1
     case "$UI_REPLY" in
         1) UI_REPLY="tcp" ;;
         2) UI_REPLY="udp" ;;
         3|"") UI_REPLY="tcp_udp" ;;
-        *) ui_warn "无效选择，已使用全转发"; UI_REPLY="tcp_udp" ;;
+        *) ui_warn "无效选择，已使用 TCP+UDP"; UI_REPLY="tcp_udp" ;;
     esac
 }
 
@@ -1408,9 +1420,9 @@ ui_select_protocol_edit() {
     UI_EDIT_ABORTED=0
     UI_REPLY=""
     case "$current_protocol" in
-        tcp) ui_form_select_read "$prompt" "1" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
-        udp) ui_form_select_read "$prompt" "2" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
-        *) ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
+        tcp) ui_form_select_read "$prompt" "1" "1) TCP" "2) UDP" "3) TCP+UDP" || return 1 ;;
+        udp) ui_form_select_read "$prompt" "2" "1) TCP" "2) UDP" "3) TCP+UDP" || return 1 ;;
+        *) ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) TCP+UDP" || return 1 ;;
     esac
     case "$UI_REPLY" in
         0)
