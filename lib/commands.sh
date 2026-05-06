@@ -642,7 +642,7 @@ cmd_traffic() {
                 stats_reset_user_cycle "$user_id"
                 echo "用户流量已重置：$(normalize_user_id "$user_id")"
             elif [ -n "$forward_id" ] && [ -z "$user_id" ]; then
-                stats_set_forward_used "$forward_id" 0
+                stats_reset_forward_cycle "$forward_id"
                 echo "转发流量已重置：$forward_id"
             else
                 pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
@@ -750,7 +750,7 @@ cmd_refresh() {
 
 cmd_reconcile() {
     config_init >/dev/null
-    local before after today need_refresh=true sent
+    local before after today need_refresh=false sent
     if stats_apply_due_resets; then
         need_refresh=true
     fi

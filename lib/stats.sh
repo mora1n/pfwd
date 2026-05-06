@@ -90,6 +90,8 @@ stats_rollup_counters() {
       | reduce $snap[] as $f (.;
           ($state.forwards[$f.id] // {
             billing_used_bytes: 0,
+            input_total_bytes: 0,
+            output_total_bytes: 0,
             input_base_bytes: 0,
             output_base_bytes: 0,
             reset_day: null,
@@ -99,6 +101,8 @@ stats_rollup_counters() {
           (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
           .forwards[$f.id] = ($old + {
             billing_used_bytes: (($old.billing_used_bytes // 0) + usage($f.traffic_mode; $in_delta; $out_delta)),
+            input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
+            output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
             input_base_bytes: $f.input_bytes,
             output_base_bytes: $f.output_bytes
           })
@@ -149,12 +153,32 @@ stats_set_user_used() {
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
     stats_update --arg id "$user_id" --argjson used "$used" --argjson snap "$snapshot" '
+      def usage($mode; $in_delta; $out_delta):
+        if $mode == "one-way" then ([ $in_delta, $out_delta ] | max) else ($in_delta + $out_delta) end;
+      def snap_forward($fid):
+        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", input_bytes: 0, output_bytes: 0});
       ($snap | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
       ($snap | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
       ([ $snap[] | select(.user_id == $id) | .id ]) as $forward_ids |
-      ([ $forward_ids[] as $fid | (.forwards[$fid].billing_used_bytes // 0) ] | add // 0) as $forward_used |
-      (.users[$id] // {}) as $old |
-      .users[$id] = ($old + {
+      .forwards |= (
+        . as $forwards_state
+        | reduce $forward_ids[] as $fid ($forwards_state;
+            (snap_forward($fid)) as $f |
+            (.[$fid] // {}) as $old |
+            (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
+            (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
+            .[$fid] = ($old + {
+              billing_used_bytes: (($old.billing_used_bytes // 0) + usage(($f.traffic_mode // "two-way"); $in_delta; $out_delta)),
+              input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
+              output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
+              input_base_bytes: ($f.input_bytes // 0),
+              output_base_bytes: ($f.output_bytes // 0)
+            })
+          )
+      )
+      | ([ $forward_ids[] as $fid | (.forwards[$fid].billing_used_bytes // 0) ] | add // 0) as $forward_used
+      | (.users[$id] // {}) as $old
+      | .users[$id] = ($old + {
         billing_used_bytes: $used,
         billing_offset_bytes: ($used - $forward_used),
         input_base_bytes: $input,
@@ -172,8 +196,30 @@ stats_set_forward_used() {
     stats_update --arg id "$forward_id" --argjson used "$used" --argjson snap "$snapshot" '
       ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
       (.forwards[$id] // {}) as $old |
+      (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
+      (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
       .forwards[$id] = ($old + {
         billing_used_bytes: $used,
+        input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
+        output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
+        input_base_bytes: ($f.input_bytes // 0),
+        output_base_bytes: ($f.output_bytes // 0)
+      })
+    '
+}
+
+stats_reset_forward_cycle() {
+    local forward_id="$1"
+    local snapshot
+    config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
+    snapshot="$(stats_current_snapshot)"
+    stats_update --arg id "$forward_id" --argjson snap "$snapshot" '
+      ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
+      (.forwards[$id] // {}) as $old |
+      .forwards[$id] = ($old + {
+        billing_used_bytes: 0,
+        input_total_bytes: 0,
+        output_total_bytes: 0,
         input_base_bytes: ($f.input_bytes // 0),
         output_base_bytes: ($f.output_bytes // 0)
       })
@@ -186,13 +232,18 @@ stats_reset_user_cycle() {
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
-    stats_update --arg id "$user_id" --argjson snap "$snapshot" '
-      [ $snap[] | select(.user_id == $id) ] as $rows |
+    stats_update --arg id "$user_id" --argjson snap "$snapshot" --slurpfile cfg "$PFWD_CONFIG_FILE" '
+      def row_for($fid):
+        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, input_bytes: 0, output_bytes: 0});
+      ([ $cfg[0].forwards[]? | select(.user_id == $id) | .id ]) as $forward_ids |
+      ([ $forward_ids[] | row_for(.) ]) as $rows |
       .forwards |= (
         . as $forwards_state
         | reduce $rows[] as $row ($forwards_state;
             .[$row.id] = ((.[$row.id] // {}) + {
               billing_used_bytes: 0,
+              input_total_bytes: 0,
+              output_total_bytes: 0,
               input_base_bytes: ($row.input_bytes // 0),
               output_base_bytes: ($row.output_bytes // 0)
             })
@@ -251,7 +302,7 @@ stats_apply_due_resets() {
         [ -n "$kind" ] || continue
         case "$kind" in
             user) stats_reset_user_cycle "$id" ;;
-            forward) stats_set_forward_used "$id" 0 ;;
+            forward) stats_reset_forward_cycle "$id" ;;
         esac
         stats_update --arg kind "$kind" --arg id "$id" --arg month "$month" '
           if $kind == "user" then .users[$id].last_reset_month = $month

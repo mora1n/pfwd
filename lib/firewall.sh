@@ -201,8 +201,8 @@ fw_render_tc() {
     local iface
     iface="$(fw_tc_interface)"
     [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
-    echo "tc qdisc replace dev $iface root handle 1: htb default 999 r2q 100"
-    echo "tc class replace dev $iface parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit quantum 1514"
+    echo "tc qdisc add dev $iface root handle 1: htb default 999 r2q 100"
+    echo "tc class add dev $iface parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit quantum 1514"
 
     local class_index=10
     jq -r '
@@ -214,17 +214,26 @@ fw_render_tc() {
       | select($rate != null)
       | [$f.id, $rate, ($f.listen_port | tostring)] | @tsv
     ' "$PFWD_CONFIG_FILE" | while IFS=$'\t' read -r id rate port; do
-        echo "tc class replace dev $iface parent 1: classid 1:$class_index htb rate $rate ceil $rate quantum 1514"
-        echo "tc filter replace dev $iface protocol ip parent 1: prio $class_index u32 match ip sport $port 0xffff flowid 1:$class_index"
+        echo "tc class add dev $iface parent 1: classid 1:$class_index htb rate $rate ceil $rate quantum 1514"
+        echo "tc filter add dev $iface protocol ip parent 1: prio $class_index u32 match ip sport $port 0xffff flowid 1:$class_index"
         class_index=$((class_index + 1))
     done
 }
 
+fw_reset_tc_root() {
+    local iface="$1"
+    [ -n "$iface" ] || return 0
+    pfwd_run tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+}
+
 fw_apply_tc() {
     pfwd_require_cmd tc
-    local rate_count
+    local rate_count iface
     rate_count="$(fw_effective_rate_count)"
     [ "$rate_count" -gt 0 ] || return 0
+    iface="$(fw_tc_interface)"
+    [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
+    fw_reset_tc_root "$iface"
     fw_render_tc | while IFS= read -r line; do
         [ -n "$line" ] || continue
         # shellcheck disable=SC2086
@@ -253,25 +262,35 @@ fw_read_counters() {
       def fstate($id): $state[0].forwards[$id] // {};
       def ustate($id): $state[0].users[$id] // {};
       def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
+      def pending_input_bytes($id):
+        (fstate($id)) as $s |
+        (snap_forward($id)) as $c |
+        (($c.input_bytes - ($s.input_base_bytes // 0)) | if . < 0 then $c.input_bytes else . end);
+      def pending_output_bytes($id):
+        (fstate($id)) as $s |
+        (snap_forward($id)) as $c |
+        (($c.output_bytes - ($s.output_base_bytes // 0)) | if . < 0 then $c.output_bytes else . end);
+      def forward_totals($id):
+        (fstate($id)) as $s |
+        {
+          input_bytes: (($s.input_total_bytes // 0) + pending_input_bytes($id)),
+          output_bytes: (($s.output_total_bytes // 0) + pending_output_bytes($id))
+        };
       def current_forward_billing($f):
         (fstate($f.id)) as $s |
-        (snap_forward($f.id)) as $c |
-        (($c.input_bytes - ($s.input_base_bytes // 0)) | if . < 0 then $c.input_bytes else . end) as $in_delta |
-        (($c.output_bytes - ($s.output_base_bytes // 0)) | if . < 0 then $c.output_bytes else . end) as $out_delta |
-        (($s.billing_used_bytes // 0) + usage(($f.traffic_mode // "two-way"); $in_delta; $out_delta));
-      def forward_billing($f):
-        current_forward_billing($f);
+        (($s.billing_used_bytes // 0) + usage(($f.traffic_mode // "two-way"); pending_input_bytes($f.id); pending_output_bytes($f.id)));
       def user_snapshot($id):
-        ($snap | map(select(.user_id == $id))) as $items |
+        ($cfg[0].forwards | map(select(.user_id == $id))) as $items |
         {
-          input_bytes: ($items | map(.input_bytes) | add // 0),
-          output_bytes: ($items | map(.output_bytes) | add // 0)
+          input_bytes: ($items | map(forward_totals(.id).input_bytes) | add // 0),
+          output_bytes: ($items | map(forward_totals(.id).output_bytes) | add // 0)
         };
-      def user_mode_billing($user_id; $mode):
+      def user_mode_usage($user_id; $mode):
         [
           $cfg[0].forwards[] |
           select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
-          usage(($mode // "two-way"); (snap_forward(.id).input_bytes // 0); (snap_forward(.id).output_bytes // 0))
+          (forward_totals(.id)) as $t |
+          usage(($mode // "two-way"); $t.input_bytes; $t.output_bytes)
         ] | add // 0;
       def user_billing($u):
         (ustate($u.id)) as $s |
@@ -282,26 +301,27 @@ fw_read_counters() {
         forwards: [
           $cfg[0].forwards[] |
           . as $f |
-          (snap_forward($f.id)) as $c |
+          (forward_totals($f.id)) as $t |
           . + {
-            input_bytes: $c.input_bytes,
-            output_bytes: $c.output_bytes,
-            one_way_bytes: usage("one-way"; $c.input_bytes; $c.output_bytes),
-            two_way_bytes: ($c.input_bytes + $c.output_bytes),
-            total_bytes: usage((.traffic_mode // "two-way"); $c.input_bytes; $c.output_bytes),
-            billing_used_bytes: forward_billing($f)
+            input_bytes: $t.input_bytes,
+            output_bytes: $t.output_bytes,
+            one_way_bytes: usage("one-way"; $t.input_bytes; $t.output_bytes),
+            two_way_bytes: ($t.input_bytes + $t.output_bytes),
+            total_bytes: usage((.traffic_mode // "two-way"); $t.input_bytes; $t.output_bytes),
+            billing_used_bytes: current_forward_billing($f)
           }
         ],
         users: [
           $cfg[0].users[] |
           . as $u |
           (user_snapshot($u.id)) as $c |
-          (user_mode_billing($u.id; "one-way")) as $one_way_used |
+          (user_mode_usage($u.id; "one-way")) as $one_way_used |
           (
             [
               $cfg[0].forwards[] |
               select(.user_id == $u.id and ((.traffic_mode // "two-way") != "one-way")) |
-              forward_billing(.)
+              (forward_totals(.id)) as $t |
+              usage((.traffic_mode // "two-way"); $t.input_bytes; $t.output_bytes)
             ] | add // 0
           ) as $two_way_used |
           . + {
