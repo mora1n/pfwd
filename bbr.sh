@@ -61,6 +61,7 @@ BBR_UI_REPLY=""
 BBR_UI_NOTICE=""
 BBR_UI_NOTICE_LEVEL=""
 BBR_APPLY_SKIPPED_SYSCTLS=""
+BBR_APPLY_SKIPPED_RUNTIME=""
 
 bbr_die() {
     echo "错误：$*" >&2
@@ -117,6 +118,43 @@ bbr_write_value() {
         return 0
     fi
     printf '%s' "$value" > "$path"
+}
+
+bbr_runtime_skip_add() {
+    local item="$1"
+    [ -n "$item" ] || return 0
+    if [ -z "$BBR_APPLY_SKIPPED_RUNTIME" ]; then
+        BBR_APPLY_SKIPPED_RUNTIME="$item"
+    else
+        BBR_APPLY_SKIPPED_RUNTIME="$BBR_APPLY_SKIPPED_RUNTIME, $item"
+    fi
+}
+
+bbr_write_optional_sysfs_value() {
+    local path="$1"
+    local value="$2"
+    local label="$3"
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
+        bbr_write_value "$path" "$value"
+        return 0
+    fi
+    if ! [ -e "$path" ]; then
+        bbr_runtime_skip_add "$label"
+        return 0
+    fi
+    if ! printf '%s' "$value" > "$path" 2>/tmp/pfwd-bbr-write.err.$$; then
+        local err=""
+        err="$(tr '\n' ' ' < /tmp/pfwd-bbr-write.err.$$ 2>/dev/null || true)"
+        rm -f /tmp/pfwd-bbr-write.err.$$
+        case "$err" in
+            *"No such file or directory"*|*"not found"*)
+                bbr_runtime_skip_add "$label"
+                return 0
+                ;;
+        esac
+        bbr_die "写入失败：$label ($path): ${err:-unknown error}"
+    fi
+    rm -f /tmp/pfwd-bbr-write.err.$$
 }
 
 bbr_write_atomic() {
@@ -321,8 +359,12 @@ bbr_menu_optimize() {
 
     bbr_optimize_apply "$profile" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
     bbr_enable_service
-    if [ -n "$BBR_APPLY_SKIPPED_SYSCTLS" ]; then
-        bbr_ui_set_notice warn "优化已应用：profile=$profile；已跳过当前内核不支持的 sysctl: $BBR_APPLY_SKIPPED_SYSCTLS"
+    local skipped_parts=()
+    [ -z "$BBR_APPLY_SKIPPED_SYSCTLS" ] || skipped_parts+=("sysctl: $BBR_APPLY_SKIPPED_SYSCTLS")
+    [ -z "$BBR_APPLY_SKIPPED_RUNTIME" ] || skipped_parts+=("网卡队列调优: $BBR_APPLY_SKIPPED_RUNTIME")
+    if [ "${#skipped_parts[@]}" -gt 0 ]; then
+        local IFS='；'
+        bbr_ui_set_notice warn "优化已应用：profile=$profile；已跳过 ${skipped_parts[*]}"
     else
         bbr_ui_set_notice success "优化已应用：profile=$profile"
     fi
@@ -388,6 +430,7 @@ tc_iface_resolved=${state_iface:-}
 egress_rate=${BBR_STATE_EGRESS_RATE:-}
 ingress_rate=${BBR_STATE_INGRESS_RATE:-}
 applied_at=${BBR_STATE_APPLIED_AT:-}
+skipped_runtime=${BBR_STATE_SKIPPED_RUNTIME:-}
 EOF
 }
 
@@ -491,6 +534,7 @@ bbr_state_reset_vars() {
     BBR_STATE_EGRESS_RATE=""
     BBR_STATE_INGRESS_RATE=""
     BBR_STATE_APPLIED_AT=""
+    BBR_STATE_SKIPPED_RUNTIME=""
 }
 
 bbr_state_load() {
@@ -508,6 +552,7 @@ bbr_state_load() {
             EGRESS_RATE) BBR_STATE_EGRESS_RATE="$value" ;;
             INGRESS_RATE) BBR_STATE_INGRESS_RATE="$value" ;;
             APPLIED_AT) BBR_STATE_APPLIED_AT="$value" ;;
+            SKIPPED_RUNTIME) BBR_STATE_SKIPPED_RUNTIME="$value" ;;
         esac
     done < "$PFWD_BBR_STATE_FILE"
 }
@@ -522,6 +567,7 @@ TC_IFACE_MODE=$4
 TC_IFACE_VALUE=$5
 EGRESS_RATE=$6
 INGRESS_RATE=$7
+SKIPPED_RUNTIME=$8
 APPLIED_AT=$(bbr_now_iso)
 EOF
 }
@@ -843,7 +889,7 @@ bbr_apply_bql_limit() {
     local queue_file
     for queue_file in /sys/class/net/"$iface"/queues/tx-*/byte_queue_limits/limit_max; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "$limit"
+        bbr_write_optional_sysfs_value "$queue_file" "$limit" "BQL:$queue_file"
     done
 }
 
@@ -858,15 +904,15 @@ bbr_apply_nic_steering() {
     fi
     for queue_file in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "$cpu_mask"
+        bbr_write_optional_sysfs_value "$queue_file" "$cpu_mask" "RPS CPUs:$queue_file"
     done
     for queue_file in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "4096"
+        bbr_write_optional_sysfs_value "$queue_file" "4096" "RPS flow cnt:$queue_file"
     done
     for queue_file in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "$cpu_mask"
+        bbr_write_optional_sysfs_value "$queue_file" "$cpu_mask" "XPS CPUs:$queue_file"
     done
 }
 
@@ -875,15 +921,15 @@ bbr_clear_nic_steering() {
     local queue_file
     for queue_file in /sys/class/net/"$iface"/queues/rx-*/rps_cpus; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "0"
+        bbr_write_optional_sysfs_value "$queue_file" "0" "RPS CPUs:$queue_file"
     done
     for queue_file in /sys/class/net/"$iface"/queues/rx-*/rps_flow_cnt; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "0"
+        bbr_write_optional_sysfs_value "$queue_file" "0" "RPS flow cnt:$queue_file"
     done
     for queue_file in /sys/class/net/"$iface"/queues/tx-*/xps_cpus; do
         [ -f "$queue_file" ] || continue
-        bbr_write_value "$queue_file" "0"
+        bbr_write_optional_sysfs_value "$queue_file" "0" "XPS CPUs:$queue_file"
     done
 }
 
@@ -987,11 +1033,12 @@ bbr_optimize_apply() {
     local bql_limit="65536"
 
     bbr_require_mutation_context
+    BBR_APPLY_SKIPPED_RUNTIME=""
     bbr_clear_previous_runtime
     bbr_apply_sysctl_profile "$profile"
     bbr_apply_runtime_state "$nic_steering" "$bql_limit" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
     bbr_mkdir_p "$PFWD_STATE_DIR"
-    bbr_state_save "$profile" "$nic_steering" "$bql_limit" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
+    bbr_state_save "$profile" "$nic_steering" "$bql_limit" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate" "$BBR_APPLY_SKIPPED_RUNTIME"
 }
 
 bbr_reset() {
@@ -1003,6 +1050,7 @@ bbr_reset() {
 
 bbr_restore() {
     bbr_require_mutation_context
+    BBR_APPLY_SKIPPED_RUNTIME=""
     bbr_state_load
     [ "$BBR_STATE_PRESENT" = "true" ] || return 0
     [ -n "$BBR_STATE_PROFILE" ] || bbr_die "无法恢复：state file 缺少 PROFILE"
