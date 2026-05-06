@@ -25,6 +25,10 @@ UI_PAGE_SCROLLABLE=0
 UI_PAGE_OFFSET=0
 UI_PAGE_LINE_COUNT=0
 UI_PAGE_RENDERER_KEY=""
+UI_WHEEL_STEP="${UI_WHEEL_STEP:-4}"
+UI_FORM_TITLE=""
+UI_FORM_HINT=""
+declare -ag UI_FORM_LINES=()
 declare -ag UI_PAGE_LINES=()
 
 ui_main_status_title() {
@@ -147,22 +151,29 @@ ui_page_prepare_frame() {
 
 ui_page_apply_default_anchor() {
     local renderer_key="$1"
-    local offset view_height line_index line_text
+    local view_height line_index line_text candidate_offset previous_line
     case "$renderer_key" in
         ui_render_main_menu_page)
             view_height="$(ui_page_view_height)"
             UI_PAGE_OFFSET="$(ui_page_max_offset "$view_height")"
-            offset="$UI_PAGE_OFFSET"
-            for ((line_index = offset; line_index >= 0; line_index--)); do
+            candidate_offset="$UI_PAGE_OFFSET"
+            for ((line_index = candidate_offset; line_index >= 0; line_index--)); do
                 line_text="${UI_PAGE_LINES[$line_index]:-}"
-                case "$line_text" in
-                    $'\033'[*) ;;
-                esac
-                if [[ "$line_text" == *"用户："* ]]; then
+                if [[ "$line_text" == 用户：* ]] || [ "$line_text" = "当前转发" ] || [[ "$line_text" == "== "* ]]; then
                     UI_PAGE_OFFSET="$line_index"
                     break
                 fi
             done
+            if [[ "${UI_PAGE_LINES[$UI_PAGE_OFFSET]:-}" == 用户：* ]] && [ "$UI_PAGE_OFFSET" -gt 0 ]; then
+                previous_line="${UI_PAGE_LINES[$((UI_PAGE_OFFSET - 1))]:-}"
+                if [ "$previous_line" = "当前转发" ]; then
+                    UI_PAGE_OFFSET=$((UI_PAGE_OFFSET - 1))
+                fi
+            fi
+            ;;
+        ui_render_users_menu_page|ui_render_forwards_menu_page|ui_render_traffic_user_menu_page*|ui_render_traffic_select_user_page|ui_render_telegram_menu_page|ui_render_export_import_menu_page|ui_render_user_select_page*|ui_render_forward_select_page*|ui_render_user_forward_select_page*|ui_render_telegram_user_select_page*)
+            view_height="$(ui_page_view_height)"
+            UI_PAGE_OFFSET="$(ui_page_max_offset "$view_height")"
             ;;
         *)
             UI_PAGE_OFFSET=0
@@ -244,6 +255,18 @@ ui_page_scroll_lines() {
     local delta="$1"
     UI_PAGE_OFFSET=$((UI_PAGE_OFFSET + delta))
     ui_page_clamp_offset
+}
+
+ui_page_scroll_wheel() {
+    local direction="$1"
+    local step="${UI_WHEEL_STEP:-4}"
+    [[ "$step" =~ ^[0-9]+$ ]] || step=4
+    [ "$step" -ge 1 ] || step=1
+    if [ "$direction" -gt 0 ]; then
+        ui_page_scroll_lines "$step"
+    else
+        ui_page_scroll_lines "-$step"
+    fi
 }
 
 ui_page_scroll_pages() {
@@ -328,12 +351,20 @@ ui_page_read_line() {
                     current_timeout=""
                 fi
                 ;;
-            $'\033[A'|$'\033OA'|$'\033[<64;'*|k)
+            $'\033[A'|$'\033OA'|k)
                 ui_page_scroll_lines -1
                 current_timeout="$timeout_seconds"
                 ;;
-            $'\033[B'|$'\033OB'|$'\033[<65;'*|j)
+            $'\033[B'|$'\033OB'|j)
                 ui_page_scroll_lines 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[<64;'*)
+                ui_page_scroll_wheel -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[<65;'*)
+                ui_page_scroll_wheel 1
                 current_timeout="$timeout_seconds"
                 ;;
             $'\033[5~')
@@ -924,6 +955,82 @@ ui_edit_read() {
     return 0
 }
 
+ui_form_reset() {
+    UI_FORM_TITLE=""
+    UI_FORM_HINT=""
+    UI_FORM_LINES=()
+}
+
+ui_form_set() {
+    local title="$1"
+    local hint="${2:-}"
+    UI_FORM_TITLE="$title"
+    UI_FORM_HINT="$hint"
+    UI_FORM_LINES=()
+}
+
+ui_form_add_line() {
+    UI_FORM_LINES+=("$1")
+}
+
+ui_form_add_kv() {
+    local label="$1"
+    local value="$2"
+    ui_form_add_line "$label：$(ui_display_or_dash "$value")"
+}
+
+ui_render_form_page() {
+    local title="$1"
+    local hint="${2:-}"
+    shift 2 || true
+    ui_header "$title"
+    [ -n "$hint" ] && ui_print_line "$hint" "2;37"
+    if [ -n "$hint" ] && [ "${#UI_FORM_LINES[@]}" -gt 0 ]; then
+        printf '\n'
+    fi
+    if [ "${#UI_FORM_LINES[@]}" -gt 0 ]; then
+        printf '%s\n' "${UI_FORM_LINES[@]}"
+    fi
+}
+
+ui_form_refresh() {
+    [ -n "$UI_FORM_TITLE" ] || return 1
+    ui_render_page ui_render_form_page "$UI_FORM_TITLE" "$UI_FORM_HINT"
+}
+
+ui_form_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    if [ -n "$UI_FORM_TITLE" ]; then
+        ui_form_refresh
+    fi
+    ui_read "$prompt" "$default"
+}
+
+ui_form_edit_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    if [ -n "$UI_FORM_TITLE" ]; then
+        ui_form_refresh
+    fi
+    ui_edit_read "$prompt" "$default"
+}
+
+ui_form_select_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    shift 2 || true
+    local options=("$@")
+    local line
+    if [ -n "$UI_FORM_TITLE" ]; then
+        ui_form_refresh
+    fi
+    for line in "${options[@]}"; do
+        printf '%s\n' "$line"
+    done
+    ui_read "$prompt" "$default"
+}
+
 ui_pause() {
     [ -t 0 ] || return 0
     printf '按回车继续...'
@@ -1061,13 +1168,13 @@ ui_select_mss_mode() {
         source="$UI_MSS_RECOMMEND_SOURCE"
     fi
 
-    echo "1) 不设置"
-    echo "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。"
-    echo "2) MSS Clamp"
-    echo "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。"
-    echo "3) 固定 MSS"
-    echo "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。"
-    ui_read "$prompt" "1" || return 1
+    ui_form_select_read "$prompt" "1" \
+        "1) 不设置" \
+        "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" \
+        "2) MSS Clamp" \
+        "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" \
+        "3) 固定 MSS" \
+        "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1
     case "$UI_REPLY" in
         1|"")
             UI_MSS_MODE=""
@@ -1086,7 +1193,7 @@ ui_select_mss_mode() {
                     ui_print_line "固定 MSS 推荐值：$recommended" "36"
                 fi
             fi
-            ui_read "固定 MSS 值" "$recommended" || return 1
+            ui_form_read "固定 MSS 值" "$recommended" || return 1
             [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
             validate_mss_value "$UI_REPLY"
             UI_MSS_VALUE="$UI_REPLY"
@@ -1114,16 +1221,10 @@ ui_select_mss_mode_edit() {
     recommended="$UI_MSS_RECOMMENDED"
     source="$UI_MSS_RECOMMEND_SOURCE"
 
-    echo "1) 不设置"
-    echo "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。"
-    echo "2) MSS Clamp"
-    echo "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。"
-    echo "3) 固定 MSS"
-    echo "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。"
     case "$current_mode" in
-        clamp) ui_read "$prompt" "2" || return 1 ;;
-        set) ui_read "$prompt" "3" || return 1 ;;
-        *) ui_read "$prompt" "1" || return 1 ;;
+        clamp) ui_form_select_read "$prompt" "2" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
+        set) ui_form_select_read "$prompt" "3" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
+        *) ui_form_select_read "$prompt" "1" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
     esac
 
     case "$UI_REPLY" in
@@ -1161,7 +1262,7 @@ ui_select_mss_mode_edit() {
                     fi
                 fi
             fi
-            ui_edit_read "固定 MSS 值" "$fixed_default" || return 1
+            ui_form_edit_read "固定 MSS 值" "$fixed_default" || return 1
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
             validate_mss_value "$UI_REPLY"
@@ -1179,11 +1280,11 @@ ui_select_snat_mode() {
     UI_SNAT_MODE="masquerade"
     UI_SNAT_SOURCE=""
 
-    echo "1) Masquerade"
-    echo "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。"
-    echo "2) 固定 SNAT 源地址"
-    echo "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。"
-    ui_read "$prompt" "1" || return 1
+    ui_form_select_read "$prompt" "1" \
+        "1) Masquerade" \
+        "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" \
+        "2) 固定 SNAT 源地址" \
+        "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1
     case "$UI_REPLY" in
         1|"")
             UI_SNAT_MODE="masquerade"
@@ -1191,7 +1292,7 @@ ui_select_snat_mode() {
             ;;
         2)
             UI_SNAT_MODE="snat"
-            ui_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
+            ui_form_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
             [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
             validate_ip_literal "$UI_REPLY"
             UI_SNAT_SOURCE="$UI_REPLY"
@@ -1213,13 +1314,9 @@ ui_select_snat_mode_edit() {
     UI_SNAT_SOURCE=""
     UI_EDIT_ABORTED=0
 
-    echo "1) Masquerade"
-    echo "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。"
-    echo "2) 固定 SNAT 源地址"
-    echo "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。"
     case "$current_mode" in
-        snat) ui_read "$prompt" "2" || return 1 ;;
-        *) ui_read "$prompt" "1" || return 1 ;;
+        snat) ui_form_select_read "$prompt" "2" "1) Masquerade" "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" "2) 固定 SNAT 源地址" "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1 ;;
+        *) ui_form_select_read "$prompt" "1" "1) Masquerade" "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" "2) 固定 SNAT 源地址" "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1 ;;
     esac
     case "$UI_REPLY" in
         0)
@@ -1237,7 +1334,7 @@ ui_select_snat_mode_edit() {
             ;;
         2)
             UI_SNAT_MODE="snat"
-            ui_edit_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" "$current_source" || return 1
+            ui_form_edit_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" "$current_source" || return 1
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
             validate_ip_literal "$UI_REPLY"
@@ -1296,10 +1393,7 @@ ui_protocol_label() {
 ui_select_protocol() {
     local prompt="$1"
     UI_REPLY=""
-    echo "1) TCP"
-    echo "2) UDP"
-    echo "3) 全转发"
-    ui_read "$prompt" "3" || return 1
+    ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) 全转发" || return 1
     case "$UI_REPLY" in
         1) UI_REPLY="tcp" ;;
         2) UI_REPLY="udp" ;;
@@ -1313,13 +1407,10 @@ ui_select_protocol_edit() {
     local current_protocol="${2:-tcp_udp}"
     UI_EDIT_ABORTED=0
     UI_REPLY=""
-    echo "1) TCP"
-    echo "2) UDP"
-    echo "3) 全转发"
     case "$current_protocol" in
-        tcp) ui_read "$prompt" "1" || return 1 ;;
-        udp) ui_read "$prompt" "2" || return 1 ;;
-        *) ui_read "$prompt" "3" || return 1 ;;
+        tcp) ui_form_select_read "$prompt" "1" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
+        udp) ui_form_select_read "$prompt" "2" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
+        *) ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) 全转发" || return 1 ;;
     esac
     case "$UI_REPLY" in
         0)
@@ -1341,9 +1432,7 @@ ui_select_traffic_mode() {
     local prompt="$1"
     local allow_empty="${2:-false}"
     UI_TRAFFIC_MODE=""
-    echo "1) 单向"
-    echo "2) 双向"
-    ui_read "$prompt" "2" || return 1
+    ui_form_select_read "$prompt" "2" "1) 单向" "2) 双向" || return 1
     if [ "$allow_empty" = "true" ] && [ -z "$UI_REPLY" ]; then
         UI_TRAFFIC_MODE=""
         return 0
@@ -1360,12 +1449,10 @@ ui_select_traffic_mode_edit() {
     local current_mode="${2:-}"
     UI_TRAFFIC_MODE=""
     UI_EDIT_ABORTED=0
-    echo "1) 单向"
-    echo "2) 双向"
     case "$current_mode" in
-        one-way) ui_read "$prompt" "1" || return 1 ;;
-        two-way) ui_read "$prompt" "2" || return 1 ;;
-        *) ui_read "$prompt" || return 1 ;;
+        one-way) ui_form_select_read "$prompt" "1" "1) 单向" "2) 双向" || return 1 ;;
+        two-way) ui_form_select_read "$prompt" "2" "1) 单向" "2) 双向" || return 1 ;;
+        *) ui_form_select_read "$prompt" "" "1) 单向" "2) 双向" || return 1 ;;
     esac
     case "$UI_REPLY" in
         0)
@@ -1823,7 +1910,7 @@ ui_select_user() {
         ui_warn "暂无用户，请先添加用户"
         return 1
     fi
-    ui_print_user_list "$allow_zero"
+    ui_render_page ui_render_user_select_page "$allow_zero"
     ui_read "选择用户序号" || return 1
     if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
         UI_EDIT_ABORTED=1
@@ -1834,6 +1921,13 @@ ui_select_user() {
     user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
     [ -n "$user_id" ] || { ui_warn "用户序号不存在"; return 1; }
     UI_REPLY="$user_id"
+}
+
+ui_render_user_select_page() {
+    local allow_zero="${1:-false}"
+    ui_header "选择用户"
+    ui_notice_render
+    ui_print_user_list "$allow_zero"
 }
 
 ui_select_user_for_telegram_config() {
@@ -1848,7 +1942,7 @@ ui_select_user_for_telegram_config() {
         rows+=$'\n'"$index"$'\t'"$user_id"
         index=$((index + 1))
     done < <(jq -r '.users[]?.id' "$PFWD_CONFIG_FILE")
-    ui_table_render $'序号\t用户' "$rows" "2"
+    ui_render_page ui_render_telegram_user_select_page "$rows"
     ui_read "选择用户序号" || return 1
     [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; return 1; }
     case "$UI_REPLY" in
@@ -1865,6 +1959,13 @@ ui_select_user_for_telegram_config() {
     user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 2].id // ""' "$PFWD_CONFIG_FILE")"
     [ -n "$user_id" ] || { ui_warn "用户序号不存在"; return 1; }
     UI_REPLY="$user_id"
+}
+
+ui_render_telegram_user_select_page() {
+    local rows="$1"
+    ui_header "选择用户"
+    ui_notice_render
+    ui_table_render $'序号\t用户' "$rows" "2"
 }
 
 ui_multiselect_normalize_tokens() {
@@ -1977,7 +2078,7 @@ ui_select_users_multi() {
     fi
     local count raw indexes user_ids
     count="$(jq '.users | length' "$PFWD_CONFIG_FILE")"
-    ui_print_user_list "$allow_zero"
+    ui_render_page ui_render_user_select_page "$allow_zero"
     ui_read "选择用户序号，可多选：1,3,5 或 1-3" || return 1
     raw="$UI_REPLY"
     ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
@@ -1998,7 +2099,7 @@ ui_select_forwards_multi() {
     fi
     local count raw indexes forward_ids
     count="$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
-    ui_select_forward_table "$allow_zero"
+    ui_render_page ui_render_forward_select_page "$allow_zero"
     ui_read "选择转发序号，可多选：1,3,5 或 1-3" || return 1
     raw="$UI_REPLY"
     ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
@@ -2026,7 +2127,7 @@ ui_select_user_forwards_multi() {
     fi
     local count raw indexes forward_ids
     count="$(jq -r --arg id "$user_id" '[.forwards[] | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE")"
-    ui_select_user_forward_table "$user_id" "$allow_zero"
+    ui_render_page ui_render_user_forward_select_page "$user_id" "$allow_zero"
     ui_read "选择转发序号，可多选：1,3,5 或 1-3" || return 1
     raw="$UI_REPLY"
     ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
@@ -2130,10 +2231,20 @@ ui_select_forward_table() {
     ui_render_forward_groups "$rows" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "暂无转发，请先添加转发"
 }
 
+ui_render_forward_select_page() {
+    local allow_zero="${1:-false}"
+    ui_header "选择转发"
+    ui_notice_render
+    if [ "$allow_zero" = "true" ]; then
+        ui_print_line "0) 返回" "36"
+    fi
+    ui_select_forward_table false
+}
+
 ui_select_forward() {
     local allow_zero="${1:-false}"
     UI_EDIT_ABORTED=0
-    ui_select_forward_table "$allow_zero" || return 1
+    ui_render_page ui_render_forward_select_page "$allow_zero" || return 1
     ui_read "选择转发序号" || return 1
     if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
         UI_EDIT_ABORTED=1
@@ -2184,11 +2295,23 @@ ui_select_user_forward_table() {
     ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$rows" "3,6,2"
 }
 
+ui_render_user_forward_select_page() {
+    local user_id="$1"
+    local allow_zero="${2:-false}"
+    ui_header "选择转发"
+    ui_notice_render
+    if [ "$allow_zero" = "true" ]; then
+        ui_print_line "0) 返回" "36"
+    fi
+    ui_print_line "用户：$user_id" "1;36"
+    ui_select_user_forward_table "$user_id" false
+}
+
 ui_select_user_forward() {
     local user_id="$1"
     local allow_zero="${2:-false}"
     UI_EDIT_ABORTED=0
-    ui_select_user_forward_table "$user_id" "$allow_zero" || return 1
+    ui_render_page ui_render_user_forward_select_page "$user_id" "$allow_zero" || return 1
     ui_read "选择转发序号" || return 1
     if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
         UI_EDIT_ABORTED=1
@@ -2279,37 +2402,56 @@ ui_menu_users() {
 
 ui_menu_add_forward() {
     local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode comment args=()
-    ui_clear_screen
-    ui_header "添加转发"
-    echo "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
+    ui_form_set "添加转发" "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
     ui_select_user true || return 0
     [ "$UI_EDIT_ABORTED" = "1" ] && return 0
     user_id="$UI_REPLY"
-    ui_read "目标 IP/域名" || return 0
+    ui_form_add_kv "用户" "$user_id"
+    ui_form_read "目标 IP/域名" || return 0
     remote_host="$UI_REPLY"
-    ui_read "目标端口" || return 0
+    ui_form_add_kv "目标 IP/域名" "$remote_host"
+    ui_form_read "目标端口" || return 0
     remote_port="$UI_REPLY"
     remote="$(ui_join_remote "$remote_host" "$remote_port")"
-    ui_read "监听 IP，留空默认双栈" "$(ui_config_value '.settings.default_listen_ip // "::"')" || return 0
+    ui_form_add_kv "目标端口" "$remote_port"
+    ui_form_read "监听 IP，留空默认双栈" "$(ui_config_value '.settings.default_listen_ip // "::"')" || return 0
     listen_ip="$UI_REPLY"
-    ui_read "固定监听端口，留空则使用随机端口" || return 0
+    ui_form_add_kv "监听 IP" "$listen_ip"
+    ui_form_read "固定监听端口，留空则使用随机端口" || return 0
     listen_port="$UI_REPLY"
     if [ -z "$listen_port" ]; then
-        ui_read "随机端口范围" "$(ui_config_value '.settings.default_random_port_range // "20000-30000"')" || return 0
+        ui_form_add_kv "监听端口" "随机"
+        ui_form_read "随机端口范围" "$(ui_config_value '.settings.default_random_port_range // "20000-30000"')" || return 0
         random_range="$UI_REPLY"
     else
         random_range=""
+        ui_form_add_kv "监听端口" "$listen_port"
     fi
-    ui_read "到期日期 YYYYMMDD，支持 +7/7d，留空不限期" || return 0
+    [ -z "$random_range" ] || ui_form_add_kv "随机端口范围" "$random_range"
+    ui_form_read "到期日期 YYYYMMDD，支持 +7/7d，留空不限期" || return 0
     stop_at="$UI_REPLY"
+    ui_form_add_kv "到期日期" "$stop_at"
     ui_select_protocol "转发协议" || return 0
     protocol="$UI_REPLY"
+    ui_form_add_kv "转发协议" "$(ui_protocol_label "$protocol")"
     ui_select_traffic_mode "流量模式" || return 0
     traffic_mode="$UI_TRAFFIC_MODE"
-    ui_read "备注，留空不设置" || return 0
+    ui_form_add_kv "流量模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向" || echo "双向" )"
+    ui_form_read "备注，留空不设置" || return 0
     comment="$UI_REPLY"
+    ui_form_add_kv "备注" "$comment"
     ui_select_mss_mode "MSS 处理方式" "$remote_host" || return 0
+    case "$UI_MSS_MODE" in
+        clamp) ui_form_add_kv "MSS" "Clamp" ;;
+        set) ui_form_add_kv "MSS" "$UI_MSS_VALUE" ;;
+        *) ui_form_add_kv "MSS" "-" ;;
+    esac
     ui_select_snat_mode "SNAT 处理方式" || return 0
+    if [ "$UI_SNAT_MODE" = "snat" ]; then
+        ui_form_add_kv "SNAT" "$UI_SNAT_SOURCE"
+    else
+        ui_form_add_kv "SNAT" "masquerade"
+    fi
 
     args=(--user-id "$user_id" --remote "$remote" --listen-ip "$listen_ip" --protocol "$protocol" --traffic-mode "$traffic_mode")
     if [ -n "$listen_port" ]; then
@@ -2329,6 +2471,7 @@ ui_menu_add_forward() {
     fi
     [ -z "$comment" ] || args+=(--comment "$comment")
 
+    ui_form_reset
     ui_run cmd_add "${args[@]}"
 }
 
@@ -2362,46 +2505,70 @@ ui_menu_forwards() {
                 current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
                 current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$current")"
 
-                ui_clear_screen
-                ui_header "修改转发"
-                echo "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
+                ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
+                ui_form_add_kv "转发 ID" "$forward_id"
+                ui_form_add_kv "当前监听 IP" "$current_listen_ip"
+                ui_form_add_kv "当前监听端口" "$current_listen_port"
+                ui_form_add_kv "当前目标 IP/域名" "$current_remote_host"
+                ui_form_add_kv "当前目标端口" "$current_remote_port"
+                ui_form_add_kv "当前协议" "$(ui_protocol_label "$current_protocol")"
+                ui_form_add_kv "当前流量模式" "$( [ "$current_mode" = "one-way" ] && echo "单向" || echo "双向" )"
+                ui_form_add_kv "当前到期日" "${current_stop_at:-}"
+                ui_form_add_kv "当前备注" "$current_comment"
 
-                ui_edit_read "监听 IP" "$current_listen_ip" || { ui_pause; continue; }
+                ui_form_edit_read "监听 IP" "$current_listen_ip" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 listen_ip="$UI_REPLY"
+                ui_form_add_kv "新监听 IP" "$listen_ip"
 
-                ui_edit_read "监听端口" "$current_listen_port" || { ui_pause; continue; }
+                ui_form_edit_read "监听端口" "$current_listen_port" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 listen_port="$UI_REPLY"
+                ui_form_add_kv "新监听端口" "$listen_port"
 
-                ui_edit_read "目标 IP/域名" "$current_remote_host" || { ui_pause; continue; }
+                ui_form_edit_read "目标 IP/域名" "$current_remote_host" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 remote_host="$UI_REPLY"
+                ui_form_add_kv "新目标 IP/域名" "$remote_host"
 
-                ui_edit_read "目标端口" "$current_remote_port" || { ui_pause; continue; }
+                ui_form_edit_read "目标端口" "$current_remote_port" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 remote_port="$UI_REPLY"
+                ui_form_add_kv "新目标端口" "$remote_port"
 
-                ui_edit_read "转发到期日 YYYYMMDD，支持 +7/7d" "${current_stop_at:-}" || { ui_pause; continue; }
+                ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d" "${current_stop_at:-}" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 stop_at="$UI_REPLY"
+                ui_form_add_kv "新到期日" "$stop_at"
 
                 ui_select_protocol_edit "转发协议" "$current_protocol" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 protocol="$UI_REPLY"
+                [ -z "$protocol" ] || ui_form_add_kv "新协议" "$(ui_protocol_label "$protocol")"
 
                 ui_select_traffic_mode_edit "流量模式" "$current_mode" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 traffic_mode="$UI_TRAFFIC_MODE"
+                [ -z "$traffic_mode" ] || ui_form_add_kv "新流量模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向" || echo "双向" )"
 
-                ui_edit_read "备注" "$current_comment" || { ui_pause; continue; }
+                ui_form_edit_read "备注" "$current_comment" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 comment="$UI_REPLY"
+                ui_form_add_kv "新备注" "$comment"
 
                 ui_select_mss_mode_edit "MSS 处理方式" "$current_mss_mode" "$current_mss_value" "$remote_host" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                case "$UI_MSS_MODE" in
+                    clamp) ui_form_add_kv "新 MSS" "Clamp" ;;
+                    set) ui_form_add_kv "新 MSS" "$UI_MSS_VALUE" ;;
+                    __CLEAR__) ui_form_add_kv "新 MSS" "清空" ;;
+                esac
                 ui_select_snat_mode_edit "SNAT 处理方式" "$current_snat_mode" "$current_snat_source" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                case "$UI_SNAT_MODE" in
+                    snat) ui_form_add_kv "新 SNAT" "$UI_SNAT_SOURCE" ;;
+                    masquerade) ui_form_add_kv "新 SNAT" "masquerade" ;;
+                esac
 
                 args=(--forward-id "$forward_id")
                 [ "$listen_ip" = "$current_listen_ip" ] || args+=(--listen-ip "$listen_ip")
@@ -2453,9 +2620,11 @@ ui_menu_forwards() {
                 if [ "${#args[@]}" -eq 2 ]; then
                     ui_warn "未修改"
                 else
+                    ui_form_reset
                     ui_run cmd_forward_update "${args[@]}"
                     [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "32"
                 fi
+                ui_form_reset
                 ui_maybe_pause success
                 ;;
             3)
@@ -2554,8 +2723,11 @@ ui_menu_expire_limit() {
                     ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     scope="$UI_REPLY"
+                    ui_form_set "流量管理" "修改转发到期日。输入 - 清空，0 返回上级。"
+                    ui_form_add_kv "用户" "$user_id"
+                    ui_form_add_kv "作用范围" "$scope"
                     if [[ "$scope" == user:* ]]; then
-                        ui_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_pause; continue; }
+                        ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
                         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                         if [ -z "$UI_REPLY" ]; then
                             ui_warn "未修改"
@@ -2565,7 +2737,7 @@ ui_menu_expire_limit() {
                             ui_run cmd_expire user-set --user-id "${scope#user:}" --stop-at "$UI_REPLY"
                         fi
                     else
-                        ui_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_pause; continue; }
+                        ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
                         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                         local stop_value="$UI_REPLY" ok=0 fail=0
                         if [ -z "$stop_value" ]; then
@@ -2595,6 +2767,7 @@ ui_menu_expire_limit() {
                             ui_batch_print_result "$ok" "$fail"
                         fi
                     fi
+                    ui_form_reset
                     ui_maybe_pause success
                     ;;
                 2)
@@ -2602,18 +2775,23 @@ ui_menu_expire_limit() {
                     ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     scope="$UI_REPLY"
+                    ui_form_set "流量管理" "修改流量配额、速率和统计模式。留空不改，0 返回上级。"
+                    ui_form_add_kv "用户" "$user_id"
+                    ui_form_add_kv "作用范围" "$scope"
                     if [[ "$scope" == user:* ]]; then
-                        ui_read "用户总流量，数字默认 GB；例如 100 / 1.5GB / 512MB；0 清除，留空不改" || continue
+                        ui_form_read "用户总流量，数字默认 GB；例如 100 / 1.5GB / 512MB；0 清除，留空不改" || { ui_form_reset; continue; }
                     else
-                        ui_read "总流量，数字默认 GB；例如 100 / 1.5GB / 512MB；0 清除，留空不改" || continue
+                        ui_form_read "总流量，数字默认 GB；例如 100 / 1.5GB / 512MB；0 清除，留空不改" || { ui_form_reset; continue; }
                     fi
                     traffic="$UI_REPLY"
+                    ui_form_add_kv "总流量" "$traffic"
                     if [[ "$scope" == user:* ]]; then
-                        ui_read "每个端口速率，数字默认 Mbps；例如 50 / 12.5Mbps / 1.2Gbps；0 清除，留空不改" || continue
+                        ui_form_read "每个端口速率，数字默认 Mbps；例如 50 / 12.5Mbps / 1.2Gbps；0 清除，留空不改" || { ui_form_reset; continue; }
                     else
-                        ui_read "速率，数字默认 Mbps；例如 50 / 12.5Mbps / 1.2Gbps；0 清除，留空不改" || continue
+                        ui_form_read "速率，数字默认 Mbps；例如 50 / 12.5Mbps / 1.2Gbps；0 清除，留空不改" || { ui_form_reset; continue; }
                     fi
                     rate="$UI_REPLY"
+                    ui_form_add_kv "速率" "$rate"
                     if [[ "$scope" == user:* ]]; then
                         current_scope_mode="$(jq -r --arg id "${scope#user:}" '
                           [ .forwards[] | select(.user_id == $id) | (.traffic_mode // "two-way") ]
@@ -2632,6 +2810,7 @@ ui_menu_expire_limit() {
                     ui_select_traffic_mode_edit "流量模式，回车不改，0 返回" "$current_mode" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                     traffic_mode="$UI_TRAFFIC_MODE"
+                    [ -z "$traffic_mode" ] || ui_form_add_kv "流量模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向" || echo "双向" )"
                     [ -z "$traffic" ] || traffic="$(normalize_ui_traffic_input "$traffic")"
                     [ -z "$rate" ] || rate="$(normalize_ui_rate_input "$rate")"
                     if [[ "$scope" == user:* ]]; then
@@ -2677,13 +2856,13 @@ ui_menu_expire_limit() {
                             ui_warn "未修改"
                         fi
                     fi
+                    ui_form_reset
                     ui_maybe_pause success
                     ;;
                 3)
-                    echo "1) 立即重置"
-                    echo "2) 设置每月重置日"
-                    echo "0) 返回"
-                    ui_read "选择" || continue
+                    ui_form_set "流量管理" "重置统计或设置重置日。"
+                    ui_form_add_kv "用户" "$user_id"
+                    ui_form_select_read "选择" "" "1) 立即重置" "2) 设置每月重置日" "0) 返回" || { ui_form_reset; continue; }
                     local reset_action="$UI_REPLY" scope="" args=()
                     case "$reset_action" in
                         1)
@@ -2704,6 +2883,7 @@ ui_menu_expire_limit() {
                                     fi
                                 done <<< "${scope#forward-list:}"
                                 ui_batch_print_result "$ok" "$fail"
+                                ui_form_reset
                                 ui_pause
                                 continue
                             fi
@@ -2713,10 +2893,12 @@ ui_menu_expire_limit() {
                             ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                             [ "$UI_EDIT_ABORTED" = "1" ] && continue
                             scope="$UI_REPLY"
-                            ui_read "每月重置日 1-31；0 关闭自动重置" || continue
+                            ui_form_add_kv "作用范围" "$scope"
+                            ui_form_read "每月重置日 1-31；0 关闭自动重置" || { ui_form_reset; continue; }
                             local day="$UI_REPLY"
                             if [ -z "$day" ]; then
                                 ui_warn "未修改"
+                                ui_form_reset
                                 ui_pause
                                 continue
                             fi
@@ -2734,16 +2916,19 @@ ui_menu_expire_limit() {
                                     fi
                                 done <<< "${scope#forward-list:}"
                                 ui_batch_print_result "$ok" "$fail"
+                                ui_form_reset
                                 ui_pause
                                 continue
                             fi
                             ui_run cmd_traffic reset-day "${args[@]}"
                             ;;
                         0)
+                            ui_form_reset
                             continue
                             ;;
                         *) ui_warn "无效选择" ;;
                     esac
+                    ui_form_reset
                     ui_maybe_pause success
                     ;;
                 4)
@@ -2751,11 +2936,15 @@ ui_menu_expire_limit() {
                     ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     scope="$UI_REPLY"
-                    ui_edit_read "已用流量，数字默认 GB；例如 100 / 100GB / 512MB" || continue
+                    ui_form_set "流量管理" "设置计费用量。输入 0 返回上级。"
+                    ui_form_add_kv "用户" "$user_id"
+                    ui_form_add_kv "作用范围" "$scope"
+                    ui_form_edit_read "已用流量，数字默认 GB；例如 100 / 100GB / 512MB" || { ui_form_reset; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     used="$UI_REPLY"
                     if [ -z "$used" ]; then
                         ui_warn "未修改"
+                        ui_form_reset
                         ui_pause
                         continue
                     fi
@@ -2774,10 +2963,12 @@ ui_menu_expire_limit() {
                             fi
                         done <<< "${scope#forward-list:}"
                         ui_batch_print_result "$ok" "$fail"
+                        ui_form_reset
                         ui_pause
                         continue
                     fi
                     ui_run cmd_traffic "${args[@]}"
+                    ui_form_reset
                     ui_maybe_pause success
                     ;;
                 0) return 0 ;;
@@ -2809,17 +3000,23 @@ ui_menu_telegram() {
                     chat_id_default="$(jq -r '.chat_id // ""' <<< "$tg")"
                     server_name_default="$(ui_user_telegram_server_name_default "$(jq -r '.server_name // ""' <<< "$tg")")"
                 fi
-                ui_read "Bot Token，例如 123456789:AA..." "$token_default" || continue
+                ui_form_set "Telegram 通知" "配置 Bot Token、Chat ID 和服务器名称。回车保留默认值。"
+                ui_form_add_kv "目标用户" "$user_id"
+                ui_form_read "Bot Token，例如 123456789:AA..." "$token_default" || { ui_form_reset; continue; }
                 token="$UI_REPLY"
-                ui_read "Chat ID，例如 123456789 或 -1001234567890" "$chat_id_default" || continue
+                ui_form_add_kv "Bot Token" "$token"
+                ui_form_read "Chat ID，例如 123456789 或 -1001234567890" "$chat_id_default" || { ui_form_reset; continue; }
                 chat_id="$UI_REPLY"
-                ui_read "服务器名称" "$server_name_default" || continue
+                ui_form_add_kv "Chat ID" "$chat_id"
+                ui_form_read "服务器名称" "$server_name_default" || { ui_form_reset; continue; }
                 server_name="$UI_REPLY"
+                ui_form_add_kv "服务器名称" "$server_name"
                 if [ "$user_id" = "__ALL_USERS__" ]; then
                     ui_run cmd_user telegram --all --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name"
                 else
                     ui_run cmd_user telegram "$user_id" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"
                 fi
+                ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新" "32"
                 ui_maybe_pause success
                 ;;
@@ -2827,11 +3024,14 @@ ui_menu_telegram() {
                 ui_select_user true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local schedule_user="$UI_REPLY" interval_choice="" interval_value="" daily_time=""
-                echo "留空表示不修改；输入 0 可清除对应定时。"
-                ui_read "间隔发送，单位分钟；例如 60" || continue
+                ui_form_set "Telegram 通知" "留空表示不修改；输入 0 可清除对应定时。"
+                ui_form_add_kv "目标用户" "$schedule_user"
+                ui_form_read "间隔发送，单位分钟；例如 60" || { ui_form_reset; continue; }
                 interval_choice="$UI_REPLY"
-                ui_read "每日发送时间 HH:MM；例如 09:30" || continue
+                ui_form_add_kv "间隔发送" "$interval_choice"
+                ui_form_read "每日发送时间 HH:MM；例如 09:30" || { ui_form_reset; continue; }
                 daily_time="$UI_REPLY"
+                ui_form_add_kv "每日发送时间" "$daily_time"
                 if [ "$interval_choice" = "0" ]; then
                     interval_value=""
                 else
@@ -2843,6 +3043,7 @@ ui_menu_telegram() {
                     daily_time="__KEEP__"
                 fi
                 ui_run cmd_notify_schedule --user-id "$schedule_user" --interval-minutes "$interval_value" --daily-time "$daily_time"
+                ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "定时发送已更新：$schedule_user" "32"
                 ui_maybe_pause success
                 ;;
