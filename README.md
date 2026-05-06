@@ -187,8 +187,6 @@ pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol
 pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol udp
 ```
 
-同一监听端口可拆成一条 `TCP` 和一条 `UDP` 转发；默认协议为 `tcp_udp`，不能与拆分后的同端口规则共存。
-
 ### nft Options
 
 ```bash
@@ -201,21 +199,10 @@ pfwd add \
   --snat-source 198.51.100.10
 ```
 
-这些字段会持久化在 `.forwards[].nft` 下，并参与运行态渲染。
-
-交互界面添加/修改转发时也可以直接设置 `MSS` 和 `SNAT`。
-
 | Option | Default | Notes |
 |--------|---------|-------|
 | `MSS` | 不设置 | 常规公网转发一般不需要；`MSS clamp` 适合 PPPoE、VPN、隧道、跨境链路；固定 `MSS` 适合已知 MTU 或上游有统一要求时 |
 | `SNAT` | `masquerade` | 普通单出口、动态公网 IP 直接用默认值；固定 `SNAT` 适合本机有额外内网 IP、多地址出口或后端只接受特定来源 IP |
-
-### Address Notes
-
-- 目标地址支持域名、IPv4、`[IPv6]:PORT` 和 `localhost`
-- 监听 IP 默认使用 `::` 双栈监听
-- 当前运行态只支持通配监听地址 `::` / `0.0.0.0`
-- `localhost` 会渲染为本地 IPv4 / IPv6 双栈目标
 
 ## pfwd-bbr
 

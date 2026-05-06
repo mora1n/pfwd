@@ -1156,6 +1156,51 @@ ui_print_main_user_summary() {
     ui_table_render $'用户名\t转发数\t计费用量\t双向\t单向\t总限额\t重置日' "$rows" "1,6,7"
 }
 
+ui_render_forward_groups() {
+    local rows="$1"
+    local headers_tsv="$2"
+    local shrink_csv="$3"
+    local empty_text="$4"
+    local current_user="" user_label="" group_rows="" group_count=0
+    local line user
+
+    if [ -z "$rows" ]; then
+        ui_print_line "$empty_text"
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r _ user _ <<< "$line"
+        if [ -z "$current_user" ]; then
+            current_user="$user"
+        fi
+        if [ "$user" != "$current_user" ]; then
+            user_label="$current_user"
+            if [ "$group_count" -gt 0 ]; then
+                user_label+="（${group_count} 条）"
+            fi
+            ui_print_line "$user_label" "1;36"
+            ui_table_render "$headers_tsv" "${group_rows%$'\n'}" "$shrink_csv"
+            printf '\n'
+            current_user="$user"
+            group_rows=""
+            group_count=0
+        fi
+        group_rows+="$line"$'\n'
+        group_count=$((group_count + 1))
+    done <<< "$rows"
+
+    if [ -n "$group_rows" ]; then
+        user_label="$current_user"
+        if [ "$group_count" -gt 0 ]; then
+            user_label+="（${group_count} 条）"
+        fi
+        ui_print_line "$user_label" "1;36"
+        ui_table_render "$headers_tsv" "${group_rows%$'\n'}" "$shrink_csv"
+    fi
+}
+
 ui_print_main_forward_summary() {
     local data="$1"
     local rows=""
@@ -1173,7 +1218,9 @@ ui_print_main_forward_summary() {
         state="$(ui_forward_state_text "$enabled")"
         rows+="$state"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
-      .forwards[]?
+      .forwards
+      | sort_by(.user_id, .listen_port, .id)
+      | .[]?
       | [
           (if .enabled then "true" else "false" end),
           .user_id,
@@ -1189,7 +1236,7 @@ ui_print_main_forward_summary() {
       | @tsv
     ' <<< "$data")
     rows="${rows%$'\n'}"
-    ui_table_render $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注' "$rows" "4,8,2,7,3"
+    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注' "4,8,2,7,3" "暂无转发，先按上面的流程添加转发。"
 }
 
 ui_print_main_forwards() {
@@ -1220,7 +1267,7 @@ ui_print_forward_list() {
         fi
         rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
-      .forwards
+      (.forwards | sort_by(.user_id, .listen_port, .id))
       | to_entries[]
       | [
           ((.key + 1) | tostring),
@@ -1254,7 +1301,7 @@ ui_print_forward_list() {
       | @tsv
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
-    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "$rows" "4,11,2,7,8,10,3"
+    ui_render_forward_groups "$rows" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "4,11,2,7,8,10,3" "暂无转发"
 }
 
 ui_print_user_list() {
@@ -1566,7 +1613,7 @@ ui_select_forward_table() {
         fi
         rows+="$index"$'\t'"$user"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\n'
     done < <(jq -r '
-      .forwards
+      (.forwards | sort_by(.user_id, .listen_port, .id))
       | to_entries[]
       | [
           ((.key + 1) | tostring),
@@ -1581,7 +1628,7 @@ ui_select_forward_table() {
       | @tsv
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
-    ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "$rows" "4,2,7,3"
+    ui_render_forward_groups "$rows" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "暂无转发，请先添加转发"
 }
 
 ui_select_forward() {
