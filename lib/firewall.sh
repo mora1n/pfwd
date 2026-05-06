@@ -241,7 +241,7 @@ fw_read_counters() {
 
     local nft_output snapshot_file
     if command -v nft >/dev/null 2>&1; then
-        nft_output="$(nft list counters "$family" "$table" 2>/dev/null || true)"
+        nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
     else
         nft_output=""
     fi

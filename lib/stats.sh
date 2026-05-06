@@ -133,7 +133,7 @@ stats_current_snapshot() {
     local family table nft_output
     family="$(fw_family)"
     table="$(fw_table)"
-    nft_output="$(nft list counters "$family" "$table" 2>/dev/null || true)"
+    nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
     stats_forward_snapshot_json "$nft_output"
 }
 
