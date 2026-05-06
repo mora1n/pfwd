@@ -19,6 +19,13 @@ UI_NOTICE_TEXT=""
 UI_NOTICE_COLOR=""
 UI_COLOR_ENABLED="${UI_COLOR_ENABLED:-auto}"
 UI_ALT_SCREEN_ACTIVE=0
+UI_TERM_HEIGHT_CACHE=""
+UI_PAGE_ACTIVE=0
+UI_PAGE_SCROLLABLE=0
+UI_PAGE_OFFSET=0
+UI_PAGE_LINE_COUNT=0
+UI_PAGE_RENDERER_KEY=""
+declare -ag UI_PAGE_LINES=()
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
@@ -61,16 +68,18 @@ ui_clear_screen() {
 ui_screen_enter() {
     [ -t 1 ] || return 0
     [ "$UI_ALT_SCREEN_ACTIVE" = "1" ] && return 0
-    printf '\033[?1049h\033[H'
+    printf '\033[?1049h\033[?1000h\033[?1006h\033[H'
     UI_ALT_SCREEN_ACTIVE=1
     UI_TERM_WIDTH_CACHE=""
+    UI_TERM_HEIGHT_CACHE=""
 }
 
 ui_screen_leave() {
     [ "$UI_ALT_SCREEN_ACTIVE" = "1" ] || return 0
-    printf '\033[?1049l'
+    printf '\033[?1006l\033[?1000l\033[?1049l'
     UI_ALT_SCREEN_ACTIVE=0
     UI_TERM_WIDTH_CACHE=""
+    UI_TERM_HEIGHT_CACHE=""
 }
 
 ui_menu_cleanup() {
@@ -95,17 +104,230 @@ ui_notice_render() {
 }
 
 ui_render_page() {
-    local frame status
+    local frame status renderer_key previous_key
     frame="$("$@")"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    ui_clear_screen
-    printf '%s' "$frame"
-    case "$frame" in
-        *$'\n') ;;
-        *) printf '\n' ;;
-    esac
+    renderer_key="$*"
+    previous_key="$UI_PAGE_RENDERER_KEY"
+    UI_PAGE_RENDERER_KEY="$renderer_key"
+    if [ "$renderer_key" != "$previous_key" ]; then
+        UI_PAGE_OFFSET=0
+    fi
+    ui_page_prepare_frame "$frame"
+    ui_page_draw
     ui_notice_clear
+}
+
+ui_term_height() {
+    local height="${LINES:-}"
+    if [ -n "$UI_TERM_HEIGHT_CACHE" ]; then
+        printf '%s' "$UI_TERM_HEIGHT_CACHE"
+        return 0
+    fi
+    if [ -z "$height" ] && [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+        height="$(tput lines 2>/dev/null || true)"
+    fi
+    [[ "$height" =~ ^[0-9]+$ ]] || height=24
+    [ "$height" -ge 12 ] || height=12
+    UI_TERM_HEIGHT_CACHE="$height"
+    printf '%s' "$height"
+}
+
+ui_page_prepare_frame() {
+    local frame="$1"
+    UI_PAGE_ACTIVE=1
+    UI_PAGE_SCROLLABLE=0
+    mapfile -t UI_PAGE_LINES <<< "$frame"
+    if [ "${#UI_PAGE_LINES[@]}" -gt 0 ] && [ -z "${UI_PAGE_LINES[-1]}" ]; then
+        unset 'UI_PAGE_LINES[-1]'
+    fi
+    UI_PAGE_LINE_COUNT="${#UI_PAGE_LINES[@]}"
+}
+
+ui_page_view_height() {
+    local height footer_lines=1
+    height="$(ui_term_height)"
+    if [ "$UI_PAGE_LINE_COUNT" -gt $((height - 1)) ]; then
+        footer_lines=2
+        UI_PAGE_SCROLLABLE=1
+    else
+        UI_PAGE_SCROLLABLE=0
+    fi
+    height=$((height - footer_lines))
+    [ "$height" -ge 3 ] || height=3
+    printf '%s' "$height"
+}
+
+ui_page_max_offset() {
+    local view_height="$1"
+    local max_offset=$((UI_PAGE_LINE_COUNT - view_height))
+    [ "$max_offset" -gt 0 ] || max_offset=0
+    printf '%s' "$max_offset"
+}
+
+ui_page_clamp_offset() {
+    local view_height max_offset
+    view_height="$(ui_page_view_height)"
+    max_offset="$(ui_page_max_offset "$view_height")"
+    if [ "$UI_PAGE_OFFSET" -lt 0 ]; then
+        UI_PAGE_OFFSET=0
+    elif [ "$UI_PAGE_OFFSET" -gt "$max_offset" ]; then
+        UI_PAGE_OFFSET="$max_offset"
+    fi
+}
+
+ui_page_draw() {
+    local prompt="${1:-}"
+    local default="${2:-}"
+    local buffer="${3:-}"
+    local view_height max_offset start_line end_line i status_text
+
+    ui_page_clamp_offset
+    view_height="$(ui_page_view_height)"
+    max_offset="$(ui_page_max_offset "$view_height")"
+    start_line="$UI_PAGE_OFFSET"
+    end_line=$((start_line + view_height))
+
+    ui_clear_screen
+    for ((i = start_line; i < end_line && i < UI_PAGE_LINE_COUNT; i++)); do
+        printf '%s\n' "${UI_PAGE_LINES[$i]}"
+    done
+
+    if [ "$UI_PAGE_SCROLLABLE" = "1" ]; then
+        status_text="滚动 $((start_line + 1))-$(( end_line < UI_PAGE_LINE_COUNT ? end_line : UI_PAGE_LINE_COUNT ))/$UI_PAGE_LINE_COUNT  鼠标滚轮/↑↓/PgUp/PgDn/j/k"
+        ui_print_line "$status_text" "2;37"
+    fi
+
+    if [ -n "$prompt" ]; then
+        if [ -n "$default" ] && [ -z "$buffer" ]; then
+            printf '%s [%s]: %s' "$prompt" "$default" "$buffer"
+        else
+            printf '%s: %s' "$prompt" "$buffer"
+        fi
+    fi
+}
+
+ui_page_deactivate() {
+    UI_PAGE_ACTIVE=0
+    UI_PAGE_SCROLLABLE=0
+    UI_PAGE_LINE_COUNT=0
+    UI_PAGE_LINES=()
+}
+
+ui_page_scroll_lines() {
+    local delta="$1"
+    UI_PAGE_OFFSET=$((UI_PAGE_OFFSET + delta))
+    ui_page_clamp_offset
+}
+
+ui_page_scroll_pages() {
+    local direction="$1"
+    local view_height
+    view_height="$(ui_page_view_height)"
+    if [ "$direction" -gt 0 ]; then
+        ui_page_scroll_lines "$view_height"
+    else
+        ui_page_scroll_lines "-$view_height"
+    fi
+}
+
+ui_read_keypress() {
+    local timeout="${1:-}"
+    local first="" next="" sequence=""
+    if [ -n "$timeout" ]; then
+        if ! IFS= read -rsn1 -t "$timeout" first; then
+            UI_REPLY=""
+            return 124
+        fi
+    else
+        if ! IFS= read -rsn1 first; then
+            UI_REPLY=""
+            return 1
+        fi
+    fi
+
+    if [ "$first" = $'\033' ]; then
+        sequence="$first"
+        while IFS= read -rsn1 -t 0.01 next; do
+            sequence+="$next"
+            case "$next" in
+                [~A-Za-zMm]) break ;;
+            esac
+        done
+        UI_REPLY="$sequence"
+    else
+        UI_REPLY="$first"
+    fi
+    return 0
+}
+
+ui_page_read_line() {
+    local prompt="$1"
+    local timeout_seconds="${2:-}"
+    local default="${3:-}"
+    local buffer="" key="" current_timeout="$timeout_seconds"
+
+    while true; do
+        ui_page_draw "$prompt" "$default" "$buffer"
+        if ui_read_keypress "$current_timeout"; then
+            key="$UI_REPLY"
+        else
+            case "$?" in
+                124)
+                    ui_page_deactivate
+                    UI_REPLY=""
+                    return 124
+                    ;;
+                *)
+                    ui_page_deactivate
+                    UI_REPLY=""
+                    return 1
+                    ;;
+            esac
+        fi
+
+        case "$key" in
+            $'\n'|$'\r')
+                ui_page_deactivate
+                UI_REPLY="$buffer"
+                [ -n "$UI_REPLY" ] || UI_REPLY="$default"
+                printf '\n'
+                return 0
+                ;;
+            $'\177'|$'\010')
+                if [ -n "$buffer" ]; then
+                    buffer="${buffer%?}"
+                    current_timeout=""
+                fi
+                ;;
+            $'\033[A'|$'\033OA'|$'\033[<64;'*|k)
+                ui_page_scroll_lines -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[B'|$'\033OB'|$'\033[<65;'*|j)
+                ui_page_scroll_lines 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[5~')
+                ui_page_scroll_pages -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[6~')
+                ui_page_scroll_pages 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033')
+                current_timeout="$timeout_seconds"
+                ;;
+            *)
+                if [[ "$key" =~ ^[[:print:]]$ ]]; then
+                    buffer+="$key"
+                    current_timeout=""
+                fi
+                ;;
+        esac
+    done
 }
 
 ui_compact_table_render() {
@@ -622,6 +844,10 @@ ui_read() {
     local prompt="$1"
     local default="${2:-}"
     UI_REPLY=""
+    if [ "$UI_PAGE_ACTIVE" = "1" ] && [ -t 0 ] && [ -t 1 ]; then
+        ui_page_read_line "$prompt" "" "$default"
+        return $?
+    fi
     if [ -n "$default" ]; then
         printf '%s [%s]: ' "$prompt" "$default"
     else
@@ -643,6 +869,11 @@ ui_read_timed() {
 
     if [ ! -t 0 ]; then
         ui_read "$prompt" "$default"
+        return $?
+    fi
+
+    if [ "$UI_PAGE_ACTIVE" = "1" ] && [ -t 1 ]; then
+        ui_page_read_line "$prompt" "$timeout_seconds" "$default"
         return $?
     fi
 
@@ -1351,7 +1582,7 @@ ui_render_forward_groups() {
     local empty_text="$4"
     local current_user="" line user first_group=true
     local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11=""
-    local group_rows="" compact_headers="" compact_shrink="" state_text="" state_color="" display_state=""
+    local group_rows="" compact_headers="" compact_shrink="" state_text="" state_color="" display_state="" group_title=""
 
     if [ -z "$rows" ]; then
         ui_print_line "$empty_text"
@@ -1368,6 +1599,9 @@ ui_render_forward_groups() {
 
         [ -n "$block_rows" ] || return 0
         ui_print_line "$block_user" "1;36"
+        if [ -n "$group_title" ]; then
+            ui_print_line "$group_title" "2;37"
+        fi
         while IFS= read -r block_line; do
             [ -n "$block_line" ] || continue
             IFS=$'\t' read -r block_enabled _ col3 col4 col5 col6 col7 col8 col9 col10 col11 <<< "$block_line"
@@ -1413,21 +1647,32 @@ ui_render_forward_groups() {
                     $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
                         compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
                         compact_shrink="2,3,4,5,6,7"
+                        group_title="状态  监听  目标  上行  下行  到期  备注"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
                         compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
                         compact_shrink="3,4,6,7,8,9,10"
+                        group_title="序号  状态  监听  目标  协议  到期  模式  MSS  SNAT  备注"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
                         compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
                         compact_shrink="3,4,6"
+                        group_title="序号  状态  监听  目标  协议  到期"
                         ;;
                     *)
                         compact_headers=""
                         compact_shrink=""
+                        group_title=""
                         ;;
                 esac
-                ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
+                case "$headers_tsv" in
+                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+                        ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "1"
+                        ;;
+                    *)
+                        ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
+                        ;;
+                esac
                 ui_rule "-" "2;37"
             fi
             current_user="$user"
@@ -1442,21 +1687,32 @@ ui_render_forward_groups() {
         $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
             compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
             compact_shrink="2,3,4,5,6,7"
+            group_title="状态  监听  目标  上行  下行  到期  备注"
             ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
             compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
             compact_shrink="3,4,6,7,8,9,10"
+            group_title="序号  状态  监听  目标  协议  到期  模式  MSS  SNAT  备注"
             ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
             compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
             compact_shrink="3,4,6"
+            group_title="序号  状态  监听  目标  协议  到期"
             ;;
         *)
             compact_headers=""
             compact_shrink=""
+            group_title=""
             ;;
     esac
-    ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
+    case "$headers_tsv" in
+        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+            ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "1"
+            ;;
+        *)
+            ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
+            ;;
+    esac
 }
 
 ui_print_main_forward_summary() {
