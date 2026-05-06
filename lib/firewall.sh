@@ -239,21 +239,20 @@ fw_read_counters() {
     table="$(fw_table)"
     stats_init >/dev/null
 
-    local nft_output snapshot_file
+    local nft_output snapshot
     if command -v nft >/dev/null 2>&1; then
         nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
     else
         nft_output=""
     fi
-    snapshot_file="$(mktemp "${PFWD_RUN_DIR}/stats-read.XXXXXX")"
-    stats_forward_snapshot_json "$nft_output" > "$snapshot_file"
-    jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" --slurpfile state "$PFWD_STATS_FILE" --slurpfile snap "$snapshot_file" '
+    snapshot="$(stats_forward_snapshot_json "$nft_output")"
+    jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" --slurpfile state "$PFWD_STATS_FILE" --argjson snap "$snapshot" '
       def usage($mode; $in_bytes; $out_bytes):
         # 这里的双向是监听端口收发总和；单向取上下行较大值。
         if $mode == "one-way" then ([ $in_bytes, $out_bytes ] | max) else ($in_bytes + $out_bytes) end;
       def fstate($id): $state[0].forwards[$id] // {};
       def ustate($id): $state[0].users[$id] // {};
-      def snap_forward($id): ($snap[0] | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
+      def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
       def current_forward_billing($f):
         (fstate($f.id)) as $s |
         (snap_forward($f.id)) as $c |
@@ -263,7 +262,7 @@ fw_read_counters() {
       def forward_billing($f):
         current_forward_billing($f);
       def user_snapshot($id):
-        ($snap[0] | map(select(.user_id == $id))) as $items |
+        ($snap | map(select(.user_id == $id))) as $items |
         {
           input_bytes: ($items | map(.input_bytes) | add // 0),
           output_bytes: ($items | map(.output_bytes) | add // 0)
@@ -316,5 +315,4 @@ fw_read_counters() {
         ]
       }
     '
-    rm -f "$snapshot_file"
 }

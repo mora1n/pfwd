@@ -44,19 +44,22 @@ stats_update() {
 stats_forward_snapshot_json() {
     local nft_text="$1"
     jq -n --arg text "$nft_text" --slurpfile cfg "$PFWD_CONFIG_FILE" '
-      def counter_bytes($name):
+      def counters_map:
         reduce ($text | split("\n")[]) as $line (
-          {in_block: false, value: null};
-          if ($line | test("^\\s*counter " + $name + " \\{$")) then
-            .in_block = true
-          elif .in_block and ($line | test("bytes [0-9]+")) then
-            .value = (($line | capture("bytes (?<b>[0-9]+)").b) | tonumber)
-          elif .in_block and ($line | test("^\\s*\\}$")) then
-            .in_block = false
+          {current: null, values: {}};
+          if ($line | test("^\\s*counter [^ ]+ \\{$")) then
+            .current = (($line | capture("^\\s*counter (?<name>[^ ]+) \\{$")).name)
+          elif .current != null and ($line | test("bytes [0-9]+")) then
+            .values[.current] = (($line | capture("bytes (?<b>[0-9]+)").b) | tonumber)
+          elif .current != null and ($line | test("^\\s*\\}$")) then
+            .current = null
           else
             .
           end
-        ) | (.value // 0);
+        ) | .values;
+      (counters_map) as $counters |
+      def counter_bytes($name):
+        ($counters[$name] // 0);
       [
         $cfg[0].forwards[]? |
         . as $f |
@@ -75,10 +78,7 @@ stats_forward_snapshot_json() {
 stats_rollup_counters() {
     local snapshot="$1"
     stats_init >/dev/null
-    local tmp
-    tmp="$(mktemp "${PFWD_RUN_DIR}/stats-rollup.XXXXXX")"
-    printf '%s\n' "$snapshot" > "$tmp"
-    stats_update --slurpfile snap "$tmp" --slurpfile cfg "$PFWD_CONFIG_FILE" '
+    stats_update --argjson snap "$snapshot" --slurpfile cfg "$PFWD_CONFIG_FILE" '
       def usage($mode; $in_delta; $out_delta):
         # 双向延续监听端口收发总和语义；单向取上下行较大值。
         if $mode == "one-way" then ([ $in_delta, $out_delta ] | max) else ($in_delta + $out_delta) end;
@@ -87,7 +87,7 @@ stats_rollup_counters() {
         | add // 0;
 
       . as $state
-      | reduce $snap[0][] as $f (.;
+      | reduce $snap[] as $f (.;
           ($state.forwards[$f.id] // {
             billing_used_bytes: 0,
             input_base_bytes: 0,
@@ -103,7 +103,7 @@ stats_rollup_counters() {
             output_base_bytes: $f.output_bytes
           })
         )
-      | reduce ($snap[0] | group_by(.user_id)[]?) as $group (.;
+      | reduce ($snap | group_by(.user_id)[]?) as $group (.;
           ($group[0].user_id) as $user_id |
           ($state.users[$user_id] // {
             billing_used_bytes: 0,
@@ -125,7 +125,6 @@ stats_rollup_counters() {
           })
         )
     '
-    rm -f "$tmp"
 }
 
 stats_current_snapshot() {
@@ -143,18 +142,16 @@ stats_rollup_current() {
 }
 
 stats_set_user_used() {
-    local user_id used snapshot tmp
+    local user_id used snapshot
     user_id="$(normalize_user_id "$1")"
     used="$2"
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
-    tmp="$(mktemp "${PFWD_RUN_DIR}/stats-user.XXXXXX")"
-    printf '%s\n' "$snapshot" > "$tmp"
-    stats_update --arg id "$user_id" --argjson used "$used" --slurpfile snap "$tmp" '
-      ($snap[0] | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
-      ($snap[0] | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
-      ([ $snap[0][] | select(.user_id == $id) | .id ]) as $forward_ids |
+    stats_update --arg id "$user_id" --argjson used "$used" --argjson snap "$snapshot" '
+      ($snap | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
+      ($snap | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
+      ([ $snap[] | select(.user_id == $id) | .id ]) as $forward_ids |
       ([ $forward_ids[] as $fid | (.forwards[$fid].billing_used_bytes // 0) ] | add // 0) as $forward_used |
       (.users[$id] // {}) as $old |
       .users[$id] = ($old + {
@@ -164,19 +161,16 @@ stats_set_user_used() {
         output_base_bytes: $output
       })
     '
-    rm -f "$tmp"
 }
 
 stats_set_forward_used() {
     local forward_id="$1"
     local used="$2"
-    local snapshot tmp
+    local snapshot
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
     snapshot="$(stats_current_snapshot)"
-    tmp="$(mktemp "${PFWD_RUN_DIR}/stats-forward.XXXXXX")"
-    printf '%s\n' "$snapshot" > "$tmp"
-    stats_update --arg id "$forward_id" --argjson used "$used" --slurpfile snap "$tmp" '
-      ($snap[0] | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
+    stats_update --arg id "$forward_id" --argjson used "$used" --argjson snap "$snapshot" '
+      ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
       (.forwards[$id] // {}) as $old |
       .forwards[$id] = ($old + {
         billing_used_bytes: $used,
@@ -184,19 +178,16 @@ stats_set_forward_used() {
         output_base_bytes: ($f.output_bytes // 0)
       })
     '
-    rm -f "$tmp"
 }
 
 stats_reset_user_cycle() {
-    local user_id snapshot tmp
+    local user_id snapshot
     user_id="$(normalize_user_id "$1")"
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
-    tmp="$(mktemp "${PFWD_RUN_DIR}/stats-user-reset.XXXXXX")"
-    printf '%s\n' "$snapshot" > "$tmp"
-    stats_update --arg id "$user_id" --slurpfile snap "$tmp" '
-      [ $snap[0][] | select(.user_id == $id) ] as $rows |
+    stats_update --arg id "$user_id" --argjson snap "$snapshot" '
+      [ $snap[] | select(.user_id == $id) ] as $rows |
       .forwards |= (
         . as $forwards_state
         | reduce $rows[] as $row ($forwards_state;
@@ -215,7 +206,6 @@ stats_reset_user_cycle() {
           output_base_bytes: ($rows | map(.output_bytes) | add // 0)
         })
     '
-    rm -f "$tmp"
 }
 
 stats_set_user_reset_day() {

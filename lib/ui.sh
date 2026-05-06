@@ -32,6 +32,8 @@ declare -ag UI_FORM_LINES=()
 declare -ag UI_FORM_OPTION_LINES=()
 declare -ag UI_PAGE_LINES=()
 declare -ag UI_DRY_RUN_LINES=()
+UI_DATA_CACHE=""
+UI_DATA_CACHE_KEY=""
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
@@ -103,6 +105,23 @@ ui_notice_clear() {
     UI_NOTICE_COLOR=""
 }
 
+ui_data_cache_clear() {
+    UI_DATA_CACHE=""
+    UI_DATA_CACHE_KEY=""
+}
+
+ui_cached_data() {
+    local cache_key="$1"
+    shift
+    if [ "$UI_DATA_CACHE_KEY" = "$cache_key" ] && [ -n "$UI_DATA_CACHE" ]; then
+        printf '%s\n' "$UI_DATA_CACHE"
+        return 0
+    fi
+    UI_DATA_CACHE="$("$@")"
+    UI_DATA_CACHE_KEY="$cache_key"
+    printf '%s\n' "$UI_DATA_CACHE"
+}
+
 ui_dry_run_reset() {
     UI_DRY_RUN_LINES=()
 }
@@ -150,6 +169,7 @@ ui_render_page() {
         ui_page_apply_default_anchor "$renderer_key"
     fi
     ui_page_draw
+    ui_data_cache_clear
     ui_notice_clear
 }
 
@@ -1670,7 +1690,7 @@ ui_format_rate() {
 }
 
 ui_main_usage_json() {
-    fw_read_counters
+    ui_cached_data "main_usage_json" fw_read_counters
 }
 
 ui_forward_usage_json() {
@@ -1680,20 +1700,216 @@ ui_forward_usage_json() {
         '
         return
     fi
-    fw_read_counters
+    ui_main_usage_json
+}
+
+ui_load_user_config_tsv() {
+    jq -r --arg id "$1" '
+      .users[]? | select(.id == $id) |
+      [
+        (.limits.traffic_bytes // "null"),
+        (.limits.rate // "null"),
+        ([.id] | .[0])
+      ] | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_user_forward_count() {
+    jq -r --arg id "$1" '[.forwards[]? | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE"
+}
+
+ui_main_user_rows() {
+    local data="$1"
+    jq -r --slurpfile cfg "$PFWD_CONFIG_FILE" '
+      .users[]? as $u
+      | ($cfg[0].forwards | map(select(.user_id == $u.id)) | length) as $count
+      | [
+          $u.id,
+          ($count | tostring),
+          (($u.billing_used_bytes // 0) | tostring),
+          (($u.two_way_bytes // 0) | tostring),
+          (($u.one_way_bytes // 0) | tostring),
+          (($u.limits.traffic_bytes // "null") | tostring),
+          (($u.reset_day // "-") | tostring)
+        ]
+      | @tsv
+    ' <<< "$data"
+}
+
+ui_main_forward_rows() {
+    local data="$1"
+    jq -r '
+      .forwards
+      | sort_by(.user_id, .listen_port, .id)
+      | .[]?
+      | [
+          (if .enabled then "true" else "false" end),
+          .user_id,
+          (.listen_ip // "::"),
+          (.listen_port | tostring),
+          .remote_host,
+          (.remote_port | tostring),
+          (.input_bytes // "0"),
+          (.output_bytes // "0"),
+          (.stop_at // "-"),
+          (if (.comment // "") == "" then "-" else .comment end)
+        ]
+      | @tsv
+    ' <<< "$data"
+}
+
+ui_user_list_rows() {
+    local allow_zero="${1:-false}"
+    local rows=""
+    local index=1
+    local user_id
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\n'
+    fi
+    while IFS= read -r user_id; do
+        rows+="$index"$'\t'"$user_id"$'\n'
+        index=$((index + 1))
+    done < <(jq -r '.users[]?.id' "$PFWD_CONFIG_FILE")
+    printf '%s' "${rows%$'\n'}"
+}
+
+ui_forward_list_rows() {
+    local rows=""
+    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display comment; do
+        local listen remote
+        listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
+        remote="$(ui_format_remote "$remote_host" "$remote_port")"
+        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+    done < <(jq -r '
+      (.forwards | sort_by(.user_id, .listen_port, .id))
+      | to_entries[]
+      | [
+          ((.key + 1) | tostring),
+          .value.user_id,
+          (if .value.enabled then "启用" else "停用" end),
+          (.value.listen_ip // "::"),
+          (.value.listen_port | tostring),
+          .value.remote_host,
+          (.value.remote_port | tostring),
+          (.value.protocol // "tcp_udp"),
+          (.value.stop_at // "-"),
+          (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
+          (
+            if (.value.nft.mss_mode // "") == "set" then
+              ((.value.nft.mss_value // "-") | tostring)
+            elif (.value.nft.mss_mode // "") == "clamp" then
+              "clamp"
+            else
+              "-"
+            end
+          ),
+          (
+            if (.value.nft.snat_mode // "masquerade") == "snat" and (.value.nft.snat_source // "") != "" then
+              .value.nft.snat_source
+            else
+              "masquerade"
+            end
+          ),
+          (if (.value.comment // "") == "" then "-" else .value.comment end)
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE")
+    printf '%s' "${rows%$'\n'}"
+}
+
+ui_telegram_configured_user_rows() {
+    jq -r '
+      .users[]?
+      | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")
+      | [
+          .id,
+          (if (.telegram.enabled // false) then "已启用" else "已停用" end),
+          (
+            [
+              (if (.telegram.schedule_interval_minutes // null) == null
+               then "间隔 -"
+               else "间隔 " + ((.telegram.schedule_interval_minutes | tostring) + "m")
+               end),
+              (if (.telegram.schedule_daily_time // null) == null
+               then "每日 -"
+               else "每日 " + .telegram.schedule_daily_time
+               end)
+            ] | join(" | ")
+          )
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_forward_select_rows() {
+    local allow_zero="${1:-false}"
+    local rows=""
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\t-\t-\t-\t-\t-\n'
+    fi
+    while IFS=$'\t' read -r index user listen_port remote_host remote_port protocol enabled stop_at; do
+        local remote_text
+        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
+        rows+="$index"$'\t'"$user"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
+    done < <(jq -r '
+      (.forwards | sort_by(.user_id, .listen_port, .id))
+      | to_entries[]
+      | [
+          ((.key + 1) | tostring),
+          .value.user_id,
+          (.value.listen_port | tostring),
+          .value.remote_host,
+          (.value.remote_port | tostring),
+          (.value.protocol // "tcp_udp"),
+          (if .value.enabled then "启用" else "停用" end),
+          (.value.stop_at // "-")
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE")
+    printf '%s' "${rows%$'\n'}"
+}
+
+ui_user_forward_select_rows() {
+    local user_id="$1"
+    local allow_zero="${2:-false}"
+    local rows=""
+    if [ "$allow_zero" = "true" ]; then
+        rows+=$'0\t返回\t-\t-\t-\t-\n'
+    fi
+    while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
+        local remote_text
+        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
+        rows+="$index"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
+    done < <(jq -r --arg id "$user_id" '
+      ([.forwards[] | select(.user_id == $id)] | sort_by(.listen_port, .id))
+      | to_entries[]
+      | [
+          ((.key + 1) | tostring),
+          (.value.listen_port | tostring),
+          .value.remote_host,
+          (.value.remote_port | tostring),
+          (.value.protocol // "tcp_udp"),
+          (if .value.enabled then "启用" else "停用" end),
+          (.value.stop_at // "-")
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE")
+    printf '%s' "${rows%$'\n'}"
 }
 
 ui_print_user_traffic_summary() {
     local user_id="$1"
-    local data total_limit used one_way two_way reset_day forward_count rate rows=""
-    data="$(fw_read_counters)"
-    total_limit="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .limits.traffic_bytes // "null"' "$PFWD_CONFIG_FILE")"
-    rate="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .limits.rate // "null"' "$PFWD_CONFIG_FILE")"
+    local data total_limit used one_way two_way reset_day forward_count rate rows="" config_tsv=""
+    data="$(ui_main_usage_json)"
+    config_tsv="$(ui_load_user_config_tsv "$user_id")"
+    total_limit="${config_tsv%%$'\t'*}"
+    config_tsv="${config_tsv#*$'\t'}"
+    rate="${config_tsv%%$'\t'*}"
     used="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .billing_used_bytes // 0' <<< "$data")"
     one_way="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .one_way_bytes // 0' <<< "$data")"
     two_way="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .two_way_bytes // 0' <<< "$data")"
     reset_day="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | .reset_day // "-"' <<< "$data")"
-    forward_count="$(jq -r --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE")"
+    forward_count="$(ui_user_forward_count "$user_id")"
     rows+="用户名"$'\t'"$user_id"$'\n'
     rows+="转发数"$'\t'"${forward_count} 个"$'\n'
     rows+="重置日"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
@@ -1717,20 +1933,7 @@ ui_print_main_user_summary() {
 
     while IFS=$'\t' read -r user count used two_way one_way limit reset_day; do
         rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
-    done < <(jq -r --slurpfile cfg "$PFWD_CONFIG_FILE" '
-      .users[]? as $u
-      | ($cfg[0].forwards | map(select(.user_id == $u.id)) | length) as $count
-      | [
-          $u.id,
-          ($count | tostring),
-          (($u.billing_used_bytes // 0) | tostring),
-          (($u.two_way_bytes // 0) | tostring),
-          (($u.one_way_bytes // 0) | tostring),
-          (($u.limits.traffic_bytes // "null") | tostring),
-          (($u.reset_day // "-") | tostring)
-        ]
-      | @tsv
-    ' <<< "$data")
+    done < <(ui_main_user_rows "$data")
     rows="${rows%$'\n'}"
     ui_table_render $'用户名\t转发数\t计费用量\t双向\t单向\t总限额\t重置日' "$rows" "1,6,7"
 }
@@ -1853,24 +2056,7 @@ ui_print_main_forward_summary() {
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
-    done < <(jq -r '
-      .forwards
-      | sort_by(.user_id, .listen_port, .id)
-      | .[]?
-      | [
-          (if .enabled then "true" else "false" end),
-          .user_id,
-          (.listen_ip // "::"),
-          (.listen_port | tostring),
-          .remote_host,
-          (.remote_port | tostring),
-          (.input_bytes // "0"),
-          (.output_bytes // "0"),
-          (.stop_at // "-"),
-          (if (.comment // "") == "" then "-" else .comment end)
-        ]
-      | @tsv
-    ' <<< "$data")
+    done < <(ui_main_forward_rows "$data")
     rows="${rows%$'\n'}"
     ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注' "4,8,2,7,3" "暂无转发，先按上面的流程添加转发。"
 }
@@ -1887,71 +2073,21 @@ ui_print_main_forwards() {
 
 ui_print_forward_list() {
     config_init >/dev/null
-    local rows=""
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         echo "暂无转发"
         return
     fi
-    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display comment; do
-        local listen remote
-        listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
-        remote="$(ui_format_remote "$remote_host" "$remote_port")"
-        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
-    done < <(jq -r '
-      (.forwards | sort_by(.user_id, .listen_port, .id))
-      | to_entries[]
-      | [
-          ((.key + 1) | tostring),
-          .value.user_id,
-          (if .value.enabled then "启用" else "停用" end),
-          (.value.listen_ip // "::"),
-          (.value.listen_port | tostring),
-          .value.remote_host,
-          (.value.remote_port | tostring),
-          (.value.protocol // "tcp_udp"),
-          (.value.stop_at // "-"),
-          (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
-          (
-            if (.value.nft.mss_mode // "") == "set" then
-              ((.value.nft.mss_value // "-") | tostring)
-            elif (.value.nft.mss_mode // "") == "clamp" then
-              "clamp"
-            else
-              "-"
-            end
-          ),
-          (
-            if (.value.nft.snat_mode // "masquerade") == "snat" and (.value.nft.snat_source // "") != "" then
-              .value.nft.snat_source
-            else
-              "masquerade"
-            end
-          ),
-          (if (.value.comment // "") == "" then "-" else .value.comment end)
-        ]
-      | @tsv
-    ' "$PFWD_CONFIG_FILE")
-    rows="${rows%$'\n'}"
-    ui_render_forward_groups "$rows" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "4,11,2,7,8,10,3" "暂无转发"
+    ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "4,11,2,7,8,10,3" "暂无转发"
 }
 
 ui_print_user_list() {
     local allow_zero="${1:-false}"
     config_init >/dev/null
-    local rows="" index=1 user_id
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         echo "暂无用户"
         return
     fi
-    if [ "$allow_zero" = "true" ]; then
-        rows+=$'0\t返回\n'
-    fi
-    while IFS= read -r user_id; do
-        rows+="$index"$'\t'"$user_id"$'\n'
-        index=$((index + 1))
-    done < <(jq -r '.users[]?.id' "$PFWD_CONFIG_FILE")
-    rows="${rows%$'\n'}"
-    ui_table_render $'序号\t用户名' "$rows" "2"
+    ui_table_render $'序号\t用户名' "$(ui_user_list_rows "$allow_zero")" "2"
 }
 
 ui_select_user() {
@@ -2207,38 +2343,12 @@ ui_user_telegram_server_name_default() {
 
 ui_print_telegram_configured_users() {
     config_init >/dev/null
-    local rows=""
     ui_print_line "已配置用户" "1;36"
     if ! jq -e '[.users[]? | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_print_line "暂无已配置用户"
         return
     fi
-
-    while IFS=$'\t' read -r user_id status schedule_text; do
-        rows+="$user_id"$'\t'"$status"$'\t'"$schedule_text"$'\n'
-    done < <(jq -r '
-      .users[]?
-      | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")
-      | [
-          .id,
-          (if (.telegram.enabled // false) then "已启用" else "已停用" end),
-          (
-            [
-              (if (.telegram.schedule_interval_minutes // null) == null
-               then "间隔 -"
-               else "间隔 " + ((.telegram.schedule_interval_minutes | tostring) + "m")
-               end),
-              (if (.telegram.schedule_daily_time // null) == null
-               then "每日 -"
-               else "每日 " + .telegram.schedule_daily_time
-               end)
-            ] | join(" | ")
-          )
-        ]
-      | @tsv
-    ' "$PFWD_CONFIG_FILE")
-    rows="${rows%$'\n'}"
-    ui_table_render $'用户\t状态\t定时发送' "$rows" "1,3"
+    ui_table_render $'用户\t状态\t定时发送' "$(ui_telegram_configured_user_rows)" "1,3"
 }
 
 ui_print_export_import_summary() {
@@ -2252,35 +2362,11 @@ ui_print_export_import_summary() {
 ui_select_forward_table() {
     local allow_zero="${1:-false}"
     config_init >/dev/null
-    local rows=""
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_warn "暂无转发，请先添加转发"
         return 1
     fi
-    if [ "$allow_zero" = "true" ]; then
-        rows+=$'0\t返回\t-\t-\t-\t-\t-\n'
-    fi
-    while IFS=$'\t' read -r index user listen_port remote_host remote_port protocol enabled stop_at; do
-        local remote_text
-        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        rows+="$index"$'\t'"$user"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
-    done < <(jq -r '
-      (.forwards | sort_by(.user_id, .listen_port, .id))
-      | to_entries[]
-      | [
-          ((.key + 1) | tostring),
-          .value.user_id,
-          (.value.listen_port | tostring),
-          .value.remote_host,
-          (.value.remote_port | tostring),
-          (.value.protocol // "tcp_udp"),
-          (if .value.enabled then "启用" else "停用" end),
-          (.value.stop_at // "-")
-        ]
-      | @tsv
-    ' "$PFWD_CONFIG_FILE")
-    rows="${rows%$'\n'}"
-    ui_render_forward_groups "$rows" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "暂无转发，请先添加转发"
+    ui_render_forward_groups "$(ui_forward_select_rows "$allow_zero")" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "暂无转发，请先添加转发"
 }
 
 ui_render_forward_select_page() {
@@ -2317,34 +2403,11 @@ ui_select_user_forward_table() {
     local user_id="$1"
     local allow_zero="${2:-false}"
     config_init >/dev/null
-    local rows=""
     if ! jq -e --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_warn "该用户暂无转发"
         return 1
     fi
-    if [ "$allow_zero" = "true" ]; then
-        rows+=$'0\t返回\t-\t-\t-\t-\n'
-    fi
-    while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
-        local remote_text
-        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        rows+="$index"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
-    done < <(jq -r --arg id "$user_id" '
-      ([.forwards[] | select(.user_id == $id)] | sort_by(.listen_port, .id))
-      | to_entries[]
-      | [
-          ((.key + 1) | tostring),
-          (.value.listen_port | tostring),
-          .value.remote_host,
-          (.value.remote_port | tostring),
-          (.value.protocol // "tcp_udp"),
-          (if .value.enabled then "启用" else "停用" end),
-          (.value.stop_at // "-")
-        ]
-      | @tsv
-    ' "$PFWD_CONFIG_FILE")
-    rows="${rows%$'\n'}"
-    ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$rows" "3,6,2"
+    ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$(ui_user_forward_select_rows "$user_id" "$allow_zero")" "3,6,2"
 }
 
 ui_render_user_forward_select_page() {

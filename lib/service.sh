@@ -108,6 +108,14 @@ service_runtime_installed() {
     service_unit_exists pfwd-forward.service && service_unit_exists pfwd.timer
 }
 
+service_primary_runtime_unit() {
+    echo "pfwd-forward.service"
+}
+
+service_timer_unit_name() {
+    echo "pfwd.timer"
+}
+
 service_runtime_status_label() {
     if service_runtime_installed; then
         echo "已安装"
@@ -126,8 +134,8 @@ service_disable() {
 
 service_disable_forwarder() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd-forward.service || true
-        pfwd_run systemctl disable pfwd-forward.service || true
+        pfwd_run systemctl stop "$(service_primary_runtime_unit)" || true
+        pfwd_run systemctl disable "$(service_primary_runtime_unit)" || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -288,7 +296,7 @@ service_update_capture_enabled_state() {
 }
 
 service_update_restore_enabled_state() {
-    local forwarder_enabled="$1"
+    local runtime_enabled="$1"
     local timer_enabled="$2"
 
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -296,17 +304,17 @@ service_update_restore_enabled_state() {
     fi
 
     pfwd_run systemctl daemon-reload
-    if [ "$forwarder_enabled" = "true" ]; then
-        pfwd_run systemctl enable pfwd-forward.service
+    if [ "$runtime_enabled" = "true" ]; then
+        pfwd_run systemctl enable "$(service_primary_runtime_unit)"
     else
-        pfwd_run systemctl disable pfwd-forward.service || true
+        pfwd_run systemctl disable "$(service_primary_runtime_unit)" || true
     fi
     if [ "$timer_enabled" = "true" ]; then
-        pfwd_run systemctl enable pfwd.timer
-        pfwd_run systemctl start pfwd.timer
+        pfwd_run systemctl enable "$(service_timer_unit_name)"
+        pfwd_run systemctl start "$(service_timer_unit_name)"
     else
-        pfwd_run systemctl stop pfwd.timer || true
-        pfwd_run systemctl disable pfwd.timer || true
+        pfwd_run systemctl stop "$(service_timer_unit_name)" || true
+        pfwd_run systemctl disable "$(service_timer_unit_name)" || true
     fi
 }
 

@@ -61,21 +61,21 @@ cmd_update_check() {
 
 cmd_update_finalize_recover() {
     local work_dir="$1"
-    local forwarder_enabled="$2"
+    local runtime_enabled="$2"
     local timer_enabled="$3"
     local error_message="$4"
 
     service_update_rollback "$work_dir" || true
-    service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled" || true
+    service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" || true
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
 
 cmd_update_finalize() {
-    local work_dir="" forwarder_enabled="" timer_enabled="" from_version="" to_version=""
+    local work_dir="" runtime_enabled="" timer_enabled="" from_version="" to_version=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
-            --forwarder-enabled) forwarder_enabled="${2:-}"; shift 2 ;;
+            --runtime-enabled) runtime_enabled="${2:-}"; shift 2 ;;
             --timer-enabled) timer_enabled="${2:-}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
@@ -86,17 +86,17 @@ cmd_update_finalize() {
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
     if ! service_install_files; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "更新收尾失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "更新收尾失败"
     fi
-    if ! service_update_restore_enabled_state "$forwarder_enabled" "$timer_enabled"; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "恢复服务启用状态失败"
+    if ! service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled"; then
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "恢复服务启用状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$forwarder_enabled" "$timer_enabled" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
@@ -114,7 +114,7 @@ cmd_update() {
     done
 
     service_installation_present || pfwd_die "未检测到已安装的 pfwd，请先执行 pfwd install"
-    local work_dir staged_dir local_version remote_version forwarder_enabled timer_enabled
+    local work_dir staged_dir local_version remote_version runtime_enabled timer_enabled
     work_dir="$(service_update_create_workdir)"
     staged_dir="$work_dir/staged"
 
@@ -151,8 +151,8 @@ cmd_update() {
 
     local_version="$(service_installed_version)"
     remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
-    forwarder_enabled="$(service_update_capture_enabled_state pfwd-forward.service)"
-    timer_enabled="$(service_update_capture_enabled_state pfwd.timer)"
+    runtime_enabled="$(service_update_capture_enabled_state "$(service_primary_runtime_unit)")"
+    timer_enabled="$(service_update_capture_enabled_state "$(service_timer_unit_name)")"
 
     service_update_backup_current "$work_dir"
     if ! service_update_apply_staged "$work_dir"; then
@@ -162,7 +162,7 @@ cmd_update() {
 
     if ! exec "$PFWD_INSTALL_DIR/pfwd.sh" __update_finalize \
         --work-dir "$work_dir" \
-        --forwarder-enabled "$forwarder_enabled" \
+        --runtime-enabled "$runtime_enabled" \
         --timer-enabled "$timer_enabled" \
         --from-version "$local_version" \
         --to-version "$remote_version"; then
@@ -676,6 +676,39 @@ cmd_stats() {
     stats_json "$user_id" "$forward_id" | jq '.'
 }
 
+cmd_doctor_benchmark() {
+    local label="$1"
+    local command="$2"
+    local loops="${3:-3}"
+    local start_ns end_ns elapsed_ms total_ms=0 max_ms=0 run_ms loop
+    for ((loop = 1; loop <= loops; loop++)); do
+        start_ns="$(date +%s%N 2>/dev/null || true)"
+        bash -lc "$command" >/dev/null 2>&1 || {
+            echo "$label：n/a"
+            return 0
+        }
+        end_ns="$(date +%s%N 2>/dev/null || true)"
+        if [[ ! "$start_ns" =~ ^[0-9]+$ ]] || [[ ! "$end_ns" =~ ^[0-9]+$ ]]; then
+            echo "$label：ok"
+            return 0
+        fi
+        run_ms=$(( (end_ns - start_ns) / 1000000 ))
+        total_ms=$((total_ms + run_ms))
+        if [ "$run_ms" -gt "$max_ms" ]; then
+            max_ms="$run_ms"
+        fi
+    done
+    elapsed_ms=$(( total_ms / loops ))
+    echo "$label：avg=${elapsed_ms}ms max=${max_ms}ms loops=${loops}"
+}
+
+cmd_doctor_benchmarks() {
+    cmd_doctor_benchmark "benchmark.fw_read_counters" "source ./pfwd.sh help >/dev/null 2>&1 || true; fw_read_counters >/dev/null"
+    cmd_doctor_benchmark "benchmark.ui_main_usage_json" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_main_usage_json >/dev/null"
+    cmd_doctor_benchmark "benchmark.main_page" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_render_main_menu_page >/dev/null"
+    cmd_doctor_benchmark "benchmark.forward_list" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_print_forward_list >/dev/null"
+}
+
 cmd_render() {
     local target="${1:-forwarder}"
     case "$target" in
@@ -764,6 +797,7 @@ cmd_doctor() {
     if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
+    cmd_doctor_benchmarks
 }
 
 cmd_install() {
