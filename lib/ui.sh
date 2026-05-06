@@ -111,10 +111,10 @@ ui_render_page() {
     renderer_key="$*"
     previous_key="$UI_PAGE_RENDERER_KEY"
     UI_PAGE_RENDERER_KEY="$renderer_key"
-    if [ "$renderer_key" != "$previous_key" ]; then
-        UI_PAGE_OFFSET=0
-    fi
     ui_page_prepare_frame "$frame"
+    if [ "$renderer_key" != "$previous_key" ]; then
+        ui_page_apply_default_anchor "$renderer_key"
+    fi
     ui_page_draw
     ui_notice_clear
 }
@@ -143,6 +143,31 @@ ui_page_prepare_frame() {
         unset 'UI_PAGE_LINES[-1]'
     fi
     UI_PAGE_LINE_COUNT="${#UI_PAGE_LINES[@]}"
+}
+
+ui_page_apply_default_anchor() {
+    local renderer_key="$1"
+    local offset view_height line_index line_text
+    case "$renderer_key" in
+        ui_render_main_menu_page)
+            view_height="$(ui_page_view_height)"
+            UI_PAGE_OFFSET="$(ui_page_max_offset "$view_height")"
+            offset="$UI_PAGE_OFFSET"
+            for ((line_index = offset; line_index >= 0; line_index--)); do
+                line_text="${UI_PAGE_LINES[$line_index]:-}"
+                case "$line_text" in
+                    $'\033'[*) ;;
+                esac
+                if [[ "$line_text" == *"用户："* ]]; then
+                    UI_PAGE_OFFSET="$line_index"
+                    break
+                fi
+            done
+            ;;
+        *)
+            UI_PAGE_OFFSET=0
+            ;;
+    esac
 }
 
 ui_page_view_height() {
@@ -247,7 +272,9 @@ ui_read_keypress() {
         fi
     fi
 
-    if [ "$first" = $'\033' ]; then
+    if [ -z "$first" ]; then
+        UI_REPLY=$'\n'
+    elif [ "$first" = $'\033' ]; then
         sequence="$first"
         while IFS= read -rsn1 -t 0.01 next; do
             sequence+="$next"
@@ -651,21 +678,14 @@ ui_table_print_row() {
         rendered="$UI_TEXT_RESULT"
         if [ -z "$code" ] && [ "${headers_ref[$i]:-}" = "状态" ]; then
             UI_CELL_COLOR=""
-            local state_stop_at="" display_state
-            case "${#headers_ref[@]}" in
-                6)
-                    state_stop_at="${cells_ref[5]:-}"
-                    ;;
-                7)
-                    state_stop_at="${cells_ref[6]:-}"
-                    ;;
-                9)
-                    state_stop_at="${cells_ref[6]:-}"
-                    ;;
-                11)
-                    state_stop_at="${cells_ref[6]:-}"
-                    ;;
-            esac
+            local state_stop_at="" display_state stop_idx
+            stop_idx=-1
+            for stop_idx in "${!headers_ref[@]}"; do
+                if [ "${headers_ref[$stop_idx]:-}" = "到期" ]; then
+                    state_stop_at="${cells_ref[$stop_idx]:-}"
+                    break
+                fi
+            done
             display_state="$(ui_forward_display_state "$cell" "$state_stop_at")"
             rendered="$(ui_forward_state_text "$display_state")"
             UI_CELL_COLOR="$(ui_forward_state_color "$display_state")"
@@ -1582,7 +1602,7 @@ ui_render_forward_groups() {
     local empty_text="$4"
     local current_user="" line user first_group=true
     local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11=""
-    local group_rows="" compact_headers="" compact_shrink="" state_text="" state_color="" display_state="" group_title=""
+    local group_rows="" group_headers="" group_shrink="" row_buffer=""
 
     if [ -z "$rows" ]; then
         ui_print_line "$empty_text"
@@ -1594,38 +1614,25 @@ ui_render_forward_groups() {
         local block_rows="$2"
         local block_headers="$3"
         local block_shrink="$4"
-        local color_column="$5"
-        local block_line="" block_enabled="" visible_rows="" color_rows=""
+        local block_line="" block_enabled="" block_user_id=""
+        local block_col3="" block_col4="" block_col5="" block_col6="" block_col7="" block_col8="" block_col9="" block_col10="" block_col11=""
+        local block_display_state=""
+        local render_rows=""
 
         [ -n "$block_rows" ] || return 0
-        ui_print_line "$block_user" "1;36"
-        if [ -n "$group_title" ]; then
-            ui_print_line "$group_title" "2;37"
-        fi
+        ui_print_line "用户：$block_user" "1;36"
         while IFS= read -r block_line; do
             [ -n "$block_line" ] || continue
-            IFS=$'\t' read -r block_enabled _ col3 col4 col5 col6 col7 col8 col9 col10 col11 <<< "$block_line"
+            IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 <<< "$block_line"
             case "$headers_tsv" in
                 $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                    display_state="$(ui_forward_display_state "$block_enabled" "$col7")"
-                    state_text="$(ui_forward_state_text "$display_state")"
-                    state_color="$(ui_forward_state_color "$display_state")"
-                    visible_rows+="$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col6"$'\t'"$col7"$'\t'"$(ui_display_or_dash "$col8")"$'\n'
-                    color_rows+="$state_color"$'\n'
+                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(ui_display_or_dash "$block_col8")"$'\n'
                     ;;
                 $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-                    display_state="$(ui_forward_display_state "$col6" "$col7")"
-                    state_text="$(ui_forward_state_text "$display_state")"
-                    state_color="$(ui_forward_state_color "$display_state")"
-                    visible_rows+="#$block_enabled"$'\t'"$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col7"$'\t'"$col8"$'\t'"$col9"$'\t'"$col10"$'\t'"$(ui_display_or_dash "$col11")"$'\n'
-                    color_rows+="$state_color"$'\n'
+                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\t'"$block_col8"$'\t'"$block_col9"$'\t'"$block_col10"$'\t'"$(ui_display_or_dash "$block_col11")"$'\n'
                     ;;
                 $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-                    display_state="$(ui_forward_display_state "$col6" "$col7")"
-                    state_text="$(ui_forward_state_text "$display_state")"
-                    state_color="$(ui_forward_state_color "$display_state")"
-                    visible_rows+="#$block_enabled"$'\t'"$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col7"$'\n'
-                    color_rows+="$state_color"$'\n'
+                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\n'
                     ;;
                 *)
                     ui_forward_line "$block_enabled" "$block_line" "$col7"
@@ -1633,9 +1640,8 @@ ui_render_forward_groups() {
                     ;;
             esac
         done <<< "$block_rows"
-        visible_rows="${visible_rows%$'\n'}"
-        color_rows="${color_rows%$'\n'}"
-        ui_compact_table_render "$block_headers" "$visible_rows" "$block_shrink" "$color_rows" "$color_column"
+        render_rows="${render_rows%$'\n'}"
+        ui_table_render "$block_headers" "$render_rows" "$block_shrink"
     }
 
     while IFS= read -r line; do
@@ -1645,35 +1651,24 @@ ui_render_forward_groups() {
             if [ "$first_group" = "false" ]; then
                 case "$headers_tsv" in
                     $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                        compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
-                        compact_shrink="2,3,4,5,6,7"
-                        group_title="状态  监听  目标  上行  下行  到期  备注"
+                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
+                        group_shrink="2,3,4,5,6,7"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-                        compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
-                        compact_shrink="3,4,6,7,8,9,10"
-                        group_title="序号  状态  监听  目标  协议  到期  模式  MSS  SNAT  备注"
+                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
+                        group_shrink="3,4,6,7,8,9,10"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-                        compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
-                        compact_shrink="3,4,6"
-                        group_title="序号  状态  监听  目标  协议  到期"
+                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
+                        group_shrink="3,4,6"
                         ;;
                     *)
-                        compact_headers=""
-                        compact_shrink=""
-                        group_title=""
+                        group_headers=""
+                        group_shrink=""
                         ;;
                 esac
-                case "$headers_tsv" in
-                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                        ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "1"
-                        ;;
-                    *)
-                        ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
-                        ;;
-                esac
-                ui_rule "-" "2;37"
+                ui_render_forward_group_block "$current_user" "$group_rows" "$group_headers" "$group_shrink"
+                printf '\n'
             fi
             current_user="$user"
             first_group=false
@@ -1685,34 +1680,23 @@ ui_render_forward_groups() {
     group_rows="${group_rows%$'\n'}"
     case "$headers_tsv" in
         $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-            compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
-            compact_shrink="2,3,4,5,6,7"
-            group_title="状态  监听  目标  上行  下行  到期  备注"
+            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
+            group_shrink="2,3,4,5,6,7"
             ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-            compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
-            compact_shrink="3,4,6,7,8,9,10"
-            group_title="序号  状态  监听  目标  协议  到期  模式  MSS  SNAT  备注"
+            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
+            group_shrink="3,4,6,7,8,9,10"
             ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-            compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
-            compact_shrink="3,4,6"
-            group_title="序号  状态  监听  目标  协议  到期"
+            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
+            group_shrink="3,4,6"
             ;;
         *)
-            compact_headers=""
-            compact_shrink=""
-            group_title=""
+            group_headers=""
+            group_shrink=""
             ;;
     esac
-    case "$headers_tsv" in
-        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-            ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "1"
-            ;;
-        *)
-            ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
-            ;;
-    esac
+    ui_render_forward_group_block "$current_user" "$group_rows" "$group_headers" "$group_shrink"
 }
 
 ui_print_main_forward_summary() {
@@ -2102,6 +2086,14 @@ ui_print_telegram_configured_users() {
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
     ui_table_render $'用户\t状态\t定时发送' "$rows" "1,3"
+}
+
+ui_print_export_import_summary() {
+    local rows=""
+    rows+="当前配置"$'\t'"$PFWD_CONFIG_FILE"$'\n'
+    rows+="当前状态"$'\t'"$PFWD_STATS_FILE"$'\n'
+    rows+="说明"$'\t'"导出会包含主配置和流量状态；导入会覆盖当前内容。"
+    ui_table_render $'项目\t值' "$rows" "2"
 }
 
 ui_select_forward_table() {
@@ -3059,9 +3051,7 @@ ui_render_telegram_menu_page() {
 ui_render_export_import_menu_page() {
     ui_header "配置导入导出"
     ui_notice_render
-    echo "当前配置：$PFWD_CONFIG_FILE"
-    echo "当前状态：$PFWD_STATS_FILE"
-    echo "导出会包含主配置和流量状态；导入会覆盖当前内容。"
+    ui_print_export_import_summary
     echo
     ui_menu_item 1 "导出配置"
     ui_menu_item 2 "导入配置"
