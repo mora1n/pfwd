@@ -76,9 +76,13 @@ pfwd_write_atomic() {
 
 pfwd_run() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN:'
-        printf ' %q' "$@"
-        printf '\n'
+        local line="DRY-RUN:"
+        local arg
+        for arg in "$@"; do
+            printf -v arg ' %q' "$arg"
+            line+="$arg"
+        done
+        ui_emit_dry_run "$line"
         return 0
     fi
     "$@"

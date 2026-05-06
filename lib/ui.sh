@@ -31,6 +31,7 @@ UI_FORM_HINT=""
 declare -ag UI_FORM_LINES=()
 declare -ag UI_FORM_OPTION_LINES=()
 declare -ag UI_PAGE_LINES=()
+declare -ag UI_DRY_RUN_LINES=()
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
@@ -102,10 +103,38 @@ ui_notice_clear() {
     UI_NOTICE_COLOR=""
 }
 
+ui_dry_run_reset() {
+    UI_DRY_RUN_LINES=()
+}
+
+ui_dry_run_add() {
+    local line="$1"
+    [ -n "$line" ] || return 0
+    UI_DRY_RUN_LINES+=("$line")
+    if [ "${#UI_DRY_RUN_LINES[@]}" -gt 8 ]; then
+        UI_DRY_RUN_LINES=("${UI_DRY_RUN_LINES[@]: -8}")
+    fi
+}
+
+ui_emit_dry_run() {
+    local line="$1"
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        ui_dry_run_add "$line"
+        return 0
+    fi
+    printf '%s\n' "$line"
+}
+
 ui_notice_render() {
-    [ -n "$UI_NOTICE_TEXT" ] || return 0
-    ui_print_line "$UI_NOTICE_TEXT" "${UI_NOTICE_COLOR:-36}"
-    printf '\n'
+    if [ -n "$UI_NOTICE_TEXT" ]; then
+        ui_print_line "$UI_NOTICE_TEXT" "${UI_NOTICE_COLOR:-36}"
+        printf '\n'
+    fi
+    if [ "${#UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
+        ui_print_line "最近 dry-run：" "2;37"
+        printf '%s\n' "${UI_DRY_RUN_LINES[@]}"
+        printf '\n'
+    fi
 }
 
 ui_render_page() {
@@ -998,6 +1027,11 @@ ui_render_form_page() {
         [ "${#UI_FORM_LINES[@]}" -eq 0 ] || printf '\n'
         printf '%s\n' "${UI_FORM_OPTION_LINES[@]}"
     fi
+    if [ "${#UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
+        printf '\n'
+        ui_print_line "最近 dry-run：" "2;37"
+        printf '%s\n' "${UI_DRY_RUN_LINES[@]}"
+    fi
 }
 
 ui_form_refresh() {
@@ -1050,6 +1084,9 @@ ui_pause() {
 }
 
 ui_run() {
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        ui_dry_run_reset
+    fi
     if ( "$@" ); then
         UI_STATUS=0
         return 0
@@ -1538,6 +1575,9 @@ ui_install_forwarder() {
 }
 
 ui_install_missing_dependencies() {
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        ui_dry_run_reset
+    fi
     if [ "$(id -u)" -ne 0 ] && [ "${PFWD_DRY_RUN:-0}" != "1" ]; then
         ui_error "安装依赖需要 root 权限，请使用 sudo pfwd。"
         return 1

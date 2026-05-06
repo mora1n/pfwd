@@ -454,8 +454,8 @@ forwarder_route_localnet_needed() {
 
 forwarder_ensure_ip_forwarding() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: sysctl -w net.ipv4.ip_forward=1\n'
-        printf 'DRY-RUN: sysctl -w net.ipv6.conf.all.forwarding=1\n'
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.ip_forward=1"
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv6.conf.all.forwarding=1"
         return 0
     fi
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -466,8 +466,8 @@ forwarder_ensure_ip_forwarding() {
 
 forwarder_ensure_route_localnet() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: sysctl -w net.ipv4.conf.all.route_localnet=1\n'
-        printf 'DRY-RUN: sysctl -w net.ipv4.conf.default.route_localnet=1\n'
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.all.route_localnet=1"
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.default.route_localnet=1"
         return 0
     fi
     sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true

@@ -62,6 +62,21 @@ BBR_UI_NOTICE=""
 BBR_UI_NOTICE_LEVEL=""
 BBR_APPLY_SKIPPED_SYSCTLS=""
 BBR_APPLY_SKIPPED_RUNTIME=""
+BBR_UI_REFRESH_INTERVAL="${BBR_UI_REFRESH_INTERVAL:-10}"
+BBR_UI_ALT_SCREEN_ACTIVE=0
+BBR_UI_TERM_HEIGHT_CACHE=""
+BBR_UI_PAGE_ACTIVE=0
+BBR_UI_PAGE_SCROLLABLE=0
+BBR_UI_PAGE_OFFSET=0
+BBR_UI_PAGE_LINE_COUNT=0
+BBR_UI_PAGE_RENDERER_KEY=""
+BBR_UI_WHEEL_STEP="${BBR_UI_WHEEL_STEP:-4}"
+BBR_UI_FORM_TITLE=""
+BBR_UI_FORM_HINT=""
+declare -ag BBR_UI_FORM_LINES=()
+declare -ag BBR_UI_FORM_OPTION_LINES=()
+declare -ag BBR_UI_PAGE_LINES=()
+declare -ag BBR_UI_DRY_RUN_LINES=()
 
 bbr_die() {
     echo "错误：$*" >&2
@@ -82,6 +97,28 @@ bbr_ui_clear_notice() {
     BBR_UI_NOTICE=""
 }
 
+bbr_ui_dry_run_reset() {
+    BBR_UI_DRY_RUN_LINES=()
+}
+
+bbr_ui_dry_run_add() {
+    local line="$1"
+    [ -n "$line" ] || return 0
+    BBR_UI_DRY_RUN_LINES+=("$line")
+    if [ "${#BBR_UI_DRY_RUN_LINES[@]}" -gt 8 ]; then
+        BBR_UI_DRY_RUN_LINES=("${BBR_UI_DRY_RUN_LINES[@]: -8}")
+    fi
+}
+
+bbr_ui_emit_dry_run() {
+    local line="$1"
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$BBR_UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        bbr_ui_dry_run_add "$line"
+        return 0
+    fi
+    printf '%s\n' "$line"
+}
+
 bbr_now_iso() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
@@ -92,9 +129,13 @@ bbr_root_prefix_real() {
 
 bbr_run() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN:'
-        printf ' %q' "$@"
-        printf '\n'
+        local line="DRY-RUN:"
+        local arg
+        for arg in "$@"; do
+            printf -v arg ' %q' "$arg"
+            line+="$arg"
+        done
+        bbr_ui_emit_dry_run "$line"
         return 0
     fi
     "$@"
@@ -102,9 +143,13 @@ bbr_run() {
 
 bbr_mkdir_p() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: mkdir -p'
-        printf ' %q' "$@"
-        printf '\n'
+        local line="DRY-RUN: mkdir -p"
+        local arg
+        for arg in "$@"; do
+            printf -v arg ' %q' "$arg"
+            line+="$arg"
+        done
+        bbr_ui_emit_dry_run "$line"
         return 0
     fi
     mkdir -p "$@"
@@ -114,7 +159,9 @@ bbr_write_value() {
     local path="$1"
     local value="$2"
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: write %s => %q\n' "$path" "$value"
+        local quoted_value
+        printf -v quoted_value '%q' "$value"
+        bbr_ui_emit_dry_run "DRY-RUN: write $path => $quoted_value"
         return 0
     fi
     printf '%s' "$value" > "$path"
@@ -160,7 +207,9 @@ bbr_write_optional_sysfs_value() {
 bbr_write_atomic() {
     local target="$1"
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: write file %q\n' "$target"
+        local quoted_target
+        printf -v quoted_target '%q' "$target"
+        bbr_ui_emit_dry_run "DRY-RUN: write file $quoted_target"
         cat >/dev/null
         return 0
     fi
@@ -173,7 +222,9 @@ bbr_write_atomic() {
 bbr_remove_path() {
     local path="$1"
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: rm -f %q\n' "$path"
+        local quoted_path
+        printf -v quoted_path '%q' "$path"
+        bbr_ui_emit_dry_run "DRY-RUN: rm -f $quoted_path"
         return 0
     fi
     rm -f "$path"
@@ -182,7 +233,9 @@ bbr_remove_path() {
 bbr_remove_tree() {
     local path="$1"
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: rm -rf %q\n' "$path"
+        local quoted_path
+        printf -v quoted_path '%q' "$path"
+        bbr_ui_emit_dry_run "DRY-RUN: rm -rf $quoted_path"
         return 0
     fi
     rm -rf "$path"
@@ -215,11 +268,286 @@ bbr_is_tty() {
 
 bbr_clear_screen() {
     [ -t 1 ] || return 0
-    printf '\033[H\033[2J'
+    printf '\033[H\033[2J\033[3J'
+}
+
+bbr_screen_enter() {
+    [ -t 1 ] || return 0
+    [ "$BBR_UI_ALT_SCREEN_ACTIVE" = "1" ] && return 0
+    printf '\033[?1049h\033[?1000h\033[?1006h\033[H'
+    BBR_UI_ALT_SCREEN_ACTIVE=1
+    BBR_UI_TERM_HEIGHT_CACHE=""
+}
+
+bbr_screen_leave() {
+    [ "$BBR_UI_ALT_SCREEN_ACTIVE" = "1" ] || return 0
+    printf '\033[?1006l\033[?1000l\033[?1049l'
+    BBR_UI_ALT_SCREEN_ACTIVE=0
+    BBR_UI_TERM_HEIGHT_CACHE=""
+}
+
+bbr_menu_cleanup() {
+    trap - EXIT INT TERM
+    bbr_screen_leave
+}
+
+bbr_term_height() {
+    local height="${LINES:-}"
+    if [ -n "$BBR_UI_TERM_HEIGHT_CACHE" ]; then
+        printf '%s' "$BBR_UI_TERM_HEIGHT_CACHE"
+        return 0
+    fi
+    if [ -z "$height" ] && [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+        height="$(tput lines 2>/dev/null || true)"
+    fi
+    [[ "$height" =~ ^[0-9]+$ ]] || height=24
+    [ "$height" -ge 12 ] || height=12
+    BBR_UI_TERM_HEIGHT_CACHE="$height"
+    printf '%s' "$height"
+}
+
+bbr_page_prepare_frame() {
+    local frame="$1"
+    BBR_UI_PAGE_ACTIVE=1
+    BBR_UI_PAGE_SCROLLABLE=0
+    mapfile -t BBR_UI_PAGE_LINES <<< "$frame"
+    if [ "${#BBR_UI_PAGE_LINES[@]}" -gt 0 ] && [ -z "${BBR_UI_PAGE_LINES[-1]}" ]; then
+        unset 'BBR_UI_PAGE_LINES[-1]'
+    fi
+    BBR_UI_PAGE_LINE_COUNT="${#BBR_UI_PAGE_LINES[@]}"
+}
+
+bbr_page_apply_default_anchor() {
+    BBR_UI_PAGE_OFFSET=0
+}
+
+bbr_page_view_height() {
+    local height footer_lines=1
+    height="$(bbr_term_height)"
+    if [ "$BBR_UI_PAGE_LINE_COUNT" -gt $((height - 1)) ]; then
+        footer_lines=2
+        BBR_UI_PAGE_SCROLLABLE=1
+    else
+        BBR_UI_PAGE_SCROLLABLE=0
+    fi
+    height=$((height - footer_lines))
+    [ "$height" -ge 3 ] || height=3
+    printf '%s' "$height"
+}
+
+bbr_page_max_offset() {
+    local view_height="$1"
+    local max_offset=$((BBR_UI_PAGE_LINE_COUNT - view_height))
+    [ "$max_offset" -gt 0 ] || max_offset=0
+    printf '%s' "$max_offset"
+}
+
+bbr_page_clamp_offset() {
+    local view_height max_offset
+    view_height="$(bbr_page_view_height)"
+    max_offset="$(bbr_page_max_offset "$view_height")"
+    if [ "$BBR_UI_PAGE_OFFSET" -lt 0 ]; then
+        BBR_UI_PAGE_OFFSET=0
+    elif [ "$BBR_UI_PAGE_OFFSET" -gt "$max_offset" ]; then
+        BBR_UI_PAGE_OFFSET="$max_offset"
+    fi
+}
+
+bbr_page_draw() {
+    local prompt="${1:-}"
+    local default="${2:-}"
+    local buffer="${3:-}"
+    local view_height start_line end_line i status_text
+
+    bbr_page_clamp_offset
+    view_height="$(bbr_page_view_height)"
+    start_line="$BBR_UI_PAGE_OFFSET"
+    end_line=$((start_line + view_height))
+
+    bbr_clear_screen
+    for ((i = start_line; i < end_line && i < BBR_UI_PAGE_LINE_COUNT; i++)); do
+        printf '%s\n' "${BBR_UI_PAGE_LINES[$i]}"
+    done
+
+    if [ "$BBR_UI_PAGE_SCROLLABLE" = "1" ]; then
+        status_text="滚动 $((start_line + 1))-$(( end_line < BBR_UI_PAGE_LINE_COUNT ? end_line : BBR_UI_PAGE_LINE_COUNT ))/$BBR_UI_PAGE_LINE_COUNT  鼠标滚轮/↑↓/PgUp/PgDn/j/k"
+        printf '%s\n' "$status_text"
+    fi
+
+    if [ -n "$prompt" ]; then
+        if [ -n "$default" ] && [ -z "$buffer" ]; then
+            printf '%s [%s]: %s' "$prompt" "$default" "$buffer"
+        else
+            printf '%s: %s' "$prompt" "$buffer"
+        fi
+    fi
+}
+
+bbr_page_deactivate() {
+    BBR_UI_PAGE_ACTIVE=0
+    BBR_UI_PAGE_SCROLLABLE=0
+    BBR_UI_PAGE_LINE_COUNT=0
+    BBR_UI_PAGE_LINES=()
+}
+
+bbr_page_scroll_lines() {
+    local delta="$1"
+    BBR_UI_PAGE_OFFSET=$((BBR_UI_PAGE_OFFSET + delta))
+    bbr_page_clamp_offset
+}
+
+bbr_page_scroll_wheel() {
+    local direction="$1"
+    local step="${BBR_UI_WHEEL_STEP:-4}"
+    [[ "$step" =~ ^[0-9]+$ ]] || step=4
+    [ "$step" -ge 1 ] || step=1
+    if [ "$direction" -gt 0 ]; then
+        bbr_page_scroll_lines "$step"
+    else
+        bbr_page_scroll_lines "-$step"
+    fi
+}
+
+bbr_page_scroll_pages() {
+    local direction="$1"
+    local view_height
+    view_height="$(bbr_page_view_height)"
+    if [ "$direction" -gt 0 ]; then
+        bbr_page_scroll_lines "$view_height"
+    else
+        bbr_page_scroll_lines "-$view_height"
+    fi
+}
+
+bbr_read_keypress() {
+    local timeout="${1:-}"
+    local first="" next="" sequence=""
+    if [ -n "$timeout" ]; then
+        if ! IFS= read -rsn1 -t "$timeout" first; then
+            BBR_UI_REPLY=""
+            return 124
+        fi
+    else
+        if ! IFS= read -rsn1 first; then
+            BBR_UI_REPLY=""
+            return 1
+        fi
+    fi
+
+    if [ -z "$first" ]; then
+        BBR_UI_REPLY=$'\n'
+    elif [ "$first" = $'\033' ]; then
+        sequence="$first"
+        while IFS= read -rsn1 -t 0.01 next; do
+            sequence+="$next"
+            case "$next" in
+                [~A-Za-zMm]) break ;;
+            esac
+        done
+        BBR_UI_REPLY="$sequence"
+    else
+        BBR_UI_REPLY="$first"
+    fi
+    return 0
+}
+
+bbr_render_page() {
+    local frame status renderer_key previous_key
+    frame="$("$@")"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    renderer_key="$*"
+    previous_key="$BBR_UI_PAGE_RENDERER_KEY"
+    BBR_UI_PAGE_RENDERER_KEY="$renderer_key"
+    bbr_page_prepare_frame "$frame"
+    if [ "$renderer_key" != "$previous_key" ]; then
+        bbr_page_apply_default_anchor "$renderer_key"
+    fi
+    bbr_page_draw
+}
+
+bbr_page_read_line() {
+    local prompt="$1"
+    local timeout_seconds="${2:-}"
+    local default="${3:-}"
+    local buffer="" key="" current_timeout="$timeout_seconds"
+
+    while true; do
+        bbr_page_draw "$prompt" "$default" "$buffer"
+        if bbr_read_keypress "$current_timeout"; then
+            key="$BBR_UI_REPLY"
+        else
+            case "$?" in
+                124)
+                    bbr_page_deactivate
+                    BBR_UI_REPLY=""
+                    return 124
+                    ;;
+                *)
+                    bbr_page_deactivate
+                    BBR_UI_REPLY=""
+                    return 1
+                    ;;
+            esac
+        fi
+
+        case "$key" in
+            $'\n'|$'\r')
+                bbr_page_deactivate
+                BBR_UI_REPLY="$buffer"
+                [ -n "$BBR_UI_REPLY" ] || BBR_UI_REPLY="$default"
+                printf '\n'
+                return 0
+                ;;
+            $'\177'|$'\010')
+                if [ -n "$buffer" ]; then
+                    buffer="${buffer%?}"
+                    current_timeout=""
+                fi
+                ;;
+            $'\033[A'|$'\033OA'|k)
+                bbr_page_scroll_lines -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[B'|$'\033OB'|j)
+                bbr_page_scroll_lines 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[<64;'*)
+                bbr_page_scroll_wheel -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[<65;'*)
+                bbr_page_scroll_wheel 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[5~')
+                bbr_page_scroll_pages -1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033[6~')
+                bbr_page_scroll_pages 1
+                current_timeout="$timeout_seconds"
+                ;;
+            $'\033')
+                current_timeout="$timeout_seconds"
+                ;;
+            *)
+                if [[ "$key" =~ ^[[:print:]]$ ]]; then
+                    buffer+="$key"
+                    current_timeout=""
+                fi
+                ;;
+        esac
+    done
 }
 
 bbr_pause() {
     [ -t 0 ] || return 0
+    if [ "$BBR_UI_PAGE_ACTIVE" = "1" ] && [ -t 1 ]; then
+        bbr_page_read_line "按回车继续" "" ""
+        return 0
+    fi
     printf '按回车继续...'
     IFS= read -r _ || true
 }
@@ -228,6 +556,10 @@ bbr_read() {
     local prompt="$1"
     local default="${2:-}"
     BBR_UI_REPLY=""
+    if [ "$BBR_UI_PAGE_ACTIVE" = "1" ] && [ -t 0 ] && [ -t 1 ]; then
+        bbr_page_read_line "$prompt" "" "$default"
+        return $?
+    fi
     if [ -n "$default" ]; then
         printf '%s [%s]: ' "$prompt" "$default"
     else
@@ -241,10 +573,129 @@ bbr_read() {
     return 0
 }
 
+bbr_read_timed() {
+    local prompt="$1"
+    local timeout_seconds="${2:-1}"
+    local default="${3:-}"
+    BBR_UI_REPLY=""
+
+    if [ ! -t 0 ]; then
+        bbr_read "$prompt" "$default"
+        return $?
+    fi
+
+    if [ "$BBR_UI_PAGE_ACTIVE" = "1" ] && [ -t 1 ]; then
+        bbr_page_read_line "$prompt" "$timeout_seconds" "$default"
+        return $?
+    fi
+
+    if [ -n "$default" ]; then
+        printf '%s [%s]: ' "$prompt" "$default"
+    else
+        printf '%s: ' "$prompt"
+    fi
+    if ! IFS= read -r -t "$timeout_seconds" BBR_UI_REPLY; then
+        BBR_UI_REPLY=""
+        return 124
+    fi
+    [ -n "$BBR_UI_REPLY" ] || BBR_UI_REPLY="$default"
+    return 0
+}
+
+bbr_form_reset() {
+    BBR_UI_FORM_TITLE=""
+    BBR_UI_FORM_HINT=""
+    BBR_UI_FORM_LINES=()
+    BBR_UI_FORM_OPTION_LINES=()
+}
+
+bbr_form_set() {
+    local title="$1"
+    local hint="${2:-}"
+    BBR_UI_FORM_TITLE="$title"
+    BBR_UI_FORM_HINT="$hint"
+    BBR_UI_FORM_LINES=()
+    BBR_UI_FORM_OPTION_LINES=()
+}
+
+bbr_form_add_line() {
+    BBR_UI_FORM_LINES+=("$1")
+}
+
+bbr_form_add_kv() {
+    local label="$1"
+    local value="$2"
+    bbr_form_add_line "$label=${value}"
+}
+
+bbr_render_form_page() {
+    local title="$1"
+    local hint="${2:-}"
+    local line
+    shift 2 || true
+    printf '== %s ==\n' "$title"
+    [ -n "$hint" ] && printf '%s\n' "$hint"
+    if [ -n "$hint" ] && { [ "${#BBR_UI_FORM_LINES[@]}" -gt 0 ] || [ "${#BBR_UI_FORM_OPTION_LINES[@]}" -gt 0 ]; }; then
+        printf '\n'
+    fi
+    if [ "${#BBR_UI_FORM_LINES[@]}" -gt 0 ]; then
+        printf '%s\n' "${BBR_UI_FORM_LINES[@]}"
+    fi
+    if [ "${#BBR_UI_FORM_OPTION_LINES[@]}" -gt 0 ]; then
+        [ "${#BBR_UI_FORM_LINES[@]}" -eq 0 ] || printf '\n'
+        printf '%s\n' "${BBR_UI_FORM_OPTION_LINES[@]}"
+    fi
+    if [ "${#BBR_UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
+        printf '\n'
+        printf '%s\n' "最近 dry-run："
+        for line in "${BBR_UI_DRY_RUN_LINES[@]}"; do
+            printf '%s\n' "$line"
+        done
+    fi
+}
+
+bbr_form_refresh() {
+    [ -n "$BBR_UI_FORM_TITLE" ] || return 1
+    bbr_render_page bbr_render_form_page "$BBR_UI_FORM_TITLE" "$BBR_UI_FORM_HINT"
+}
+
+bbr_form_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    if [ -n "$BBR_UI_FORM_TITLE" ]; then
+        bbr_form_refresh
+    fi
+    bbr_read "$prompt" "$default"
+}
+
+bbr_form_select_read() {
+    local prompt="$1"
+    local default="${2:-}"
+    local status=0
+    shift 2 || true
+    local options=("$@")
+    local line
+    if [ -n "$BBR_UI_FORM_TITLE" ]; then
+        BBR_UI_FORM_OPTION_LINES=("${options[@]}")
+        bbr_form_refresh
+        bbr_read "$prompt" "$default" || status=$?
+        BBR_UI_FORM_OPTION_LINES=()
+        return "$status"
+    fi
+    for line in "${options[@]}"; do
+        printf '%s\n' "$line"
+    done
+    bbr_read "$prompt" "$default"
+}
+
 bbr_confirm_text() {
     local expected="$1"
     local prompt="$2"
-    bbr_read "$prompt" || return 1
+    if [ -n "$BBR_UI_FORM_TITLE" ]; then
+        bbr_form_read "$prompt" || return 1
+    else
+        bbr_read "$prompt" || return 1
+    fi
     [ "$BBR_UI_REPLY" = "$expected" ]
 }
 
@@ -252,9 +703,9 @@ bbr_default_iface_prompt() {
     local iface
     iface="$(bbr_default_route_iface)"
     if [ -n "$iface" ]; then
-        printf '默认路由网卡（当前：%s）\n' "$iface"
+        printf '默认路由网卡（当前：%s）' "$iface"
     else
-        printf '默认路由网卡（当前未探测到）\n'
+        printf '默认路由网卡（当前未探测到）'
     fi
 }
 
@@ -263,15 +714,15 @@ bbr_menu_status() {
 }
 
 bbr_menu_choose_profile() {
-    echo "1) balanced"
-    echo "   通用平衡档，适合大多数中转和公网主机。"
-    echo "2) gaming"
-    echo "   偏低延迟，适合对交互响应更敏感的链路。"
-    echo "3) lowmem"
-    echo "   偏保守内存占用，适合小内存主机。"
-    echo "4) relay"
-    echo "   偏中转吞吐和连接数，适合高并发转发节点。"
-    bbr_read "优化档位" "1" || return 1
+    bbr_form_select_read "优化档位" "1" \
+        "1) balanced" \
+        "   通用平衡档，适合大多数中转和公网主机。" \
+        "2) gaming" \
+        "   偏低延迟，适合对交互响应更敏感的链路。" \
+        "3) lowmem" \
+        "   偏保守内存占用，适合小内存主机。" \
+        "4) relay" \
+        "   偏中转吞吐和连接数，适合高并发转发节点。" || return 1
     case "$BBR_UI_REPLY" in
         1|"") BBR_UI_REPLY="balanced" ;;
         2) BBR_UI_REPLY="gaming" ;;
@@ -282,11 +733,11 @@ bbr_menu_choose_profile() {
 }
 
 bbr_menu_choose_nic_steering() {
-    echo "1) 关闭"
-    echo "   保持当前网卡队列分发默认状态。"
-    echo "2) 开启"
-    echo "   启用 RPS/XPS；适合多核主机、并发流量较大时。"
-    bbr_read "NIC steering" "1" || return 1
+    bbr_form_select_read "NIC steering" "1" \
+        "1) 关闭" \
+        "   保持当前网卡队列分发默认状态。" \
+        "2) 开启" \
+        "   启用 RPS/XPS；适合多核主机、并发流量较大时。" || return 1
     case "$BBR_UI_REPLY" in
         1|"") BBR_UI_REPLY="false" ;;
         2) BBR_UI_REPLY="true" ;;
@@ -295,19 +746,19 @@ bbr_menu_choose_nic_steering() {
 }
 
 bbr_menu_choose_iface_mode() {
-    echo "1) 使用默认路由网卡"
-    echo "   适合单出口主机，自动沿系统默认路由选择网卡。"
-    echo "2) 手动指定网卡"
-    echo "   适合多网卡、多出口或默认路由不等于目标出口时。"
-    bbr_default_iface_prompt
-    bbr_read "网卡选择" "1" || return 1
+    bbr_form_add_line "$(bbr_default_iface_prompt)"
+    bbr_form_select_read "网卡选择" "1" \
+        "1) 使用默认路由网卡" \
+        "   适合单出口主机，自动沿系统默认路由选择网卡。" \
+        "2) 手动指定网卡" \
+        "   适合多网卡、多出口或默认路由不等于目标出口时。" || return 1
     case "$BBR_UI_REPLY" in
         1|"")
             BBR_UI_REPLY="auto|"
             ;;
         2)
             local iface=""
-            bbr_read "网卡名，例如 eth0" || return 1
+            bbr_form_read "网卡名，例如 eth0" || return 1
             iface="$BBR_UI_REPLY"
             [ -n "$iface" ] || bbr_die "必须提供网卡名"
             BBR_UI_REPLY="explicit|$iface"
@@ -320,8 +771,10 @@ bbr_menu_choose_iface_mode() {
 
 bbr_menu_rate_prompt() {
     local label="$1"
-    echo "留空表示不设置。支持 100mbit / 100M / 1gbit。"
-    bbr_read "$label" "" || return 1
+    if [ "${#BBR_UI_FORM_LINES[@]}" -eq 0 ] || [ "${BBR_UI_FORM_LINES[-1]}" != "留空表示不设置。支持 100mbit / 100M / 1gbit。" ]; then
+        bbr_form_add_line "留空表示不设置。支持 100mbit / 100M / 1gbit。"
+    fi
+    bbr_form_read "$label" "" || return 1
     if [ -n "$BBR_UI_REPLY" ]; then
         BBR_UI_REPLY="$(bbr_normalize_rate "$BBR_UI_REPLY")"
     fi
@@ -336,22 +789,33 @@ bbr_menu_optimize() {
     local ingress_rate=""
     local iface_spec=""
 
+    bbr_ui_dry_run_reset
+    bbr_form_set "应用优化" "按顺序选择档位、网卡和限速；回车使用默认值。"
     bbr_menu_choose_profile || return 1
     profile="$BBR_UI_REPLY"
+    bbr_form_add_kv "profile" "$profile"
 
     bbr_menu_choose_nic_steering || return 1
     nic_steering="$BBR_UI_REPLY"
+    bbr_form_add_kv "nic_steering" "$nic_steering"
 
     bbr_menu_choose_iface_mode || return 1
     iface_spec="$BBR_UI_REPLY"
     tc_iface_mode="${iface_spec%%|*}"
     tc_iface_value="${iface_spec#*|}"
+    if [ "$tc_iface_mode" = "explicit" ]; then
+        bbr_form_add_kv "tc_iface" "$tc_iface_value"
+    else
+        bbr_form_add_kv "tc_iface" "auto"
+    fi
 
     bbr_menu_rate_prompt "出口限速 egress rate" || return 1
     egress_rate="$BBR_UI_REPLY"
+    bbr_form_add_kv "egress_rate" "${egress_rate:--}"
 
     bbr_menu_rate_prompt "入口限速 ingress rate" || return 1
     ingress_rate="$BBR_UI_REPLY"
+    bbr_form_add_kv "ingress_rate" "${ingress_rate:--}"
 
     if [ -z "$egress_rate" ] && [ -z "$ingress_rate" ]; then
         bbr_ui_set_notice info "提示：本次不会启用 tc shaping。"
@@ -359,6 +823,7 @@ bbr_menu_optimize() {
 
     bbr_optimize_apply "$profile" "$nic_steering" "$tc_iface_mode" "$tc_iface_value" "$egress_rate" "$ingress_rate"
     bbr_enable_service
+    bbr_form_reset
     local skipped_parts=()
     [ -z "$BBR_APPLY_SKIPPED_SYSCTLS" ] || skipped_parts+=("sysctl: $BBR_APPLY_SKIPPED_SYSCTLS")
     [ -z "$BBR_APPLY_SKIPPED_RUNTIME" ] || skipped_parts+=("网卡队列调优: $BBR_APPLY_SKIPPED_RUNTIME")
@@ -371,25 +836,34 @@ bbr_menu_optimize() {
 }
 
 bbr_menu_reset() {
+    bbr_ui_dry_run_reset
+    bbr_form_set "重置优化" "将清理当前 BBR / sysctl / tc 运行态。"
     if bbr_confirm_text "reset" "输入 reset 确认重置优化"; then
+        bbr_form_reset
         bbr_reset
         bbr_disable_service
         bbr_ui_set_notice success "优化已重置"
     else
+        bbr_form_reset
         bbr_ui_set_notice warn "已取消"
     fi
 }
 
 bbr_menu_install() {
+    bbr_ui_dry_run_reset
     bbr_install
     bbr_ui_set_notice success "pfwd-bbr 已安装"
 }
 
 bbr_menu_uninstall() {
+    bbr_ui_dry_run_reset
+    bbr_form_set "卸载 pfwd-bbr" "将移除脚本、service 和已保存的 BBR 运行态。"
     if bbr_confirm_text "uninstall" "输入 uninstall 确认卸载 pfwd-bbr"; then
+        bbr_form_reset
         bbr_uninstall
         bbr_ui_set_notice success "pfwd-bbr 已卸载"
     else
+        bbr_form_reset
         bbr_ui_set_notice warn "已取消"
     fi
 }
@@ -435,11 +909,18 @@ EOF
 }
 
 bbr_menu_render() {
-    bbr_clear_screen
+    local line
     printf '== pfwd-bbr ==\n'
     printf '%s\n' "$(bbr_status_summary)"
     echo
     bbr_ui_print_notice
+    if [ "${#BBR_UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
+        echo "最近 dry-run："
+        for line in "${BBR_UI_DRY_RUN_LINES[@]}"; do
+            printf '%s\n' "$line"
+        done
+        echo
+    fi
     echo "1) 查看状态"
     echo "2) 应用优化"
     echo "3) 重置优化"
@@ -450,19 +931,29 @@ bbr_menu_render() {
 
 bbr_menu() {
     bbr_ui_clear_notice
+    bbr_screen_enter
+    trap bbr_menu_cleanup EXIT INT TERM
     while true; do
-        bbr_menu_render
-        bbr_read "选择" || return 0
+        bbr_render_page bbr_menu_render
+        if bbr_read_timed "选择" "$BBR_UI_REFRESH_INTERVAL"; then
+            :
+        else
+            case "$?" in
+                124) continue ;;
+                *) break ;;
+            esac
+        fi
         case "$BBR_UI_REPLY" in
             1) bbr_menu_status ;;
             2) bbr_menu_optimize ;;
             3) bbr_menu_reset ;;
             4) bbr_menu_install ;;
             5) bbr_menu_uninstall ;;
-            0) return 0 ;;
+            0) break ;;
             *) bbr_ui_set_notice warn "无效选择" ;;
         esac
     done
+    bbr_menu_cleanup
 }
 
 bbr_ensure_shortcuts() {
@@ -898,7 +1389,7 @@ bbr_apply_nic_steering() {
     local cpu_mask queue_file
     cpu_mask="$(bbr_cpu_mask_all)"
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        printf 'DRY-RUN: sysctl -w net.core.rps_sock_flow_entries=32768\n'
+        bbr_ui_emit_dry_run "DRY-RUN: sysctl -w net.core.rps_sock_flow_entries=32768"
     else
         sysctl -w net.core.rps_sock_flow_entries=32768 >/dev/null 2>&1 || true
     fi
@@ -1070,7 +1561,11 @@ bbr_service_available() {
 
 bbr_enable_service() {
     if ! bbr_service_available; then
-        echo "提示：未检测到已安装的 pfwd-bbr.service；当前优化仅对本次运行生效。" >&2
+        if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$BBR_UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+            bbr_ui_set_notice info "未检测到 pfwd-bbr.service；当前优化仅对本次运行生效。"
+        else
+            echo "提示：未检测到已安装的 pfwd-bbr.service；当前优化仅对本次运行生效。" >&2
+        fi
         return 0
     fi
     systemctl daemon-reload
@@ -1149,6 +1644,7 @@ $cmd - pfwd BBR / optimize manager
 
 说明：
   - 无参数且在交互终端运行时，会进入交互式菜单并原位刷新状态。
+  - 主菜单默认每 10 秒自动刷新一次，长页面支持鼠标滚轮、方向键和 PgUp/PgDn 滚动。
   - optimize 会写入 /etc/sysctl.d/99-pfwd-bbr.conf，并按需要应用 BQL、RPS/XPS 与 tc shaping。
   - 当前内核不支持的 sysctl 项会自动跳过。
   - 若已安装 pfwd-bbr.service，成功的 optimize 会自动启用该 unit 以便开机恢复。
