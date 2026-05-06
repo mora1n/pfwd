@@ -4,7 +4,7 @@ UI_REPLY=""
 UI_STATUS=0
 UI_TRAFFIC_MODE=""
 UI_EDIT_ABORTED=0
-UI_REFRESH_INTERVAL="${UI_REFRESH_INTERVAL:-3}"
+UI_REFRESH_INTERVAL="${UI_REFRESH_INTERVAL:-5}"
 UI_TERM_WIDTH_CACHE=""
 UI_WIDTH_RESULT=0
 UI_TEXT_RESULT=""
@@ -15,6 +15,8 @@ UI_SNAT_MODE="masquerade"
 UI_SNAT_SOURCE=""
 UI_MSS_RECOMMENDED=""
 UI_MSS_RECOMMEND_SOURCE=""
+UI_NOTICE_TEXT=""
+UI_NOTICE_COLOR=""
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
@@ -38,6 +40,36 @@ ui_clear_screen() {
     [ -t 1 ] || return 0
     UI_TERM_WIDTH_CACHE=""
     printf '\033[H\033[2J'
+}
+
+ui_notice_set() {
+    UI_NOTICE_TEXT="$1"
+    UI_NOTICE_COLOR="${2:-36}"
+}
+
+ui_notice_clear() {
+    UI_NOTICE_TEXT=""
+    UI_NOTICE_COLOR=""
+}
+
+ui_notice_render() {
+    [ -n "$UI_NOTICE_TEXT" ] || return 0
+    ui_print_line "$UI_NOTICE_TEXT" "${UI_NOTICE_COLOR:-36}"
+    printf '\n'
+}
+
+ui_render_page() {
+    local frame status
+    frame="$("$@")"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    ui_clear_screen
+    printf '%s' "$frame"
+    case "$frame" in
+        *$'\n') ;;
+        *) printf '\n' ;;
+    esac
+    ui_notice_clear
 }
 
 ui_term_width() {
@@ -292,10 +324,25 @@ ui_table_print_row() {
         rendered="$UI_TEXT_RESULT"
         if [ -z "$code" ] && [ "${headers_ref[$i]:-}" = "状态" ]; then
             UI_CELL_COLOR=""
-            case "$rendered" in
-                "● 开启") UI_CELL_COLOR="1;32" ;;
-                "■ 暂停") UI_CELL_COLOR="1;33" ;;
+            local state_stop_at="" display_state
+            case "${#headers_ref[@]}" in
+                6)
+                    state_stop_at="${cells_ref[5]:-}"
+                    ;;
+                7)
+                    state_stop_at="${cells_ref[6]:-}"
+                    ;;
+                9)
+                    state_stop_at="${cells_ref[6]:-}"
+                    ;;
+                11)
+                    state_stop_at="${cells_ref[6]:-}"
+                    ;;
             esac
+            display_state="$(ui_forward_display_state "$cell" "$state_stop_at")"
+            rendered="$(ui_forward_state_text "$display_state")"
+            UI_CELL_COLOR="$(ui_forward_state_color "$display_state")"
+            ui_display_width_value "$rendered"
             if [ -n "$UI_CELL_COLOR" ] && ui_use_color; then
                 rendered=$'\033['"${UI_CELL_COLOR}"'m'"$rendered"$'\033[0m'
             fi
@@ -356,37 +403,59 @@ ui_table_render() {
 }
 
 ui_forward_state_text() {
-    if [ "$1" = "true" ]; then
-        echo "● 开启"
-    else
-        echo "■ 暂停"
-    fi
+    case "$1" in
+        active|true|启用) printf '●' ;;
+        paused|false|停用|暂停) printf '■' ;;
+        stopped|停止) printf '■' ;;
+        *) printf '■' ;;
+    esac
 }
 
 ui_forward_state_color() {
-    if [ "$1" = "true" ]; then
-        echo "1;32"
-    else
-        echo "1;33"
+    case "$1" in
+        active|true|启用) echo "1;32" ;;
+        paused|false|停用|暂停) echo "1;33" ;;
+        stopped|停止) echo "1;31" ;;
+        *) echo "1;33" ;;
+    esac
+}
+
+ui_forward_display_state() {
+    local enabled="$1"
+    local stop_at="${2:-}"
+    local today
+    if [ "$enabled" = "true" ] || [ "$enabled" = "启用" ] || [ "$enabled" = "active" ]; then
+        printf 'active'
+        return 0
     fi
+    today="$(date '+%Y-%m-%d')"
+    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$today" -o "$stop_at" = "$today" ]; then
+        printf 'stopped'
+        return 0
+    fi
+    printf 'paused'
 }
 
 ui_forward_state_cell() {
     local enabled="$1"
-    local state_text state_color
-    state_text="$(ui_forward_state_text "$enabled")"
-    state_color="$(ui_forward_state_color "$enabled")"
+    local stop_at="${2:-}"
+    local display_state state_text state_color
+    display_state="$(ui_forward_display_state "$enabled" "$stop_at")"
+    state_text="$(ui_forward_state_text "$display_state")"
+    state_color="$(ui_forward_state_color "$display_state")"
     ui_color "$state_color" "$state_text"
 }
 
 ui_forward_line() {
     local enabled="$1"
     local body="$2"
-    local state_text state_color
-    state_text="$(ui_forward_state_text "$enabled")"
-    state_color="$(ui_forward_state_color "$enabled")"
+    local stop_at="${3:-}"
+    local display_state state_text state_color
+    display_state="$(ui_forward_display_state "$enabled" "$stop_at")"
+    state_text="$(ui_forward_state_text "$display_state")"
+    state_color="$(ui_forward_state_color "$display_state")"
     ui_color "$state_color" "$state_text"
-    printf '  %s\n' "$body"
+    printf ' %s\n' "$body"
 }
 
 ui_header() {
@@ -1159,10 +1228,9 @@ ui_print_main_user_summary() {
 ui_render_forward_groups() {
     local rows="$1"
     local headers_tsv="$2"
-    local shrink_csv="$3"
     local empty_text="$4"
-    local current_user="" user_label="" group_rows="" group_count=0
-    local line user
+    local current_user="" group_count=0 line user first_group=true
+    local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11=""
 
     if [ -z "$rows" ]; then
         ui_print_line "$empty_text"
@@ -1172,33 +1240,34 @@ ui_render_forward_groups() {
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         IFS=$'\t' read -r _ user _ <<< "$line"
-        if [ -z "$current_user" ]; then
-            current_user="$user"
-        fi
-        if [ "$user" != "$current_user" ]; then
-            user_label="$current_user"
-            if [ "$group_count" -gt 0 ]; then
-                user_label+="（${group_count} 条）"
+        if [ -z "$current_user" ] || [ "$user" != "$current_user" ]; then
+            if [ "$first_group" = "false" ]; then
+                ui_rule "-" "2;37"
             fi
-            ui_print_line "$user_label" "1;36"
-            ui_table_render "$headers_tsv" "${group_rows%$'\n'}" "$shrink_csv"
-            printf '\n'
             current_user="$user"
-            group_rows=""
             group_count=0
+            first_group=false
         fi
-        group_rows+="$line"$'\n'
+        IFS=$'\t' read -r enabled user col3 col4 col5 col6 col7 col8 col9 col10 col11 <<< "$line"
+        if [ "$group_count" -eq 0 ]; then
+            ui_print_line "$current_user" "1;36"
+        fi
+        case "$headers_tsv" in
+            $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+                ui_forward_line "$enabled" "$col3 -> $col4  上行:$col5  下行:$col6  到期:$col7  备注:$(ui_display_or_dash "$col8")" "$col7"
+                ;;
+            $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
+                ui_forward_line "$col6" "#$enabled  $col3 -> $col4  协议:$col5  到期:$col7  模式:$col8  MSS:$col9  SNAT:$col10  备注:$(ui_display_or_dash "$col11")" "$col7"
+                ;;
+            $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
+                ui_forward_line "$col6" "#$enabled  监听:$col3  目标:$col4  协议:$col5  到期:$col7" "$col7"
+                ;;
+            *)
+                ui_forward_line "$enabled" "$line"
+                ;;
+        esac
         group_count=$((group_count + 1))
     done <<< "$rows"
-
-    if [ -n "$group_rows" ]; then
-        user_label="$current_user"
-        if [ "$group_count" -gt 0 ]; then
-            user_label+="（${group_count} 条）"
-        fi
-        ui_print_line "$user_label" "1;36"
-        ui_table_render "$headers_tsv" "${group_rows%$'\n'}" "$shrink_csv"
-    fi
 }
 
 ui_print_main_forward_summary() {
@@ -1212,11 +1281,10 @@ ui_print_main_forward_summary() {
     fi
 
     while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at comment; do
-        local remote_text listen_text state
+        local remote_text listen_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
-        state="$(ui_forward_state_text "$enabled")"
-        rows+="$state"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+        rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
       .forwards
       | sort_by(.user_id, .listen_port, .id)
@@ -1257,15 +1325,10 @@ ui_print_forward_list() {
         return
     fi
     while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display comment; do
-        local listen remote state
+        local listen remote
         listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         remote="$(ui_format_remote "$remote_host" "$remote_port")"
-        if [ "$enabled" = "启用" ]; then
-            state="$(ui_forward_state_text true)"
-        else
-            state="$(ui_forward_state_text false)"
-        fi
-        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
       (.forwards | sort_by(.user_id, .listen_port, .id))
       | to_entries[]
@@ -1455,7 +1518,9 @@ ui_resolve_user_ids_by_indexes() {
 ui_resolve_forward_ids_by_indexes() {
     local indexes="$1"
     jq -r --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
-      [ .forwards[]?.id ] as $ids
+      [ .forwards[]? | { id, user_id, listen_port, sort_id: .id } ]
+      | sort_by(.user_id, .listen_port, .sort_id)
+      | map(.id) as $ids
       | $idxs[]
       | $ids[. - 1] // empty
     ' "$PFWD_CONFIG_FILE"
@@ -1465,7 +1530,9 @@ ui_resolve_user_forward_ids_by_indexes() {
     local user_id="$1"
     local indexes="$2"
     jq -r --arg id "$user_id" --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
-      [ .forwards[] | select(.user_id == $id) | .id ] as $ids
+      [ .forwards[] | select(.user_id == $id) | { id, listen_port, sort_id: .id } ]
+      | sort_by(.listen_port, .sort_id)
+      | map(.id) as $ids
       | $idxs[]
       | $ids[. - 1] // empty
     ' "$PFWD_CONFIG_FILE"
@@ -1604,14 +1671,9 @@ ui_select_forward_table() {
         rows+=$'0\t返回\t-\t-\t-\t-\t-\n'
     fi
     while IFS=$'\t' read -r index user listen_port remote_host remote_port protocol enabled stop_at; do
-        local remote_text state
+        local remote_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        if [ "$enabled" = "启用" ]; then
-            state="$(ui_forward_state_text true)"
-        else
-            state="$(ui_forward_state_text false)"
-        fi
-        rows+="$index"$'\t'"$user"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\n'
+        rows+="$index"$'\t'"$user"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
     done < <(jq -r '
       (.forwards | sort_by(.user_id, .listen_port, .id))
       | to_entries[]
@@ -1642,7 +1704,11 @@ ui_select_forward() {
     fi
     [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; return 1; }
     local forward_id
-    forward_id="$(jq -r --argjson idx "$UI_REPLY" '.forwards[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
+    forward_id="$(jq -r --argjson idx "$UI_REPLY" '
+      [ .forwards[]? | { id, user_id, listen_port, sort_id: .id } ]
+      | sort_by(.user_id, .listen_port, .sort_id)
+      | .[$idx - 1].id // ""
+    ' "$PFWD_CONFIG_FILE")"
     [ -n "$forward_id" ] || { ui_warn "转发序号不存在"; return 1; }
     UI_REPLY="$forward_id"
 }
@@ -1660,16 +1726,11 @@ ui_select_user_forward_table() {
         rows+=$'0\t返回\t-\t-\t-\t-\n'
     fi
     while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
-        local remote_text state
+        local remote_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        if [ "$enabled" = "启用" ]; then
-            state="$(ui_forward_state_text true)"
-        else
-            state="$(ui_forward_state_text false)"
-        fi
-        rows+="$index"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state"$'\t'"$stop_at"$'\n'
+        rows+="$index"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
     done < <(jq -r --arg id "$user_id" '
-      [.forwards[] | select(.user_id == $id)]
+      ([.forwards[] | select(.user_id == $id)] | sort_by(.listen_port, .id))
       | to_entries[]
       | [
           ((.key + 1) | tostring),
@@ -1698,7 +1759,11 @@ ui_select_user_forward() {
     fi
     [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; return 1; }
     local forward_id
-    forward_id="$(jq -r --arg id "$user_id" --argjson idx "$UI_REPLY" '[.forwards[] | select(.user_id == $id)][$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
+    forward_id="$(jq -r --arg id "$user_id" --argjson idx "$UI_REPLY" '
+      [ .forwards[] | select(.user_id == $id) | { id, listen_port, sort_id: .id } ]
+      | sort_by(.listen_port, .sort_id)
+      | .[$idx - 1].id // ""
+    ' "$PFWD_CONFIG_FILE")"
     [ -n "$forward_id" ] || { ui_warn "转发序号不存在"; return 1; }
     UI_REPLY="$forward_id"
 }
@@ -1727,13 +1792,7 @@ ui_select_traffic_scope() {
 
 ui_menu_users() {
     while true; do
-        ui_clear_screen
-        ui_header "用户管理"
-        ui_print_user_list
-        echo
-        ui_menu_item 1 "添加用户"
-        ui_menu_item 2 "删除用户"
-        ui_menu_item 0 "返回"
+        ui_render_page ui_render_users_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
@@ -1741,6 +1800,9 @@ ui_menu_users() {
                 UI_REPLY="$(normalize_user_id "$UI_REPLY")"
                 [ -n "$UI_REPLY" ] || { ui_warn "用户名不能为空"; ui_pause; continue; }
                 ui_run cmd_user add "$UI_REPLY"
+                if [ "$UI_STATUS" -eq 0 ]; then
+                    ui_notice_set "用户已添加：$UI_REPLY" "32"
+                fi
                 ui_pause
                 ;;
             2)
@@ -1766,6 +1828,7 @@ ui_menu_users() {
                         fi
                     done <<< "$user_ids"
                     ui_batch_print_result "$ok" "$fail"
+                    ui_notice_set "批量删除用户完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 else
                     ui_warn "已取消"
                 fi
@@ -1834,20 +1897,12 @@ ui_menu_add_forward() {
 
 ui_menu_forwards() {
     while true; do
-        ui_clear_screen
-        ui_header "转发管理"
-        ui_print_forward_list
-        echo
-        ui_menu_item 1 "添加转发"
-        ui_menu_item 2 "修改转发"
-        ui_menu_item 3 "暂停转发"
-        ui_menu_item 4 "恢复转发"
-        ui_menu_item 5 "删除转发"
-        ui_menu_item 0 "返回"
+        ui_render_page ui_render_forwards_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
                 ui_menu_add_forward
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "32"
                 ui_pause
                 ;;
             2)
@@ -1962,6 +2017,7 @@ ui_menu_forwards() {
                     ui_warn "未修改"
                 else
                     ui_run cmd_forward_update "${args[@]}"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "32"
                 fi
                 ui_pause
                 ;;
@@ -1979,7 +2035,7 @@ ui_menu_forwards() {
                     fi
                 done <<< "$stop_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_pause
+                ui_notice_set "批量暂停完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ;;
             4)
                 ui_select_forwards_multi || { ui_pause; continue; }
@@ -1995,7 +2051,7 @@ ui_menu_forwards() {
                     fi
                 done <<< "$start_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_pause
+                ui_notice_set "批量恢复完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ;;
             5)
                 ui_select_forwards_multi || { ui_pause; continue; }
@@ -2025,10 +2081,10 @@ ui_menu_forwards() {
                         fi
                     done <<< "$delete_ids"
                     ui_batch_print_result "$ok" "$fail"
+                    ui_notice_set "批量删除转发完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 else
                     ui_warn "已取消"
                 fi
-                ui_pause
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -2038,21 +2094,22 @@ ui_menu_forwards() {
 
 ui_menu_expire_limit() {
     while true; do
-        ui_clear_screen
-        ui_header "流量管理"
-        ui_select_user true || { ui_pause; return 0; }
-        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
-        local user_id="$UI_REPLY"
+        ui_render_page ui_render_traffic_select_user_page
+        ui_read "选择用户序号" || return 0
+        case "$UI_REPLY" in
+            0) return 0 ;;
+            '')
+                ui_warn "无效序号"
+                ui_pause
+                continue
+                ;;
+        esac
+        [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
+        local user_id
+        user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
+        [ -n "$user_id" ] || { ui_warn "用户序号不存在"; ui_pause; continue; }
         while true; do
-            ui_clear_screen
-            ui_header "流量管理"
-            ui_print_user_traffic_summary "$user_id"
-            echo
-            ui_menu_item 1 "转发到期日"
-            ui_menu_item 2 "端口设置"
-            ui_menu_item 3 "流量重置日"
-            ui_menu_item 4 "设置已用流量"
-            ui_menu_item 0 "返回"
+            ui_render_page ui_render_traffic_user_menu_page "$user_id"
             ui_read "选择" || return 0
             case "$UI_REPLY" in
                 1)
@@ -2295,17 +2352,7 @@ ui_menu_expire_limit() {
 
 ui_menu_telegram() {
     while true; do
-        ui_clear_screen
-        ui_header "Telegram 通知"
-        ui_print_telegram_configured_users
-        echo
-        ui_menu_item 1 "配置用户 Telegram"
-        ui_menu_item 2 "设置定时发送"
-        ui_menu_item 3 "发送测试通知"
-        ui_menu_item 4 "启用通知"
-        ui_menu_item 5 "停用通知"
-        ui_menu_item 6 "删除通知"
-        ui_menu_item 0 "返回"
+        ui_render_page ui_render_telegram_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
@@ -2439,15 +2486,7 @@ ui_menu_telegram() {
 
 ui_menu_export_import() {
     while true; do
-        ui_clear_screen
-        ui_header "配置导入导出"
-        echo "当前配置：$PFWD_CONFIG_FILE"
-        echo "当前状态：$PFWD_STATS_FILE"
-        echo "导出会包含主配置和流量状态；导入会覆盖当前内容。"
-        echo
-        ui_menu_item 1 "导出配置"
-        ui_menu_item 2 "导入配置"
-        ui_menu_item 0 "返回"
+        ui_render_page ui_render_export_import_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
@@ -2492,6 +2531,89 @@ ui_menu_update() {
     ui_pause
 }
 
+ui_render_main_menu_page() {
+    ui_title
+    ui_notice_render
+    ui_print_main_forwards
+    echo
+    ui_menu_item 1 "用户管理"
+    ui_menu_item 2 "转发管理"
+    ui_menu_item 3 "流量管理"
+    ui_menu_item 4 "Telegram 通知"
+    ui_menu_item 5 "配置导入导出"
+    ui_menu_item 6 "更新"
+    ui_menu_item 7 "卸载"
+    ui_menu_item 0 "退出"
+}
+
+ui_render_users_menu_page() {
+    ui_header "用户管理"
+    ui_notice_render
+    ui_print_user_list
+    echo
+    ui_menu_item 1 "添加用户"
+    ui_menu_item 2 "删除用户"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_forwards_menu_page() {
+    ui_header "转发管理"
+    ui_notice_render
+    ui_print_forward_list
+    echo
+    ui_menu_item 1 "添加转发"
+    ui_menu_item 2 "修改转发"
+    ui_menu_item 3 "暂停转发"
+    ui_menu_item 4 "恢复转发"
+    ui_menu_item 5 "删除转发"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_traffic_user_menu_page() {
+    local user_id="$1"
+    ui_header "流量管理"
+    ui_notice_render
+    ui_print_user_traffic_summary "$user_id"
+    echo
+    ui_menu_item 1 "转发到期日"
+    ui_menu_item 2 "端口设置"
+    ui_menu_item 3 "流量重置日"
+    ui_menu_item 4 "设置已用流量"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_traffic_select_user_page() {
+    ui_header "流量管理"
+    ui_notice_render
+    ui_print_user_list true
+}
+
+ui_render_telegram_menu_page() {
+    ui_header "Telegram 通知"
+    ui_notice_render
+    ui_print_telegram_configured_users
+    echo
+    ui_menu_item 1 "配置用户 Telegram"
+    ui_menu_item 2 "设置定时发送"
+    ui_menu_item 3 "发送测试通知"
+    ui_menu_item 4 "启用通知"
+    ui_menu_item 5 "停用通知"
+    ui_menu_item 6 "删除通知"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_export_import_menu_page() {
+    ui_header "配置导入导出"
+    ui_notice_render
+    echo "当前配置：$PFWD_CONFIG_FILE"
+    echo "当前状态：$PFWD_STATS_FILE"
+    echo "导出会包含主配置和流量状态；导入会覆盖当前内容。"
+    echo
+    ui_menu_item 1 "导出配置"
+    ui_menu_item 2 "导入配置"
+    ui_menu_item 0 "返回"
+}
+
 ui_menu_uninstall() {
     ui_clear_screen
     ui_header "卸载"
@@ -2516,18 +2638,7 @@ cmd_menu() {
     config_init >/dev/null
     ui_runtime_install_preflight
     while true; do
-        ui_clear_screen
-        ui_title
-        ui_print_main_forwards
-        echo
-        ui_menu_item 1 "用户管理"
-        ui_menu_item 2 "转发管理"
-        ui_menu_item 3 "流量管理"
-        ui_menu_item 4 "Telegram 通知"
-        ui_menu_item 5 "配置导入导出"
-        ui_menu_item 6 "更新"
-        ui_menu_item 7 "卸载"
-        ui_menu_item 0 "退出"
+        ui_render_page ui_render_main_menu_page
         if ui_read_timed "选择" "$UI_REFRESH_INTERVAL"; then
             :
         else
