@@ -1328,6 +1328,172 @@ ui_select_user_for_telegram_config() {
     UI_REPLY="$user_id"
 }
 
+ui_multiselect_normalize_tokens() {
+    local raw="$1"
+    raw="${raw// /}"
+    raw="${raw#,}"
+    raw="${raw%,}"
+    printf '%s' "$raw"
+}
+
+ui_multiselect_parse_indexes() {
+    local raw="$1"
+    local max_index="$2"
+    local allow_zero="${3:-false}"
+    local normalized token start end value
+    local -A seen=()
+    local values=()
+
+    UI_EDIT_ABORTED=0
+    UI_REPLY=""
+    normalized="$(ui_multiselect_normalize_tokens "$raw")"
+    [ -n "$normalized" ] || { ui_warn "请选择至少一个序号"; return 1; }
+
+    if [ "$allow_zero" = "true" ] && [ "$normalized" = "0" ]; then
+        UI_EDIT_ABORTED=1
+        return 0
+    fi
+
+    while IFS= read -r token; do
+        [ -n "$token" ] || { ui_warn "多选格式无效"; return 1; }
+        if [[ "$token" =~ ^[0-9]+$ ]]; then
+            value="$token"
+            if [ "$allow_zero" = "true" ] && [ "$value" = "0" ]; then
+                ui_warn "0 只能单独输入表示返回"
+                return 1
+            fi
+            if [ "$value" -lt 1 ] || [ "$value" -gt "$max_index" ]; then
+                ui_warn "序号超出范围：$value"
+                return 1
+            fi
+            seen["$value"]=1
+        elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            if [ "$start" -gt "$end" ]; then
+                ui_warn "范围无效：$token"
+                return 1
+            fi
+            if [ "$start" -lt 1 ] || [ "$end" -gt "$max_index" ]; then
+                ui_warn "序号超出范围：$token"
+                return 1
+            fi
+            for ((value = start; value <= end; value++)); do
+                seen["$value"]=1
+            done
+        else
+            ui_warn "多选格式无效：$token"
+            return 1
+        fi
+    done < <(printf '%s\n' "$normalized" | tr ',' '\n')
+
+    for ((value = 1; value <= max_index; value++)); do
+        if [ -n "${seen[$value]:-}" ]; then
+            values+=("$value")
+        fi
+    done
+    [ "${#values[@]}" -gt 0 ] || { ui_warn "请选择至少一个序号"; return 1; }
+    UI_REPLY="$(printf '%s\n' "${values[@]}")"
+}
+
+ui_resolve_user_ids_by_indexes() {
+    local indexes="$1"
+    jq -r --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      [ .users[]?.id ] as $ids
+      | $idxs[]
+      | $ids[. - 1] // empty
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_resolve_forward_ids_by_indexes() {
+    local indexes="$1"
+    jq -r --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      [ .forwards[]?.id ] as $ids
+      | $idxs[]
+      | $ids[. - 1] // empty
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_resolve_user_forward_ids_by_indexes() {
+    local user_id="$1"
+    local indexes="$2"
+    jq -r --arg id "$user_id" --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      [ .forwards[] | select(.user_id == $id) | .id ] as $ids
+      | $idxs[]
+      | $ids[. - 1] // empty
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_select_users_multi() {
+    local allow_zero="${1:-false}"
+    UI_EDIT_ABORTED=0
+    config_init >/dev/null
+    if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
+        ui_warn "暂无用户，请先添加用户"
+        return 1
+    fi
+    local count raw indexes user_ids
+    count="$(jq '.users | length' "$PFWD_CONFIG_FILE")"
+    ui_print_user_list "$allow_zero"
+    ui_read "选择用户序号，可多选：1,3,5 或 1-3" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    user_ids="$(ui_resolve_user_ids_by_indexes "$indexes")"
+    [ -n "$user_ids" ] || { ui_warn "用户序号不存在"; return 1; }
+    UI_REPLY="$user_ids"
+}
+
+ui_select_forwards_multi() {
+    local allow_zero="${1:-false}"
+    UI_EDIT_ABORTED=0
+    config_init >/dev/null
+    if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
+        ui_warn "暂无转发，请先添加转发"
+        return 1
+    fi
+    local count raw indexes forward_ids
+    count="$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
+    ui_select_forward_table "$allow_zero"
+    ui_read "选择转发序号，可多选：1,3,5 或 1-3" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    forward_ids="$(ui_resolve_forward_ids_by_indexes "$indexes")"
+    [ -n "$forward_ids" ] || { ui_warn "转发序号不存在"; return 1; }
+    UI_REPLY="$forward_ids"
+}
+
+ui_batch_print_result() {
+    local ok="$1"
+    local fail="$2"
+    ui_print_line "完成：成功 $ok 项，失败 $fail 项" "36"
+}
+
+ui_select_user_forwards_multi() {
+    local user_id="$1"
+    local allow_zero="${2:-false}"
+    UI_EDIT_ABORTED=0
+    config_init >/dev/null
+    if ! jq -e --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
+        ui_warn "该用户暂无转发"
+        return 1
+    fi
+    local count raw indexes forward_ids
+    count="$(jq -r --arg id "$user_id" '[.forwards[] | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE")"
+    ui_select_user_forward_table "$user_id" "$allow_zero"
+    ui_read "选择转发序号，可多选：1,3,5 或 1-3" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    forward_ids="$(ui_resolve_user_forward_ids_by_indexes "$user_id" "$indexes")"
+    [ -n "$forward_ids" ] || { ui_warn "转发序号不存在"; return 1; }
+    UI_REPLY="$forward_ids"
+}
+
 ui_user_telegram_config() {
     local user_id="$1"
     config_init >/dev/null
@@ -1379,9 +1545,8 @@ ui_print_telegram_configured_users() {
     ui_table_render $'用户\t状态\t定时发送' "$rows" "1,3"
 }
 
-ui_select_forward() {
+ui_select_forward_table() {
     local allow_zero="${1:-false}"
-    UI_EDIT_ABORTED=0
     config_init >/dev/null
     local rows=""
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
@@ -1417,6 +1582,12 @@ ui_select_forward() {
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
     ui_table_render $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "$rows" "4,2,7,3"
+}
+
+ui_select_forward() {
+    local allow_zero="${1:-false}"
+    UI_EDIT_ABORTED=0
+    ui_select_forward_table "$allow_zero" || return 1
     ui_read "选择转发序号" || return 1
     if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
         UI_EDIT_ABORTED=1
@@ -1429,10 +1600,9 @@ ui_select_forward() {
     UI_REPLY="$forward_id"
 }
 
-ui_select_user_forward() {
+ui_select_user_forward_table() {
     local user_id="$1"
     local allow_zero="${2:-false}"
-    UI_EDIT_ABORTED=0
     config_init >/dev/null
     local rows=""
     if ! jq -e --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
@@ -1467,6 +1637,13 @@ ui_select_user_forward() {
     ' "$PFWD_CONFIG_FILE")
     rows="${rows%$'\n'}"
     ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$rows" "3,6,2"
+}
+
+ui_select_user_forward() {
+    local user_id="$1"
+    local allow_zero="${2:-false}"
+    UI_EDIT_ABORTED=0
+    ui_select_user_forward_table "$user_id" "$allow_zero" || return 1
     ui_read "选择转发序号" || return 1
     if [ "$allow_zero" = "true" ] && [ "$UI_REPLY" = "0" ]; then
         UI_EDIT_ABORTED=1
@@ -1484,7 +1661,7 @@ ui_select_traffic_scope() {
     UI_EDIT_ABORTED=0
     echo "0) 返回"
     echo "1) 用户所有端口"
-    echo "2) 单个端口"
+    echo "2) 选择端口，可多选"
     ui_read "作用范围" "1" || return 1
     case "$UI_REPLY" in
         0)
@@ -1493,9 +1670,9 @@ ui_select_traffic_scope() {
             ;;
         1|"") UI_REPLY="user:$user_id" ;;
         2)
-            ui_select_user_forward "$user_id" true || return 1
+            ui_select_user_forwards_multi "$user_id" true || return 1
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
-            UI_REPLY="forward:$UI_REPLY"
+            UI_REPLY="forward-list:$UI_REPLY"
             ;;
         *) ui_warn "无效选择"; return 1 ;;
     esac
@@ -1520,11 +1697,28 @@ ui_menu_users() {
                 ui_pause
                 ;;
             2)
-                ui_select_user true || { ui_pause; continue; }
+                ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local user_id="$UI_REPLY"
-                if ui_confirm_text "$user_id" "输入用户名确认删除"; then
-                    ui_run cmd_user delete "$user_id"
+                local user_ids="$UI_REPLY" user_list=""
+                while IFS= read -r user_id; do
+                    [ -n "$user_id" ] || continue
+                    user_list+="${user_id}"$'\n'
+                done <<< "$user_ids"
+                user_list="${user_list%$'\n'}"
+                ui_print_line "将删除以下用户：" "33"
+                printf '%s\n' "$user_list"
+                if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
+                    local ok=0 fail=0
+                    while IFS= read -r user_id; do
+                        [ -n "$user_id" ] || continue
+                        if cmd_user delete "$user_id"; then
+                            ok=$((ok + 1))
+                        else
+                            fail=$((fail + 1))
+                            ui_error "删除失败：$user_id"
+                        fi
+                    done <<< "$user_ids"
+                    ui_batch_print_result "$ok" "$fail"
                 else
                     ui_warn "已取消"
                 fi
@@ -1725,20 +1919,65 @@ ui_menu_forwards() {
                 ui_pause
                 ;;
             3)
-                ui_select_forward || { ui_pause; continue; }
-                ui_run cmd_toggle_forward false "$UI_REPLY"
+                ui_select_forwards_multi || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                local stop_ids="$UI_REPLY" ok=0 fail=0
+                while IFS= read -r forward_id; do
+                    [ -n "$forward_id" ] || continue
+                    if cmd_toggle_forward false "$forward_id"; then
+                        ok=$((ok + 1))
+                    else
+                        fail=$((fail + 1))
+                        ui_error "暂停失败：$forward_id"
+                    fi
+                done <<< "$stop_ids"
+                ui_batch_print_result "$ok" "$fail"
                 ui_pause
                 ;;
             4)
-                ui_select_forward || { ui_pause; continue; }
-                ui_run cmd_toggle_forward true "$UI_REPLY"
+                ui_select_forwards_multi || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                local start_ids="$UI_REPLY" ok=0 fail=0
+                while IFS= read -r forward_id; do
+                    [ -n "$forward_id" ] || continue
+                    if cmd_toggle_forward true "$forward_id"; then
+                        ok=$((ok + 1))
+                    else
+                        fail=$((fail + 1))
+                        ui_error "恢复失败：$forward_id"
+                    fi
+                done <<< "$start_ids"
+                ui_batch_print_result "$ok" "$fail"
                 ui_pause
                 ;;
             5)
-                ui_select_forward || { ui_pause; continue; }
-                local forward_id="$UI_REPLY"
-                if ui_confirm_text "$forward_id" "输入转发 ID $forward_id 确认删除"; then
-                    ui_run cmd_delete "$forward_id"
+                ui_select_forwards_multi || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                local delete_ids="$UI_REPLY" summary=""
+                while IFS= read -r forward_id; do
+                    [ -n "$forward_id" ] || continue
+                    summary+="$(
+                        jq -r --arg id "$forward_id" '
+                          .forwards[] | select(.id == $id) |
+                          "\(.id)  用户:\(.user_id)  监听:\(.listen_port)"
+                        ' "$PFWD_CONFIG_FILE"
+                    )"$'\n'
+                done <<< "$delete_ids"
+                summary="${summary%$'\n'}"
+                ui_print_line "将删除以下转发：" "33"
+                printf '%s\n' "$summary"
+                if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
+                    local ok=0 fail=0
+                    while IFS= read -r forward_id; do
+                        [ -n "$forward_id" ] || continue
+                        if cmd_delete "$forward_id"; then
+                            ok=$((ok + 1))
+                        else
+                            fail=$((fail + 1))
+                            ui_error "删除失败：$forward_id"
+                        fi
+                    done <<< "$delete_ids"
+                    ui_batch_print_result "$ok" "$fail"
                 else
                     ui_warn "已取消"
                 fi
@@ -1770,7 +2009,7 @@ ui_menu_expire_limit() {
             ui_read "选择" || return 0
             case "$UI_REPLY" in
                 1)
-                    local scope="" forward_id="" current_stop_at=""
+                    local scope="" current_stop_at=""
                     ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     scope="$UI_REPLY"
@@ -1785,16 +2024,34 @@ ui_menu_expire_limit() {
                             ui_run cmd_expire user-set --user-id "${scope#user:}" --stop-at "$UI_REPLY"
                         fi
                     else
-                        forward_id="${scope#forward:}"
-                        current_stop_at="$(jq -r --arg id "$forward_id" '.forwards[] | select(.id == $id) | (.stop_at // "")' "$PFWD_CONFIG_FILE")"
-                        ui_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" "${current_stop_at:-}" || { ui_pause; continue; }
+                        ui_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_pause; continue; }
                         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                        if [ -z "$UI_REPLY" ] || [ "$UI_REPLY" = "$current_stop_at" ]; then
+                        local stop_value="$UI_REPLY" ok=0 fail=0
+                        if [ -z "$stop_value" ]; then
                             ui_warn "未修改"
-                        elif [ "$UI_REPLY" = "-" ]; then
-                            ui_run cmd_expire clear "$forward_id"
                         else
-                            ui_run cmd_expire set "$forward_id" --stop-at "$UI_REPLY"
+                            while IFS= read -r forward_id; do
+                                [ -n "$forward_id" ] || continue
+                                current_stop_at="$(jq -r --arg id "$forward_id" '.forwards[] | select(.id == $id) | (.stop_at // "")' "$PFWD_CONFIG_FILE")"
+                                if [ "$stop_value" = "$current_stop_at" ]; then
+                                    continue
+                                elif [ "$stop_value" = "-" ]; then
+                                    if cmd_expire clear "$forward_id"; then
+                                        ok=$((ok + 1))
+                                    else
+                                        fail=$((fail + 1))
+                                        ui_error "清除到期失败：$forward_id"
+                                    fi
+                                else
+                                    if cmd_expire set "$forward_id" --stop-at "$stop_value"; then
+                                        ok=$((ok + 1))
+                                    else
+                                        fail=$((fail + 1))
+                                        ui_error "设置到期失败：$forward_id"
+                                    fi
+                                fi
+                            done <<< "${scope#forward-list:}"
+                            ui_batch_print_result "$ok" "$fail"
                         fi
                     fi
                     ui_pause
@@ -1824,7 +2081,12 @@ ui_menu_expire_limit() {
                         ' "$PFWD_CONFIG_FILE")"
                         current_mode="$current_scope_mode"
                     else
-                        current_mode="$(jq -r --arg id "${scope#forward:}" '.forwards[] | select(.id == $id) | (.traffic_mode // "two-way")' "$PFWD_CONFIG_FILE")"
+                        current_scope_mode="$(jq -r --argjson ids "$(printf '%s\n' "${scope#forward-list:}" | jq -Rcs 'split("\n") | map(select(length > 0))')" '
+                          [ .forwards[] | select(.id as $id | $ids | index($id)) | (.traffic_mode // "two-way") ]
+                          | unique
+                          | if length == 1 then .[0] else "" end
+                        ' "$PFWD_CONFIG_FILE")"
+                        current_mode="$current_scope_mode"
                     fi
                     ui_select_traffic_mode_edit "流量模式，回车不改，0 返回" "$current_mode" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
@@ -1854,11 +2116,22 @@ ui_menu_expire_limit() {
                             ui_warn "未修改"
                         fi
                     else
-                        [ -z "$traffic" ] || args+=(--traffic "$traffic")
-                        [ -z "$rate" ] || args+=(--rate "$rate")
-                        [ -z "$traffic_mode" ] || args+=(--traffic-mode "$traffic_mode")
                         if [ -n "$traffic" ] || [ -n "$rate" ] || [ -n "$traffic_mode" ]; then
-                            ui_run cmd_limit "${args[@]}"
+                            local ok=0 fail=0
+                            while IFS= read -r forward_id; do
+                                [ -n "$forward_id" ] || continue
+                                args=(set --forward-id "$forward_id")
+                                [ -z "$traffic" ] || args+=(--traffic "$traffic")
+                                [ -z "$rate" ] || args+=(--rate "$rate")
+                                [ -z "$traffic_mode" ] || args+=(--traffic-mode "$traffic_mode")
+                                if cmd_limit "${args[@]}"; then
+                                    ok=$((ok + 1))
+                                else
+                                    fail=$((fail + 1))
+                                    ui_error "端口设置失败：$forward_id"
+                                fi
+                            done <<< "${scope#forward-list:}"
+                            ui_batch_print_result "$ok" "$fail"
                         else
                             ui_warn "未修改"
                         fi
@@ -1879,7 +2152,19 @@ ui_menu_expire_limit() {
                             if [[ "$scope" == user:* ]]; then
                                 args=(--user-id "${scope#user:}")
                             else
-                                args=(--forward-id "${scope#forward:}")
+                                local ok=0 fail=0
+                                while IFS= read -r forward_id; do
+                                    [ -n "$forward_id" ] || continue
+                                    if cmd_traffic reset-now --forward-id "$forward_id"; then
+                                        ok=$((ok + 1))
+                                    else
+                                        fail=$((fail + 1))
+                                        ui_error "立即重置失败：$forward_id"
+                                    fi
+                                done <<< "${scope#forward-list:}"
+                                ui_batch_print_result "$ok" "$fail"
+                                ui_pause
+                                continue
                             fi
                             ui_run cmd_traffic reset-now "${args[@]}"
                             ;;
@@ -1897,7 +2182,19 @@ ui_menu_expire_limit() {
                             if [[ "$scope" == user:* ]]; then
                                 args=(set --user-id "${scope#user:}" --day "$day")
                             else
-                                args=(set --forward-id "${scope#forward:}" --day "$day")
+                                local ok=0 fail=0
+                                while IFS= read -r forward_id; do
+                                    [ -n "$forward_id" ] || continue
+                                    if cmd_traffic reset-day set --forward-id "$forward_id" --day "$day"; then
+                                        ok=$((ok + 1))
+                                    else
+                                        fail=$((fail + 1))
+                                        ui_error "设置重置日失败：$forward_id"
+                                    fi
+                                done <<< "${scope#forward-list:}"
+                                ui_batch_print_result "$ok" "$fail"
+                                ui_pause
+                                continue
                             fi
                             ui_run cmd_traffic reset-day "${args[@]}"
                             ;;
@@ -1925,7 +2222,19 @@ ui_menu_expire_limit() {
                     if [[ "$scope" == user:* ]]; then
                         args=(used set --user-id "${scope#user:}" --used "$used")
                     else
-                        args=(used set --forward-id "${scope#forward:}" --used "$used")
+                        local ok=0 fail=0
+                        while IFS= read -r forward_id; do
+                            [ -n "$forward_id" ] || continue
+                            if cmd_traffic used set --forward-id "$forward_id" --used "$used"; then
+                                ok=$((ok + 1))
+                            else
+                                fail=$((fail + 1))
+                                ui_error "设置已用流量失败：$forward_id"
+                            fi
+                        done <<< "${scope#forward-list:}"
+                        ui_batch_print_result "$ok" "$fail"
+                        ui_pause
+                        continue
                     fi
                     ui_run cmd_traffic "${args[@]}"
                     ui_pause
@@ -2005,27 +2314,74 @@ ui_menu_telegram() {
                 ui_pause
                 ;;
             3)
-                ui_select_user true || { ui_pause; continue; }
+                ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                ui_run cmd_notify_test --user-id "$UI_REPLY"
+                local test_ids="$UI_REPLY" ok=0 fail=0
+                while IFS= read -r user_id; do
+                    [ -n "$user_id" ] || continue
+                    if cmd_notify_test --user-id "$user_id"; then
+                        ok=$((ok + 1))
+                    else
+                        fail=$((fail + 1))
+                        ui_error "测试通知失败：$user_id"
+                    fi
+                done <<< "$test_ids"
+                ui_batch_print_result "$ok" "$fail"
                 ui_pause
                 ;;
             4)
-                ui_select_user true || { ui_pause; continue; }
+                ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                ui_run cmd_notify_enable --user-id "$UI_REPLY"
+                local enable_ids="$UI_REPLY" ok=0 fail=0
+                while IFS= read -r user_id; do
+                    [ -n "$user_id" ] || continue
+                    if cmd_notify_enable --user-id "$user_id"; then
+                        ok=$((ok + 1))
+                    else
+                        fail=$((fail + 1))
+                        ui_error "启用通知失败：$user_id"
+                    fi
+                done <<< "$enable_ids"
+                ui_batch_print_result "$ok" "$fail"
                 ui_pause
                 ;;
             5)
-                ui_select_user true || { ui_pause; continue; }
+                ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                ui_run cmd_notify_disable --user-id "$UI_REPLY"
+                local disable_ids="$UI_REPLY" ok=0 fail=0
+                while IFS= read -r user_id; do
+                    [ -n "$user_id" ] || continue
+                    if cmd_notify_disable --user-id "$user_id"; then
+                        ok=$((ok + 1))
+                    else
+                        fail=$((fail + 1))
+                        ui_error "停用通知失败：$user_id"
+                    fi
+                done <<< "$disable_ids"
+                ui_batch_print_result "$ok" "$fail"
                 ui_pause
                 ;;
             6)
-                ui_select_user true || { ui_pause; continue; }
+                ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                ui_run cmd_notify_delete --user-id "$UI_REPLY"
+                local delete_ids="$UI_REPLY"
+                ui_print_line "将删除以下通知配置：" "33"
+                printf '%s\n' "$delete_ids"
+                if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
+                    local ok=0 fail=0
+                    while IFS= read -r user_id; do
+                        [ -n "$user_id" ] || continue
+                        if cmd_notify_delete --user-id "$user_id"; then
+                            ok=$((ok + 1))
+                        else
+                            fail=$((fail + 1))
+                            ui_error "删除通知失败：$user_id"
+                        fi
+                    done <<< "$delete_ids"
+                    ui_batch_print_result "$ok" "$fail"
+                else
+                    ui_warn "已取消"
+                fi
                 ui_pause
                 ;;
             0) return 0 ;;
