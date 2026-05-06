@@ -832,8 +832,8 @@ ui_table_render() {
 
 ui_forward_state_text() {
     case "$1" in
-        active|true|启用) printf '●' ;;
-        paused|false|停用|暂停) printf '■' ;;
+        active|true|启用|已启用) printf '●' ;;
+        paused|false|停用|暂停|已停用) printf '■' ;;
         stopped|停止) printf '■' ;;
         *) printf '■' ;;
     esac
@@ -841,8 +841,8 @@ ui_forward_state_text() {
 
 ui_forward_state_color() {
     case "$1" in
-        active|true|启用) echo "1;32" ;;
-        paused|false|停用|暂停) echo "1;33" ;;
+        active|true|启用|已启用) echo "1;32" ;;
+        paused|false|停用|暂停|已停用) echo "1;33" ;;
         stopped|停止) echo "1;31" ;;
         *) echo "1;33" ;;
     esac
@@ -852,8 +852,12 @@ ui_forward_display_state() {
     local enabled="$1"
     local stop_at="${2:-}"
     local today
-    if [ "$enabled" = "true" ] || [ "$enabled" = "启用" ] || [ "$enabled" = "active" ]; then
+    if [ "$enabled" = "true" ] || [ "$enabled" = "启用" ] || [ "$enabled" = "已启用" ] || [ "$enabled" = "active" ]; then
         printf 'active'
+        return 0
+    fi
+    if [ "$enabled" = "false" ] || [ "$enabled" = "停用" ] || [ "$enabled" = "已停用" ] || [ "$enabled" = "暂停" ] || [ "$enabled" = "paused" ]; then
+        printf 'paused'
         return 0
     fi
     today="$(date '+%Y-%m-%d')"
