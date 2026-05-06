@@ -4,7 +4,7 @@ UI_REPLY=""
 UI_STATUS=0
 UI_TRAFFIC_MODE=""
 UI_EDIT_ABORTED=0
-UI_REFRESH_INTERVAL="${UI_REFRESH_INTERVAL:-5}"
+UI_REFRESH_INTERVAL="${UI_REFRESH_INTERVAL:-10}"
 UI_TERM_WIDTH_CACHE=""
 UI_WIDTH_RESULT=0
 UI_TEXT_RESULT=""
@@ -17,13 +17,29 @@ UI_MSS_RECOMMENDED=""
 UI_MSS_RECOMMEND_SOURCE=""
 UI_NOTICE_TEXT=""
 UI_NOTICE_COLOR=""
+UI_COLOR_ENABLED="${UI_COLOR_ENABLED:-auto}"
+UI_ALT_SCREEN_ACTIVE=0
 
 ui_main_status_title() {
     ui_color "1;96" "端口转发"
 }
 
 ui_use_color() {
-    [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+    case "${UI_COLOR_ENABLED:-auto}" in
+        1|true|yes) [ -z "${NO_COLOR:-}" ] ;;
+        0|false|no) return 1 ;;
+        *)
+            [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+            ;;
+    esac
+}
+
+ui_detect_color_support() {
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        UI_COLOR_ENABLED=1
+    else
+        UI_COLOR_ENABLED=0
+    fi
 }
 
 ui_color() {
@@ -39,7 +55,27 @@ ui_color() {
 ui_clear_screen() {
     [ -t 1 ] || return 0
     UI_TERM_WIDTH_CACHE=""
-    printf '\033[H\033[2J'
+    printf '\033[H\033[2J\033[3J'
+}
+
+ui_screen_enter() {
+    [ -t 1 ] || return 0
+    [ "$UI_ALT_SCREEN_ACTIVE" = "1" ] && return 0
+    printf '\033[?1049h\033[H'
+    UI_ALT_SCREEN_ACTIVE=1
+    UI_TERM_WIDTH_CACHE=""
+}
+
+ui_screen_leave() {
+    [ "$UI_ALT_SCREEN_ACTIVE" = "1" ] || return 0
+    printf '\033[?1049l'
+    UI_ALT_SCREEN_ACTIVE=0
+    UI_TERM_WIDTH_CACHE=""
+}
+
+ui_menu_cleanup() {
+    trap - EXIT INT TERM
+    ui_screen_leave
 }
 
 ui_notice_set() {
@@ -70,6 +106,75 @@ ui_render_page() {
         *) printf '\n' ;;
     esac
     ui_notice_clear
+}
+
+ui_compact_table_render() {
+    local headers_tsv="$1"
+    local rows="${2:-}"
+    local shrink_csv="${3:-}"
+    local color_rows="${4:-}"
+    local color_column="${5:-0}"
+    local -a headers=() widths=() row_lines=() color_lines=() cells=()
+    local line i term_width
+
+    IFS=$'\t' read -r -a headers <<< "$headers_tsv"
+    [ "${#headers[@]}" -gt 0 ] || return 0
+
+    for i in "${!headers[@]}"; do
+        ui_display_width_value "${headers[$i]}"
+        widths[$i]="$UI_WIDTH_RESULT"
+    done
+
+    if [ -n "$rows" ]; then
+        while IFS= read -r line; do
+            row_lines+=("$line")
+            IFS=$'\t' read -r -a cells <<< "$line"
+            for i in "${!headers[@]}"; do
+                ui_display_width_value "${cells[$i]:-}"
+                if [ "$UI_WIDTH_RESULT" -gt "${widths[$i]}" ]; then
+                    widths[$i]="$UI_WIDTH_RESULT"
+                fi
+            done
+        done <<< "$rows"
+    fi
+
+    if [ -n "$color_rows" ]; then
+        while IFS= read -r line; do
+            color_lines+=("$line")
+        done <<< "$color_rows"
+    fi
+
+    term_width="$(ui_term_width)"
+    ui_table_fit_widths widths "$shrink_csv" "$term_width"
+
+    for i in "${!row_lines[@]}"; do
+        line="${row_lines[$i]}"
+        IFS=$'\t' read -r -a cells <<< "$line"
+        ui_compact_table_print_row widths cells "${color_lines[$i]:-}" "$color_column"
+    done
+}
+
+ui_compact_table_print_row() {
+    local widths_name="$1"
+    local cells_name="$2"
+    local highlight_color="${3:-}"
+    local highlight_column="${4:-0}"
+    local -n widths_ref="$widths_name"
+    local -n cells_ref="$cells_name"
+    local i rendered
+
+    for i in "${!widths_ref[@]}"; do
+        rendered="$(ui_table_pad_cell "${cells_ref[$i]:-}" "${widths_ref[$i]}")"
+        if [ "$i" -gt 0 ]; then
+            printf '  '
+        fi
+        if [ $((i + 1)) -eq "$highlight_column" ] && [ -n "$highlight_color" ] && [ -n "${cells_ref[$i]:-}" ]; then
+            ui_color "$highlight_color" "$rendered"
+        else
+            printf '%s' "$rendered"
+        fi
+    done
+    printf '\n'
 }
 
 ui_term_width() {
@@ -456,6 +561,21 @@ ui_forward_line() {
     state_color="$(ui_forward_state_color "$display_state")"
     ui_color "$state_color" "$state_text"
     printf ' %s\n' "$body"
+}
+
+ui_maybe_pause() {
+    local mode="${1:-status}"
+    case "$mode" in
+        success)
+            [ "$UI_STATUS" -eq 0 ] || ui_pause
+            ;;
+        always)
+            ui_pause
+            ;;
+        *)
+            [ "$UI_STATUS" -eq 0 ] || ui_pause
+            ;;
+    esac
 }
 
 ui_header() {
@@ -1229,45 +1349,114 @@ ui_render_forward_groups() {
     local rows="$1"
     local headers_tsv="$2"
     local empty_text="$4"
-    local current_user="" group_count=0 line user first_group=true
+    local current_user="" line user first_group=true
     local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11=""
+    local group_rows="" compact_headers="" compact_shrink="" state_text="" state_color="" display_state=""
 
     if [ -z "$rows" ]; then
         ui_print_line "$empty_text"
         return 0
     fi
 
+    ui_render_forward_group_block() {
+        local block_user="$1"
+        local block_rows="$2"
+        local block_headers="$3"
+        local block_shrink="$4"
+        local color_column="$5"
+        local block_line="" block_enabled="" visible_rows="" color_rows=""
+
+        [ -n "$block_rows" ] || return 0
+        ui_print_line "$block_user" "1;36"
+        while IFS= read -r block_line; do
+            [ -n "$block_line" ] || continue
+            IFS=$'\t' read -r block_enabled _ col3 col4 col5 col6 col7 col8 col9 col10 col11 <<< "$block_line"
+            case "$headers_tsv" in
+                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+                    display_state="$(ui_forward_display_state "$block_enabled" "$col7")"
+                    state_text="$(ui_forward_state_text "$display_state")"
+                    state_color="$(ui_forward_state_color "$display_state")"
+                    visible_rows+="$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col6"$'\t'"$col7"$'\t'"$(ui_display_or_dash "$col8")"$'\n'
+                    color_rows+="$state_color"$'\n'
+                    ;;
+                $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
+                    display_state="$(ui_forward_display_state "$col6" "$col7")"
+                    state_text="$(ui_forward_state_text "$display_state")"
+                    state_color="$(ui_forward_state_color "$display_state")"
+                    visible_rows+="#$block_enabled"$'\t'"$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col7"$'\t'"$col8"$'\t'"$col9"$'\t'"$col10"$'\t'"$(ui_display_or_dash "$col11")"$'\n'
+                    color_rows+="$state_color"$'\n'
+                    ;;
+                $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
+                    display_state="$(ui_forward_display_state "$col6" "$col7")"
+                    state_text="$(ui_forward_state_text "$display_state")"
+                    state_color="$(ui_forward_state_color "$display_state")"
+                    visible_rows+="#$block_enabled"$'\t'"$state_text"$'\t'"$col3"$'\t'"$col4"$'\t'"$col5"$'\t'"$col7"$'\n'
+                    color_rows+="$state_color"$'\n'
+                    ;;
+                *)
+                    ui_forward_line "$block_enabled" "$block_line" "$col7"
+                    continue
+                    ;;
+            esac
+        done <<< "$block_rows"
+        visible_rows="${visible_rows%$'\n'}"
+        color_rows="${color_rows%$'\n'}"
+        ui_compact_table_render "$block_headers" "$visible_rows" "$block_shrink" "$color_rows" "$color_column"
+    }
+
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         IFS=$'\t' read -r _ user _ <<< "$line"
         if [ -z "$current_user" ] || [ "$user" != "$current_user" ]; then
             if [ "$first_group" = "false" ]; then
+                case "$headers_tsv" in
+                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+                        compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
+                        compact_shrink="2,3,4,5,6,7"
+                        ;;
+                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
+                        compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
+                        compact_shrink="3,4,6,7,8,9,10"
+                        ;;
+                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
+                        compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
+                        compact_shrink="3,4,6"
+                        ;;
+                    *)
+                        compact_headers=""
+                        compact_shrink=""
+                        ;;
+                esac
+                ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
                 ui_rule "-" "2;37"
             fi
             current_user="$user"
-            group_count=0
             first_group=false
+            group_rows=""
         fi
-        IFS=$'\t' read -r enabled user col3 col4 col5 col6 col7 col8 col9 col10 col11 <<< "$line"
-        if [ "$group_count" -eq 0 ]; then
-            ui_print_line "$current_user" "1;36"
-        fi
-        case "$headers_tsv" in
-            $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                ui_forward_line "$enabled" "$col3 -> $col4  上行:$col5  下行:$col6  到期:$col7  备注:$(ui_display_or_dash "$col8")" "$col7"
-                ;;
-            $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-                ui_forward_line "$col6" "#$enabled  $col3 -> $col4  协议:$col5  到期:$col7  模式:$col8  MSS:$col9  SNAT:$col10  备注:$(ui_display_or_dash "$col11")" "$col7"
-                ;;
-            $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-                ui_forward_line "$col6" "#$enabled  监听:$col3  目标:$col4  协议:$col5  到期:$col7" "$col7"
-                ;;
-            *)
-                ui_forward_line "$enabled" "$line"
-                ;;
-        esac
-        group_count=$((group_count + 1))
+        group_rows+="$line"$'\n'
     done <<< "$rows"
+
+    group_rows="${group_rows%$'\n'}"
+    case "$headers_tsv" in
+        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
+            compact_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
+            compact_shrink="2,3,4,5,6,7"
+            ;;
+        $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
+            compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
+            compact_shrink="3,4,6,7,8,9,10"
+            ;;
+        $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
+            compact_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
+            compact_shrink="3,4,6"
+            ;;
+        *)
+            compact_headers=""
+            compact_shrink=""
+            ;;
+    esac
+    ui_render_forward_group_block "$current_user" "$group_rows" "$compact_headers" "$compact_shrink" "2"
 }
 
 ui_print_main_forward_summary() {
@@ -1803,7 +1992,7 @@ ui_menu_users() {
                 if [ "$UI_STATUS" -eq 0 ]; then
                     ui_notice_set "用户已添加：$UI_REPLY" "32"
                 fi
-                ui_pause
+                ui_maybe_pause success
                 ;;
             2)
                 ui_select_users_multi true || { ui_pause; continue; }
@@ -1832,7 +2021,7 @@ ui_menu_users() {
                 else
                     ui_warn "已取消"
                 fi
-                ui_pause
+                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -1903,7 +2092,7 @@ ui_menu_forwards() {
             1)
                 ui_menu_add_forward
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "32"
-                ui_pause
+                ui_maybe_pause success
                 ;;
             2)
                 ui_select_forward true || { ui_pause; continue; }
@@ -2019,7 +2208,7 @@ ui_menu_forwards() {
                     ui_run cmd_forward_update "${args[@]}"
                     [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "32"
                 fi
-                ui_pause
+                ui_maybe_pause success
                 ;;
             3)
                 ui_select_forwards_multi || { ui_pause; continue; }
@@ -2158,7 +2347,7 @@ ui_menu_expire_limit() {
                             ui_batch_print_result "$ok" "$fail"
                         fi
                     fi
-                    ui_pause
+                    ui_maybe_pause success
                     ;;
                 2)
                     local scope="" traffic="" rate="" args=() current_mode="" traffic_mode="" current_scope_mode=""
@@ -2240,7 +2429,7 @@ ui_menu_expire_limit() {
                             ui_warn "未修改"
                         fi
                     fi
-                    ui_pause
+                    ui_maybe_pause success
                     ;;
                 3)
                     echo "1) 立即重置"
@@ -2307,7 +2496,7 @@ ui_menu_expire_limit() {
                             ;;
                         *) ui_warn "无效选择" ;;
                     esac
-                    ui_pause
+                    ui_maybe_pause success
                     ;;
                 4)
                     local scope="" used="" args=()
@@ -2341,7 +2530,7 @@ ui_menu_expire_limit() {
                         continue
                     fi
                     ui_run cmd_traffic "${args[@]}"
-                    ui_pause
+                    ui_maybe_pause success
                     ;;
                 0) return 0 ;;
                 *) ui_warn "无效选择"; ui_pause ;;
@@ -2383,7 +2572,8 @@ ui_menu_telegram() {
                 else
                     ui_run cmd_user telegram "$user_id" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"
                 fi
-                ui_pause
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新" "32"
+                ui_maybe_pause success
                 ;;
             2)
                 ui_select_user true || { ui_pause; continue; }
@@ -2405,7 +2595,8 @@ ui_menu_telegram() {
                     daily_time="__KEEP__"
                 fi
                 ui_run cmd_notify_schedule --user-id "$schedule_user" --interval-minutes "$interval_value" --daily-time "$daily_time"
-                ui_pause
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "定时发送已更新：$schedule_user" "32"
+                ui_maybe_pause success
                 ;;
             3)
                 ui_select_users_multi true || { ui_pause; continue; }
@@ -2421,7 +2612,8 @@ ui_menu_telegram() {
                     fi
                 done <<< "$test_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_pause
+                ui_notice_set "测试通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                ui_maybe_pause success
                 ;;
             4)
                 ui_select_users_multi true || { ui_pause; continue; }
@@ -2437,7 +2629,8 @@ ui_menu_telegram() {
                     fi
                 done <<< "$enable_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_pause
+                ui_notice_set "启用通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                ui_maybe_pause success
                 ;;
             5)
                 ui_select_users_multi true || { ui_pause; continue; }
@@ -2453,7 +2646,8 @@ ui_menu_telegram() {
                     fi
                 done <<< "$disable_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_pause
+                ui_notice_set "停用通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                ui_maybe_pause success
                 ;;
             6)
                 ui_select_users_multi true || { ui_pause; continue; }
@@ -2473,10 +2667,11 @@ ui_menu_telegram() {
                         fi
                     done <<< "$delete_ids"
                     ui_batch_print_result "$ok" "$fail"
+                    ui_notice_set "删除通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 else
                     ui_warn "已取消"
                 fi
-                ui_pause
+                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -2493,7 +2688,8 @@ ui_menu_export_import() {
                 ui_edit_read "导出文件路径" "$(pfwd_default_export_path)" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_export "$UI_REPLY"
-                ui_pause
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导出：$UI_REPLY" "32"
+                ui_maybe_pause success
                 ;;
             2)
                 ui_edit_read "导入文件路径" "" || { ui_pause; continue; }
@@ -2506,10 +2702,11 @@ ui_menu_export_import() {
                 local import_path="$UI_REPLY"
                 if ui_confirm_text "import" "输入 import 确认覆盖当前配置"; then
                     ui_run cmd_import "$import_path"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导入：$import_path" "32"
                 else
                     ui_warn "已取消"
                 fi
-                ui_pause
+                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -2528,7 +2725,8 @@ ui_menu_update() {
         return 0
     fi
     ui_run cmd_update
-    ui_pause
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "pfwd 已更新" "32"
+    ui_maybe_pause success
 }
 
 ui_render_main_menu_page() {
@@ -2637,6 +2835,9 @@ cmd_menu() {
     ui_dependency_preflight
     config_init >/dev/null
     ui_runtime_install_preflight
+    ui_detect_color_support
+    ui_screen_enter
+    trap ui_menu_cleanup EXIT INT TERM
     while true; do
         ui_render_page ui_render_main_menu_page
         if ui_read_timed "选择" "$UI_REFRESH_INTERVAL"; then
@@ -2644,7 +2845,7 @@ cmd_menu() {
         else
             case "$?" in
                 124) continue ;;
-                *) return 0 ;;
+                *) break ;;
             esac
         fi
         case "$UI_REPLY" in
@@ -2655,8 +2856,9 @@ cmd_menu() {
             5) ui_menu_export_import ;;
             6) ui_menu_update ;;
             7) ui_menu_uninstall ;;
-            0) return 0 ;;
+            0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac
     done
+    ui_menu_cleanup
 }
