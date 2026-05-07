@@ -2177,11 +2177,119 @@ ui_select_user_for_telegram_config() {
     UI_REPLY="$user_id"
 }
 
+ui_select_users_for_telegram_config_multi() {
+    config_init >/dev/null
+    UI_EDIT_ABORTED=0
+    if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
+        ui_warn "暂无用户，请先添加用户"
+        return 1
+    fi
+    local rows=$'0\t返回\n1\t所有用户'
+    local user_count index raw indexes selected_count user_ids
+    local user_id
+    user_count="$(jq '.users | length' "$PFWD_CONFIG_FILE")"
+    index=2
+    while IFS= read -r user_id; do
+        rows+=$'\n'"$index"$'\t'"$user_id"
+        index=$((index + 1))
+    done < <(jq -r '.users[]?.id' "$PFWD_CONFIG_FILE")
+
+    ui_render_page ui_render_telegram_user_select_page_config "$rows"
+    ui_read "选择用户序号，可多选：2,4,6 或 2-5；1 表示所有用户" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$((user_count + 1))" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    selected_count="$(printf '%s\n' "$indexes" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if printf '%s\n' "$indexes" | grep -qx '1'; then
+        [ "$selected_count" = "1" ] || { ui_warn "“所有用户”只能单独选择"; return 1; }
+        UI_REPLY="__ALL_USERS__"
+        return 0
+    fi
+    user_ids="$(jq -r --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      [ .users[]?.id ] as $ids
+      | $idxs[]
+      | $ids[. - 2] // empty
+    ' "$PFWD_CONFIG_FILE")"
+    [ -n "$user_ids" ] || { ui_warn "用户序号不存在"; return 1; }
+    UI_REPLY="$user_ids"
+}
+
 ui_render_telegram_user_select_page() {
     local rows="$1"
     ui_header "选择用户"
     ui_notice_render
     ui_table_render $'序号\t用户' "$rows" "2"
+}
+
+ui_render_telegram_user_select_page_config() {
+    local rows="$1"
+    ui_header "选择用户"
+    ui_notice_render
+    ui_print_line "1 表示所有用户；也支持多选具体用户。" "36"
+    ui_table_render $'序号\t用户' "$rows" "2"
+}
+
+ui_telegram_configured_user_select_rows() {
+    local rows=""
+    local index=1 user status schedule
+    while IFS=$'\t' read -r user status schedule; do
+        [ -n "$user" ] || continue
+        rows+="$index"$'\t'"$user"$'\t'"$status"$'\t'"$schedule"$'\n'
+        index=$((index + 1))
+    done < <(ui_telegram_configured_user_rows)
+    printf '%s' "${rows%$'\n'}"
+}
+
+ui_render_telegram_user_select_page_configured() {
+    local rows="$1"
+    local empty="${2:-false}"
+    ui_header "选择已配置用户"
+    ui_notice_render
+    if [ "$empty" = "true" ]; then
+        ui_warn "暂无已配置用户，请先配置 Telegram。"
+        ui_table_render $'序号\t操作' "$rows" "2"
+    else
+        ui_print_line "支持多选：1,3,5 或 1-3" "36"
+        ui_table_render $'序号\t用户\t状态\t定时发送' "$rows" "2,4"
+    fi
+}
+
+ui_select_configured_users_multi() {
+    config_init >/dev/null
+    UI_EDIT_ABORTED=0
+    local configured_count rows raw indexes user_ids
+    configured_count="$(jq '[.users[]? | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")] | length' "$PFWD_CONFIG_FILE")"
+    if [ "$configured_count" -eq 0 ]; then
+        rows=$'0\t返回'
+        ui_render_page ui_render_telegram_user_select_page_configured "$rows" "true"
+        ui_read "选择 0 返回" || return 1
+        if [ "$UI_REPLY" = "0" ]; then
+            UI_EDIT_ABORTED=1
+            return 0
+        fi
+        ui_warn "暂无已配置用户，请先配置 Telegram。"
+        return 1
+    fi
+
+    rows="$(ui_telegram_configured_user_select_rows)"
+    ui_render_page ui_render_telegram_user_select_page_configured "$rows" "false"
+    ui_read "选择已配置用户序号，可多选：1,3,5 或 1-3" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$configured_count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    user_ids="$(jq -r --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      [
+        .users[]?
+        | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")
+        | .id
+      ] as $ids
+      | $idxs[]
+      | $ids[. - 1] // empty
+    ' "$PFWD_CONFIG_FILE")"
+    [ -n "$user_ids" ] || { ui_warn "用户序号不存在"; return 1; }
+    UI_REPLY="$user_ids"
 }
 
 ui_multiselect_normalize_tokens() {
@@ -3139,23 +3247,35 @@ ui_menu_telegram() {
         case "$UI_REPLY" in
             1)
                 UI_EDIT_ABORTED=0
-                ui_select_user_for_telegram_config || { ui_pause; continue; }
+                ui_select_users_for_telegram_config_multi || { ui_pause; continue; }
                 [ "${UI_EDIT_ABORTED:-0}" = "1" ] && continue
                 local user_id="$UI_REPLY" token="" chat_id="" server_name="" enabled="" tg="" token_default="" chat_id_default="" server_name_default=""
+                local selected_users="$UI_REPLY" selected_count target_user ok=0 fail=0
+                selected_count="$(printf '%s\n' "$selected_users" | sed '/^$/d' | wc -l | tr -d ' ')"
                 if [ "$user_id" = "__ALL_USERS__" ]; then
                     token_default=""
                     chat_id_default=""
                     server_name_default="$(hostname 2>/dev/null || echo pfwd)"
                     enabled="__KEEP__"
-                else
-                    tg="$(ui_user_telegram_config "$user_id")"
+                elif [ "$selected_count" = "1" ]; then
+                    target_user="$(printf '%s\n' "$selected_users" | sed -n '1p')"
+                    tg="$(ui_user_telegram_config "$target_user")"
                     enabled="$(jq -r '.enabled // false' <<< "$tg")"
                     token_default="$(jq -r '.bot_token // ""' <<< "$tg")"
                     chat_id_default="$(jq -r '.chat_id // ""' <<< "$tg")"
                     server_name_default="$(ui_user_telegram_server_name_default "$(jq -r '.server_name // ""' <<< "$tg")")"
+                else
+                    token_default=""
+                    chat_id_default=""
+                    server_name_default="$(hostname 2>/dev/null || echo pfwd)"
+                    enabled="__KEEP__"
                 fi
                 ui_form_set "Telegram 通知" "配置 Bot Token、Chat ID 和服务器名称。回车保留默认值。"
-                ui_form_add_kv "目标用户" "$user_id"
+                if [ "$user_id" = "__ALL_USERS__" ]; then
+                    ui_form_add_kv "目标用户" "所有用户"
+                else
+                    ui_form_add_kv "目标用户" "$(printf '%s\n' "$selected_users" | jq -Rrsc 'split("\n") | map(select(length > 0)) | join(", ")')"
+                fi
                 ui_form_read "Bot Token，例如 123456789:AA..." "$token_default" || { ui_form_reset; continue; }
                 token="$UI_REPLY"
                 ui_form_add_kv "Bot Token" "$token"
@@ -3168,10 +3288,27 @@ ui_menu_telegram() {
                 if [ "$user_id" = "__ALL_USERS__" ]; then
                     ui_run cmd_user telegram --all --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name"
                 else
-                    ui_run cmd_user telegram "$user_id" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"
+                    while IFS= read -r target_user; do
+                        [ -n "$target_user" ] || continue
+                        tg="$(ui_user_telegram_config "$target_user")"
+                        enabled="$(jq -r '.enabled // false' <<< "$tg")"
+                        if cmd_user telegram "$target_user" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"; then
+                            ok=$((ok + 1))
+                        else
+                            fail=$((fail + 1))
+                            ui_error "更新 Telegram 配置失败：$target_user"
+                        fi
+                    done <<< "$selected_users"
+                    UI_STATUS=0
+                    [ "$fail" -eq 0 ] || UI_STATUS=1
+                    ui_batch_print_result "$ok" "$fail"
                 fi
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新" "32"
+                if [ "$user_id" = "__ALL_USERS__" ]; then
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新：全部用户" "32"
+                else
+                    ui_notice_set "Telegram 配置更新完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                fi
                 ui_maybe_pause success
                 ;;
             2)
@@ -3202,7 +3339,7 @@ ui_menu_telegram() {
                 ui_maybe_pause success
                 ;;
             3)
-                ui_select_users_multi true || { ui_pause; continue; }
+                ui_select_configured_users_multi || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local test_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r user_id; do
