@@ -93,6 +93,12 @@ validate_traffic_mode() {
     esac
 }
 
+validate_traffic_ratio() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || pfwd_die "无效流量倍率：$value"
+    awk -v value="$value" 'BEGIN { exit !(value > 0) }' || pfwd_die "流量倍率必须大于 0：$value"
+}
+
 validate_forward_protocol() {
     local value="$1"
     case "$value" in
@@ -339,6 +345,31 @@ normalize_ui_rate_input() {
         return 0
     fi
     pfwd_die "无效速率：$1；支持数字(默认Mbps)或小数 + K/M/G、Kbps/Mbps/Gbps"
+}
+
+normalize_traffic_ratio_input() {
+    local raw="$1"
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    [ -n "$raw" ] || return 0
+    validate_traffic_ratio "$raw"
+    awk -v value="$raw" 'BEGIN {
+        formatted = sprintf("%.6f", value + 0)
+        sub(/0+$/, "", formatted)
+        sub(/[.]$/, "", formatted)
+        if (formatted == "") formatted = "1"
+        print formatted
+    }'
+}
+
+format_ratio() {
+    local raw="${1:-1}"
+    awk -v value="$raw" 'BEGIN {
+        formatted = sprintf("%.2f", value + 0)
+        sub(/0+$/, "", formatted)
+        sub(/[.]$/, "", formatted)
+        if (formatted == "") formatted = "1"
+        print formatted "x"
+    }'
 }
 
 format_bytes() {

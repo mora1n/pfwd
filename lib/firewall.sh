@@ -20,18 +20,16 @@ fw_tc_interface() {
 
 fw_forward_usage_expr() {
     local mode="$1"
-    local in_bytes="$2"
-    local out_bytes="$3"
-    # 双向按监听端口收发总和统计；单向取上行和下行较大值。
-    if [ "$mode" = "two-way" ]; then
-        echo $((in_bytes + out_bytes))
-    else
-        if [ "$in_bytes" -ge "$out_bytes" ]; then
-            echo "$in_bytes"
-        else
-            echo "$out_bytes"
-        fi
-    fi
+    local ratio="${2:-1}"
+    local in_bytes="$3"
+    local out_bytes="$4"
+    awk -v mode="$mode" -v ratio="$ratio" -v in_bytes="$in_bytes" -v out_bytes="$out_bytes" '
+        BEGIN {
+            factor = (mode == "one-way") ? 1 : 2
+            billed = int(in_bytes * ratio) + int(out_bytes * ratio)
+            printf "%.0f\n", billed * factor
+        }
+    '
 }
 
 fw_counter_names() {
@@ -256,9 +254,10 @@ fw_read_counters() {
     fi
     snapshot="$(stats_forward_snapshot_json "$nft_output")"
     jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" --slurpfile state "$PFWD_STATS_FILE" --argjson snap "$snapshot" '
-      def usage($mode; $in_bytes; $out_bytes):
-        # 这里的双向是监听端口收发总和；单向取上下行较大值。
-        if $mode == "one-way" then ([ $in_bytes, $out_bytes ] | max) else ($in_bytes + $out_bytes) end;
+      def mode_factor($mode):
+        if $mode == "one-way" then 1 else 2 end;
+      def billed_usage($mode; $ratio; $in_bytes; $out_bytes):
+        ((((($in_bytes * $ratio) | floor) + (($out_bytes * $ratio) | floor))) * mode_factor($mode));
       def fstate($id): $state[0].forwards[$id] // {};
       def ustate($id): $state[0].users[$id] // {};
       def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
@@ -278,7 +277,7 @@ fw_read_counters() {
         };
       def current_forward_billing($f):
         (fstate($f.id)) as $s |
-        (($s.billing_used_bytes // 0) + usage(($f.traffic_mode // "two-way"); pending_input_bytes($f.id); pending_output_bytes($f.id)));
+        (($s.billing_used_bytes // 0) + billed_usage(($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)));
       def user_snapshot($id):
         ($cfg[0].forwards | map(select(.user_id == $id))) as $items |
         {
@@ -290,7 +289,7 @@ fw_read_counters() {
           $cfg[0].forwards[] |
           select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
           (forward_totals(.id)) as $t |
-          usage(($mode // "two-way"); $t.input_bytes; $t.output_bytes)
+          billed_usage(($mode // "two-way"); (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes)
         ] | add // 0;
       def user_billing($u):
         (ustate($u.id)) as $s |
@@ -305,9 +304,9 @@ fw_read_counters() {
           . + {
             input_bytes: $t.input_bytes,
             output_bytes: $t.output_bytes,
-            one_way_bytes: usage("one-way"; $t.input_bytes; $t.output_bytes),
-            two_way_bytes: ($t.input_bytes + $t.output_bytes),
-            total_bytes: usage((.traffic_mode // "two-way"); $t.input_bytes; $t.output_bytes),
+            one_way_bytes: billed_usage("one-way"; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
+            two_way_bytes: billed_usage("two-way"; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
+            total_bytes: billed_usage((.traffic_mode // "two-way"); (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
             billing_used_bytes: current_forward_billing($f)
           }
         ],
@@ -321,7 +320,7 @@ fw_read_counters() {
               $cfg[0].forwards[] |
               select(.user_id == $u.id and ((.traffic_mode // "two-way") != "one-way")) |
               (forward_totals(.id)) as $t |
-              usage((.traffic_mode // "two-way"); $t.input_bytes; $t.output_bytes)
+              billed_usage((.traffic_mode // "two-way"); (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes)
             ] | add // 0
           ) as $two_way_used |
           . + {

@@ -68,6 +68,7 @@ stats_forward_snapshot_json() {
           id: $f.id,
           user_id: $f.user_id,
           traffic_mode: ($f.traffic_mode // "two-way"),
+          traffic_ratio: ($f.traffic_ratio // 1),
           input_bytes: counter_bytes("fwd_" + $safe + "_in"),
           output_bytes: counter_bytes("fwd_" + $safe + "_out")
         }
@@ -79,9 +80,10 @@ stats_rollup_counters() {
     local snapshot="$1"
     stats_init >/dev/null
     stats_update --argjson snap "$snapshot" --slurpfile cfg "$PFWD_CONFIG_FILE" '
-      def usage($mode; $in_delta; $out_delta):
-        # 双向延续监听端口收发总和语义；单向取上下行较大值。
-        if $mode == "one-way" then ([ $in_delta, $out_delta ] | max) else ($in_delta + $out_delta) end;
+      def mode_factor($mode):
+        if $mode == "one-way" then 1 else 2 end;
+      def billed_usage($mode; $ratio; $in_delta; $out_delta):
+        ((((($in_delta * $ratio) | floor) + (($out_delta * $ratio) | floor))) * mode_factor($mode));
       def user_forward_sum($state; $user_id):
         [ $cfg[0].forwards[]? | select(.user_id == $user_id) | ($state.forwards[.id].billing_used_bytes // 0) ]
         | add // 0;
@@ -100,7 +102,7 @@ stats_rollup_counters() {
           (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
           (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
           .forwards[$f.id] = ($old + {
-            billing_used_bytes: (($old.billing_used_bytes // 0) + usage($f.traffic_mode; $in_delta; $out_delta)),
+            billing_used_bytes: (($old.billing_used_bytes // 0) + billed_usage($f.traffic_mode; ($f.traffic_ratio // 1); $in_delta; $out_delta)),
             input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
             output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
             input_base_bytes: $f.input_bytes,
@@ -153,10 +155,12 @@ stats_set_user_used() {
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
     stats_update --arg id "$user_id" --argjson used "$used" --argjson snap "$snapshot" '
-      def usage($mode; $in_delta; $out_delta):
-        if $mode == "one-way" then ([ $in_delta, $out_delta ] | max) else ($in_delta + $out_delta) end;
+      def mode_factor($mode):
+        if $mode == "one-way" then 1 else 2 end;
+      def billed_usage($mode; $ratio; $in_delta; $out_delta):
+        ((((($in_delta * $ratio) | floor) + (($out_delta * $ratio) | floor))) * mode_factor($mode));
       def snap_forward($fid):
-        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", input_bytes: 0, output_bytes: 0});
+        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", traffic_ratio: 1, input_bytes: 0, output_bytes: 0});
       ($snap | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
       ($snap | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
       ([ $snap[] | select(.user_id == $id) | .id ]) as $forward_ids |
@@ -168,7 +172,7 @@ stats_set_user_used() {
             (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
             (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
             .[$fid] = ($old + {
-              billing_used_bytes: (($old.billing_used_bytes // 0) + usage(($f.traffic_mode // "two-way"); $in_delta; $out_delta)),
+              billing_used_bytes: (($old.billing_used_bytes // 0) + billed_usage(($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1); $in_delta; $out_delta)),
               input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
               output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
               input_base_bytes: ($f.input_bytes // 0),

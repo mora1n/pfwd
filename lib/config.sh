@@ -352,10 +352,11 @@ config_validate_new_forward() {
     local stop_at="$5"
     local traffic_mode="$6"
     local protocol="$7"
-    local mss_mode="${8:-}"
-    local mss_value="${9:-}"
-    local snat_mode="${10:-masquerade}"
-    local snat_source="${11:-}"
+    local traffic_ratio="${8:-1.0}"
+    local mss_mode="${9:-}"
+    local mss_value="${10:-}"
+    local snat_mode="${11:-masquerade}"
+    local snat_source="${12:-}"
 
     validate_user_id "$user_id"
     validate_listen_ip "$listen_ip"
@@ -363,6 +364,7 @@ config_validate_new_forward() {
     validate_host_port "$remote"
     validate_traffic_mode "$traffic_mode"
     validate_forward_protocol "$protocol"
+    validate_traffic_ratio "$traffic_ratio"
     validate_mss_mode "$mss_mode"
     validate_snat_mode "$snat_mode"
     if [ "$mss_mode" = "set" ]; then
@@ -399,15 +401,17 @@ config_validate_forward_batch() {
     local stop_at="$6"
     local traffic_mode="$7"
     local protocol="$8"
-    local mss_mode="${9:-}"
-    local mss_value="${10:-}"
-    local snat_mode="${11:-masquerade}"
-    local snat_source="${12:-}"
+    local traffic_ratio="${9:-1.0}"
+    local mss_mode="${10:-}"
+    local mss_value="${11:-}"
+    local snat_mode="${12:-masquerade}"
+    local snat_source="${13:-}"
 
     validate_user_id "$user_id"
     validate_listen_ip "$listen_ip"
     validate_traffic_mode "$traffic_mode"
     validate_forward_protocol "$protocol"
+    validate_traffic_ratio "$traffic_ratio"
     validate_mss_mode "$mss_mode"
     validate_snat_mode "$snat_mode"
     if [ "$mss_mode" = "set" ]; then
@@ -463,14 +467,16 @@ config_add_forward() {
     local stop_at="$5"
     local traffic_mode="$6"
     local protocol="$7"
-    local comment="${8:-}"
-    local mss_mode="${9:-}"
-    local mss_value="${10:-}"
-    local snat_mode="${11:-masquerade}"
-    local snat_source="${12:-}"
+    local traffic_ratio="${8:-1.0}"
+    local comment="${9:-}"
+    local mss_mode="${10:-}"
+    local mss_value="${11:-}"
+    local snat_mode="${12:-masquerade}"
+    local snat_source="${13:-}"
 
     [ -z "$stop_at" ] || stop_at="$(normalize_date_input "$stop_at")"
-    config_validate_new_forward "$user_id" "$listen_ip" "$listen_port" "$remote" "$stop_at" "$traffic_mode" "$protocol" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
+    traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio")"
+    config_validate_new_forward "$user_id" "$listen_ip" "$listen_port" "$remote" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
 
     local id now remote_host remote_port parsed
     id="$(pfwd_id fwd)"
@@ -489,6 +495,7 @@ config_add_forward() {
       --arg stop_at "$stop_at" \
       --arg traffic_mode "$traffic_mode" \
       --arg protocol "$protocol" \
+      --arg traffic_ratio "$traffic_ratio" \
       --arg comment "$comment" \
       --arg mss_mode "$mss_mode" \
       --arg mss_value "$mss_value" \
@@ -506,6 +513,7 @@ config_add_forward() {
         "enabled": true,
         "stop_at": (if $stop_at == "" then null else $stop_at end),
         "traffic_mode": $traffic_mode,
+        "traffic_ratio": ($traffic_ratio | tonumber),
         "comment": (if $comment == "" then null else $comment end),
         "nft": {
           "mss_mode": (if $mss_mode == "" then null else $mss_mode end),
@@ -533,14 +541,16 @@ config_add_forward_batch() {
     local stop_at="$6"
     local traffic_mode="$7"
     local protocol="$8"
-    local comment="${9:-}"
-    local mss_mode="${10:-}"
-    local mss_value="${11:-}"
-    local snat_mode="${12:-masquerade}"
-    local snat_source="${13:-}"
+    local traffic_ratio="${9:-1.0}"
+    local comment="${10:-}"
+    local mss_mode="${11:-}"
+    local mss_value="${12:-}"
+    local snat_mode="${13:-masquerade}"
+    local snat_source="${14:-}"
 
     [ -z "$stop_at" ] || stop_at="$(normalize_date_input "$stop_at")"
-    config_validate_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
+    traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio")"
+    config_validate_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
 
     local count id now jq_forwards="[]" listen_port remote_port
     count="$(printf '%s\n' "$listen_ports" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -560,6 +570,7 @@ config_add_forward_batch() {
           --arg stop_at "$stop_at" \
           --arg traffic_mode "$traffic_mode" \
           --arg protocol "$protocol" \
+          --arg traffic_ratio "$traffic_ratio" \
           --arg comment "$comment" \
           --arg mss_mode "$mss_mode" \
           --arg mss_value "$mss_value" \
@@ -577,6 +588,7 @@ config_add_forward_batch() {
             "enabled": true,
             "stop_at": (if $stop_at == "" then null else $stop_at end),
             "traffic_mode": $traffic_mode,
+            "traffic_ratio": ($traffic_ratio | tonumber),
             "comment": (if $comment == "" then null else $comment end),
             "nft": {
               "mss_mode": (if $mss_mode == "" then null else $mss_mode end),
@@ -769,18 +781,19 @@ config_update_forward() {
     local stop_at_raw="$6"
     local protocol_raw="$7"
     local traffic_mode_raw="$8"
-    local comment_raw="${9:-__KEEP__}"
-    local mss_mode_raw="${10:-__KEEP__}"
-    local mss_value_raw="${11:-__KEEP__}"
-    local snat_mode_raw="${12:-__KEEP__}"
-    local snat_source_raw="${13:-__KEEP__}"
+    local traffic_ratio_raw="${9:-__KEEP__}"
+    local comment_raw="${10:-__KEEP__}"
+    local mss_mode_raw="${11:-__KEEP__}"
+    local mss_value_raw="${12:-__KEEP__}"
+    local snat_mode_raw="${13:-__KEEP__}"
+    local snat_source_raw="${14:-__KEEP__}"
 
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
 
     local current
     current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
 
-    local current_listen_ip current_listen_port current_remote_host current_remote_port current_stop_at current_protocol current_traffic_mode
+    local current_listen_ip current_listen_port current_remote_host current_remote_port current_stop_at current_protocol current_traffic_mode current_traffic_ratio
     current_listen_ip="$(jq -r '.listen_ip // ""' <<< "$current")"
     current_listen_port="$(jq -r '.listen_port' <<< "$current")"
     current_remote_host="$(jq -r '.remote_host' <<< "$current")"
@@ -788,8 +801,9 @@ config_update_forward() {
     current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
     current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
     current_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
+    current_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
 
-    local new_listen_ip new_listen_port new_remote_host new_remote_port new_stop_at new_protocol new_traffic_mode remote_spec
+    local new_listen_ip new_listen_port new_remote_host new_remote_port new_stop_at new_protocol new_traffic_mode new_traffic_ratio remote_spec
     local current_comment current_mss_mode current_mss_value current_snat_mode current_snat_source
     local new_comment new_mss_mode new_mss_value new_snat_mode new_snat_source
     current_comment="$(jq -r '.comment // ""' <<< "$current")"
@@ -861,6 +875,15 @@ config_update_forward() {
         *)
             validate_traffic_mode "$traffic_mode_raw"
             new_traffic_mode="$traffic_mode_raw"
+            ;;
+    esac
+
+    case "$traffic_ratio_raw" in
+        __KEEP__|"")
+            new_traffic_ratio="$current_traffic_ratio"
+            ;;
+        *)
+            new_traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio_raw")"
             ;;
     esac
 
@@ -958,6 +981,7 @@ config_update_forward() {
       --arg stop_at "$new_stop_at" \
       --arg protocol "$new_protocol" \
       --arg traffic_mode "$new_traffic_mode" \
+      --arg traffic_ratio "$new_traffic_ratio" \
       --arg comment "$new_comment" \
       --arg mss_mode "$new_mss_mode" \
       --arg mss_value "$new_mss_value" \
@@ -972,6 +996,7 @@ config_update_forward() {
           | .stop_at = (if $stop_at == "" then null else $stop_at end)
           | .protocol = $protocol
           | .traffic_mode = $traffic_mode
+          | .traffic_ratio = ($traffic_ratio | tonumber)
           | .comment = (if $comment == "" then null else $comment end)
           | .nft = {
               "mss_mode": (if $mss_mode == "" then null else $mss_mode end),

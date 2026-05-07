@@ -83,14 +83,14 @@ notify_status_message() {
         printf '用户：<b>%s</b>\n' "$user_name"
         printf '转发数：%s\n' "$(echo "$stats" | jq -r '.forwards | length')"
         printf '计费用量：%s\n' "$(format_bytes "$(echo "$user_json" | jq -r '.billing_used_bytes // 0')")"
-        printf '双向流量：%s\n' "$(format_bytes "$(echo "$user_json" | jq -r '.two_way_bytes // 0')")"
-        printf '单向流量：%s\n' "$(format_bytes "$(echo "$user_json" | jq -r '.one_way_bytes // 0')")"
+        printf '双向计费：%s\n' "$(format_bytes "$(echo "$user_json" | jq -r '.two_way_bytes // 0')")"
+        printf '单向计费：%s\n' "$(format_bytes "$(echo "$user_json" | jq -r '.one_way_bytes // 0')")"
         printf '总流量限制：%s\n' "$(ui_format_limit "$total_limit")"
         printf '重置日：%s\n' "$reset_day"
         printf '\n<b>端口明细</b>\n'
         if jq -e '.forwards | length > 0' <<< "$stats" >/dev/null; then
             jq -c '.forwards[]' <<< "$stats" | while IFS= read -r row; do
-                local enabled listen_port input_bytes output_bytes total_bytes limit rate stop_at status_text
+                local enabled listen_port input_bytes output_bytes total_bytes limit rate stop_at status_text ratio
                 local protocol
                 enabled="$(echo "$row" | jq -r '.enabled')"
                 listen_port="$(echo "$row" | jq -r '.listen_port')"
@@ -98,6 +98,7 @@ notify_status_message() {
                 input_bytes="$(echo "$row" | jq -r '.input_bytes // 0')"
                 output_bytes="$(echo "$row" | jq -r '.output_bytes // 0')"
                 total_bytes="$(echo "$row" | jq -r '.total_bytes // 0')"
+                ratio="$(echo "$row" | jq -r '(.traffic_ratio // 1) | tostring')"
                 limit="$(echo "$row" | jq -r '.limits.traffic_bytes // "null"')"
                 rate="$(echo "$row" | jq -r '.limits.rate // "null"')"
                 if [ -z "$rate" ] || [ "$rate" = "null" ]; then
@@ -109,7 +110,7 @@ notify_status_message() {
                 else
                     status_text="暂停"
                 fi
-                printf '%s 端口 <b>%s</b> | 协议 %s | 状态 %s | 总量 %s | 上行 %s | 下行 %s | 速率 %s | 限额 %s | 到期 %s\n' \
+                printf '%s 端口 <b>%s</b> | 协议 %s | 状态 %s | 计费总量 %s | 上行 %s | 下行 %s | 倍率 %s | 速率 %s | 限额 %s | 到期 %s\n' \
                     "$(notify_status_icon "$enabled")" \
                     "$listen_port" \
                     "$(ui_protocol_label "$protocol")" \
@@ -117,6 +118,7 @@ notify_status_message() {
                     "$(format_bytes "$total_bytes")" \
                     "$(format_bytes "$input_bytes")" \
                     "$(format_bytes "$output_bytes")" \
+                    "$(format_ratio "$ratio")" \
                     "$(notify_rate_text "$rate")" \
                     "$(ui_format_limit "$limit")" \
                     "$stop_at"

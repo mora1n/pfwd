@@ -183,13 +183,13 @@ pfwd - nft 端口转发管理脚本
   pfwd user list
   pfwd user delete <username>
   pfwd user telegram <username>|--all --bot-token TOKEN --chat-id CHAT_ID [--server-name NAME] [--enabled true|false]
-  pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --listen-port PORT[,PORT]|START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
-  pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --random-port START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
+  pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --listen-port PORT[,PORT]|START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
+  pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --random-port START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
   pfwd list [--user-id ID]
   pfwd start <forward_id>
   pfwd stop <forward_id>
   pfwd delete <forward_id>
-  pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]
+  pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]
   pfwd expire set <forward_id> --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d
   pfwd expire clear <forward_id>
   pfwd expire user-set --user-id ID --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d

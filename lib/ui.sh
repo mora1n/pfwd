@@ -1505,7 +1505,11 @@ ui_select_traffic_mode() {
     local prompt="$1"
     local allow_empty="${2:-false}"
     UI_TRAFFIC_MODE=""
-    ui_form_select_read "$prompt" "2" "1) 单向" "2) 双向" || return 1
+    ui_form_select_read "$prompt" "2" \
+        "1) 单向计费" \
+        "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" \
+        "2) 双向计费" \
+        "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1
     if [ "$allow_empty" = "true" ] && [ -z "$UI_REPLY" ]; then
         UI_TRAFFIC_MODE=""
         return 0
@@ -1523,9 +1527,9 @@ ui_select_traffic_mode_edit() {
     UI_TRAFFIC_MODE=""
     UI_EDIT_ABORTED=0
     case "$current_mode" in
-        one-way) ui_form_select_read "$prompt" "1" "1) 单向" "2) 双向" || return 1 ;;
-        two-way) ui_form_select_read "$prompt" "2" "1) 单向" "2) 双向" || return 1 ;;
-        *) ui_form_select_read "$prompt" "" "1) 单向" "2) 双向" || return 1 ;;
+        one-way) ui_form_select_read "$prompt" "1" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
+        two-way) ui_form_select_read "$prompt" "2" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
+        *) ui_form_select_read "$prompt" "" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
     esac
     case "$UI_REPLY" in
         0)
@@ -1540,6 +1544,24 @@ ui_select_traffic_mode_edit() {
         2) UI_TRAFFIC_MODE="two-way" ;;
         *) ui_warn "无效选择"; return 1 ;;
     esac
+}
+
+ui_read_traffic_ratio() {
+    local prompt="$1"
+    local default="${2:-1.0}"
+    UI_TRAFFIC_RATIO=""
+    ui_form_read "$prompt" "$default" || return 1
+    UI_TRAFFIC_RATIO="$(normalize_traffic_ratio_input "$UI_REPLY")"
+}
+
+ui_read_traffic_ratio_edit() {
+    local prompt="$1"
+    local default="${2:-1.0}"
+    UI_TRAFFIC_RATIO=""
+    UI_EDIT_ABORTED=0
+    ui_form_edit_read "$prompt" "$default" || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    UI_TRAFFIC_RATIO="$(normalize_traffic_ratio_input "$UI_REPLY")"
 }
 
 ui_missing_dependencies() {
@@ -1756,6 +1778,7 @@ ui_main_forward_rows() {
           (.input_bytes // "0"),
           (.output_bytes // "0"),
           (.stop_at // "-"),
+          ((.traffic_ratio // 1) | tostring),
           (if (.comment // "") == "" then "-" else .comment end)
         ]
       | @tsv
@@ -1779,11 +1802,11 @@ ui_user_list_rows() {
 
 ui_forward_list_rows() {
     local rows=""
-    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode mss_display snat_display comment; do
+    while IFS=$'\t' read -r index user enabled listen_ip listen_port remote_host remote_port protocol stop_at mode ratio mss_display snat_display comment; do
         local listen remote
         listen="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         remote="$(ui_format_remote "$remote_host" "$remote_port")"
-        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+        rows+="$index"$'\t'"$user"$'\t'"$listen"$'\t'"$remote"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\t'"$mode"$'\t'"$(format_ratio "$ratio")"$'\t'"$mss_display"$'\t'"$snat_display"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(jq -r '
       (.forwards | sort_by(.user_id, .listen_port, .id))
       | to_entries[]
@@ -1798,6 +1821,7 @@ ui_forward_list_rows() {
           (.value.protocol // "tcp_udp"),
           (.value.stop_at // "-"),
           (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
+          ((.value.traffic_ratio // 1) | tostring),
           (
             if (.value.nft.mss_mode // "") == "set" then
               ((.value.nft.mss_value // "-") | tostring)
@@ -1920,8 +1944,8 @@ ui_print_user_traffic_summary() {
     rows+="总限额"$'\t'"$(ui_format_limit "$total_limit")"$'\n'
     rows+="每端口速率"$'\t'"$(ui_format_rate "$rate")"$'\n'
     rows+="计费用量"$'\t'"$(format_bytes "$used")"$'\n'
-    rows+="双向"$'\t'"$(format_bytes "$two_way")"$'\n'
-    rows+="单向"$'\t'"$(format_bytes "$one_way")"
+    rows+="双向计费"$'\t'"$(format_bytes "$two_way")"$'\n'
+    rows+="单向计费"$'\t'"$(format_bytes "$one_way")"
     ui_table_render $'项目\t值' "$rows" "2"
 }
 
@@ -1939,7 +1963,7 @@ ui_print_main_user_summary() {
         rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
     done < <(ui_main_user_rows "$data")
     rows="${rows%$'\n'}"
-    ui_table_render $'用户名\t转发数\t计费用量\t双向\t单向\t总限额\t重置日' "$rows" "1,6,7"
+    ui_table_render $'用户名\t转发数\t计费用量\t双向计费\t单向计费\t总限额\t重置日' "$rows" "1,6,7"
 }
 
 ui_render_forward_groups() {
@@ -1947,7 +1971,7 @@ ui_render_forward_groups() {
     local headers_tsv="$2"
     local empty_text="$4"
     local current_user="" line user first_group=true
-    local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11=""
+    local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11="" col12=""
     local group_rows="" group_headers="" group_shrink="" row_buffer=""
 
     if [ -z "$rows" ]; then
@@ -1961,7 +1985,7 @@ ui_render_forward_groups() {
         local block_headers="$3"
         local block_shrink="$4"
         local block_line="" block_enabled="" block_user_id=""
-        local block_col3="" block_col4="" block_col5="" block_col6="" block_col7="" block_col8="" block_col9="" block_col10="" block_col11=""
+        local block_col3="" block_col4="" block_col5="" block_col6="" block_col7="" block_col8="" block_col9="" block_col10="" block_col11="" block_col12=""
         local block_display_state=""
         local render_rows=""
 
@@ -1969,13 +1993,13 @@ ui_render_forward_groups() {
         ui_print_line "用户：$block_user" "1;36"
         while IFS= read -r block_line; do
             [ -n "$block_line" ] || continue
-            IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 <<< "$block_line"
+            IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 block_col12 <<< "$block_line"
             case "$headers_tsv" in
-                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(ui_display_or_dash "$block_col8")"$'\n'
+                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
+                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(format_ratio "$block_col8")"$'\t'"$(ui_display_or_dash "$block_col9")"$'\n'
                     ;;
-                $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\t'"$block_col8"$'\t'"$block_col9"$'\t'"$block_col10"$'\t'"$(ui_display_or_dash "$block_col11")"$'\n'
+                $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
+                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\t'"$block_col8"$'\t'"$(format_ratio "$block_col9")"$'\t'"$block_col10"$'\t'"$block_col11"$'\t'"$(ui_display_or_dash "$block_col12")"$'\n'
                     ;;
                 $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
                     render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\n'
@@ -1996,13 +2020,13 @@ ui_render_forward_groups() {
         if [ -z "$current_user" ] || [ "$user" != "$current_user" ]; then
             if [ "$first_group" = "false" ]; then
                 case "$headers_tsv" in
-                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
-                        group_shrink="2,3,4,5,6,7"
+                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
+                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
+                        group_shrink="2,3,4,5,6,7,8"
                         ;;
-                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
-                        group_shrink="3,4,6,7,8,9,10"
+                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
+                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
+                        group_shrink="3,4,6,7,8,9,10,11"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
                         group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
@@ -2025,13 +2049,13 @@ ui_render_forward_groups() {
 
     group_rows="${group_rows%$'\n'}"
     case "$headers_tsv" in
-        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注')
-            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t备注'
-            group_shrink="2,3,4,5,6,7"
+        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
+            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
+            group_shrink="2,3,4,5,6,7,8"
             ;;
-        $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注')
-            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\tMSS\tSNAT\t备注'
-            group_shrink="3,4,6,7,8,9,10"
+        $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
+            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
+            group_shrink="3,4,6,7,8,9,10,11"
             ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
             group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
@@ -2055,14 +2079,14 @@ ui_print_main_forward_summary() {
         return
     fi
 
-    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at comment; do
+    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at ratio comment; do
         local remote_text listen_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
-        rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+        rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(format_ratio "$ratio")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(ui_main_forward_rows "$data")
     rows="${rows%$'\n'}"
-    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t备注' "4,8,2,7,3" "暂无转发，先按上面的流程添加转发。"
+    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注' "4,9,2,7,3" "暂无转发，先按上面的流程添加转发。"
 }
 
 ui_print_main_forwards() {
@@ -2081,7 +2105,7 @@ ui_print_forward_list() {
         echo "暂无转发"
         return
     fi
-    ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\tMSS\tSNAT\t备注' "4,11,2,7,8,10,3" "暂无转发"
+    ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注' "4,12,2,7,8,10,3" "暂无转发"
 }
 
 ui_print_user_list() {
@@ -2520,7 +2544,7 @@ ui_menu_users() {
 }
 
 ui_menu_add_forward() {
-    local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode comment args=()
+    local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode traffic_ratio comment args=()
     ui_form_set "添加转发" "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
     ui_select_user true || return 0
     [ "$UI_EDIT_ABORTED" = "1" ] && return 0
@@ -2553,9 +2577,12 @@ ui_menu_add_forward() {
     ui_select_protocol "转发协议" || return 0
     protocol="$UI_REPLY"
     ui_form_add_kv "转发协议" "$(ui_protocol_label "$protocol")"
-    ui_select_traffic_mode "流量模式" || return 0
+    ui_select_traffic_mode "计费模式" || return 0
     traffic_mode="$UI_TRAFFIC_MODE"
-    ui_form_add_kv "流量模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向" || echo "双向" )"
+    ui_form_add_kv "计费模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
+    ui_read_traffic_ratio "流量倍率，默认 1.0" "1.0" || return 0
+    traffic_ratio="$UI_TRAFFIC_RATIO"
+    ui_form_add_kv "倍率" "$(format_ratio "$traffic_ratio")"
     ui_form_read "备注，留空不设置" || return 0
     comment="$UI_REPLY"
     ui_form_add_kv "备注" "$comment"
@@ -2572,7 +2599,7 @@ ui_menu_add_forward() {
         ui_form_add_kv "SNAT" "masquerade"
     fi
 
-    args=(--user-id "$user_id" --remote "$remote" --listen-ip "$listen_ip" --protocol "$protocol" --traffic-mode "$traffic_mode")
+    args=(--user-id "$user_id" --remote "$remote" --listen-ip "$listen_ip" --protocol "$protocol" --traffic-mode "$traffic_mode" --traffic-ratio "$traffic_ratio")
     if [ -n "$listen_port" ]; then
         args+=(--listen-port "$listen_port")
     else
@@ -2607,9 +2634,9 @@ ui_menu_forwards() {
             2)
                 ui_select_forward true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_comment=""
+                local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_ratio="" current_comment=""
                 local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
-                local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" comment="" args=()
+                local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" traffic_ratio="" comment="" args=()
                 current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
                 current_listen_ip="$(jq -r '.listen_ip // "::"' <<< "$current")"
                 current_listen_port="$(jq -r '.listen_port' <<< "$current")"
@@ -2618,6 +2645,7 @@ ui_menu_forwards() {
                 current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
                 current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
                 current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
+                current_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
                 current_comment="$(jq -r '.comment // ""' <<< "$current")"
                 current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$current")"
                 current_mss_value="$(jq -r '.nft.mss_value // ""' <<< "$current")"
@@ -2631,7 +2659,8 @@ ui_menu_forwards() {
                 ui_form_add_kv "当前目标 IP/域名" "$current_remote_host"
                 ui_form_add_kv "当前目标端口" "$current_remote_port"
                 ui_form_add_kv "当前协议" "$(ui_protocol_label "$current_protocol")"
-                ui_form_add_kv "当前流量模式" "$( [ "$current_mode" = "one-way" ] && echo "单向" || echo "双向" )"
+                ui_form_add_kv "当前计费模式" "$( [ "$current_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
+                ui_form_add_kv "当前倍率" "$(format_ratio "$current_ratio")"
                 ui_form_add_kv "当前到期日" "${current_stop_at:-}"
                 ui_form_add_kv "当前备注" "$current_comment"
 
@@ -2665,10 +2694,15 @@ ui_menu_forwards() {
                 protocol="$UI_REPLY"
                 [ -z "$protocol" ] || ui_form_add_kv "新协议" "$(ui_protocol_label "$protocol")"
 
-                ui_select_traffic_mode_edit "流量模式" "$current_mode" || { ui_pause; continue; }
+                ui_select_traffic_mode_edit "计费模式" "$current_mode" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                 traffic_mode="$UI_TRAFFIC_MODE"
-                [ -z "$traffic_mode" ] || ui_form_add_kv "新流量模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向" || echo "双向" )"
+                [ -z "$traffic_mode" ] || ui_form_add_kv "新计费模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
+
+                ui_read_traffic_ratio_edit "流量倍率" "$current_ratio" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                traffic_ratio="$UI_TRAFFIC_RATIO"
+                ui_form_add_kv "新倍率" "$(format_ratio "$traffic_ratio")"
 
                 ui_form_edit_read "备注" "$current_comment" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
@@ -2701,6 +2735,7 @@ ui_menu_forwards() {
                 fi
                 [ -z "$protocol" ] || [ "$protocol" = "$current_protocol" ] || args+=(--protocol "$protocol")
                 [ -z "$traffic_mode" ] || [ "$traffic_mode" = "$current_mode" ] || args+=(--traffic-mode "$traffic_mode")
+                [ -z "$traffic_ratio" ] || [ "$traffic_ratio" = "$current_ratio" ] || args+=(--traffic-ratio "$traffic_ratio")
                 if [ "$comment" = "-" ]; then
                     [ -n "$current_comment" ] && args+=(--clear-comment)
                 elif [ "$comment" != "$current_comment" ]; then

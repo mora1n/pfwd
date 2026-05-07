@@ -306,7 +306,7 @@ cmd_notify_delete() {
 
 cmd_add() {
     local user_id="" remote="" listen_ip="" listen_port="" random_range="" stop_at="" protocol="tcp_udp" traffic_mode="two-way"
-    local comment="" mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
+    local traffic_ratio="1.0" comment="" mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
     config_init >/dev/null
     listen_ip="$(jq -r '.settings.default_listen_ip // "::"' "$PFWD_CONFIG_FILE")"
 
@@ -320,6 +320,7 @@ cmd_add() {
             --stop-at) stop_at="${2:-}"; shift 2 ;;
             --protocol) protocol="${2:-}"; shift 2 ;;
             --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            --traffic-ratio) traffic_ratio="${2:-}"; shift 2 ;;
             --comment) comment="${2:-}"; shift 2 ;;
             --mss-clamp) mss_mode="clamp"; mss_value=""; shift ;;
             --mss) mss_mode="set"; mss_value="${2:-}"; shift 2 ;;
@@ -353,7 +354,7 @@ cmd_add() {
         listen_ports="$(expand_port_spec "$listen_port")"
     fi
 
-    forward_ids="$(config_add_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source")"
+    forward_ids="$(config_add_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source")"
     count="$(printf '%s\n' "$forward_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
     echo "转发已添加：$count 条"
     printf '%s\n' "$forward_ids" | sed '/^$/d' | sed 's/^/  /'
@@ -378,7 +379,7 @@ cmd_list() {
           .forwards[]?
           | select(.user_id == $id)
           | (.nft.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode, (.nft.mss_mode // "-"), (if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.nft.mss_mode // "-"),(if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     else
@@ -389,7 +390,7 @@ cmd_list() {
             end;
           .forwards[]?
           | (.nft.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode, (.nft.mss_mode // "-"), (if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.nft.mss_mode // "-"),(if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     fi
@@ -507,7 +508,7 @@ cmd_forward_update() {
     local forward_id=""
     local listen_ip="__KEEP__" listen_port="__KEEP__" remote_host="__KEEP__" remote_port="__KEEP__"
     local stop_at="__KEEP__" protocol="__KEEP__" traffic_mode="__KEEP__"
-    local comment="__KEEP__" mss_mode="__KEEP__" mss_value="__KEEP__" snat_mode="__KEEP__" snat_source="__KEEP__"
+    local traffic_ratio="__KEEP__" comment="__KEEP__" mss_mode="__KEEP__" mss_value="__KEEP__" snat_mode="__KEEP__" snat_source="__KEEP__"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --forward-id) forward_id="${2:-}"; shift 2 ;;
@@ -519,6 +520,7 @@ cmd_forward_update() {
             --clear-stop-at) stop_at="__CLEAR__"; shift ;;
             --protocol) protocol="${2:-}"; shift 2 ;;
             --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            --traffic-ratio) traffic_ratio="${2:-}"; shift 2 ;;
             --comment) comment="${2:-}"; shift 2 ;;
             --clear-comment) comment="__CLEAR__"; shift ;;
             --mss-clamp) mss_mode="clamp"; mss_value="__CLEAR__"; shift ;;
@@ -530,7 +532,7 @@ cmd_forward_update() {
         esac
     done
     [ -n "$forward_id" ] || pfwd_die "必须提供 --forward-id"
-    config_update_forward "$forward_id" "$listen_ip" "$listen_port" "$remote_host" "$remote_port" "$stop_at" "$protocol" "$traffic_mode" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
+    config_update_forward "$forward_id" "$listen_ip" "$listen_port" "$remote_host" "$remote_port" "$stop_at" "$protocol" "$traffic_mode" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
     echo "转发已更新：$forward_id"
     cmd_refresh_after_change
 }
