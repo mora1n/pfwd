@@ -15,12 +15,15 @@ notify_html_escape() {
 notify_send_telegram() {
     local user_id="$1"
     local message="$2"
+    local require_enabled="${3:-true}"
     config_init >/dev/null
     local tg enabled token chat_id
     tg="$(notify_user_config "$user_id")"
     [ -n "$tg" ] && [ "$tg" != "null" ] || pfwd_die "未找到该用户的 Telegram 配置：$user_id"
     enabled="$(echo "$tg" | jq -r '.enabled // false')"
-    [ "$enabled" = "true" ] || pfwd_die "该用户的 Telegram 通知未启用：$user_id"
+    if [ "$require_enabled" = "true" ]; then
+        [ "$enabled" = "true" ] || pfwd_die "该用户的 Telegram 通知未启用：$user_id"
+    fi
     token="$(echo "$tg" | jq -r '.bot_token // ""')"
     chat_id="$(echo "$tg" | jq -r '.chat_id // ""')"
     [ -n "$token" ] || pfwd_die "该用户的 Telegram bot token 为空：$user_id"

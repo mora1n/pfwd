@@ -3365,11 +3365,11 @@ ui_menu_telegram() {
                         ok=$((ok + 1))
                     else
                         fail=$((fail + 1))
-                        ui_error "启用通知失败：$user_id"
+                        ui_error "恢复通知失败：$user_id"
                     fi
                 done <<< "$enable_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_notice_set "启用通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                ui_notice_set "恢复通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ui_maybe_pause success
                 ;;
             5)
@@ -3382,18 +3382,18 @@ ui_menu_telegram() {
                         ok=$((ok + 1))
                     else
                         fail=$((fail + 1))
-                        ui_error "停用通知失败：$user_id"
+                        ui_error "暂停通知失败：$user_id"
                     fi
                 done <<< "$disable_ids"
                 ui_batch_print_result "$ok" "$fail"
-                ui_notice_set "停用通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                ui_notice_set "暂停通知完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ui_maybe_pause success
                 ;;
             6)
                 ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local delete_ids="$UI_REPLY"
-                ui_print_line "将删除以下通知配置：" "33"
+                ui_print_line "将删除以下通知配置（Bot Token、Chat ID、服务器名称、间隔/定时设置）：" "33"
                 printf '%s\n' "$delete_ids"
                 if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
                     local ok=0 fail=0
@@ -3534,8 +3534,8 @@ ui_render_telegram_menu_page() {
     ui_menu_item 1 "配置用户 Telegram"
     ui_menu_item 2 "设置定时发送"
     ui_menu_item 3 "发送测试通知"
-    ui_menu_item 4 "启用通知"
-    ui_menu_item 5 "停用通知"
+    ui_menu_item 4 "恢复通知"
+    ui_menu_item 5 "暂停通知"
     ui_menu_item 6 "删除通知"
     ui_menu_item 0 "返回"
 }

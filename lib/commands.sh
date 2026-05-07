@@ -780,7 +780,7 @@ cmd_notify_test() {
         esac
     done
     [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
-    notify_send_telegram "$user_id" "$(notify_status_message "$user_id")"
+    notify_send_telegram "$user_id" "$(notify_status_message "$user_id")" "false"
     echo "通知已发送：$user_id"
 }
 
