@@ -774,6 +774,19 @@ ui_table_print_row() {
             if [ -n "$UI_CELL_COLOR" ] && ui_use_color; then
                 rendered=$'\033['"${UI_CELL_COLOR}"'m'"$rendered"$'\033[0m'
             fi
+        elif [ -z "$code" ] && [ "${headers_ref[$i]:-}" = "值" ] && [ "${headers_ref[0]:-}" = "项目" ]; then
+            UI_CELL_COLOR=""
+            local guard_label="" guard_state=""
+            guard_label="${cells_ref[0]:-}"
+            guard_state="$(ui_guard_summary_state "$guard_label" "$cell")"
+            if [ -n "$guard_state" ]; then
+                rendered="$(ui_forward_state_text "$guard_state")"
+                UI_CELL_COLOR="$(ui_forward_state_color "$guard_state")"
+                ui_display_width_value "$rendered"
+                if [ -n "$UI_CELL_COLOR" ] && ui_use_color; then
+                    rendered=$'\033['"${UI_CELL_COLOR}"'m'"$rendered"$'\033[0m'
+                fi
+            fi
         fi
         line+=" "
         line+="$rendered"
@@ -876,6 +889,38 @@ ui_forward_state_cell() {
     state_text="$(ui_forward_state_text "$display_state")"
     state_color="$(ui_forward_state_color "$display_state")"
     ui_color "$state_color" "$state_text"
+}
+
+ui_guard_summary_state() {
+    local item="$1"
+    local value="$2"
+    case "$item" in
+        "启用状态")
+            case "$value" in
+                已启用|启用|开启|开|true|active|●) printf 'active' ;;
+                已停用|停用|关闭|关|false|paused|■) printf 'paused' ;;
+            esac
+            ;;
+        "封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
+            case "$value" in
+                开|开启|启用|已启用|true|active|●) printf 'active' ;;
+                关|关闭|停用|已停用|false|paused|■) printf 'paused' ;;
+            esac
+            ;;
+    esac
+}
+
+ui_guard_summary_rows() {
+    local rows line item value guard_state
+    rows="$(guard_render_status)"
+    while IFS=$'\t' read -r item value; do
+        [ -n "$item" ] || continue
+        guard_state="$(ui_guard_summary_state "$item" "$value")"
+        if [ -n "$guard_state" ]; then
+            value="$(ui_forward_state_text "$guard_state")"
+        fi
+        printf '%s\t%s\n' "$item" "$value"
+    done <<< "$rows"
 }
 
 ui_forward_line() {
@@ -3470,7 +3515,7 @@ ui_menu_update() {
 }
 
 ui_print_guard_summary() {
-    ui_table_render $'项目\t值' "$(guard_render_status)" "2"
+    ui_table_render $'项目\t值' "$(ui_guard_summary_rows)" "2"
 }
 
 ui_render_guard_menu_page() {

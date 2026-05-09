@@ -73,9 +73,10 @@ EOF
 
 service_install_files() {
     pfwd_mkdirs
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
     [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
+    [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IP 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)"
     if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
         cp "$PFWD_SCRIPT_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     fi
@@ -84,6 +85,9 @@ service_install_files() {
     fi
     if [ "$PFWD_SCRIPT_DIR/lib" != "$PFWD_INSTALL_DIR/lib" ]; then
         cp "$PFWD_SCRIPT_DIR/lib/"*.sh "$PFWD_INSTALL_DIR/lib/"
+    fi
+    if [ "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" != "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" ]; then
+        cp "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     fi
     if [ -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ]; then
         if [ "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" != "$PFWD_GUARD_BIN_PATH" ]; then
@@ -280,6 +284,7 @@ service_update_download_bundle() {
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$staged_dir/pfwd.sh" || return 1
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$staged_dir/bbr.sh" || return 1
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$(guard_asset_name)" "$staged_dir/assets/$(guard_asset_name)" || return 1
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$staged_dir/assets/cn-aggregated.zone" || return 1
     for lib in "${PFWD_LIB_FILES[@]}"; do
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/lib/$lib.sh" "$staged_dir/lib/$lib.sh" || return 1
     done
@@ -299,6 +304,10 @@ service_update_validate_bundle() {
     }
     [ -f "$dir/assets/$(guard_asset_name)" ] || {
         echo "更新包缺少 assets/$(guard_asset_name)" >&2
+        return 1
+    }
+    [ -f "$dir/assets/cn-aggregated.zone" ] || {
+        echo "更新包缺少 assets/cn-aggregated.zone" >&2
         return 1
     }
     bash -n "$dir/pfwd.sh" || return 1
@@ -328,6 +337,7 @@ service_update_bundle_digest() {
     payload="pfwd.sh $(pfwd_file_checksum "$dir/pfwd.sh")"$'\n'
     payload="${payload}bbr.sh $(pfwd_file_checksum "$dir/bbr.sh")"$'\n'
     payload="${payload}guard $(pfwd_file_checksum "$guard_file")"$'\n'
+    payload="${payload}assets/cn-aggregated.zone $(pfwd_file_checksum "$dir/assets/cn-aggregated.zone")"$'\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
         payload="${payload}lib/$lib.sh $(pfwd_file_checksum "$dir/lib/$lib.sh")"$'\n'
     done
@@ -408,10 +418,11 @@ service_update_apply_staged() {
     local staged_dir="$work_dir/staged"
     local lib
 
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")"
     install -m 0755 "$staged_dir/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     install -m 0755 "$staged_dir/bbr.sh" "$PFWD_INSTALL_DIR/bbr.sh"
     install -m 0755 "$staged_dir/assets/$(guard_asset_name)" "$PFWD_GUARD_BIN_PATH"
+    install -m 0644 "$staged_dir/assets/cn-aggregated.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     for lib in "${PFWD_LIB_FILES[@]}"; do
         install -m 0644 "$staged_dir/lib/$lib.sh" "$PFWD_INSTALL_DIR/lib/$lib.sh"
     done

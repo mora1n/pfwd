@@ -86,7 +86,7 @@ pfwd_bootstrap_install() {
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$guard_bin_dir" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$guard_bin_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
@@ -97,6 +97,7 @@ pfwd_bootstrap_install() {
     }
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$guard_asset" "$guard_bin_dir/pfwd-guard"
     chmod +x "$guard_bin_dir/pfwd-guard"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do

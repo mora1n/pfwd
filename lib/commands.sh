@@ -931,7 +931,7 @@ cmd_guard() {
             case "$mode" in
                 cn)
                     guard_config_set_whitelist "$mode" "$source_url" "" "manual"
-                    guard_refresh_cn_whitelist
+                    guard_sync_cn_whitelist
                     ;;
                 custom)
                     [ -n "$file_path" ] || pfwd_die "custom 模式必须提供 --file"

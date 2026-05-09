@@ -60,7 +60,7 @@ pfwd
 
 ### Offline Install
 
-适用于目标机器无法直接访问 GitHub 的场景。可以先在本地打包 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`，再拷贝到目标机器离线安装。
+适用于目标机器无法直接访问 GitHub 的场景。离线包需要同时包含 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`；其中 `assets/` 除了 guard 预编译二进制，还包含国内 IP 白名单种子 `cn-aggregated.zone`。
 
 离线安装完成后，系统文件结构如下：
 
@@ -76,6 +76,8 @@ pfwd
 │   ├── bbr.sh                  # BBR / optimize 主脚本
 │   ├── bin/
 │   │   └── pfwd-guard          # 协议封锁 / IP 白名单预编译 guard
+│   ├── assets/
+│   │   └── cn-aggregated.zone  # 国内 IP 白名单离线种子
 │   └── lib/
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
@@ -142,7 +144,19 @@ ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
 /usr/local/bin/pfwd install
 ```
 
-5. 完成后可先检查：
+5. 如需离线启用国内 IP 白名单，可直接执行：
+
+```bash
+pfwd guard whitelist --mode cn
+```
+
+后续机器具备外网时，再执行：
+
+```bash
+pfwd guard whitelist refresh
+```
+
+6. 完成后可先检查：
 
 ```bash
 pfwd doctor

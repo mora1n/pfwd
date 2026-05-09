@@ -154,6 +154,13 @@ guard_local_asset_path() {
     printf '%s/assets/%s\n' "$script_dir" "$asset"
 }
 
+guard_local_cn_whitelist_seed_path() {
+    local script_dir
+    script_dir="$(guard_script_dir)"
+    [ -n "$script_dir" ] || return 1
+    printf '%s/assets/cn-aggregated.zone\n' "$script_dir"
+}
+
 guard_fetch_url() {
     local url="$1"
     local target="$2"
@@ -323,6 +330,20 @@ guard_import_custom_whitelist() {
     guard_config_mark_last_good "$file_path" "$(guard_now_iso)"
 }
 
+guard_import_local_cn_whitelist_seed() {
+    local file_path
+    file_path="$(guard_local_cn_whitelist_seed_path)" || return 1
+    [ -f "$file_path" ] || return 1
+    guard_store_whitelist_file "$file_path"
+    guard_config_mark_last_good "$file_path" "$(guard_now_iso)"
+}
+
+guard_sync_cn_whitelist() {
+    if ! guard_import_local_cn_whitelist_seed; then
+        guard_refresh_cn_whitelist
+    fi
+}
+
 guard_prepare_whitelist() {
     local mode custom_file
     mode="$(guard_whitelist_mode)"
@@ -332,7 +353,7 @@ guard_prepare_whitelist() {
             ;;
         cn)
             if [ ! -s "$(guard_whitelist_file)" ]; then
-                guard_refresh_cn_whitelist
+                guard_sync_cn_whitelist
             fi
             ;;
         custom)
