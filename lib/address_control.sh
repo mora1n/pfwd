@@ -189,22 +189,6 @@ address_control_runtime_enabled() {
     [ "$(address_control_enabled)" = "true" ] && echo true || echo false
 }
 
-address_control_state_label() {
-    if [ "$(address_control_enabled)" != "true" ]; then
-        printf '已停用\n'
-        return 0
-    fi
-    if [ "$(address_control_include_cn)" = "true" ] && [ "$(address_control_custom_cidrs_count)" -gt 0 ]; then
-        printf '国内 + 自定义\n'
-    elif [ "$(address_control_include_cn)" = "true" ]; then
-        printf '仅国内\n'
-    elif [ "$(address_control_custom_cidrs_count)" -gt 0 ]; then
-        printf '仅自定义\n'
-    else
-        printf '已启用\n'
-    fi
-}
-
 address_control_status_json() {
     jq -n \
       --argjson enabled "$(address_control_enabled)" \
@@ -215,7 +199,6 @@ address_control_status_json() {
       --arg last_good_updated_at "$(address_control_last_good_updated_at)" \
       --argjson entries "$(address_control_entry_count)" \
       --argjson custom_cidrs_count "$(address_control_custom_cidrs_count)" \
-      --arg state_label "$(address_control_state_label)" \
       '{
         enabled: $enabled,
         include_cn: $include_cn,
@@ -224,8 +207,7 @@ address_control_status_json() {
         last_good_source: $last_good_source,
         last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
         entries: $entries,
-        custom_cidrs_count: $custom_cidrs_count,
-        state_label: $state_label
+        custom_cidrs_count: $custom_cidrs_count
       }'
 }
 
@@ -234,9 +216,8 @@ address_control_render_status() {
     json="$(address_control_status_json)"
     jq -r '
       [
-        ["地域控制模式", .state_label],
         ["启用白名单", (if .enabled then "开" else "关" end)],
-        ["包含国内 IP", (if .include_cn then "开" else "关" end)],
+        ["包含国内 IP", (if .enabled then (if .include_cn then "开" else "关" end) else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],

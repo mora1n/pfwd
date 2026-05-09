@@ -901,12 +901,6 @@ ui_guard_summary_state() {
                 已停用|停用|关闭|关|false|paused|■) printf 'paused' ;;
             esac
             ;;
-        "地域控制模式")
-            case "$value" in
-                仅国内|仅自定义|国内\ +\ 自定义|已启用) printf 'active' ;;
-                已停用) printf 'paused' ;;
-            esac
-            ;;
         "启用白名单"|"包含国内 IP"|"封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
             case "$value" in
                 开|开启|启用|已启用|true|active|●) printf 'active' ;;
@@ -3608,10 +3602,10 @@ ui_menu_guard() {
                 include_cn="$(address_control_include_cn)"
                 if [ "$include_cn" = "true" ]; then
                     ui_run cmd_address_control --include-cn false
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已关闭" "32"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从白名单移出国内 IP 段" "32"
                 else
                     ui_run cmd_address_control --include-cn true
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已开启" "32"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入白名单" "32"
                 fi
                 ui_maybe_pause success
                 ;;
