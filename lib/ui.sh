@@ -1086,6 +1086,10 @@ ui_render_form_page() {
     shift 2 || true
     ui_header "$title"
     [ -n "$hint" ] && ui_print_line "$hint" "2;37"
+    if [ -n "$UI_NOTICE_TEXT" ]; then
+        printf '\n'
+        ui_print_line "$UI_NOTICE_TEXT" "${UI_NOTICE_COLOR:-36}"
+    fi
     if [ -n "$hint" ] && { [ "${#UI_FORM_LINES[@]}" -gt 0 ] || [ "${#UI_FORM_OPTION_LINES[@]}" -gt 0 ]; }; then
         printf '\n'
     fi
@@ -1126,24 +1130,50 @@ ui_form_edit_read() {
     ui_edit_read "$prompt" "$default"
 }
 
+ui_form_select_has_choice() {
+    local selected="$1"
+    shift || true
+    local line
+    for line in "$@"; do
+        if [[ "$line" =~ ^([0-9]+)\) ]]; then
+            [ "$selected" = "${BASH_REMATCH[1]}" ] && return 0
+        fi
+    done
+    return 1
+}
+
 ui_form_select_read() {
     local prompt="$1"
     local default="${2:-}"
-    local status=0
     shift 2 || true
     local options=("$@")
-    local line
-    if [ -n "$UI_FORM_TITLE" ]; then
-        UI_FORM_OPTION_LINES=("${options[@]}")
-        ui_form_refresh
-        ui_read "$prompt" "$default" || status=$?
-        UI_FORM_OPTION_LINES=()
-        return "$status"
-    fi
-    for line in "${options[@]}"; do
-        printf '%s\n' "$line"
+    local line status
+
+    while true; do
+        status=0
+        if [ -n "$UI_FORM_TITLE" ]; then
+            UI_FORM_OPTION_LINES=("${options[@]}")
+            ui_form_refresh
+            ui_read "$prompt" "$default" || status=$?
+            UI_FORM_OPTION_LINES=()
+        else
+            for line in "${options[@]}"; do
+                printf '%s\n' "$line"
+            done
+            ui_read "$prompt" "$default" || status=$?
+        fi
+
+        [ "$status" -eq 0 ] || return "$status"
+        if [ -z "$UI_REPLY" ] || ui_form_select_has_choice "$UI_REPLY" "${options[@]}"; then
+            return 0
+        fi
+
+        if [ -n "$UI_FORM_TITLE" ]; then
+            ui_notice_set "无效选择，请重新输入。" "33"
+        else
+            ui_warn "无效选择，请重新输入。"
+        fi
     done
-    ui_read "$prompt" "$default"
 }
 
 ui_pause() {
@@ -3548,14 +3578,17 @@ ui_menu_guard() {
                 ;;
             3)
                 ui_form_set "协议封锁" "HTTPS 会同时开启 HTTP 和 TLS 封锁；仅覆盖 TCP 首包。"
-                ui_form_select_read "HTTP [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                ui_form_select_read "HTTP" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
                 local block_http="false" block_tls="false" block_socks="false"
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
                 [ "$UI_REPLY" = "2" ] && block_http="true"
                 ui_form_add_kv "HTTP" "$( [ "$block_http" = "true" ] && echo 开启 || echo 关闭 )"
-                ui_form_select_read "TLS [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                ui_form_select_read "TLS" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
                 [ "$UI_REPLY" = "2" ] && block_tls="true"
                 ui_form_add_kv "TLS" "$( [ "$block_tls" = "true" ] && echo 开启 || echo 关闭 )"
-                ui_form_select_read "SOCKS [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                ui_form_select_read "SOCKS" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
                 [ "$UI_REPLY" = "2" ] && block_socks="true"
                 ui_form_add_kv "SOCKS" "$( [ "$block_socks" = "true" ] && echo 开启 || echo 关闭 )"
                 ui_run cmd_guard protocols --http "$block_http" --tls "$block_tls" --socks "$block_socks"
@@ -3565,8 +3598,12 @@ ui_menu_guard() {
                 ;;
             4)
                 ui_form_set "白名单模式" "全局生效；国内 IP 白名单默认使用 https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone 。"
-                ui_form_select_read "模式 [1]" "1" "1) 国内 IP 白名单" "2) 自定义 CIDR 白名单" "3) 关闭白名单" || { ui_form_reset; continue; }
+                ui_form_select_read "模式" "1" "0) 返回" "1) 国内 IP 白名单" "2) 自定义 CIDR 白名单" "3) 关闭白名单" || { ui_form_reset; continue; }
                 case "$UI_REPLY" in
+                    0)
+                        ui_form_reset
+                        continue
+                        ;;
                     1)
                         ui_run cmd_guard whitelist --mode cn
                         ;;
