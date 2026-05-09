@@ -16,11 +16,12 @@ config_default_json() {
       "tc_interface": "",
       "block_http": false,
       "block_tls": false,
-      "block_socks": false,
-      "whitelist_mode": "off",
-      "whitelist_source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
-      "whitelist_refresh_mode": "manual",
-      "whitelist_file": "",
+      "block_socks": false
+    },
+    "address_control": {
+      "mode": "off",
+      "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
+      "file": "",
       "last_good_source": "",
       "last_good_updated_at": null
     }

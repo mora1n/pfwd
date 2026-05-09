@@ -261,6 +261,24 @@ fw_read_counters() {
       def fstate($id): $state[0].forwards[$id] // {};
       def ustate($id): $state[0].users[$id] // {};
       def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
+      def seeded_one_way_display($f):
+        (fstate($f.id)) as $s |
+        if ($s | has("one_way_display_bytes")) then
+          ($s.one_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "one-way") then
+          billed_usage("one-way"; ($f.traffic_ratio // 1); ($s.input_total_bytes // 0); ($s.output_total_bytes // 0))
+        else
+          0
+        end;
+      def seeded_two_way_display($f):
+        (fstate($f.id)) as $s |
+        if ($s | has("two_way_display_bytes")) then
+          ($s.two_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "two-way") then
+          billed_usage("two-way"; ($f.traffic_ratio // 1); ($s.input_total_bytes // 0); ($s.output_total_bytes // 0))
+        else
+          0
+        end;
       def pending_input_bytes($id):
         (fstate($id)) as $s |
         (snap_forward($id)) as $c |
@@ -278,19 +296,20 @@ fw_read_counters() {
       def current_forward_billing($f):
         (fstate($f.id)) as $s |
         (($s.billing_used_bytes // 0) + billed_usage(($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)));
+      def current_forward_one_way_display($f):
+        seeded_one_way_display($f) + (if ($f.traffic_mode // "two-way") == "one-way" then billed_usage("one-way"; ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)) else 0 end);
+      def current_forward_two_way_display($f):
+        seeded_two_way_display($f) + (if ($f.traffic_mode // "two-way") == "two-way" then billed_usage("two-way"; ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)) else 0 end);
       def user_snapshot($id):
         ($cfg[0].forwards | map(select(.user_id == $id))) as $items |
         {
           input_bytes: ($items | map(forward_totals(.id).input_bytes) | add // 0),
           output_bytes: ($items | map(forward_totals(.id).output_bytes) | add // 0)
         };
-      def user_mode_usage($user_id; $mode):
-        [
-          $cfg[0].forwards[] |
-          select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
-          (forward_totals(.id)) as $t |
-          billed_usage($mode; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes)
-        ] | add // 0;
+      def user_one_way_display($user_id):
+        [ $cfg[0].forwards[] | select(.user_id == $user_id) | current_forward_one_way_display(.) ] | add // 0;
+      def user_two_way_display($user_id):
+        [ $cfg[0].forwards[] | select(.user_id == $user_id) | current_forward_two_way_display(.) ] | add // 0;
       def user_billing($u):
         (ustate($u.id)) as $s |
         ([ $cfg[0].forwards[] | select(.user_id == $u.id) | current_forward_billing(.) ] | add // 0) as $forward_used |
@@ -304,9 +323,9 @@ fw_read_counters() {
           . + {
             input_bytes: $t.input_bytes,
             output_bytes: $t.output_bytes,
-            one_way_bytes: billed_usage("one-way"; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
-            two_way_bytes: billed_usage("two-way"; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
-            total_bytes: billed_usage((.traffic_mode // "two-way"); (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes),
+            one_way_bytes: current_forward_one_way_display($f),
+            two_way_bytes: current_forward_two_way_display($f),
+            total_bytes: (current_forward_one_way_display($f) + current_forward_two_way_display($f)),
             billing_used_bytes: current_forward_billing($f)
           }
         ],
@@ -314,8 +333,8 @@ fw_read_counters() {
           $cfg[0].users[] |
           . as $u |
           (user_snapshot($u.id)) as $c |
-          (user_mode_usage($u.id; "one-way")) as $one_way_used |
-          (user_mode_usage($u.id; "two-way")) as $two_way_used |
+          (user_one_way_display($u.id)) as $one_way_used |
+          (user_two_way_display($u.id)) as $two_way_used |
           . + {
             input_bytes: $c.input_bytes,
             output_bytes: $c.output_bytes,

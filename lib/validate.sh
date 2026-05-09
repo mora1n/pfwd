@@ -231,6 +231,14 @@ validate_bool() {
     esac
 }
 
+validate_address_control_mode() {
+    local value="$1"
+    case "$value" in
+        off|lan|cn|custom) ;;
+        *) pfwd_die "无效地址访问控制模式：$value" ;;
+    esac
+}
+
 validate_reset_day() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "无效重置日：$value"

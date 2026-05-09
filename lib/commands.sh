@@ -9,6 +9,10 @@ cmd_refresh_after_change() {
     cmd_refresh
 }
 
+cmd_rollup_before_traffic_semantics_change() {
+    stats_rollup_current
+}
+
 cmd_export() {
     [ "$#" -le 1 ] || pfwd_die "用法：pfwd export [file]"
     local file_path="${1:-$(pfwd_default_export_path)}"
@@ -496,6 +500,9 @@ cmd_limit() {
     [ -z "$traffic" ] || traffic_bytes="$(parse_size_bytes "$traffic")"
     [ -z "$rate" ] || normalized_rate="$(normalize_rate "$rate")"
     if [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+        if [ -n "$mode" ]; then
+            cmd_rollup_before_traffic_semantics_change
+        fi
         config_set_forward_limit "$forward_id" "$traffic_bytes" "$normalized_rate" "$mode"
         echo "转发限制已更新：$forward_id"
         cmd_refresh_after_change
@@ -536,6 +543,9 @@ cmd_forward_update() {
         esac
     done
     [ -n "$forward_id" ] || pfwd_die "必须提供 --forward-id"
+    if [ "$traffic_mode" != "__KEEP__" ] || [ "$traffic_ratio" != "__KEEP__" ]; then
+        cmd_rollup_before_traffic_semantics_change
+    fi
     config_update_forward "$forward_id" "$listen_ip" "$listen_port" "$remote_host" "$remote_port" "$stop_at" "$protocol" "$traffic_mode" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
     echo "转发已更新：$forward_id"
     cmd_refresh_after_change
@@ -552,6 +562,7 @@ cmd_user_forwards_traffic_mode() {
     done
     [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
     [ -n "$traffic_mode" ] || pfwd_die "必须提供 --traffic-mode"
+    cmd_rollup_before_traffic_semantics_change
     config_set_user_forwards_traffic_mode "$user_id" "$traffic_mode"
     echo "用户全部转发流量模式已更新：$(normalize_user_id "$user_id") mode=$traffic_mode"
     cmd_refresh_after_change
@@ -575,6 +586,9 @@ cmd_user_forwards_limit() {
     [ "$traffic" = "__KEEP__" ] || traffic_bytes="$(parse_size_bytes "$traffic")"
     [ "$rate" = "__KEEP__" ] || normalized_rate="$(normalize_rate "$rate")"
 
+    if [ "$mode" != "__KEEP__" ]; then
+        cmd_rollup_before_traffic_semantics_change
+    fi
     config_set_user_forward_limits "$user_id" "$traffic_bytes" "$normalized_rate" "$mode"
     echo "用户全部转发限制已更新：$user_id"
     cmd_refresh_after_change
@@ -812,6 +826,9 @@ cmd_doctor() {
     guard_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard.%s：%s\n' "$key" "$value"
     done
+    address_control_render_status | while IFS=$'\t' read -r key value; do
+        printf 'address_control.%s：%s\n' "$key" "$value"
+    done
     cmd_doctor_benchmarks
 }
 
@@ -898,58 +915,73 @@ cmd_guard() {
             cmd_refresh
             echo "guard 协议封锁已更新"
             ;;
-        whitelist)
-            local mode="" source_url="" file_path="" refresh_requested="false"
-            while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    --mode) mode="${2:-}"; shift 2 ;;
-                    --source-url) source_url="${2:-}"; shift 2 ;;
-                    --file|--import-file) file_path="${2:-}"; shift 2 ;;
-                    refresh) refresh_requested="true"; shift ;;
-                    *) pfwd_die "未知选项：$1" ;;
-                esac
-            done
-            if [ "$refresh_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ]; then
-                case "$(guard_whitelist_mode)" in
-                    cn) guard_refresh_cn_whitelist ;;
-                    custom)
-                        file_path="$(guard_whitelist_custom_file)"
-                        [ -n "$file_path" ] || pfwd_die "当前未配置自定义白名单文件"
-                        guard_import_custom_whitelist "$file_path"
-                        ;;
-                    off) pfwd_die "当前白名单模式为 off，请先切换到 cn 或 custom" ;;
-                esac
-                cmd_refresh
-                echo "guard 白名单已刷新"
-                return 0
-            fi
-
-            [ -n "$mode" ] || mode="$(guard_whitelist_mode)"
-            [ -n "$source_url" ] || source_url="$(guard_whitelist_source_url)"
-            [ -n "$file_path" ] || file_path="$(guard_whitelist_custom_file)"
-            guard_validate_whitelist_mode "$mode"
-            case "$mode" in
-                cn)
-                    guard_config_set_whitelist "$mode" "$source_url" "" "manual"
-                    guard_sync_cn_whitelist
-                    ;;
-                custom)
-                    [ -n "$file_path" ] || pfwd_die "custom 模式必须提供 --file"
-                    file_path="$(guard_expand_path "$file_path")"
-                    guard_config_set_whitelist "$mode" "$source_url" "$file_path" "manual"
-                    guard_import_custom_whitelist "$file_path"
-                    ;;
-                off)
-                    guard_config_set_whitelist "$mode" "$source_url" "" "manual"
-                    ;;
-            esac
-            cmd_refresh
-            echo "guard 白名单已更新"
-            ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols"
             ;;
     esac
+}
+
+cmd_address_control() {
+    config_init >/dev/null
+    local mode="" source_url="" file_path="" refresh_requested="false" status_requested="false"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode) mode="${2:-}"; shift 2 ;;
+            --source-url) source_url="${2:-}"; shift 2 ;;
+            --file|--import-file) file_path="${2:-}"; shift 2 ;;
+            refresh) refresh_requested="true"; shift ;;
+            status) status_requested="true"; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+
+    if [ "$status_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ] && [ "$refresh_requested" = "false" ]; then
+        address_control_render_status
+        return 0
+    fi
+
+    if [ "$refresh_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ]; then
+        case "$(address_control_mode)" in
+            lan) address_control_sync_lan ;;
+            cn) address_control_refresh_cn ;;
+            custom)
+                file_path="$(address_control_custom_file)"
+                [ -n "$file_path" ] || pfwd_die "当前未配置自定义地址访问控制文件"
+                address_control_import_custom "$file_path"
+                ;;
+            off) pfwd_die "当前地址访问控制模式为 off，请先切换到 lan、cn 或 custom" ;;
+        esac
+        cmd_refresh
+        echo "地址访问控制数据已刷新"
+        return 0
+    fi
+
+    [ -n "$mode" ] || mode="$(address_control_mode)"
+    [ -n "$source_url" ] || source_url="$(address_control_source_url)"
+    [ -n "$file_path" ] || file_path="$(address_control_custom_file)"
+    validate_address_control_mode "$mode"
+    case "$mode" in
+        lan)
+            address_control_config_set "$mode" "$source_url" ""
+            address_control_sync_lan
+            ;;
+        cn)
+            address_control_config_set "$mode" "$source_url" ""
+            address_control_sync_cn
+            ;;
+        custom)
+            [ -n "$file_path" ] || pfwd_die "custom 模式必须提供 --file"
+            file_path="$(pfwd_expand_path "$file_path")"
+            address_control_config_set "$mode" "$source_url" "$file_path"
+            address_control_import_custom "$file_path"
+            ;;
+        off)
+            address_control_config_set "$mode" "$source_url" ""
+            rm -f "$(address_control_allow_file)" 2>/dev/null || true
+            ;;
+    esac
+    cmd_refresh
+    echo "地址访问控制已更新"
 }
 
 cmd_uninstall() {

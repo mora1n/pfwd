@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate forwarder firewall stats notify guard service commands ui)
+PFWD_LIB_FILES=(core config validate address_control forwarder firewall stats notify guard service commands ui)
 
 pfwd_bootstrap_guard_asset_name() {
     local arch
@@ -178,6 +178,7 @@ pfwd_main() {
         notify-disable) cmd_notify_disable "$@" ;;
         notify-delete) cmd_notify_delete "$@" ;;
         guard) cmd_guard "$@" ;;
+        address-control) cmd_address_control "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
@@ -231,8 +232,9 @@ pfwd - nft 端口转发管理脚本
   pfwd notify-delete --user-id ID
   pfwd guard enable|disable|status|apply|remove
   pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off]
-  pfwd guard whitelist --mode off|cn|custom [--source-url URL] [--file FILE]
-  pfwd guard whitelist refresh
+  pfwd address-control [--mode off|lan|cn|custom] [--source-url URL] [--file FILE]
+  pfwd address-control refresh
+  pfwd address-control status
   pfwd doctor
   pfwd install
   pfwd update [--check|--yes]
@@ -251,7 +253,8 @@ pfwd - nft 端口转发管理脚本
   MSS 和固定 SNAT 通过 `.forwards[].nft` 字段持久化。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
-  协议封锁和 IP 白名单由 `guard` 子命令管理；国内白名单默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`。
+  协议封锁由 `guard` 子命令管理；地址访问控制由 `address-control` 子命令管理。
+  地址访问控制当前仅支持 IPv4 目标 CIDR；国内目标默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`。
 EOF
 }
 

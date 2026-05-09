@@ -237,6 +237,7 @@ service_uninstall_files() {
     rm -f "$PFWD_INSTALL_DIR/pfwd.sh"
     rm -f "$PFWD_GUARD_BIN_PATH"
     rm -rf "$PFWD_GUARD_STATE_DIR"
+    rm -rf "$PFWD_ADDRESS_CONTROL_STATE_DIR"
     rm -rf "$PFWD_INSTALL_DIR/lib"
     rmdir "$PFWD_INSTALL_DIR/bin" 2>/dev/null || true
 }
@@ -248,7 +249,8 @@ service_purge_state() {
 service_verify_removed() {
     local leftovers=()
     for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_GUARD_BIN_PATH" \
-        "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_WHITELIST_IPV4_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" "$PFWD_GUARD_LINK_EGRESS_PATH" \
+        "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" "$PFWD_GUARD_LINK_EGRESS_PATH" \
+        "$PFWD_ADDRESS_CONTROL_STATE_DIR" "$PFWD_ADDRESS_CONTROL_ALLOW_IPV4_FILE" \
         "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
         "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer" "$PFWD_SYSTEMD_DIR/pfwd-guard.service"; do
         [ ! -e "$path" ] || leftovers+=("$path")

@@ -84,6 +84,22 @@ stats_rollup_counters() {
         if $mode == "one-way" then 1 else 2 end;
       def billed_usage($mode; $ratio; $in_delta; $out_delta):
         ((((($in_delta * $ratio) | floor) + (($out_delta * $ratio) | floor))) * mode_factor($mode));
+      def seeded_one_way_display($old; $f):
+        if ($old | has("one_way_display_bytes")) then
+          ($old.one_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "one-way") then
+          billed_usage("one-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
+      def seeded_two_way_display($old; $f):
+        if ($old | has("two_way_display_bytes")) then
+          ($old.two_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "two-way") then
+          billed_usage("two-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
       def user_forward_sum($state; $user_id):
         [ $cfg[0].forwards[]? | select(.user_id == $user_id) | ($state.forwards[.id].billing_used_bytes // 0) ]
         | add // 0;
@@ -103,6 +119,8 @@ stats_rollup_counters() {
           (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
           .forwards[$f.id] = ($old + {
             billing_used_bytes: (($old.billing_used_bytes // 0) + billed_usage($f.traffic_mode; ($f.traffic_ratio // 1); $in_delta; $out_delta)),
+            one_way_display_bytes: (seeded_one_way_display($old; $f) + (if $f.traffic_mode == "one-way" then billed_usage("one-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
+            two_way_display_bytes: (seeded_two_way_display($old; $f) + (if $f.traffic_mode == "two-way" then billed_usage("two-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
             input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
             output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
             input_base_bytes: $f.input_bytes,
@@ -159,6 +177,22 @@ stats_set_user_used() {
         if $mode == "one-way" then 1 else 2 end;
       def billed_usage($mode; $ratio; $in_delta; $out_delta):
         ((((($in_delta * $ratio) | floor) + (($out_delta * $ratio) | floor))) * mode_factor($mode));
+      def seeded_one_way_display($old; $f):
+        if ($old | has("one_way_display_bytes")) then
+          ($old.one_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "one-way") then
+          billed_usage("one-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
+      def seeded_two_way_display($old; $f):
+        if ($old | has("two_way_display_bytes")) then
+          ($old.two_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "two-way") then
+          billed_usage("two-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
       def snap_forward($fid):
         ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", traffic_ratio: 1, input_bytes: 0, output_bytes: 0});
       ($snap | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
@@ -173,6 +207,8 @@ stats_set_user_used() {
             (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
             .[$fid] = ($old + {
               billing_used_bytes: (($old.billing_used_bytes // 0) + billed_usage(($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1); $in_delta; $out_delta)),
+              one_way_display_bytes: (seeded_one_way_display($old; $f) + (if ($f.traffic_mode // "two-way") == "one-way" then billed_usage("one-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
+              two_way_display_bytes: (seeded_two_way_display($old; $f) + (if ($f.traffic_mode // "two-way") == "two-way" then billed_usage("two-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
               input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
               output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
               input_base_bytes: ($f.input_bytes // 0),
@@ -198,12 +234,34 @@ stats_set_forward_used() {
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
     snapshot="$(stats_current_snapshot)"
     stats_update --arg id "$forward_id" --argjson used "$used" --argjson snap "$snapshot" '
+      def mode_factor($mode):
+        if $mode == "one-way" then 1 else 2 end;
+      def billed_usage($mode; $ratio; $in_delta; $out_delta):
+        ((((($in_delta * $ratio) | floor) + (($out_delta * $ratio) | floor))) * mode_factor($mode));
+      def seeded_one_way_display($old; $f):
+        if ($old | has("one_way_display_bytes")) then
+          ($old.one_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "one-way") then
+          billed_usage("one-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
+      def seeded_two_way_display($old; $f):
+        if ($old | has("two_way_display_bytes")) then
+          ($old.two_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "two-way") then
+          billed_usage("two-way"; ($f.traffic_ratio // 1); ($old.input_total_bytes // 0); ($old.output_total_bytes // 0))
+        else
+          0
+        end;
       ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
       (.forwards[$id] // {}) as $old |
       (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
       (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
       .forwards[$id] = ($old + {
         billing_used_bytes: $used,
+        one_way_display_bytes: (seeded_one_way_display($old; $f) + (if ($f.traffic_mode // "two-way") == "one-way" then billed_usage("one-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
+        two_way_display_bytes: (seeded_two_way_display($old; $f) + (if ($f.traffic_mode // "two-way") == "two-way" then billed_usage("two-way"; ($f.traffic_ratio // 1); $in_delta; $out_delta) else 0 end)),
         input_total_bytes: (($old.input_total_bytes // 0) + $in_delta),
         output_total_bytes: (($old.output_total_bytes // 0) + $out_delta),
         input_base_bytes: ($f.input_bytes // 0),
@@ -222,6 +280,8 @@ stats_reset_forward_cycle() {
       (.forwards[$id] // {}) as $old |
       .forwards[$id] = ($old + {
         billing_used_bytes: 0,
+        one_way_display_bytes: 0,
+        two_way_display_bytes: 0,
         input_total_bytes: 0,
         output_total_bytes: 0,
         input_base_bytes: ($f.input_bytes // 0),
@@ -246,6 +306,8 @@ stats_reset_user_cycle() {
         | reduce $rows[] as $row ($forwards_state;
             .[$row.id] = ((.[$row.id] // {}) + {
               billing_used_bytes: 0,
+              one_way_display_bytes: 0,
+              two_way_display_bytes: 0,
               input_total_bytes: 0,
               output_total_bytes: 0,
               input_base_bytes: ($row.input_bytes // 0),

@@ -100,27 +100,12 @@ guard_status_file() {
     printf '%s\n' "${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}"
 }
 
-guard_whitelist_file() {
-    printf '%s\n' "${PFWD_GUARD_WHITELIST_IPV4_FILE:-$RFWD_GUARD_WHITELIST_IPV4_FILE}"
-}
-
 guard_ingress_pin_path() {
     printf '%s\n' "${PFWD_GUARD_LINK_INGRESS_PATH:-$RFWD_GUARD_LINK_INGRESS_PATH}"
 }
 
 guard_state_dir() {
     printf '%s\n' "${PFWD_GUARD_STATE_DIR:-$RFWD_GUARD_STATE_DIR}"
-}
-
-guard_default_source_url() {
-    printf '%s\n' "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone"
-}
-
-guard_validate_whitelist_mode() {
-    case "$1" in
-        off|cn|custom) ;;
-        *) guard_die "无效白名单模式：$1" ;;
-    esac
 }
 
 guard_asset_name() {
@@ -154,25 +139,6 @@ guard_local_asset_path() {
     printf '%s/assets/%s\n' "$script_dir" "$asset"
 }
 
-guard_local_cn_whitelist_seed_path() {
-    local script_dir
-    script_dir="$(guard_script_dir)"
-    [ -n "$script_dir" ] || return 1
-    printf '%s/assets/cn-aggregated.zone\n' "$script_dir"
-}
-
-guard_fetch_url() {
-    local url="$1"
-    local target="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 10 --max-time 300 "$url" -o "$target"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$target" "$url"
-    else
-        guard_die "需要 curl 或 wget 下载白名单数据"
-    fi
-}
-
 guard_tc_interface() {
     local iface=""
     iface="$(jq -r '.settings.guard.tc_interface // empty' "$(guard_config_file)")"
@@ -203,50 +169,12 @@ guard_block_socks() {
     jq -r '.settings.guard.block_socks // false' "$(guard_config_file)"
 }
 
-guard_whitelist_mode() {
-    jq -r '.settings.guard.whitelist_mode // "off"' "$(guard_config_file)"
-}
-
-guard_whitelist_source_url() {
-    jq -r --arg url "$(guard_default_source_url)" '.settings.guard.whitelist_source_url // $url' "$(guard_config_file)"
-}
-
-guard_whitelist_custom_file() {
-    jq -r '.settings.guard.whitelist_file // ""' "$(guard_config_file)"
-}
-
-guard_whitelist_refresh_mode() {
-    jq -r '.settings.guard.whitelist_refresh_mode // "manual"' "$(guard_config_file)"
-}
-
 guard_bool_to_json() {
     case "$1" in
         true) echo true ;;
         false) echo false ;;
         *) guard_die "无效布尔值：$1" ;;
     esac
-}
-
-guard_filter_ipv4_cidrs() {
-    awk '
-      function valid_octet(v) { return v ~ /^[0-9]+$/ && v >= 0 && v <= 255 }
-      function valid_mask(v) { return v ~ /^[0-9]+$/ && v >= 0 && v <= 32 }
-      /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {
-        split($0, a, /[.\/]/)
-        if (valid_octet(a[1]) && valid_octet(a[2]) && valid_octet(a[3]) && valid_octet(a[4]) && valid_mask(a[5])) {
-          print $0
-        }
-      }
-    ' | sort -u
-}
-
-guard_store_whitelist_file() {
-    local source_file="$1"
-    local target_file
-    target_file="$(guard_whitelist_file)"
-    mkdir -p "$(dirname "$target_file")"
-    guard_filter_ipv4_cidrs < "$source_file" | guard_write_atomic "$target_file"
-    [ -s "$target_file" ] || guard_die "白名单为空：$source_file"
 }
 
 guard_config_set_enabled() {
@@ -283,98 +211,8 @@ guard_config_set_protocols() {
     '
 }
 
-guard_config_set_whitelist() {
-    local mode="$1"
-    local source_url="$2"
-    local file_path="$3"
-    local refresh_mode="$4"
-    guard_validate_whitelist_mode "$mode"
-    [ -n "$source_url" ] || source_url="$(guard_default_source_url)"
-    config_update \
-      --arg mode "$mode" \
-      --arg source_url "$source_url" \
-      --arg file_path "$file_path" \
-      --arg refresh_mode "$refresh_mode" '
-      (.settings.guard //= {})
-      | .settings.guard.whitelist_mode = $mode
-      | .settings.guard.whitelist_source_url = $source_url
-      | .settings.guard.whitelist_file = $file_path
-      | .settings.guard.whitelist_refresh_mode = $refresh_mode
-    '
-}
-
-guard_config_mark_last_good() {
-    local source="$1"
-    local updated_at="$2"
-    config_update --arg source "$source" --arg updated_at "$updated_at" '
-      (.settings.guard //= {})
-      | .settings.guard.last_good_source = $source
-      | .settings.guard.last_good_updated_at = $updated_at
-    '
-}
-
-guard_refresh_cn_whitelist() {
-    local url tmp
-    url="$(guard_whitelist_source_url)"
-    tmp="$(mktemp)"
-    guard_fetch_url "$url" "$tmp"
-    guard_store_whitelist_file "$tmp"
-    rm -f "$tmp"
-    guard_config_mark_last_good "$url" "$(guard_now_iso)"
-}
-
-guard_import_custom_whitelist() {
-    local file_path="$1"
-    [ -f "$file_path" ] || guard_die "白名单文件不存在：$file_path"
-    guard_store_whitelist_file "$file_path"
-    guard_config_mark_last_good "$file_path" "$(guard_now_iso)"
-}
-
-guard_import_local_cn_whitelist_seed() {
-    local file_path
-    file_path="$(guard_local_cn_whitelist_seed_path)" || return 1
-    [ -f "$file_path" ] || return 1
-    guard_store_whitelist_file "$file_path"
-    guard_config_mark_last_good "$file_path" "$(guard_now_iso)"
-}
-
-guard_sync_cn_whitelist() {
-    if ! guard_import_local_cn_whitelist_seed; then
-        guard_refresh_cn_whitelist
-    fi
-}
-
-guard_prepare_whitelist() {
-    local mode custom_file
-    mode="$(guard_whitelist_mode)"
-    case "$mode" in
-        off)
-            return 0
-            ;;
-        cn)
-            if [ ! -s "$(guard_whitelist_file)" ]; then
-                guard_sync_cn_whitelist
-            fi
-            ;;
-        custom)
-            custom_file="$(guard_whitelist_custom_file)"
-            [ -n "$custom_file" ] || guard_die "自定义白名单模式缺少文件路径"
-            if [ ! -s "$(guard_whitelist_file)" ]; then
-                guard_import_custom_whitelist "$custom_file"
-            fi
-            ;;
-    esac
-}
-
 guard_binary_exists() {
     [ -x "$(guard_bin_path)" ]
-}
-
-guard_runtime_enabled() {
-    case "$(guard_whitelist_mode)" in
-        off) echo false ;;
-        *) echo true ;;
-    esac
 }
 
 guard_apply_runtime() {
@@ -388,25 +226,22 @@ guard_apply_runtime() {
         return 0
     fi
 
-    local iface whitelist_enabled
+    local iface
     iface="$(guard_tc_interface)"
     [ -n "$iface" ] || guard_die "无法确定 guard 网卡，请先设置 tc_interface"
-    guard_prepare_whitelist
-    whitelist_enabled="$(guard_runtime_enabled)"
 
     guard_run "$(guard_bin_path)" apply \
       --iface "$iface" \
       --ingress-pin "$(guard_ingress_pin_path)" \
       --status-file "$(guard_status_file)" \
-      --whitelist-file "$(guard_whitelist_file)" \
-      --whitelist-enabled "$whitelist_enabled" \
+      --whitelist-enabled false \
       --block-http "$(guard_block_http)" \
       --block-tls "$(guard_block_tls)" \
       --block-socks "$(guard_block_socks)"
 
     if [ "$quiet" != "true" ]; then
-        printf 'guard 已应用：iface=%s whitelist=%s http=%s tls=%s socks=%s\n' \
-          "$iface" "$whitelist_enabled" "$(guard_block_http)" "$(guard_block_tls)" "$(guard_block_socks)"
+        printf 'guard 已应用：iface=%s http=%s tls=%s socks=%s\n' \
+          "$iface" "$(guard_block_http)" "$(guard_block_tls)" "$(guard_block_socks)"
     fi
 }
 
@@ -422,17 +257,8 @@ guard_remove_runtime() {
     fi
     egress_pin="${PFWD_GUARD_LINK_EGRESS_PATH:-${RFWD_GUARD_LINK_EGRESS_PATH:-}}"
     rm -f "$(guard_ingress_pin_path)" ${egress_pin:+"$egress_pin"}
-    rm -f "$(guard_whitelist_file)" 2>/dev/null || true
     if [ "$quiet" != "true" ]; then
         echo "guard 已移除"
-    fi
-}
-
-guard_whitelist_entry_count() {
-    if [ -s "$(guard_whitelist_file)" ]; then
-        sed '/^$/d' "$(guard_whitelist_file)" | wc -l | tr -d ' '
-    else
-        echo 0
     fi
 }
 
@@ -442,18 +268,12 @@ guard_status_json() {
       --arg script "$(guard_script_name)" \
       --arg iface "$(guard_tc_interface)" \
       --arg bin "$(guard_bin_path)" \
-      --arg mode "$(guard_whitelist_mode)" \
-      --arg source_url "$(guard_whitelist_source_url)" \
-      --arg custom_file "$(guard_whitelist_custom_file)" \
-      --arg refresh_mode "$(guard_whitelist_refresh_mode)" \
-      --arg whitelist_file "$(guard_whitelist_file)" \
       --arg status_file "$(guard_status_file)" \
       --arg ingress_pin "$(guard_ingress_pin_path)" \
       --argjson enabled "$(guard_bool_to_json "$(guard_enabled)")" \
       --argjson block_http "$(guard_bool_to_json "$(guard_block_http)")" \
       --argjson block_tls "$(guard_bool_to_json "$(guard_block_tls)")" \
       --argjson block_socks "$(guard_bool_to_json "$(guard_block_socks)")" \
-      --argjson whitelist_entries "$(guard_whitelist_entry_count)" \
       '{
         script: $script,
         enabled: $enabled,
@@ -461,12 +281,6 @@ guard_status_json() {
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
-        whitelist_mode: $mode,
-        whitelist_source_url: $source_url,
-        whitelist_custom_file: $custom_file,
-        whitelist_refresh_mode: $refresh_mode,
-        whitelist_file: $whitelist_file,
-        whitelist_entries: $whitelist_entries,
         guard_binary: $bin,
         status_file: $status_file,
         ingress_pin: $ingress_pin
@@ -483,10 +297,6 @@ guard_render_status() {
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
-        ["白名单模式", .whitelist_mode],
-        ["白名单来源", .whitelist_source_url],
-        ["自定义文件", (if .whitelist_custom_file == "" then "-" else .whitelist_custom_file end)],
-        ["白名单条目", (.whitelist_entries | tostring)],
         ["guard 二进制", .guard_binary],
         ["状态文件", .status_file]
       ]

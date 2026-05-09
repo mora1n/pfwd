@@ -923,6 +923,10 @@ ui_guard_summary_rows() {
     done <<< "$rows"
 }
 
+ui_address_control_summary_rows() {
+    address_control_render_status
+}
+
 ui_forward_line() {
     local enabled="$1"
     local body="$2"
@@ -3549,15 +3553,13 @@ ui_print_guard_summary() {
 }
 
 ui_render_guard_menu_page() {
-    ui_header "协议封锁 / IP 白名单"
+    ui_header "协议封锁"
     ui_notice_render
     ui_print_guard_summary
     echo
     ui_menu_item 1 "启用 guard"
     ui_menu_item 2 "停用 guard"
     ui_menu_item 3 "设置封锁协议"
-    ui_menu_item 4 "设置白名单模式"
-    ui_menu_item 5 "刷新国内 IP 白名单"
     ui_menu_item 0 "返回"
 }
 
@@ -3596,33 +3598,61 @@ ui_menu_guard() {
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
                 ui_maybe_pause success
                 ;;
-            4)
-                ui_form_set "白名单模式" "全局生效；国内 IP 白名单默认使用 https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone 。"
-                ui_form_select_read "模式" "1" "0) 返回" "1) 国内 IP 白名单" "2) 自定义 CIDR 白名单" "3) 关闭白名单" || { ui_form_reset; continue; }
-                case "$UI_REPLY" in
-                    0)
-                        ui_form_reset
-                        continue
-                        ;;
-                    1)
-                        ui_run cmd_guard whitelist --mode cn
-                        ;;
-                    2)
-                        ui_form_read "自定义白名单文件路径" "$(guard_whitelist_custom_file)" || { ui_form_reset; continue; }
-                        [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供文件路径"; ui_pause; continue; }
-                        ui_run cmd_guard whitelist --mode custom --file "$UI_REPLY"
-                        ;;
-                    3)
-                        ui_run cmd_guard whitelist --mode off
-                        ;;
-                esac
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_print_address_control_summary() {
+    ui_table_render $'项目\t值' "$(ui_address_control_summary_rows)" "2"
+}
+
+ui_render_address_control_menu_page() {
+    ui_header "地址访问控制"
+    ui_notice_render
+    ui_print_address_control_summary
+    echo
+    ui_menu_item 1 "设置局域网目标"
+    ui_menu_item 2 "设置国内目标"
+    ui_menu_item 3 "设置自定义目标"
+    ui_menu_item 4 "关闭地址访问控制"
+    ui_menu_item 5 "刷新地址数据"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_address_control() {
+    while true; do
+        ui_render_page ui_render_address_control_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_run cmd_address_control --mode lan
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为局域网目标" "32"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_run cmd_address_control --mode cn
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为国内目标" "32"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_form_set "自定义目标 CIDR 文件" "仅允许访问命中的 IPv4 目标 CIDR；未命中目标会被丢弃。"
+                ui_form_read "文件路径" "$(address_control_custom_file)" || { ui_form_reset; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供文件路径"; ui_pause; continue; }
+                ui_run cmd_address_control --mode custom --file "$UI_REPLY"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 白名单模式已更新" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为自定义目标" "32"
+                ui_maybe_pause success
+                ;;
+            4)
+                ui_run cmd_address_control --mode off
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已关闭" "32"
                 ui_maybe_pause success
                 ;;
             5)
-                ui_run cmd_guard whitelist refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已刷新" "32"
+                ui_run cmd_address_control refresh
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制数据已刷新" "32"
                 ui_maybe_pause success
                 ;;
             0) return 0 ;;
@@ -3640,10 +3670,11 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "协议封锁 / IP 白名单"
-    ui_menu_item 6 "配置导入导出"
-    ui_menu_item 7 "更新"
-    ui_menu_item 8 "卸载"
+    ui_menu_item 5 "协议封锁"
+    ui_menu_item 6 "地址访问控制"
+    ui_menu_item 7 "配置导入导出"
+    ui_menu_item 8 "更新"
+    ui_menu_item 9 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -3755,9 +3786,10 @@ cmd_menu() {
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
             5) ui_menu_guard ;;
-            6) ui_menu_export_import ;;
-            7) ui_menu_update ;;
-            8) ui_menu_uninstall ;;
+            6) ui_menu_address_control ;;
+            7) ui_menu_export_import ;;
+            8) ui_menu_update ;;
+            9) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac
