@@ -3553,7 +3553,6 @@ ui_print_guard_summary() {
 }
 
 ui_menu_guard() {
-    local include_cn
     while true; do
         ui_render_page ui_render_guard_menu_page
         ui_read "选择" || return 0
@@ -3588,46 +3587,6 @@ ui_menu_guard() {
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
                 ui_maybe_pause success
                 ;;
-            4)
-                ui_run cmd_address_control --enabled true
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "32"
-                ui_maybe_pause success
-                ;;
-            5)
-                ui_run cmd_address_control --enabled false
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "32"
-                ui_maybe_pause success
-                ;;
-            6)
-                include_cn="$(address_control_include_cn)"
-                if [ "$include_cn" = "true" ]; then
-                    ui_run cmd_address_control --include-cn false
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从白名单移出国内 IP 段" "32"
-                else
-                    ui_run cmd_address_control --include-cn true
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入白名单" "32"
-                fi
-                ui_maybe_pause success
-                ;;
-            7)
-                ui_form_set "自定义 CIDR" "输入一个 IPv4 CIDR；会和国内 IP 白名单并存。"
-                ui_form_read "CIDR" "" || { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
-                ui_run cmd_address_control --enabled true --cidr "$UI_REPLY"
-                ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已追加" "32"
-                ui_maybe_pause success
-                ;;
-            8)
-                ui_run cmd_address_control --clear-custom
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
-                ui_maybe_pause success
-                ;;
-            9)
-                ui_run cmd_address_control refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "32"
-                ui_maybe_pause success
-                ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac
@@ -3638,22 +3597,172 @@ ui_print_address_control_summary() {
     ui_table_render $'项目\t值' "$(ui_address_control_summary_rows)" "2"
 }
 
+ui_custom_cidr_rows() {
+    local idx=2 cidr
+    printf '1\t删除所有自定义 CIDR\n'
+    while IFS= read -r cidr; do
+        [ -n "$cidr" ] || continue
+        printf '%s\t%s\n' "$idx" "$cidr"
+        idx=$((idx + 1))
+    done < <(address_control_custom_cidrs_tsv)
+}
+
+ui_print_custom_cidr_list() {
+    ui_table_render $'序号\t自定义 CIDR' "$(ui_custom_cidr_rows)" "2"
+}
+
+ui_menu_whitelist_cidrs_delete() {
+    local count raw indexes cidr_indexes resolved_indexes
+    count="$(address_control_custom_cidrs_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "暂无自定义 CIDR"
+        ui_pause
+        return 0
+    fi
+    ui_render_page ui_render_whitelist_cidrs_menu_page
+    ui_read "选择 CIDR 序号，可单/多/连续选择；1 表示删除全部" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$((count + 1))" false || return 1
+    indexes="$UI_REPLY"
+    if printf '%s\n' "$indexes" | grep -qx '1'; then
+        ui_run cmd_address_control_custom clear
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
+        return 0
+    fi
+    resolved_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
+    [ -n "$resolved_indexes" ] || { ui_warn "请选择要删除的自定义 CIDR"; return 1; }
+    ui_run cmd_address_control_custom delete $resolved_indexes
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已删除" "32"
+}
+
+ui_render_whitelist_cidrs_menu_page() {
+    ui_header "自定义 CIDR"
+    ui_notice_render
+    ui_print_custom_cidr_list
+    echo
+    ui_menu_item 1 "删除所有自定义 CIDR"
+    ui_menu_item 2 "增加 CIDR"
+    ui_menu_item 3 "删除 CIDR"
+    ui_menu_item 4 "修改 CIDR"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist_cidrs() {
+    local count selected display_index real_index current_cidr
+    while true; do
+        ui_render_page ui_render_whitelist_cidrs_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_run cmd_address_control_custom clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_form_set "增加自定义 CIDR" "输入一个 IPv4 CIDR；会和允许国内 IP 共同组成白名单。"
+                ui_form_read "CIDR" "" || { ui_form_reset; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                ui_run cmd_address_control_custom add "$UI_REPLY"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已添加" "32"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_menu_whitelist_cidrs_delete
+                ui_maybe_pause success
+                ;;
+            4)
+                count="$(address_control_custom_cidrs_count)"
+                if [ "$count" -eq 0 ]; then
+                    ui_warn "暂无自定义 CIDR"
+                    ui_pause
+                    continue
+                fi
+                ui_render_page ui_render_whitelist_cidrs_menu_page
+                ui_read "选择要修改的 CIDR 序号（2-${count}+1）" || return 0
+                [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
+                display_index="$UI_REPLY"
+                [ "$display_index" -ge 2 ] && [ "$display_index" -le $((count + 1)) ] || { ui_warn "序号超出范围"; ui_pause; continue; }
+                real_index=$((display_index - 1))
+                current_cidr="$(address_control_custom_cidr_by_index "$real_index")"
+                [ -n "$current_cidr" ] || { ui_warn "自定义 CIDR 序号不存在"; ui_pause; continue; }
+                ui_form_set "修改自定义 CIDR" "输入新的 IPv4 CIDR。"
+                ui_form_add_kv "当前 CIDR" "$current_cidr"
+                ui_form_read "新 CIDR" "$current_cidr" || { ui_form_reset; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                ui_run cmd_address_control_custom update "$real_index" "$UI_REPLY"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已更新" "32"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_render_whitelist_menu_page() {
+    ui_header "白名单管理"
+    ui_notice_render
+    ui_print_address_control_summary
+    echo
+    ui_menu_item 1 "启动白名单"
+    ui_menu_item 2 "关闭白名单"
+    ui_menu_item 3 "允许国内IP"
+    ui_menu_item 4 "自定义 CIDR"
+    ui_menu_item 5 "刷新白名单数据"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist() {
+    local include_cn
+    while true; do
+        ui_render_page ui_render_whitelist_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_run cmd_address_control --enabled true
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "32"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_run cmd_address_control --enabled false
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "32"
+                ui_maybe_pause success
+                ;;
+            3)
+                include_cn="$(address_control_include_cn)"
+                if [ "$include_cn" = "true" ]; then
+                    ui_run cmd_address_control --include-cn false
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从白名单移出国内 IP 段" "32"
+                else
+                    ui_run cmd_address_control --include-cn true
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入白名单" "32"
+                fi
+                ui_maybe_pause success
+                ;;
+            4)
+                ui_menu_whitelist_cidrs
+                ;;
+            5)
+                ui_run cmd_address_control refresh
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "32"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
 ui_render_guard_menu_page() {
-    ui_header "协议封锁 / 白名单"
+    ui_header "协议封锁"
     ui_notice_render
     ui_print_guard_summary
-    echo
-    ui_print_address_control_summary
     echo
     ui_menu_item 1 "启用 guard"
     ui_menu_item 2 "停用 guard"
     ui_menu_item 3 "设置封锁协议"
-    ui_menu_item 4 "启用白名单"
-    ui_menu_item 5 "停用白名单"
-    ui_menu_item 6 "切换国内 IP"
-    ui_menu_item 7 "追加自定义 CIDR"
-    ui_menu_item 8 "清空自定义 CIDR"
-    ui_menu_item 9 "刷新白名单数据"
     ui_menu_item 0 "返回"
 }
 
@@ -3666,10 +3775,11 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "协议封锁 / 白名单"
-    ui_menu_item 6 "配置导入导出"
-    ui_menu_item 7 "更新"
-    ui_menu_item 8 "卸载"
+    ui_menu_item 5 "协议封锁"
+    ui_menu_item 6 "白名单管理"
+    ui_menu_item 7 "配置导入导出"
+    ui_menu_item 8 "更新"
+    ui_menu_item 9 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -3781,9 +3891,10 @@ cmd_menu() {
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
             5) ui_menu_guard ;;
-            6) ui_menu_export_import ;;
-            7) ui_menu_update ;;
-            8) ui_menu_uninstall ;;
+            6) ui_menu_whitelist ;;
+            7) ui_menu_export_import ;;
+            8) ui_menu_update ;;
+            9) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

@@ -986,6 +986,51 @@ cmd_address_control() {
     echo "协议封锁 / 白名单已更新"
 }
 
+cmd_address_control_custom() {
+    config_init >/dev/null
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        list)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom list"
+            address_control_custom_cidrs_tsv
+            ;;
+        add)
+            local cidr="${1:-}"
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom add <IPv4/CIDR>"
+            address_control_append_custom_cidr "$cidr"
+            address_control_prepare_runtime
+            cmd_refresh
+            echo "自定义 CIDR 已添加：$cidr"
+            ;;
+        clear)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom clear"
+            address_control_clear_custom_cidrs
+            address_control_prepare_runtime
+            cmd_refresh
+            echo "自定义 CIDR 已清空"
+            ;;
+        delete)
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd address-control-custom delete <index...>"
+            address_control_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
+            address_control_prepare_runtime
+            cmd_refresh
+            echo "自定义 CIDR 已删除"
+            ;;
+        update)
+            local index="${1:-}" cidr="${2:-}"
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/CIDR>"
+            address_control_replace_custom_cidr_by_index "$index" "$cidr"
+            address_control_prepare_runtime
+            cmd_refresh
+            echo "自定义 CIDR 已更新：$index -> $cidr"
+            ;;
+        *)
+            pfwd_die "用法：pfwd address-control-custom list|add|clear|delete|update"
+            ;;
+    esac
+}
+
 cmd_uninstall() {
     while [ "$#" -gt 0 ]; do
         pfwd_die "未知选项：$1"

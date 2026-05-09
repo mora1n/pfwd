@@ -36,6 +36,10 @@ address_control_custom_cidrs_tsv() {
     jq -r '.settings.address_control.custom_cidrs // [] | .[]' "$PFWD_CONFIG_FILE"
 }
 
+address_control_custom_cidrs_json() {
+    jq -c '.settings.address_control.custom_cidrs // []' "$PFWD_CONFIG_FILE"
+}
+
 address_control_entry_count() {
     if [ -s "$(address_control_allow_file)" ]; then
         sed '/^$/d' "$(address_control_allow_file)" | wc -l | tr -d ' '
@@ -119,6 +123,65 @@ address_control_config_set_custom_cidrs() {
             | map(select(length > 0))
             | unique))
     '
+}
+
+address_control_append_custom_cidr() {
+    local cidr="$1"
+    validate_ipv4_cidr "$cidr"
+    config_update --arg cidr "$cidr" '
+      (.settings.address_control //= {})
+      | .settings.address_control.custom_cidrs =
+          (((.settings.address_control.custom_cidrs // []) + [$cidr]) | unique)
+    '
+}
+
+address_control_clear_custom_cidrs() {
+    config_update '
+      (.settings.address_control //= {})
+      | .settings.address_control.custom_cidrs = []
+    '
+}
+
+address_control_replace_custom_cidr_by_index() {
+    local index="$1"
+    local cidr="$2"
+    validate_ipv4_cidr "$cidr"
+    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "无效自定义 CIDR 序号：$index"
+    config_update --argjson index "$index" --arg cidr "$cidr" '
+      (.settings.address_control //= {})
+      | (.settings.address_control.custom_cidrs // []) as $items
+      | if $index < 1 or $index > ($items | length) then
+          error("自定义 CIDR 序号超出范围")
+        else
+          .settings.address_control.custom_cidrs =
+            ([ range(0; $items|length) as $i | if $i == ($index - 1) then $cidr else $items[$i] end ] | unique)
+        end
+    '
+}
+
+address_control_delete_custom_cidrs_by_indexes() {
+    local indexes="$1"
+    [ -n "$indexes" ] || pfwd_die "缺少自定义 CIDR 序号"
+    config_update --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      (.settings.address_control //= {})
+      | (.settings.address_control.custom_cidrs // []) as $items
+      | if ($idxs | length) == 0 then
+          error("缺少自定义 CIDR 序号")
+        elif (($idxs | min) < 1) or (($idxs | max) > ($items | length)) then
+          error("自定义 CIDR 序号超出范围")
+        else
+          .settings.address_control.custom_cidrs =
+            [ range(0; $items | length) as $i | select(([$idxs[] - 1] | index($i)) | not) | $items[$i] ]
+        end
+    '
+}
+
+address_control_custom_cidr_by_index() {
+    local index="$1"
+    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "无效自定义 CIDR 序号：$index"
+    jq -r --argjson index "$index" '
+      (.settings.address_control.custom_cidrs // [])[($index - 1)] // empty
+    ' "$PFWD_CONFIG_FILE"
 }
 
 address_control_refresh_cn() {
