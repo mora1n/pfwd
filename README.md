@@ -129,10 +129,11 @@ tar xzf pfwd-offline.tar.gz
 3. 安装脚本和模块文件：
 
 ```bash
-install -d /usr/local/lib/pfwd/lib /usr/local/lib/pfwd/bin /usr/local/bin
+install -d /usr/local/lib/pfwd/lib /usr/local/lib/pfwd/bin /usr/local/lib/pfwd/assets /usr/local/bin
 install -m 755 pfwd.sh /usr/local/lib/pfwd/pfwd.sh
 install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
 install -m 755 assets/pfwd-guard-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-guard
+install -m 644 assets/cn-aggregated.zone /usr/local/lib/pfwd/assets/cn-aggregated.zone
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr

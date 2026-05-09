@@ -76,7 +76,7 @@ service_install_files() {
     mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
     [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
-    [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IP 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)"
+    [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IP 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated.zone $PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
         cp "$PFWD_SCRIPT_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     fi

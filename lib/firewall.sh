@@ -287,7 +287,7 @@ fw_read_counters() {
       def user_mode_usage($user_id; $mode):
         [
           $cfg[0].forwards[] |
-          select(.user_id == $user_id) |
+          select(.user_id == $user_id and ((.traffic_mode // "two-way") == $mode)) |
           (forward_totals(.id)) as $t |
           billed_usage($mode; (.traffic_ratio // 1); $t.input_bytes; $t.output_bytes)
         ] | add // 0;
