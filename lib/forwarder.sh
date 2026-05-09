@@ -365,12 +365,13 @@ forwarder_render_to_stdout() {
 
     echo "    chain forward {"
     echo "        type filter hook forward priority 0; policy accept;"
+    echo "        ct state established,related accept"
     if [ "$(address_control_runtime_enabled)" = "true" ]; then
         if [ -s "$(address_control_allow_ipv4_file)" ]; then
-            echo '        meta nfproto ipv4 ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
+            echo '        ct status dnat ct state new meta nfproto ipv4 ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
         fi
         if [ -s "$(address_control_allow_ipv6_file)" ]; then
-            echo '        meta nfproto ipv6 ip6 saddr != @pfwd_addrctl_allow_v6 drop comment "Inbound whitelist denies unmatched IPv6 sources"'
+            echo '        ct status dnat ct state new meta nfproto ipv6 ip6 saddr != @pfwd_addrctl_allow_v6 drop comment "Inbound whitelist denies unmatched IPv6 sources"'
         fi
     fi
     for ipver in 4 6; do
@@ -379,7 +380,6 @@ forwarder_render_to_stdout() {
             echo "        $(forwarder_dispatch_tokens "$proto" "$ipver") jump $(forwarder_subchain_name forward "$proto" "$ipver")"
         done
     done
-    echo "        ct state established,related accept"
     echo "    }"
     echo
 
