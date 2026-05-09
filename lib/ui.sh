@@ -907,7 +907,7 @@ ui_guard_summary_state() {
                 已停用) printf 'paused' ;;
             esac
             ;;
-        "封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
+        "启用白名单"|"包含国内 IP"|"封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
             case "$value" in
                 开|开启|启用|已启用|true|active|●) printf 'active' ;;
                 关|关闭|停用|已停用|false|paused|■) printf 'paused' ;;
