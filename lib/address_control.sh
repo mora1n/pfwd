@@ -4,12 +4,24 @@ address_control_default_source_url() {
     printf '%s\n' "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone"
 }
 
+address_control_default_ipv6_source_url() {
+    printf '%s\n' "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone"
+}
+
 address_control_state_dir() {
     printf '%s\n' "$PFWD_ADDRESS_CONTROL_STATE_DIR"
 }
 
 address_control_allow_file() {
     printf '%s\n' "$PFWD_ADDRESS_CONTROL_ALLOW_IPV4_FILE"
+}
+
+address_control_allow_ipv4_file() {
+    printf '%s\n' "$PFWD_ADDRESS_CONTROL_ALLOW_IPV4_FILE"
+}
+
+address_control_allow_ipv6_file() {
+    printf '%s\n' "$PFWD_ADDRESS_CONTROL_ALLOW_IPV6_FILE"
 }
 
 address_control_enabled() {
@@ -41,11 +53,14 @@ address_control_custom_cidrs_json() {
 }
 
 address_control_entry_count() {
-    if [ -s "$(address_control_allow_file)" ]; then
-        sed '/^$/d' "$(address_control_allow_file)" | wc -l | tr -d ' '
-    else
-        echo 0
+    local total=0
+    if [ -s "$(address_control_allow_ipv4_file)" ]; then
+        total=$((total + $(sed '/^$/d' "$(address_control_allow_ipv4_file)" | wc -l | tr -d ' ')))
     fi
+    if [ -s "$(address_control_allow_ipv6_file)" ]; then
+        total=$((total + $(sed '/^$/d' "$(address_control_allow_ipv6_file)" | wc -l | tr -d ' ')))
+    fi
+    echo "$total"
 }
 
 address_control_custom_cidrs_count() {
@@ -65,13 +80,45 @@ address_control_filter_ipv4_cidrs() {
     ' | sort -u
 }
 
+address_control_filter_ipv6_cidrs() {
+    python3 -c '
+import ipaddress
+import sys
+
+items = set()
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    try:
+        network = ipaddress.ip_network(line, strict=False)
+    except Exception:
+        continue
+    if network.version != 6:
+        continue
+    items.add(str(network))
+
+for item in sorted(items):
+    print(item)
+'
+}
+
 address_control_write_allow_file() {
     local source_file="$1"
     local target_file
-    target_file="$(address_control_allow_file)"
+    target_file="$(address_control_allow_ipv4_file)"
     mkdir -p "$(dirname "$target_file")"
     address_control_filter_ipv4_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
     [ -s "$target_file" ] || pfwd_die "白名单来源 IP 集合为空：$source_file"
+}
+
+address_control_write_allow_ipv6_file() {
+    local source_file="$1"
+    local target_file
+    target_file="$(address_control_allow_ipv6_file)"
+    mkdir -p "$(dirname "$target_file")"
+    address_control_filter_ipv6_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
+    [ -s "$target_file" ] || pfwd_die "白名单来源 IPv6 集合为空：$source_file"
 }
 
 address_control_mark_last_good() {
@@ -88,7 +135,7 @@ address_control_validate_custom_cidrs() {
     local cidr
     while IFS= read -r cidr; do
         [ -n "$cidr" ] || continue
-        validate_ipv4_cidr "$cidr"
+        validate_ip_cidr "$cidr"
     done
 }
 
@@ -127,7 +174,7 @@ address_control_config_set_custom_cidrs() {
 
 address_control_append_custom_cidr() {
     local cidr="$1"
-    validate_ipv4_cidr "$cidr"
+    validate_ip_cidr "$cidr"
     config_update --arg cidr "$cidr" '
       (.settings.address_control //= {})
       | .settings.address_control.custom_cidrs =
@@ -145,7 +192,7 @@ address_control_clear_custom_cidrs() {
 address_control_replace_custom_cidr_by_index() {
     local index="$1"
     local cidr="$2"
-    validate_ipv4_cidr "$cidr"
+    validate_ip_cidr "$cidr"
     [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "无效自定义 CIDR 序号：$index"
     config_update --argjson index "$index" --arg cidr "$cidr" '
       (.settings.address_control //= {})
@@ -194,6 +241,15 @@ address_control_refresh_cn() {
     address_control_mark_last_good "$url" "$(pfwd_now_iso)"
 }
 
+address_control_refresh_cn_ipv6() {
+    local url tmp
+    url="$(address_control_default_ipv6_source_url)"
+    tmp="$(mktemp)"
+    pfwd_bootstrap_download "$url" "$tmp"
+    address_control_write_allow_ipv6_file "$tmp"
+    rm -f "$tmp"
+}
+
 address_control_import_local_cn_seed() {
     local file_path="$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     [ -f "$file_path" ] || return 1
@@ -201,31 +257,56 @@ address_control_import_local_cn_seed() {
     address_control_mark_last_good "$file_path" "$(pfwd_now_iso)"
 }
 
+address_control_import_local_cn_seed_ipv6() {
+    local file_path="$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
+    [ -f "$file_path" ] || return 1
+    address_control_write_allow_ipv6_file "$file_path"
+}
+
 address_control_sync_cn() {
     if ! address_control_import_local_cn_seed; then
         address_control_refresh_cn
     fi
+    if ! address_control_import_local_cn_seed_ipv6; then
+        address_control_refresh_cn_ipv6
+    fi
 }
 
 address_control_merge_runtime() {
-    local tmp
-    tmp="$(mktemp)"
+    local tmp_v4 tmp_v6
+    tmp_v4="$(mktemp)"
+    tmp_v6="$(mktemp)"
     if [ "$(address_control_include_cn)" = "true" ]; then
-        if [ -s "$(address_control_allow_file).cn" ]; then
-            cat "$(address_control_allow_file).cn" >> "$tmp"
-            printf '\n' >> "$tmp"
+        if [ -s "$(address_control_allow_ipv4_file).cn" ]; then
+            cat "$(address_control_allow_ipv4_file).cn" >> "$tmp_v4"
+            printf '\n' >> "$tmp_v4"
+        fi
+        if [ -s "$(address_control_allow_ipv6_file).cn" ]; then
+            cat "$(address_control_allow_ipv6_file).cn" >> "$tmp_v6"
+            printf '\n' >> "$tmp_v6"
         fi
     fi
-    address_control_custom_cidrs_tsv >> "$tmp"
-    address_control_write_allow_file "$tmp"
-    rm -f "$tmp"
+    address_control_custom_cidrs_tsv | address_control_filter_ipv4_cidrs >> "$tmp_v4"
+    address_control_custom_cidrs_tsv | address_control_filter_ipv6_cidrs >> "$tmp_v6"
+
+    if [ -s "$tmp_v4" ]; then
+        address_control_write_allow_file "$tmp_v4"
+    else
+        : > "$(address_control_allow_ipv4_file)"
+    fi
+    if [ -s "$tmp_v6" ]; then
+        address_control_write_allow_ipv6_file "$tmp_v6"
+    else
+        : > "$(address_control_allow_ipv6_file)"
+    fi
+    rm -f "$tmp_v4" "$tmp_v6"
 }
 
 address_control_prepare_runtime() {
     local cn_tmp
     if [ "$(address_control_enabled)" != "true" ]; then
-        rm -f "$(address_control_allow_file)" 2>/dev/null || true
-        rm -f "$(address_control_allow_file).cn" 2>/dev/null || true
+        rm -f "$(address_control_allow_ipv4_file)" "$(address_control_allow_ipv6_file)" 2>/dev/null || true
+        rm -f "$(address_control_allow_ipv4_file).cn" "$(address_control_allow_ipv6_file).cn" 2>/dev/null || true
         return 0
     fi
 
@@ -240,9 +321,19 @@ address_control_prepare_runtime() {
             mv "$cn_tmp.filtered" "$cn_tmp"
             address_control_mark_last_good "$(address_control_source_url)" "$(pfwd_now_iso)"
         fi
-        mv "$cn_tmp" "$(address_control_allow_file).cn"
+        mv "$cn_tmp" "$(address_control_allow_ipv4_file).cn"
+
+        cn_tmp="$(mktemp)"
+        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" ]; then
+            address_control_filter_ipv6_cidrs < "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" | pfwd_write_atomic "$cn_tmp"
+        else
+            pfwd_bootstrap_download "$(address_control_default_ipv6_source_url)" "$cn_tmp"
+            address_control_filter_ipv6_cidrs < "$cn_tmp" | pfwd_write_atomic "$cn_tmp.filtered"
+            mv "$cn_tmp.filtered" "$cn_tmp"
+        fi
+        mv "$cn_tmp" "$(address_control_allow_ipv6_file).cn"
     else
-        rm -f "$(address_control_allow_file).cn" 2>/dev/null || true
+        rm -f "$(address_control_allow_ipv4_file).cn" "$(address_control_allow_ipv6_file).cn" 2>/dev/null || true
     fi
 
     address_control_merge_runtime
@@ -257,7 +348,8 @@ address_control_status_json() {
       --argjson enabled "$(address_control_enabled)" \
       --argjson include_cn "$(address_control_include_cn)" \
       --arg source_url "$(address_control_source_url)" \
-      --arg allow_file "$(address_control_allow_file)" \
+      --arg allow_ipv4_file "$(address_control_allow_ipv4_file)" \
+      --arg allow_ipv6_file "$(address_control_allow_ipv6_file)" \
       --arg last_good_source "$(address_control_last_good_source)" \
       --arg last_good_updated_at "$(address_control_last_good_updated_at)" \
       --argjson entries "$(address_control_entry_count)" \
@@ -266,7 +358,8 @@ address_control_status_json() {
         enabled: $enabled,
         include_cn: $include_cn,
         source_url: $source_url,
-        allow_file: $allow_file,
+        allow_ipv4_file: $allow_ipv4_file,
+        allow_ipv6_file: $allow_ipv6_file,
         last_good_source: $last_good_source,
         last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
         entries: $entries,
@@ -284,7 +377,8 @@ address_control_render_status() {
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],
-        ["运行态文件", .allow_file]
+        ["IPv4 文件", .allow_ipv4_file],
+        ["IPv6 文件", .allow_ipv6_file]
       ]
       | map(@tsv)
       | .[]

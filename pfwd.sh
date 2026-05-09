@@ -98,6 +98,7 @@ pfwd_bootstrap_install() {
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$guard_asset" "$guard_bin_dir/pfwd-guard"
     chmod +x "$guard_bin_dir/pfwd-guard"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -232,7 +233,7 @@ pfwd - nft 端口转发管理脚本
   pfwd notify-delete --user-id ID
   pfwd guard enable|disable|status|apply|remove
   pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off]
-  pfwd address-control [--enabled true|false] [--include-cn true|false] [--cidr IPv4/CIDR] [--replace-custom] [--clear-custom] [--source-url URL]
+  pfwd address-control [--enabled true|false] [--include-cn true|false] [--cidr IPv4/IPv6 CIDR] [--replace-custom] [--clear-custom] [--source-url URL]
   pfwd address-control refresh
   pfwd address-control status
   pfwd doctor
@@ -254,8 +255,8 @@ pfwd - nft 端口转发管理脚本
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
   协议封锁由 `guard` 子命令管理；白名单由 `address-control` 子命令管理。
-  白名单限制的是入站来源 IPv4 CIDR；默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
-  白名单启用时 IPv6 入站默认拦截；国内 IP 默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`。
+  白名单限制的是入站来源 IPv4 / IPv6 CIDR；默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
+  白名单支持 IPv4 / IPv6 CIDR；国内 IPv4 默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`，国内 IPv6 默认数据源为 `https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone`。
 EOF
 }
 

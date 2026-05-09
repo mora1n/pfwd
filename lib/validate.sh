@@ -245,6 +245,37 @@ validate_ipv4_cidr() {
     done
 }
 
+validate_ipv6_cidr() {
+    local value="$1"
+    local output
+    output="$(python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    network = ipaddress.IPv6Network(value, strict=False)
+except Exception:
+    sys.exit(1)
+
+sys.stdout.write(str(network))
+PY
+)" || pfwd_die "无效 IPv6 CIDR：$value"
+    [ -n "$output" ] || pfwd_die "无效 IPv6 CIDR：$value"
+}
+
+validate_ip_cidr() {
+    local value="$1"
+    case "$value" in
+        *:*)
+            validate_ipv6_cidr "$value"
+            ;;
+        *)
+            validate_ipv4_cidr "$value"
+            ;;
+    esac
+}
+
 validate_reset_day() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "无效重置日：$value"

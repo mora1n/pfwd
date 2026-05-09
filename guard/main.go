@@ -31,6 +31,7 @@ type bpfObjects struct {
 	IngressGuard     *ebpf.Program `ebpf:"ingress_guard"`
 	GuardSettings    *ebpf.Map     `ebpf:"guard_settings"`
 	GuardWhitelistV4 *ebpf.Map     `ebpf:"guard_whitelist_v4"`
+	GuardWhitelistV6 *ebpf.Map     `ebpf:"guard_whitelist_v6"`
 	GuardStats       *ebpf.Map     `ebpf:"guard_stats"`
 }
 
@@ -47,6 +48,9 @@ func (o *bpfObjects) Close() {
 	if o.GuardWhitelistV4 != nil {
 		_ = o.GuardWhitelistV4.Close()
 	}
+	if o.GuardWhitelistV6 != nil {
+		_ = o.GuardWhitelistV6.Close()
+	}
 	if o.GuardStats != nil {
 		_ = o.GuardStats.Close()
 	}
@@ -62,6 +66,11 @@ type guardSettings struct {
 type whitelistKeyV4 struct {
 	PrefixLen uint32
 	Addr      uint32
+}
+
+type whitelistKeyV6 struct {
+	PrefixLen uint32
+	Addr      [16]byte
 }
 
 type applyOptions struct {
@@ -265,7 +274,7 @@ func applyGuard(opts applyOptions) error {
 
 	whitelistEntries := 0
 	if opts.WhitelistEnabled {
-		whitelistEntries, err = loadWhitelistFile(objs.GuardWhitelistV4, opts.WhitelistFile)
+		whitelistEntries, err = loadWhitelistFile(objs.GuardWhitelistV4, objs.GuardWhitelistV6, opts.WhitelistFile)
 		if err != nil {
 			return err
 		}
@@ -356,50 +365,75 @@ func updateSettings(settingsMap *ebpf.Map, opts applyOptions) error {
 	return nil
 }
 
-func loadWhitelistFile(whitelistMap *ebpf.Map, filePath string) (int, error) {
-	if whitelistMap == nil {
+func loadWhitelistFile(whitelistMapV4 *ebpf.Map, whitelistMapV6 *ebpf.Map, filePath string) (int, error) {
+	if whitelistMapV4 == nil {
 		return 0, fmt.Errorf("guard_whitelist_v4 map 未加载")
 	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		return 0, fmt.Errorf("打开白名单文件失败: %w", err)
+	if whitelistMapV6 == nil {
+		return 0, fmt.Errorf("guard_whitelist_v6 map 未加载")
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	lineNo := 0
+	parts := strings.Split(filePath, ":")
 	count := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
 			continue
 		}
 
-		prefix, err := netip.ParsePrefix(line)
+		file, err := os.Open(part)
 		if err != nil {
-			return 0, fmt.Errorf("解析白名单失败 (%s:%d): %w", filePath, lineNo, err)
-		}
-		prefix = prefix.Masked()
-		if !prefix.Addr().Is4() {
-			return 0, fmt.Errorf("仅支持 IPv4 白名单 (%s:%d): %s", filePath, lineNo, line)
+			return 0, fmt.Errorf("打开白名单文件失败: %w", err)
 		}
 
-		addr := prefix.Addr().As4()
-		key := whitelistKeyV4{
-			PrefixLen: uint32(prefix.Bits()),
-			Addr:      binary.BigEndian.Uint32(addr[:]),
-		}
-		value := uint8(1)
-		if err := whitelistMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return 0, fmt.Errorf("写入白名单失败 (%s:%d): %w", filePath, lineNo, err)
-		}
-		count++
-	}
+		scanner := bufio.NewScanner(file)
+		lineNo := 0
+		for scanner.Scan() {
+			lineNo++
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
 
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("读取白名单文件失败: %w", err)
+			prefix, err := netip.ParsePrefix(line)
+			if err != nil {
+				_ = file.Close()
+				return 0, fmt.Errorf("解析白名单失败 (%s:%d): %w", part, lineNo, err)
+			}
+			prefix = prefix.Masked()
+
+			value := uint8(1)
+			if prefix.Addr().Is4() {
+				addr := prefix.Addr().As4()
+				key := whitelistKeyV4{
+					PrefixLen: uint32(prefix.Bits()),
+					Addr:      binary.BigEndian.Uint32(addr[:]),
+				}
+				if err := whitelistMapV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
+					_ = file.Close()
+					return 0, fmt.Errorf("写入 IPv4 白名单失败 (%s:%d): %w", part, lineNo, err)
+				}
+			} else {
+				addr := prefix.Addr().As16()
+				key := whitelistKeyV6{
+					PrefixLen: uint32(prefix.Bits()),
+					Addr:      addr,
+				}
+				if err := whitelistMapV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
+					_ = file.Close()
+					return 0, fmt.Errorf("写入 IPv6 白名单失败 (%s:%d): %w", part, lineNo, err)
+				}
+			}
+			count++
+		}
+
+		if err := scanner.Err(); err != nil {
+			_ = file.Close()
+			return 0, fmt.Errorf("读取白名单文件失败: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return 0, fmt.Errorf("关闭白名单文件失败: %w", err)
+		}
 	}
 	return count, nil
 }

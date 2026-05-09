@@ -3659,7 +3659,7 @@ ui_menu_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "增加自定义 CIDR" "输入一个 IPv4 CIDR；会和允许国内 IP 共同组成白名单。"
+                ui_form_set "增加自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR；会和允许国内 IP 共同组成白名单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
                 ui_run cmd_address_control_custom add "$UI_REPLY"
@@ -3686,7 +3686,7 @@ ui_menu_whitelist_cidrs() {
                 real_index=$((display_index - 1))
                 current_cidr="$(address_control_custom_cidr_by_index "$real_index")"
                 [ -n "$current_cidr" ] || { ui_warn "自定义 CIDR 序号不存在"; ui_pause; continue; }
-                ui_form_set "修改自定义 CIDR" "输入新的 IPv4 CIDR。"
+                ui_form_set "修改自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR。"
                 ui_form_add_kv "当前 CIDR" "$current_cidr"
                 ui_form_read "新 CIDR" "$current_cidr" || { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }

@@ -24,6 +24,11 @@ struct whitelist_key_v4 {
     __u32 addr;
 };
 
+struct whitelist_key_v6 {
+    __u32 prefixlen;
+    __u8 addr[16];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -38,6 +43,14 @@ struct {
     __type(key, struct whitelist_key_v4);
     __type(value, __u8);
 } guard_whitelist_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct whitelist_key_v6);
+    __type(value, __u8);
+} guard_whitelist_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -63,6 +76,22 @@ static __always_inline int whitelist_match_v4(__be32 addr) {
     __u8 *value;
 
     value = bpf_map_lookup_elem(&guard_whitelist_v4, &key);
+    return value != 0;
+}
+
+static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
+    struct whitelist_key_v6 key = {
+        .prefixlen = 128,
+    };
+    __u8 *value;
+    int i;
+
+#pragma unroll
+    for (i = 0; i < 16; i++) {
+        key.addr[i] = addr[i];
+    }
+
+    value = bpf_map_lookup_elem(&guard_whitelist_v6, &key);
     return value != 0;
 }
 
@@ -263,6 +292,10 @@ int ingress_guard(struct __sk_buff *skb) {
             return TC_ACT_OK;
         }
         if (ip6.nexthdr != IPPROTO_TCP) {
+            return TC_ACT_OK;
+        }
+        if (settings->whitelist_enabled && whitelist_match_v6(ip6.saddr)) {
+            stat_inc(STAT_WHITELIST_HIT);
             return TC_ACT_OK;
         }
         l4_offset = ETH_HLEN + sizeof(ip6);

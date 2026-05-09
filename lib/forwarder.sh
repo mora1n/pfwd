@@ -320,14 +320,26 @@ forwarder_render_to_stdout() {
 
     echo "table inet $table {"
     if [ "$(address_control_runtime_enabled)" = "true" ]; then
-        echo "    set pfwd_addrctl_allow_v4 {"
-        echo "        type ipv4_addr"
-        echo "        flags interval"
-        echo "        elements = {"
-        sed 's/^/            /;s/$/,/' "$(address_control_allow_file)"
-        echo "        }"
-        echo "    }"
-        echo
+        if [ -s "$(address_control_allow_ipv4_file)" ]; then
+            echo "    set pfwd_addrctl_allow_v4 {"
+            echo "        type ipv4_addr"
+            echo "        flags interval"
+            echo "        elements = {"
+            sed 's/^/            /;s/$/,/' "$(address_control_allow_ipv4_file)"
+            echo "        }"
+            echo "    }"
+            echo
+        fi
+        if [ -s "$(address_control_allow_ipv6_file)" ]; then
+            echo "    set pfwd_addrctl_allow_v6 {"
+            echo "        type ipv6_addr"
+            echo "        flags interval"
+            echo "        elements = {"
+            sed 's/^/            /;s/$/,/' "$(address_control_allow_ipv6_file)"
+            echo "        }"
+            echo "    }"
+            echo
+        fi
     fi
     echo "    chain prerouting {"
         echo "        type nat hook prerouting priority dstnat; policy accept;"
@@ -354,8 +366,12 @@ forwarder_render_to_stdout() {
     echo "    chain forward {"
     echo "        type filter hook forward priority 0; policy accept;"
     if [ "$(address_control_runtime_enabled)" = "true" ]; then
-        echo '        meta nfproto ipv6 drop comment "Inbound whitelist denies IPv6 sources"'
-        echo '        ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
+        if [ -s "$(address_control_allow_ipv4_file)" ]; then
+            echo '        meta nfproto ipv4 ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
+        fi
+        if [ -s "$(address_control_allow_ipv6_file)" ]; then
+            echo '        meta nfproto ipv6 ip6 saddr != @pfwd_addrctl_allow_v6 drop comment "Inbound whitelist denies unmatched IPv6 sources"'
+        fi
     fi
     for ipver in 4 6; do
         for proto in tcp; do

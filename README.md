@@ -21,8 +21,8 @@
 `pfwd` 的入口侧访问控制统一收口到 `协议封锁 / 白名单`：
 
 - 协议封锁：由 `guard` 负责，按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`，适合中转机快速拦截特征明显的高风险流量。
-- 白名单：由 `nftables` 负责，限制入站来源 IPv4 CIDR。默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
-- 当前边界：协议封锁仅覆盖 TCP 首包识别；白名单当前仅支持 IPv4 CIDR，启用后 IPv6 入站默认拦截。
+- 白名单：由 `nftables` 负责，限制入站来源 IPv4 / IPv6 CIDR。默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
+- 当前边界：协议封锁仅覆盖 TCP 首包识别；白名单支持 IPv4 / IPv6 CIDR。
 
 常用命令：
 
@@ -61,7 +61,7 @@ pfwd
 
 ### Offline Install
 
-适用于目标机器无法直接访问 GitHub 的场景。离线包需要同时包含 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`；其中 `assets/` 除了 guard 预编译二进制，还包含国内 IP 白名单种子 `cn-aggregated.zone`。
+适用于目标机器无法直接访问 GitHub 的场景。离线包需要同时包含 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`；其中 `assets/` 除了 guard 预编译二进制，还包含国内 IPv4 / IPv6 白名单种子 `cn-aggregated.zone` 和 `cn-aggregated-v6.zone`。
 
 离线安装完成后，系统文件结构如下：
 
@@ -78,7 +78,8 @@ pfwd
 │   ├── bin/
 │   │   └── pfwd-guard          # 协议封锁预编译 guard
 │   ├── assets/
-│   │   └── cn-aggregated.zone  # 国内目标地址离线种子
+│   │   ├── cn-aggregated.zone     # 国内 IPv4 白名单离线种子
+│   │   └── cn-aggregated-v6.zone  # 国内 IPv6 白名单离线种子
 │   └── lib/
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
@@ -99,7 +100,8 @@ pfwd
 │   ├── stats.json              # 流量统计状态文件
 │   ├── bbr-state.env           # BBR / optimize 状态文件
 │   ├── address_control/
-│   │   └── allow_ipv4.txt      # 入站来源 IPv4 白名单运行态
+│   │   ├── allow_ipv4.txt      # 入站来源 IPv4 白名单运行态
+│   │   └── allow_ipv6.txt      # 入站来源 IPv6 白名单运行态
 │   └── guard/
 │       └── status.json         # guard 运行状态
 │
@@ -137,6 +139,7 @@ install -m 755 pfwd.sh /usr/local/lib/pfwd/pfwd.sh
 install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
 install -m 755 assets/pfwd-guard-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-guard
 install -m 644 assets/cn-aggregated.zone /usr/local/lib/pfwd/assets/cn-aggregated.zone
+install -m 644 assets/cn-aggregated-v6.zone /usr/local/lib/pfwd/assets/cn-aggregated-v6.zone
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr

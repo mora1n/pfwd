@@ -956,7 +956,7 @@ cmd_address_control() {
     [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
     [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
     if [ -n "$cidr" ]; then
-        validate_ipv4_cidr "$cidr"
+        validate_ip_cidr "$cidr"
     fi
 
     if [ "$enabled" = "__KEEP__" ]; then
@@ -997,7 +997,7 @@ cmd_address_control_custom() {
             ;;
         add)
             local cidr="${1:-}"
-            [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom add <IPv4/CIDR>"
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom add <IPv4/IPv6 CIDR>"
             address_control_append_custom_cidr "$cidr"
             address_control_prepare_runtime
             cmd_refresh
@@ -1019,7 +1019,7 @@ cmd_address_control_custom() {
             ;;
         update)
             local index="${1:-}" cidr="${2:-}"
-            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/CIDR>"
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/IPv6 CIDR>"
             address_control_replace_custom_cidr_by_index "$index" "$cidr"
             address_control_prepare_runtime
             cmd_refresh
