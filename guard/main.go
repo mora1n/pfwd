@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -83,6 +84,7 @@ type statusFilePayload struct {
 	Applied           bool   `json:"applied"`
 	BinaryVersion     string `json:"binary_version"`
 	AppliedAt         string `json:"applied_at"`
+	AttachMode        string `json:"attach_mode"`
 	Interface         string `json:"interface"`
 	InterfaceIndex    int    `json:"interface_index"`
 	IngressPin        string `json:"ingress_pin"`
@@ -244,7 +246,10 @@ func applyGuard(opts applyOptions) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("移除 memlock 限制失败: %w", err)
 	}
-	if err := removePinnedLink(opts.IngressPin); err != nil {
+	if err := removeGuard(removeOptions{
+		IngressPin: opts.IngressPin,
+		StatusFile: opts.StatusFile,
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧 guard link 失败: %w", err)
 	}
 
@@ -266,30 +271,16 @@ func applyGuard(opts applyOptions) error {
 		}
 	}
 
-	attachedLink, err := link.AttachTCX(link.TCXOptions{
-		Interface: iface.Index,
-		Program:   objs.IngressGuard,
-		Attach:    ebpf.AttachTCXIngress,
-	})
+	attachMode, err := attachGuard(iface, objs.IngressGuard, opts.IngressPin)
 	if err != nil {
-		return fmt.Errorf("挂载 TCX ingress 失败: %w", err)
-	}
-	defer attachedLink.Close()
-
-	if err := os.MkdirAll(filepath.Dir(opts.IngressPin), 0o755); err != nil {
-		return fmt.Errorf("创建 bpffs 目录失败: %w", err)
-	}
-	if err := attachedLink.Pin(opts.IngressPin); err != nil {
-		return fmt.Errorf("pin guard link 失败: %w", err)
-	}
-	if err := attachedLink.Close(); err != nil {
-		return fmt.Errorf("关闭 guard link fd 失败: %w", err)
+		return err
 	}
 
 	payload := statusFilePayload{
 		Applied:          true,
 		BinaryVersion:    binaryVersion,
 		AppliedAt:        time.Now().UTC().Format(time.RFC3339),
+		AttachMode:       attachMode,
 		Interface:        iface.Name,
 		InterfaceIndex:   iface.Index,
 		IngressPin:       opts.IngressPin,
@@ -311,8 +302,20 @@ func removeGuard(opts removeOptions) error {
 	if opts.IngressPin == "" {
 		return fmt.Errorf("缺少 --ingress-pin")
 	}
-	if err := removePinnedLink(opts.IngressPin); err != nil {
-		return fmt.Errorf("移除 guard link 失败: %w", err)
+	payload, _ := readStatusFile(opts.StatusFile)
+	switch payload.AttachMode {
+	case "tc":
+		if payload.Interface != "" {
+			_ = runTC("filter", "delete", "dev", payload.Interface, "ingress")
+			_ = runTC("qdisc", "delete", "dev", payload.Interface, "clsact")
+		}
+		if err := removePinnedProgram(opts.IngressPin); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("移除 pinned guard program 失败: %w", err)
+		}
+	default:
+		if err := removePinnedLink(opts.IngressPin); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("移除 guard link 失败: %w", err)
+		}
 	}
 	if opts.StatusFile != "" {
 		if err := removeIfExists(opts.StatusFile); err != nil {
@@ -401,6 +404,45 @@ func loadWhitelistFile(whitelistMap *ebpf.Map, filePath string) (int, error) {
 	return count, nil
 }
 
+func attachGuard(iface *net.Interface, prog *ebpf.Program, pinPath string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(pinPath), 0o755); err != nil {
+		return "", fmt.Errorf("创建 bpffs 目录失败: %w", err)
+	}
+
+	attachedLink, err := link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   prog,
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err == nil {
+		defer attachedLink.Close()
+		if err := attachedLink.Pin(pinPath); err != nil {
+			return "", fmt.Errorf("pin guard link 失败: %w", err)
+		}
+		if err := attachedLink.Close(); err != nil {
+			return "", fmt.Errorf("关闭 guard link fd 失败: %w", err)
+		}
+		return "tcx", nil
+	}
+
+	if !strings.Contains(err.Error(), "requires >= v6.6") && !strings.Contains(strings.ToLower(err.Error()), "not supported") {
+		return "", fmt.Errorf("挂载 TCX ingress 失败: %w", err)
+	}
+
+	if err := prog.Pin(pinPath); err != nil {
+		return "", fmt.Errorf("pin guard program 失败: %w", err)
+	}
+	if err := ensureClsact(iface.Name); err != nil {
+		_ = removePinnedProgram(pinPath)
+		return "", err
+	}
+	if err := runTC("filter", "replace", "dev", iface.Name, "ingress", "bpf", "direct-action", "object-pinned", pinPath); err != nil {
+		_ = removePinnedProgram(pinPath)
+		return "", fmt.Errorf("挂载 tc ingress filter 失败: %w", err)
+	}
+	return "tc", nil
+}
+
 func removePinnedLink(pinPath string) error {
 	if pinPath == "" {
 		return fmt.Errorf("pin path 不能为空")
@@ -424,6 +466,47 @@ func removePinnedLink(pinPath string) error {
 	}
 	if err := loadedLink.Unpin(); err != nil {
 		return fmt.Errorf("unpin guard link 失败: %w", err)
+	}
+	return nil
+}
+
+func removePinnedProgram(pinPath string) error {
+	if pinPath == "" {
+		return fmt.Errorf("pin path 不能为空")
+	}
+	prog, err := ebpf.LoadPinnedProgram(pinPath, nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return fmt.Errorf("加载 pinned guard program 失败: %w", err)
+	}
+	defer prog.Close()
+	if err := prog.Unpin(); err != nil {
+		return fmt.Errorf("unpin guard program 失败: %w", err)
+	}
+	return nil
+}
+
+func ensureClsact(iface string) error {
+	if err := runTC("qdisc", "replace", "dev", iface, "clsact"); err == nil {
+		return nil
+	}
+	if err := runTC("qdisc", "add", "dev", iface, "clsact"); err != nil && !strings.Contains(err.Error(), "File exists") {
+		return fmt.Errorf("创建 clsact qdisc 失败: %w", err)
+	}
+	return nil
+}
+
+func runTC(args ...string) error {
+	cmd := exec.Command("tc", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			return err
+		}
+		return fmt.Errorf("%s: %w", text, err)
 	}
 	return nil
 }

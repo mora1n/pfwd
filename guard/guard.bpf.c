@@ -128,29 +128,83 @@ static __always_inline int match_socks(const __u8 *payload, __u32 len) {
 
 static __always_inline int inspect_tcp_payload(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len, const struct guard_settings *settings) {
     __u8 payload[64];
-    __u32 to_read;
-
-    if (payload_len == 0) {
+    if (payload_len >= 8) {
+        if (bpf_skb_load_bytes(skb, payload_offset, payload, 8) < 0) {
+            stat_inc(STAT_PARSE_SKIP);
+            return TC_ACT_OK;
+        }
+        if (settings->block_http && match_http(payload, 8)) {
+            stat_inc(STAT_HTTP_DROP);
+            return TC_ACT_SHOT;
+        }
+        if (settings->block_tls && match_tls_client_hello(payload, 8)) {
+            stat_inc(STAT_TLS_DROP);
+            return TC_ACT_SHOT;
+        }
+        if (settings->block_socks && match_socks(payload, 8)) {
+            stat_inc(STAT_SOCKS_DROP);
+            return TC_ACT_SHOT;
+        }
         return TC_ACT_OK;
     }
 
-    to_read = payload_len > sizeof(payload) ? sizeof(payload) : payload_len;
-    if (bpf_skb_load_bytes(skb, payload_offset, payload, to_read) < 0) {
-        stat_inc(STAT_PARSE_SKIP);
+    if (payload_len >= 6) {
+        if (bpf_skb_load_bytes(skb, payload_offset, payload, 6) < 0) {
+            stat_inc(STAT_PARSE_SKIP);
+            return TC_ACT_OK;
+        }
+        if (settings->block_http && match_http(payload, 6)) {
+            stat_inc(STAT_HTTP_DROP);
+            return TC_ACT_SHOT;
+        }
+        if (settings->block_tls && match_tls_client_hello(payload, 6)) {
+            stat_inc(STAT_TLS_DROP);
+            return TC_ACT_SHOT;
+        }
+        if (settings->block_socks && match_socks(payload, 6)) {
+            stat_inc(STAT_SOCKS_DROP);
+            return TC_ACT_SHOT;
+        }
         return TC_ACT_OK;
     }
 
-    if (settings->block_http && match_http(payload, to_read)) {
-        stat_inc(STAT_HTTP_DROP);
-        return TC_ACT_SHOT;
+    if (payload_len >= 5) {
+        if (bpf_skb_load_bytes(skb, payload_offset, payload, 5) < 0) {
+            stat_inc(STAT_PARSE_SKIP);
+            return TC_ACT_OK;
+        }
+        if (settings->block_http && match_http(payload, 5)) {
+            stat_inc(STAT_HTTP_DROP);
+            return TC_ACT_SHOT;
+        }
+        if (settings->block_socks && match_socks(payload, 5)) {
+            stat_inc(STAT_SOCKS_DROP);
+            return TC_ACT_SHOT;
+        }
+        return TC_ACT_OK;
     }
-    if (settings->block_tls && match_tls_client_hello(payload, to_read)) {
-        stat_inc(STAT_TLS_DROP);
-        return TC_ACT_SHOT;
+
+    if (payload_len >= 4) {
+        if (bpf_skb_load_bytes(skb, payload_offset, payload, 4) < 0) {
+            stat_inc(STAT_PARSE_SKIP);
+            return TC_ACT_OK;
+        }
+        if (settings->block_http && match_http(payload, 4)) {
+            stat_inc(STAT_HTTP_DROP);
+            return TC_ACT_SHOT;
+        }
+        return TC_ACT_OK;
     }
-    if (settings->block_socks && match_socks(payload, to_read)) {
-        stat_inc(STAT_SOCKS_DROP);
-        return TC_ACT_SHOT;
+
+    if (payload_len >= 3) {
+        if (bpf_skb_load_bytes(skb, payload_offset, payload, 3) < 0) {
+            stat_inc(STAT_PARSE_SKIP);
+            return TC_ACT_OK;
+        }
+        if (settings->block_socks && match_socks(payload, 3)) {
+            stat_inc(STAT_SOCKS_DROP);
+            return TC_ACT_SHOT;
+        }
     }
 
     return TC_ACT_OK;
