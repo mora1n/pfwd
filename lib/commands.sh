@@ -63,20 +63,22 @@ cmd_update_finalize_recover() {
     local work_dir="$1"
     local runtime_enabled="$2"
     local timer_enabled="$3"
-    local error_message="$4"
+    local guard_enabled="$4"
+    local error_message="$5"
 
     service_update_rollback "$work_dir" || true
-    service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" || true
+    service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" "$guard_enabled" || true
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
 
 cmd_update_finalize() {
-    local work_dir="" runtime_enabled="" timer_enabled="" from_version="" to_version=""
+    local work_dir="" runtime_enabled="" timer_enabled="" guard_enabled="" from_version="" to_version=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
             --runtime-enabled) runtime_enabled="${2:-}"; shift 2 ;;
             --timer-enabled) timer_enabled="${2:-}"; shift 2 ;;
+            --guard-enabled) guard_enabled="${2:-}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
@@ -86,17 +88,17 @@ cmd_update_finalize() {
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
     if ! service_install_files; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "更新收尾失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "更新收尾失败"
     fi
-    if ! service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled"; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "恢复服务启用状态失败"
+    if ! service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" "$guard_enabled"; then
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "恢复服务启用状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
@@ -114,7 +116,7 @@ cmd_update() {
     done
 
     service_installation_present || pfwd_die "未检测到已安装的 pfwd，请先执行 pfwd install"
-    local work_dir staged_dir local_version remote_version runtime_enabled timer_enabled
+    local work_dir staged_dir local_version remote_version runtime_enabled timer_enabled guard_enabled
     work_dir="$(service_update_create_workdir)"
     staged_dir="$work_dir/staged"
 
@@ -153,6 +155,7 @@ cmd_update() {
     remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
     runtime_enabled="$(service_update_capture_enabled_state "$(service_primary_runtime_unit)")"
     timer_enabled="$(service_update_capture_enabled_state "$(service_timer_unit_name)")"
+    guard_enabled="$(service_update_capture_enabled_state "$(service_guard_unit_name)")"
 
     service_update_backup_current "$work_dir"
     if ! service_update_apply_staged "$work_dir"; then
@@ -164,6 +167,7 @@ cmd_update() {
         --work-dir "$work_dir" \
         --runtime-enabled "$runtime_enabled" \
         --timer-enabled "$timer_enabled" \
+        --guard-enabled "$guard_enabled" \
         --from-version "$local_version" \
         --to-version "$remote_version"; then
         service_update_rollback "$work_dir" || true
@@ -717,6 +721,7 @@ cmd_render() {
         forwarder) forwarder_render_config ;;
         nft) fw_render_nft ;;
         tc) fw_render_tc ;;
+        guard) guard_render_status ;;
         units)
             echo "# pfwd-forward.service"
             forwarder_service_unit
@@ -726,8 +731,10 @@ cmd_render() {
             service_timer_unit
             echo "# pfwd-bbr.service"
             bbr_service_unit
+            echo "# pfwd-guard.service"
+            guard_service_unit
             ;;
-        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|units]" ;;
+        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|guard|units]" ;;
     esac
 }
 
@@ -741,6 +748,7 @@ cmd_apply_runtime() {
     forwarder_apply_runtime
     fw_apply_nft
     fw_apply_tc
+    guard_apply_runtime true
     echo "已刷新"
 }
 
@@ -793,12 +801,17 @@ cmd_doctor() {
     if command -v nft >/dev/null 2>&1; then echo "nft：$(command -v nft)"; else echo "nft：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
     if command -v systemctl >/dev/null 2>&1; then echo "systemctl：正常"; else echo "systemctl：缺失"; fi
+    if guard_binary_exists; then echo "guard：$(guard_bin_path)"; else echo "guard：缺失"; fi
     echo "运行态安装：$(service_runtime_status_label)"
     if service_unit_exists pfwd-forward.service; then echo "pfwd-forward.service：已安装"; else echo "pfwd-forward.service：未安装"; fi
     if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
     if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
+    if service_unit_exists pfwd-guard.service; then echo "pfwd-guard.service：已安装"; else echo "pfwd-guard.service：未安装"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
+    guard_render_status | while IFS=$'\t' read -r key value; do
+        printf 'guard.%s：%s\n' "$key" "$value"
+    done
     cmd_doctor_benchmarks
 }
 
@@ -806,6 +819,9 @@ cmd_install() {
     config_init
     service_install_files
     service_enable
+    if command -v systemctl >/dev/null 2>&1; then
+        pfwd_run systemctl enable pfwd-guard.service
+    fi
     cmd_apply_runtime
     echo "已安装：$PFWD_BIN_PATH"
     echo "BBR 管理入口：$PFWD_BBR_ALIAS_BIN_PATH"
@@ -817,7 +833,123 @@ cmd_forward_boot() {
     forwarder_apply_runtime
     fw_apply_nft
     fw_apply_tc
+    guard_apply_runtime true
     echo "boot restore complete"
+}
+
+cmd_guard() {
+    config_init >/dev/null
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        enable)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard enable"
+            guard_config_set_enabled true
+            cmd_refresh
+            echo "guard 已启用"
+            ;;
+        disable)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard disable"
+            guard_config_set_enabled false
+            guard_remove_runtime
+            echo "guard 已停用"
+            ;;
+        apply)
+            local quiet="false"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --quiet) quiet="true"; shift ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            guard_apply_runtime "$quiet"
+            ;;
+        remove)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard remove"
+            guard_remove_runtime
+            ;;
+        status)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard status"
+            guard_render_status
+            ;;
+        protocols)
+            local http="__KEEP__" https="__KEEP__" tls="__KEEP__" socks="__KEEP__"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --http) http="${2:-}"; shift 2 ;;
+                    --https) https="${2:-}"; shift 2 ;;
+                    --tls) tls="${2:-}"; shift 2 ;;
+                    --socks) socks="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ "$http" = "__KEEP__" ] || validate_bool "$http"
+            [ "$https" = "__KEEP__" ] || validate_bool "$https"
+            [ "$tls" = "__KEEP__" ] || validate_bool "$tls"
+            [ "$socks" = "__KEEP__" ] || validate_bool "$socks"
+            if [ "$https" != "__KEEP__" ]; then
+                http="$https"
+                tls="$https"
+            fi
+            [ "$http" = "__KEEP__" ] && http="$(guard_block_http)"
+            [ "$tls" = "__KEEP__" ] && tls="$(guard_block_tls)"
+            [ "$socks" = "__KEEP__" ] && socks="$(guard_block_socks)"
+            guard_config_set_protocols "$http" "$tls" "$socks"
+            cmd_refresh
+            echo "guard 协议封锁已更新"
+            ;;
+        whitelist)
+            local mode="" source_url="" file_path="" refresh_requested="false"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --mode) mode="${2:-}"; shift 2 ;;
+                    --source-url) source_url="${2:-}"; shift 2 ;;
+                    --file|--import-file) file_path="${2:-}"; shift 2 ;;
+                    refresh) refresh_requested="true"; shift ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            if [ "$refresh_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ]; then
+                case "$(guard_whitelist_mode)" in
+                    cn) guard_refresh_cn_whitelist ;;
+                    custom)
+                        file_path="$(guard_whitelist_custom_file)"
+                        [ -n "$file_path" ] || pfwd_die "当前未配置自定义白名单文件"
+                        guard_import_custom_whitelist "$file_path"
+                        ;;
+                    off) pfwd_die "当前白名单模式为 off，请先切换到 cn 或 custom" ;;
+                esac
+                cmd_refresh
+                echo "guard 白名单已刷新"
+                return 0
+            fi
+
+            [ -n "$mode" ] || mode="$(guard_whitelist_mode)"
+            [ -n "$source_url" ] || source_url="$(guard_whitelist_source_url)"
+            [ -n "$file_path" ] || file_path="$(guard_whitelist_custom_file)"
+            guard_validate_whitelist_mode "$mode"
+            case "$mode" in
+                cn)
+                    guard_config_set_whitelist "$mode" "$source_url" "" "manual"
+                    guard_refresh_cn_whitelist
+                    ;;
+                custom)
+                    [ -n "$file_path" ] || pfwd_die "custom 模式必须提供 --file"
+                    file_path="$(guard_expand_path "$file_path")"
+                    guard_config_set_whitelist "$mode" "$source_url" "$file_path" "manual"
+                    guard_import_custom_whitelist "$file_path"
+                    ;;
+                off)
+                    guard_config_set_whitelist "$mode" "$source_url" "" "manual"
+                    ;;
+            esac
+            cmd_refresh
+            echo "guard 白名单已更新"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist"
+            ;;
+    esac
 }
 
 cmd_uninstall() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.1.0"
+PFWD_VERSION="0.1.1"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -28,7 +28,17 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate forwarder firewall stats notify service commands ui)
+PFWD_LIB_FILES=(core config validate forwarder firewall stats notify guard service commands ui)
+
+pfwd_bootstrap_guard_asset_name() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) echo "pfwd-guard-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-guard-linux-arm64" ;;
+        *) return 1 ;;
+    esac
+}
 
 pfwd_bootstrap_root_prefix() {
     local prefix="${PFWD_ROOT_PREFIX:-/}"
@@ -69,17 +79,24 @@ pfwd_bootstrap_download() {
 }
 
 pfwd_bootstrap_install() {
-    local install_dir bin_path systemd_dir lib_dir
+    local install_dir bin_path systemd_dir lib_dir guard_bin_dir guard_asset
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
+    guard_bin_dir="$install_dir/bin"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$guard_bin_dir" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
     chmod +x "$install_dir/bbr.sh"
+    guard_asset="$(pfwd_bootstrap_guard_asset_name)" || {
+        echo "错误：当前架构暂不支持 guard 预编译二进制：$(uname -m)" >&2
+        exit 1
+    }
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$guard_asset" "$guard_bin_dir/pfwd-guard"
+    chmod +x "$guard_bin_dir/pfwd-guard"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -159,6 +176,7 @@ pfwd_main() {
         notify-schedule) cmd_notify_schedule "$@" ;;
         notify-disable) cmd_notify_disable "$@" ;;
         notify-delete) cmd_notify_delete "$@" ;;
+        guard) cmd_guard "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
@@ -210,6 +228,10 @@ pfwd - nft 端口转发管理脚本
   pfwd notify-schedule --user-id ID [--interval-minutes 60|--clear-interval] [--daily-time 09:30|--clear-daily]
   pfwd notify-disable --user-id ID
   pfwd notify-delete --user-id ID
+  pfwd guard enable|disable|status|apply|remove
+  pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off]
+  pfwd guard whitelist --mode off|cn|custom [--source-url URL] [--file FILE]
+  pfwd guard whitelist refresh
   pfwd doctor
   pfwd install
   pfwd update [--check|--yes]
@@ -225,9 +247,10 @@ pfwd - nft 端口转发管理脚本
 监听 IP 默认使用 :: 双栈监听；当前 nft 后端仅支持 :: / 0.0.0.0 这类通配监听地址。
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
-MSS 和固定 SNAT 通过 `.forwards[].nft` 字段持久化。
-MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
-内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
+  MSS 和固定 SNAT 通过 `.forwards[].nft` 字段持久化。
+  MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
+  内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
+  协议封锁和 IP 白名单由 `guard` 子命令管理；国内白名单默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`。
 EOF
 }
 

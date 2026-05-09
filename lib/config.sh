@@ -10,7 +10,20 @@ config_default_json() {
     "domain_refresh_interval": "60s",
     "tc_interface": "",
     "default_listen_ip": "::",
-    "default_random_port_range": "20000-30000"
+    "default_random_port_range": "20000-30000",
+    "guard": {
+      "enabled": false,
+      "tc_interface": "",
+      "block_http": false,
+      "block_tls": false,
+      "block_socks": false,
+      "whitelist_mode": "off",
+      "whitelist_source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
+      "whitelist_refresh_mode": "manual",
+      "whitelist_file": "",
+      "last_good_source": "",
+      "last_good_updated_at": null
+    }
   },
   "users": [],
   "forwards": []

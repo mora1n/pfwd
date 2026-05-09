@@ -3469,6 +3469,86 @@ ui_menu_update() {
     ui_maybe_pause success
 }
 
+ui_print_guard_summary() {
+    ui_table_render $'项目\t值' "$(guard_render_status)" "2"
+}
+
+ui_render_guard_menu_page() {
+    ui_header "协议封锁 / IP 白名单"
+    ui_notice_render
+    ui_print_guard_summary
+    echo
+    ui_menu_item 1 "启用 guard"
+    ui_menu_item 2 "停用 guard"
+    ui_menu_item 3 "设置封锁协议"
+    ui_menu_item 4 "设置白名单模式"
+    ui_menu_item 5 "刷新国内 IP 白名单"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_guard() {
+    while true; do
+        ui_render_page ui_render_guard_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_run cmd_guard enable
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已启用" "32"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_run cmd_guard disable
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已停用" "32"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_form_set "协议封锁" "HTTPS 会同时开启 HTTP 和 TLS 封锁；仅覆盖 TCP 首包。"
+                ui_form_select_read "HTTP [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                local block_http="false" block_tls="false" block_socks="false"
+                [ "$UI_REPLY" = "2" ] && block_http="true"
+                ui_form_add_kv "HTTP" "$( [ "$block_http" = "true" ] && echo 开启 || echo 关闭 )"
+                ui_form_select_read "TLS [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "2" ] && block_tls="true"
+                ui_form_add_kv "TLS" "$( [ "$block_tls" = "true" ] && echo 开启 || echo 关闭 )"
+                ui_form_select_read "SOCKS [1]" "1" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "2" ] && block_socks="true"
+                ui_form_add_kv "SOCKS" "$( [ "$block_socks" = "true" ] && echo 开启 || echo 关闭 )"
+                ui_run cmd_guard protocols --http "$block_http" --tls "$block_tls" --socks "$block_socks"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
+                ui_maybe_pause success
+                ;;
+            4)
+                ui_form_set "白名单模式" "全局生效；国内 IP 白名单默认使用 https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone 。"
+                ui_form_select_read "模式 [1]" "1" "1) 国内 IP 白名单" "2) 自定义 CIDR 白名单" "3) 关闭白名单" || { ui_form_reset; continue; }
+                case "$UI_REPLY" in
+                    1)
+                        ui_run cmd_guard whitelist --mode cn
+                        ;;
+                    2)
+                        ui_form_read "自定义白名单文件路径" "$(guard_whitelist_custom_file)" || { ui_form_reset; continue; }
+                        [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供文件路径"; ui_pause; continue; }
+                        ui_run cmd_guard whitelist --mode custom --file "$UI_REPLY"
+                        ;;
+                    3)
+                        ui_run cmd_guard whitelist --mode off
+                        ;;
+                esac
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 白名单模式已更新" "32"
+                ui_maybe_pause success
+                ;;
+            5)
+                ui_run cmd_guard whitelist refresh
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已刷新" "32"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
 ui_render_main_menu_page() {
     ui_title
     ui_notice_render
@@ -3478,9 +3558,10 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "配置导入导出"
-    ui_menu_item 6 "更新"
-    ui_menu_item 7 "卸载"
+    ui_menu_item 5 "协议封锁 / IP 白名单"
+    ui_menu_item 6 "配置导入导出"
+    ui_menu_item 7 "更新"
+    ui_menu_item 8 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -3591,9 +3672,10 @@ cmd_menu() {
             2) ui_menu_forwards ;;
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
-            5) ui_menu_export_import ;;
-            6) ui_menu_update ;;
-            7) ui_menu_uninstall ;;
+            5) ui_menu_guard ;;
+            6) ui_menu_export_import ;;
+            7) ui_menu_update ;;
+            8) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

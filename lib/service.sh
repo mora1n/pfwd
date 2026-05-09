@@ -16,6 +16,7 @@ EOF
 service_installation_present() {
     [ -f "$PFWD_INSTALL_DIR/pfwd.sh" ] || return 1
     [ -f "$PFWD_INSTALL_DIR/bbr.sh" ] || return 1
+    [ -x "$PFWD_GUARD_BIN_PATH" ] || return 1
     [ -d "$PFWD_INSTALL_DIR/lib" ] || return 1
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -54,9 +55,25 @@ WantedBy=multi-user.target
 EOF
 }
 
+guard_service_unit() {
+    cat <<EOF
+[Unit]
+Description=pfwd guard runtime restore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$PFWD_BIN_PATH guard apply --quiet
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 service_install_files() {
     pfwd_mkdirs
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
     [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
     if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
@@ -68,8 +85,16 @@ service_install_files() {
     if [ "$PFWD_SCRIPT_DIR/lib" != "$PFWD_INSTALL_DIR/lib" ]; then
         cp "$PFWD_SCRIPT_DIR/lib/"*.sh "$PFWD_INSTALL_DIR/lib/"
     fi
+    if [ -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ]; then
+        if [ "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" != "$PFWD_GUARD_BIN_PATH" ]; then
+            cp "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" "$PFWD_GUARD_BIN_PATH"
+        fi
+    elif [ ! -x "$PFWD_GUARD_BIN_PATH" ]; then
+        pfwd_die "安装包不完整：缺少 guard 预编译二进制 ($PFWD_SCRIPT_DIR/assets/$(guard_asset_name))"
+    fi
     chmod +x "$PFWD_INSTALL_DIR/pfwd.sh"
     chmod +x "$PFWD_INSTALL_DIR/bbr.sh"
+    chmod +x "$PFWD_GUARD_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
@@ -77,6 +102,7 @@ service_install_files() {
     service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
     service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
     bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
+    guard_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-guard.service"
 }
 
 service_ensure_shortcut() {
@@ -116,6 +142,10 @@ service_timer_unit_name() {
     echo "pfwd.timer"
 }
 
+service_guard_unit_name() {
+    echo "pfwd-guard.service"
+}
+
 service_runtime_status_label() {
     if service_runtime_installed; then
         echo "已安装"
@@ -126,8 +156,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-guard.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-guard.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -194,12 +224,17 @@ service_uninstall_files() {
     service_disable
     service_cleanup_nft_tables
     service_cleanup_pfwd_tc
+    guard_remove_runtime true || true
     rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.timer"
+          "$PFWD_SYSTEMD_DIR/pfwd.timer" \
+          "$PFWD_SYSTEMD_DIR/pfwd-guard.service"
     rm -f "$PFWD_BIN_PATH"
     rm -f "$PFWD_INSTALL_DIR/pfwd.sh"
+    rm -f "$PFWD_GUARD_BIN_PATH"
+    rm -rf "$PFWD_GUARD_STATE_DIR"
     rm -rf "$PFWD_INSTALL_DIR/lib"
+    rmdir "$PFWD_INSTALL_DIR/bin" 2>/dev/null || true
 }
 
 service_purge_state() {
@@ -208,8 +243,10 @@ service_purge_state() {
 
 service_verify_removed() {
     local leftovers=()
-    for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/lib" "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
-        "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer"; do
+    for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_GUARD_BIN_PATH" \
+        "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_WHITELIST_IPV4_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" "$PFWD_GUARD_LINK_EGRESS_PATH" \
+        "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
+        "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer" "$PFWD_SYSTEMD_DIR/pfwd-guard.service"; do
         [ ! -e "$path" ] || leftovers+=("$path")
     done
     if [ "${#leftovers[@]}" -gt 0 ]; then
@@ -239,9 +276,10 @@ service_update_download_bundle() {
     local staged_dir="$work_dir/staged"
     local lib
 
-    mkdir -p "$staged_dir/lib"
+    mkdir -p "$staged_dir/lib" "$staged_dir/assets"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$staged_dir/pfwd.sh" || return 1
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$staged_dir/bbr.sh" || return 1
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$(guard_asset_name)" "$staged_dir/assets/$(guard_asset_name)" || return 1
     for lib in "${PFWD_LIB_FILES[@]}"; do
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/lib/$lib.sh" "$staged_dir/lib/$lib.sh" || return 1
     done
@@ -259,6 +297,10 @@ service_update_validate_bundle() {
         echo "更新包缺少 bbr.sh" >&2
         return 1
     }
+    [ -f "$dir/assets/$(guard_asset_name)" ] || {
+        echo "更新包缺少 assets/$(guard_asset_name)" >&2
+        return 1
+    }
     bash -n "$dir/pfwd.sh" || return 1
     bash -n "$dir/bbr.sh" || return 1
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -273,9 +315,19 @@ service_update_validate_bundle() {
 service_update_bundle_digest() {
     local dir="$1"
     local payload="" lib
+    local guard_file=""
+
+    if [ -f "$dir/assets/$(guard_asset_name)" ]; then
+        guard_file="$dir/assets/$(guard_asset_name)"
+    elif [ -f "$dir/bin/pfwd-guard" ]; then
+        guard_file="$dir/bin/pfwd-guard"
+    else
+        pfwd_die "缺少 guard 二进制用于生成摘要：$dir"
+    fi
 
     payload="pfwd.sh $(pfwd_file_checksum "$dir/pfwd.sh")"$'\n'
     payload="${payload}bbr.sh $(pfwd_file_checksum "$dir/bbr.sh")"$'\n'
+    payload="${payload}guard $(pfwd_file_checksum "$guard_file")"$'\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
         payload="${payload}lib/$lib.sh $(pfwd_file_checksum "$dir/lib/$lib.sh")"$'\n'
     done
@@ -298,6 +350,7 @@ service_update_capture_enabled_state() {
 service_update_restore_enabled_state() {
     local runtime_enabled="$1"
     local timer_enabled="$2"
+    local guard_enabled="${3:-false}"
 
     if ! command -v systemctl >/dev/null 2>&1; then
         return 0
@@ -315,6 +368,12 @@ service_update_restore_enabled_state() {
     else
         pfwd_run systemctl stop "$(service_timer_unit_name)" || true
         pfwd_run systemctl disable "$(service_timer_unit_name)" || true
+    fi
+    if [ "$guard_enabled" = "true" ]; then
+        pfwd_run systemctl enable "$(service_guard_unit_name)"
+    else
+        pfwd_run systemctl stop "$(service_guard_unit_name)" || true
+        pfwd_run systemctl disable "$(service_guard_unit_name)" || true
     fi
 }
 
@@ -334,7 +393,10 @@ service_update_backup_current() {
     if [ -e "$PFWD_BBR_ALIAS_BIN_PATH" ]; then
         cp -a "$PFWD_BBR_ALIAS_BIN_PATH" "$backup_dir/bin/pfwd-bbr"
     fi
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service; do
+    if [ -e "$PFWD_GUARD_BIN_PATH" ]; then
+        cp -a "$PFWD_GUARD_BIN_PATH" "$backup_dir/bin/pfwd-guard"
+    fi
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-guard.service; do
         if [ -e "$PFWD_SYSTEMD_DIR/$unit" ]; then
             cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/systemd/$unit"
         fi
@@ -346,9 +408,10 @@ service_update_apply_staged() {
     local staged_dir="$work_dir/staged"
     local lib
 
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
+    mkdir -p "$PFWD_INSTALL_DIR/lib" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_GUARD_BIN_PATH")"
     install -m 0755 "$staged_dir/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
     install -m 0755 "$staged_dir/bbr.sh" "$PFWD_INSTALL_DIR/bbr.sh"
+    install -m 0755 "$staged_dir/assets/$(guard_asset_name)" "$PFWD_GUARD_BIN_PATH"
     for lib in "${PFWD_LIB_FILES[@]}"; do
         install -m 0644 "$staged_dir/lib/$lib.sh" "$PFWD_INSTALL_DIR/lib/$lib.sh"
     done
@@ -383,12 +446,19 @@ service_update_rollback() {
         rm -f "$PFWD_BBR_ALIAS_BIN_PATH"
         cp -a "$backup_dir/bin/pfwd-bbr" "$PFWD_BBR_ALIAS_BIN_PATH"
     fi
+    if [ -e "$backup_dir/bin/pfwd-guard" ]; then
+        mkdir -p "$(dirname "$PFWD_GUARD_BIN_PATH")"
+        rm -f "$PFWD_GUARD_BIN_PATH"
+        cp -a "$backup_dir/bin/pfwd-guard" "$PFWD_GUARD_BIN_PATH"
+    fi
 
     mkdir -p "$PFWD_SYSTEMD_DIR"
     rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
           "$PFWD_SYSTEMD_DIR/pfwd.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.timer"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service; do
+          "$PFWD_SYSTEMD_DIR/pfwd.timer" \
+          "$PFWD_SYSTEMD_DIR/pfwd-bbr.service" \
+          "$PFWD_SYSTEMD_DIR/pfwd-guard.service"
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-guard.service; do
         if [ -e "$backup_dir/systemd/$unit" ]; then
             cp -a "$backup_dir/systemd/$unit" "$PFWD_SYSTEMD_DIR/$unit"
         fi

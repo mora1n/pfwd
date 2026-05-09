@@ -16,6 +16,24 @@
 | Ops | 支持安装、更新、刷新、排查、导出、导入、卸载 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
+## Guard
+
+`guard` 用于补充入口侧访问控制，支持 TCP 首包协议封锁和全局 IPv4 白名单：
+
+- 协议封锁：可按需拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`，适合中转机快速拦截特征明显的高风险流量。
+- IP 白名单：可按 CIDR 导入自定义 IPv4 白名单，也可直接使用国内白名单。
+- 默认国内白名单源：`https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`
+- 当前边界：仅覆盖 TCP 首包识别；不检查 UDP 内容，不做深度协议解析。
+
+常用命令：
+
+```bash
+pfwd guard enable
+pfwd guard protocols --https true --socks true
+pfwd guard whitelist --mode cn
+pfwd guard status
+```
+
 ## Requirements
 
 | Dependency | Purpose |
@@ -42,7 +60,7 @@ pfwd
 
 ### Offline Install
 
-适用于目标机器无法直接访问 GitHub 的场景。可以先在本地打包 `pfwd.sh`、`bbr.sh` 和 `lib/`，再拷贝到目标机器离线安装。
+适用于目标机器无法直接访问 GitHub 的场景。可以先在本地打包 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`，再拷贝到目标机器离线安装。
 
 离线安装完成后，系统文件结构如下：
 
@@ -56,6 +74,8 @@ pfwd
 ├── /usr/local/lib/pfwd/
 │   ├── pfwd.sh                 # pfwd 主脚本
 │   ├── bbr.sh                  # BBR / optimize 主脚本
+│   ├── bin/
+│   │   └── pfwd-guard          # 协议封锁 / IP 白名单预编译 guard
 │   └── lib/
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
@@ -73,7 +93,10 @@ pfwd
 │
 ├── /var/lib/pfwd/
 │   ├── stats.json              # 流量统计状态文件
-│   └── bbr-state.env           # BBR / optimize 状态文件
+│   ├── bbr-state.env           # BBR / optimize 状态文件
+│   └── guard/
+│       ├── status.json         # guard 运行状态
+│       └── whitelist_ipv4.txt  # guard IPv4 白名单缓存
 │
 ├── /run/pfwd/
 │   ├── runtime.json            # 当前解析后的运行态
@@ -83,7 +106,8 @@ pfwd
     ├── pfwd-forward.service    # 开机恢复转发运行态
     ├── pfwd.service            # 到期停转、通知、状态同步
     ├── pfwd.timer              # 定时触发 pfwd.service
-    └── pfwd-bbr.service        # 开机恢复 BBR / optimize 运行态
+    ├── pfwd-bbr.service        # 开机恢复 BBR / optimize 运行态
+    └── pfwd-guard.service      # 开机恢复协议封锁 / IP 白名单运行态
 ```
 
 建议的离线安装步骤：
@@ -91,7 +115,7 @@ pfwd
 1. 在可联网机器准备离线包：
 
 ```bash
-tar czf pfwd-offline.tar.gz pfwd.sh bbr.sh lib/
+tar czf pfwd-offline.tar.gz pfwd.sh bbr.sh lib/ assets/
 ```
 
 2. 把 `pfwd-offline.tar.gz` 拷贝到目标机器并解压：
@@ -103,9 +127,10 @@ tar xzf pfwd-offline.tar.gz
 3. 安装脚本和模块文件：
 
 ```bash
-install -d /usr/local/lib/pfwd/lib /usr/local/bin
+install -d /usr/local/lib/pfwd/lib /usr/local/lib/pfwd/bin /usr/local/bin
 install -m 755 pfwd.sh /usr/local/lib/pfwd/pfwd.sh
 install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
+install -m 755 assets/pfwd-guard-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-guard
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
