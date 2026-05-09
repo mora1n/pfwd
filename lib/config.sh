@@ -19,9 +19,10 @@ config_default_json() {
       "block_socks": false
     },
     "address_control": {
-      "mode": "off",
+      "enabled": false,
+      "include_cn": true,
+      "custom_cidrs": [],
       "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
-      "file": "",
       "last_good_source": "",
       "last_good_updated_at": null
     }

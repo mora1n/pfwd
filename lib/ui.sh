@@ -901,6 +901,12 @@ ui_guard_summary_state() {
                 已停用|停用|关闭|关|false|paused|■) printf 'paused' ;;
             esac
             ;;
+        "地域控制模式")
+            case "$value" in
+                仅国内|仅自定义|国内\ +\ 自定义|已启用) printf 'active' ;;
+                已停用) printf 'paused' ;;
+            esac
+            ;;
         "封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
             case "$value" in
                 开|开启|启用|已启用|true|active|●) printf 'active' ;;
@@ -3552,18 +3558,8 @@ ui_print_guard_summary() {
     ui_table_render $'项目\t值' "$(ui_guard_summary_rows)" "2"
 }
 
-ui_render_guard_menu_page() {
-    ui_header "协议封锁"
-    ui_notice_render
-    ui_print_guard_summary
-    echo
-    ui_menu_item 1 "启用 guard"
-    ui_menu_item 2 "停用 guard"
-    ui_menu_item 3 "设置封锁协议"
-    ui_menu_item 0 "返回"
-}
-
 ui_menu_guard() {
+    local include_cn
     while true; do
         ui_render_page ui_render_guard_menu_page
         ui_read "选择" || return 0
@@ -3598,6 +3594,46 @@ ui_menu_guard() {
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
                 ui_maybe_pause success
                 ;;
+            4)
+                ui_run cmd_address_control --enabled true
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "32"
+                ui_maybe_pause success
+                ;;
+            5)
+                ui_run cmd_address_control --enabled false
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "32"
+                ui_maybe_pause success
+                ;;
+            6)
+                include_cn="$(address_control_include_cn)"
+                if [ "$include_cn" = "true" ]; then
+                    ui_run cmd_address_control --include-cn false
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已关闭" "32"
+                else
+                    ui_run cmd_address_control --include-cn true
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "国内 IP 白名单已开启" "32"
+                fi
+                ui_maybe_pause success
+                ;;
+            7)
+                ui_form_set "自定义 CIDR" "输入一个 IPv4 CIDR；会和国内 IP 白名单并存。"
+                ui_form_read "CIDR" "" || { ui_form_reset; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                ui_run cmd_address_control --enabled true --cidr "$UI_REPLY"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已追加" "32"
+                ui_maybe_pause success
+                ;;
+            8)
+                ui_run cmd_address_control --clear-custom
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
+                ui_maybe_pause success
+                ;;
+            9)
+                ui_run cmd_address_control refresh
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "32"
+                ui_maybe_pause success
+                ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac
@@ -3608,57 +3644,23 @@ ui_print_address_control_summary() {
     ui_table_render $'项目\t值' "$(ui_address_control_summary_rows)" "2"
 }
 
-ui_render_address_control_menu_page() {
-    ui_header "地址访问控制"
+ui_render_guard_menu_page() {
+    ui_header "协议封锁 / 白名单"
     ui_notice_render
+    ui_print_guard_summary
+    echo
     ui_print_address_control_summary
     echo
-    ui_menu_item 1 "设置局域网目标"
-    ui_menu_item 2 "设置国内目标"
-    ui_menu_item 3 "设置自定义目标"
-    ui_menu_item 4 "关闭地址访问控制"
-    ui_menu_item 5 "刷新地址数据"
+    ui_menu_item 1 "启用 guard"
+    ui_menu_item 2 "停用 guard"
+    ui_menu_item 3 "设置封锁协议"
+    ui_menu_item 4 "启用白名单"
+    ui_menu_item 5 "停用白名单"
+    ui_menu_item 6 "切换国内 IP"
+    ui_menu_item 7 "追加自定义 CIDR"
+    ui_menu_item 8 "清空自定义 CIDR"
+    ui_menu_item 9 "刷新白名单数据"
     ui_menu_item 0 "返回"
-}
-
-ui_menu_address_control() {
-    while true; do
-        ui_render_page ui_render_address_control_menu_page
-        ui_read "选择" || return 0
-        case "$UI_REPLY" in
-            1)
-                ui_run cmd_address_control --mode lan
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为局域网目标" "32"
-                ui_maybe_pause success
-                ;;
-            2)
-                ui_run cmd_address_control --mode cn
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为国内目标" "32"
-                ui_maybe_pause success
-                ;;
-            3)
-                ui_form_set "自定义目标 CIDR 文件" "仅允许访问命中的 IPv4 目标 CIDR；未命中目标会被丢弃。"
-                ui_form_read "文件路径" "$(address_control_custom_file)" || { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供文件路径"; ui_pause; continue; }
-                ui_run cmd_address_control --mode custom --file "$UI_REPLY"
-                ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已切换为自定义目标" "32"
-                ui_maybe_pause success
-                ;;
-            4)
-                ui_run cmd_address_control --mode off
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制已关闭" "32"
-                ui_maybe_pause success
-                ;;
-            5)
-                ui_run cmd_address_control refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "地址访问控制数据已刷新" "32"
-                ui_maybe_pause success
-                ;;
-            0) return 0 ;;
-            *) ui_warn "无效选择"; ui_pause ;;
-        esac
-    done
 }
 
 ui_render_main_menu_page() {
@@ -3670,11 +3672,10 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "协议封锁"
-    ui_menu_item 6 "地址访问控制"
-    ui_menu_item 7 "配置导入导出"
-    ui_menu_item 8 "更新"
-    ui_menu_item 9 "卸载"
+    ui_menu_item 5 "协议封锁 / 白名单"
+    ui_menu_item 6 "配置导入导出"
+    ui_menu_item 7 "更新"
+    ui_menu_item 8 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -3786,10 +3787,9 @@ cmd_menu() {
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
             5) ui_menu_guard ;;
-            6) ui_menu_address_control ;;
-            7) ui_menu_export_import ;;
-            8) ui_menu_update ;;
-            9) ui_menu_uninstall ;;
+            6) ui_menu_export_import ;;
+            7) ui_menu_update ;;
+            8) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

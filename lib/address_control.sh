@@ -12,16 +12,28 @@ address_control_allow_file() {
     printf '%s\n' "$PFWD_ADDRESS_CONTROL_ALLOW_IPV4_FILE"
 }
 
-address_control_mode() {
-    jq -r '.settings.address_control.mode // "off"' "$PFWD_CONFIG_FILE"
+address_control_enabled() {
+    jq -r '.settings.address_control.enabled // false' "$PFWD_CONFIG_FILE"
+}
+
+address_control_include_cn() {
+    jq -r '.settings.address_control.include_cn // true' "$PFWD_CONFIG_FILE"
 }
 
 address_control_source_url() {
     jq -r --arg url "$(address_control_default_source_url)" '.settings.address_control.source_url // $url' "$PFWD_CONFIG_FILE"
 }
 
-address_control_custom_file() {
-    jq -r '.settings.address_control.file // ""' "$PFWD_CONFIG_FILE"
+address_control_last_good_source() {
+    jq -r '.settings.address_control.last_good_source // ""' "$PFWD_CONFIG_FILE"
+}
+
+address_control_last_good_updated_at() {
+    jq -r '.settings.address_control.last_good_updated_at // empty' "$PFWD_CONFIG_FILE"
+}
+
+address_control_custom_cidrs_tsv() {
+    jq -r '.settings.address_control.custom_cidrs // [] | .[]' "$PFWD_CONFIG_FILE"
 }
 
 address_control_entry_count() {
@@ -30,6 +42,10 @@ address_control_entry_count() {
     else
         echo 0
     fi
+}
+
+address_control_custom_cidrs_count() {
+    jq -r '.settings.address_control.custom_cidrs // [] | length' "$PFWD_CONFIG_FILE"
 }
 
 address_control_filter_ipv4_cidrs() {
@@ -51,7 +67,7 @@ address_control_write_allow_file() {
     target_file="$(address_control_allow_file)"
     mkdir -p "$(dirname "$target_file")"
     address_control_filter_ipv4_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
-    [ -s "$target_file" ] || pfwd_die "地址访问控制目标集合为空：$source_file"
+    [ -s "$target_file" ] || pfwd_die "白名单来源 IP 集合为空：$source_file"
 }
 
 address_control_mark_last_good() {
@@ -64,20 +80,44 @@ address_control_mark_last_good() {
     '
 }
 
-address_control_config_set() {
-    local mode="$1"
-    local source_url="$2"
-    local file_path="$3"
-    validate_address_control_mode "$mode"
+address_control_validate_custom_cidrs() {
+    local cidr
+    while IFS= read -r cidr; do
+        [ -n "$cidr" ] || continue
+        validate_ipv4_cidr "$cidr"
+    done
+}
+
+address_control_config_set_state() {
+    local enabled="$1"
+    local include_cn="$2"
+    local source_url="$3"
+    validate_bool "$enabled"
+    validate_bool "$include_cn"
     [ -n "$source_url" ] || source_url="$(address_control_default_source_url)"
     config_update \
-      --arg mode "$mode" \
-      --arg source_url "$source_url" \
-      --arg file_path "$file_path" '
+      --argjson enabled "$enabled" \
+      --argjson include_cn "$include_cn" \
+      --arg source_url "$source_url" '
       (.settings.address_control //= {})
-      | .settings.address_control.mode = $mode
+      | .settings.address_control.enabled = $enabled
+      | .settings.address_control.include_cn = $include_cn
       | .settings.address_control.source_url = $source_url
-      | .settings.address_control.file = $file_path
+    '
+}
+
+address_control_config_set_custom_cidrs() {
+    local cidrs_file="$1"
+    [ -f "$cidrs_file" ] || pfwd_die "自定义 CIDR 临时文件不存在：$cidrs_file"
+    address_control_validate_custom_cidrs < "$cidrs_file"
+    config_update --rawfile cidrs "$cidrs_file" '
+      (.settings.address_control //= {})
+      | .settings.address_control.custom_cidrs =
+          (($cidrs
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | unique))
     '
 }
 
@@ -104,80 +144,88 @@ address_control_sync_cn() {
     fi
 }
 
-address_control_import_custom() {
-    local file_path="$1"
-    [ -f "$file_path" ] || pfwd_die "地址访问控制文件不存在：$file_path"
-    address_control_write_allow_file "$file_path"
-    address_control_mark_last_good "$file_path" "$(pfwd_now_iso)"
-}
-
-address_control_sync_lan() {
+address_control_merge_runtime() {
     local tmp
     tmp="$(mktemp)"
-    cat > "$tmp" <<'EOF'
-10.0.0.0/8
-100.64.0.0/10
-127.0.0.0/8
-169.254.0.0/16
-172.16.0.0/12
-192.0.0.0/24
-192.0.2.0/24
-192.168.0.0/16
-198.18.0.0/15
-198.51.100.0/24
-203.0.113.0/24
-224.0.0.0/4
-240.0.0.0/4
-EOF
+    if [ "$(address_control_include_cn)" = "true" ]; then
+        if [ -s "$(address_control_allow_file).cn" ]; then
+            cat "$(address_control_allow_file).cn" >> "$tmp"
+            printf '\n' >> "$tmp"
+        fi
+    fi
+    address_control_custom_cidrs_tsv >> "$tmp"
     address_control_write_allow_file "$tmp"
     rm -f "$tmp"
-    address_control_mark_last_good "built-in:lan" "$(pfwd_now_iso)"
 }
 
 address_control_prepare_runtime() {
-    local mode custom_file
-    mode="$(address_control_mode)"
-    case "$mode" in
-        off)
-            rm -f "$(address_control_allow_file)" 2>/dev/null || true
-            ;;
-        lan)
-            if [ ! -s "$(address_control_allow_file)" ]; then
-                address_control_sync_lan
-            fi
-            ;;
-        cn)
-            if [ ! -s "$(address_control_allow_file)" ]; then
-                address_control_sync_cn
-            fi
-            ;;
-        custom)
-            custom_file="$(address_control_custom_file)"
-            [ -n "$custom_file" ] || pfwd_die "自定义地址访问控制模式缺少文件路径"
-            if [ ! -s "$(address_control_allow_file)" ]; then
-                address_control_import_custom "$custom_file"
-            fi
-            ;;
-    esac
+    local cn_tmp
+    if [ "$(address_control_enabled)" != "true" ]; then
+        rm -f "$(address_control_allow_file)" 2>/dev/null || true
+        rm -f "$(address_control_allow_file).cn" 2>/dev/null || true
+        return 0
+    fi
+
+    if [ "$(address_control_include_cn)" = "true" ]; then
+        cn_tmp="$(mktemp)"
+        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" ]; then
+            address_control_filter_ipv4_cidrs < "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" | pfwd_write_atomic "$cn_tmp"
+            address_control_mark_last_good "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" "$(pfwd_now_iso)"
+        else
+            pfwd_bootstrap_download "$(address_control_source_url)" "$cn_tmp"
+            address_control_filter_ipv4_cidrs < "$cn_tmp" | pfwd_write_atomic "$cn_tmp.filtered"
+            mv "$cn_tmp.filtered" "$cn_tmp"
+            address_control_mark_last_good "$(address_control_source_url)" "$(pfwd_now_iso)"
+        fi
+        mv "$cn_tmp" "$(address_control_allow_file).cn"
+    else
+        rm -f "$(address_control_allow_file).cn" 2>/dev/null || true
+    fi
+
+    address_control_merge_runtime
 }
 
 address_control_runtime_enabled() {
-    [ "$(address_control_mode)" = "off" ] && echo false || echo true
+    [ "$(address_control_enabled)" = "true" ] && echo true || echo false
+}
+
+address_control_state_label() {
+    if [ "$(address_control_enabled)" != "true" ]; then
+        printf '已停用\n'
+        return 0
+    fi
+    if [ "$(address_control_include_cn)" = "true" ] && [ "$(address_control_custom_cidrs_count)" -gt 0 ]; then
+        printf '国内 + 自定义\n'
+    elif [ "$(address_control_include_cn)" = "true" ]; then
+        printf '仅国内\n'
+    elif [ "$(address_control_custom_cidrs_count)" -gt 0 ]; then
+        printf '仅自定义\n'
+    else
+        printf '已启用\n'
+    fi
 }
 
 address_control_status_json() {
     jq -n \
-      --arg mode "$(address_control_mode)" \
+      --argjson enabled "$(address_control_enabled)" \
+      --argjson include_cn "$(address_control_include_cn)" \
       --arg source_url "$(address_control_source_url)" \
-      --arg custom_file "$(address_control_custom_file)" \
       --arg allow_file "$(address_control_allow_file)" \
+      --arg last_good_source "$(address_control_last_good_source)" \
+      --arg last_good_updated_at "$(address_control_last_good_updated_at)" \
       --argjson entries "$(address_control_entry_count)" \
+      --argjson custom_cidrs_count "$(address_control_custom_cidrs_count)" \
+      --arg state_label "$(address_control_state_label)" \
       '{
-        mode: $mode,
+        enabled: $enabled,
+        include_cn: $include_cn,
         source_url: $source_url,
-        custom_file: $custom_file,
         allow_file: $allow_file,
-        entries: $entries
+        last_good_source: $last_good_source,
+        last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
+        entries: $entries,
+        custom_cidrs_count: $custom_cidrs_count,
+        state_label: $state_label
       }'
 }
 
@@ -186,10 +234,12 @@ address_control_render_status() {
     json="$(address_control_status_json)"
     jq -r '
       [
-        ["地址控制模式", .mode],
-        ["地址来源", .source_url],
-        ["自定义文件", (if .custom_file == "" then "-" else .custom_file end)],
-        ["地址条目", (.entries | tostring)],
+        ["地域控制模式", .state_label],
+        ["启用白名单", (if .enabled then "开" else "关" end)],
+        ["包含国内 IP", (if .include_cn then "开" else "关" end)],
+        ["自定义 CIDR", (.custom_cidrs_count | tostring)],
+        ["白名单条目", (.entries | tostring)],
+        ["来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],
         ["运行态文件", .allow_file]
       ]
       | map(@tsv)

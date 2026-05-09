@@ -827,7 +827,7 @@ cmd_doctor() {
         printf 'guard.%s：%s\n' "$key" "$value"
     done
     address_control_render_status | while IFS=$'\t' read -r key value; do
-        printf 'address_control.%s：%s\n' "$key" "$value"
+        printf 'guard_whitelist.%s：%s\n' "$key" "$value"
     done
     cmd_doctor_benchmarks
 }
@@ -923,65 +923,67 @@ cmd_guard() {
 
 cmd_address_control() {
     config_init >/dev/null
-    local mode="" source_url="" file_path="" refresh_requested="false" status_requested="false"
+    local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local refresh_requested="false" status_requested="false"
+    local tmp_cidrs current_cidrs
+
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --mode) mode="${2:-}"; shift 2 ;;
+            --enabled) enabled="${2:-}"; shift 2 ;;
+            --include-cn) include_cn="${2:-}"; shift 2 ;;
             --source-url) source_url="${2:-}"; shift 2 ;;
-            --file|--import-file) file_path="${2:-}"; shift 2 ;;
+            --cidr) cidr="${2:-}"; shift 2 ;;
+            --replace-custom) replace_custom="true"; shift ;;
+            --clear-custom) clear_custom="true"; shift ;;
             refresh) refresh_requested="true"; shift ;;
             status) status_requested="true"; shift ;;
             *) pfwd_die "未知选项：$1" ;;
         esac
     done
 
-    if [ "$status_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ] && [ "$refresh_requested" = "false" ]; then
+    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         address_control_render_status
         return 0
     fi
 
-    if [ "$refresh_requested" = "true" ] && [ -z "$mode" ] && [ -z "$source_url" ] && [ -z "$file_path" ]; then
-        case "$(address_control_mode)" in
-            lan) address_control_sync_lan ;;
-            cn) address_control_refresh_cn ;;
-            custom)
-                file_path="$(address_control_custom_file)"
-                [ -n "$file_path" ] || pfwd_die "当前未配置自定义地址访问控制文件"
-                address_control_import_custom "$file_path"
-                ;;
-            off) pfwd_die "当前地址访问控制模式为 off，请先切换到 lan、cn 或 custom" ;;
-        esac
+    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+        address_control_prepare_runtime
         cmd_refresh
-        echo "地址访问控制数据已刷新"
+        echo "白名单数据已刷新"
         return 0
     fi
 
-    [ -n "$mode" ] || mode="$(address_control_mode)"
+    [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
+    [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
+    if [ -n "$cidr" ]; then
+        validate_ipv4_cidr "$cidr"
+    fi
+
+    if [ "$enabled" = "__KEEP__" ]; then
+        enabled="$(address_control_enabled)"
+    fi
+    if [ "$include_cn" = "__KEEP__" ]; then
+        include_cn="$(address_control_include_cn)"
+    fi
     [ -n "$source_url" ] || source_url="$(address_control_source_url)"
-    [ -n "$file_path" ] || file_path="$(address_control_custom_file)"
-    validate_address_control_mode "$mode"
-    case "$mode" in
-        lan)
-            address_control_config_set "$mode" "$source_url" ""
-            address_control_sync_lan
-            ;;
-        cn)
-            address_control_config_set "$mode" "$source_url" ""
-            address_control_sync_cn
-            ;;
-        custom)
-            [ -n "$file_path" ] || pfwd_die "custom 模式必须提供 --file"
-            file_path="$(pfwd_expand_path "$file_path")"
-            address_control_config_set "$mode" "$source_url" "$file_path"
-            address_control_import_custom "$file_path"
-            ;;
-        off)
-            address_control_config_set "$mode" "$source_url" ""
-            rm -f "$(address_control_allow_file)" 2>/dev/null || true
-            ;;
-    esac
+
+    address_control_config_set_state "$enabled" "$include_cn" "$source_url"
+
+    tmp_cidrs="$(mktemp)"
+    if [ "$clear_custom" != "true" ]; then
+        if [ "$replace_custom" != "true" ]; then
+            address_control_custom_cidrs_tsv > "$tmp_cidrs"
+        fi
+        if [ -n "$cidr" ]; then
+            printf '%s\n' "$cidr" >> "$tmp_cidrs"
+        fi
+    fi
+    address_control_config_set_custom_cidrs "$tmp_cidrs"
+    rm -f "$tmp_cidrs"
+
+    address_control_prepare_runtime
     cmd_refresh
-    echo "地址访问控制已更新"
+    echo "协议封锁 / 白名单已更新"
 }
 
 cmd_uninstall() {

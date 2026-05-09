@@ -231,12 +231,18 @@ validate_bool() {
     esac
 }
 
-validate_address_control_mode() {
+validate_ipv4_cidr() {
     local value="$1"
-    case "$value" in
-        off|lan|cn|custom) ;;
-        *) pfwd_die "无效地址访问控制模式：$value" ;;
-    esac
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]] || pfwd_die "无效 IPv4 CIDR：$value"
+    local ip mask octet
+    ip="${value%/*}"
+    mask="${value#*/}"
+    [ "$mask" -ge 0 ] && [ "$mask" -le 32 ] || pfwd_die "无效 IPv4 CIDR 掩码：$value"
+    IFS='.' read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || pfwd_die "无效 IPv4 CIDR：$value"
+        [ "$octet" -ge 0 ] && [ "$octet" -le 255 ] || pfwd_die "无效 IPv4 CIDR：$value"
+    done
 }
 
 validate_reset_day() {

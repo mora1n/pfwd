@@ -18,18 +18,19 @@
 
 ## Access Control
 
-`pfwd` 将访问控制拆成两部分：
+`pfwd` 的入口侧访问控制统一收口到 `协议封锁 / 白名单`：
 
 - 协议封锁：由 `guard` 负责，按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`，适合中转机快速拦截特征明显的高风险流量。
-- 地址访问控制：由 `nftables` 负责，按目标 IPv4 CIDR 做全局允许列表控制，支持 `局域网目标`、`国内目标` 和 `自定义目标` 三种模式。
-- 当前边界：协议封锁仅覆盖 TCP 首包识别；地址访问控制当前仅支持 IPv4 目标 CIDR，开启时 IPv6 目标默认拦截。
+- 白名单：由 `nftables` 负责，限制入站来源 IPv4 CIDR。默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
+- 当前边界：协议封锁仅覆盖 TCP 首包识别；白名单当前仅支持 IPv4 CIDR，启用后 IPv6 入站默认拦截。
 
 常用命令：
 
 ```bash
 pfwd guard enable
 pfwd guard protocols --https true --socks true
-pfwd address-control --mode cn
+pfwd address-control --enabled true --include-cn true
+pfwd address-control --cidr 203.0.113.0/24
 pfwd guard status
 pfwd address-control status
 ```
@@ -60,7 +61,7 @@ pfwd
 
 ### Offline Install
 
-适用于目标机器无法直接访问 GitHub 的场景。离线包需要同时包含 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`；其中 `assets/` 除了 guard 预编译二进制，还包含国内目标地址数据种子 `cn-aggregated.zone`。
+适用于目标机器无法直接访问 GitHub 的场景。离线包需要同时包含 `pfwd.sh`、`bbr.sh`、`lib/` 和 `assets/`；其中 `assets/` 除了 guard 预编译二进制，还包含国内 IP 白名单种子 `cn-aggregated.zone`。
 
 离线安装完成后，系统文件结构如下：
 
@@ -82,7 +83,7 @@ pfwd
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
 │       ├── validate.sh         # 参数校验、端口/地址/速率解析
-│       ├── address_control.sh  # 目标地址访问控制数据准备与状态展示
+│       ├── address_control.sh  # 白名单数据准备与状态展示
 │       ├── forwarder.sh        # nft 转发表运行态解析与渲染
 │       ├── firewall.sh         # 流量统计、限额、tc 渲染
 │       ├── stats.sh            # 流量状态快照与汇总
@@ -98,7 +99,7 @@ pfwd
 │   ├── stats.json              # 流量统计状态文件
 │   ├── bbr-state.env           # BBR / optimize 状态文件
 │   ├── address_control/
-│   │   └── allow_ipv4.txt      # 地址访问控制 IPv4 允许集
+│   │   └── allow_ipv4.txt      # 入站来源 IPv4 白名单运行态
 │   └── guard/
 │       └── status.json         # guard 运行状态
 │
@@ -147,10 +148,10 @@ ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
 /usr/local/bin/pfwd install
 ```
 
-5. 如需离线启用国内目标地址控制，可直接执行：
+5. 如需离线启用国内 IP 白名单，可直接执行：
 
 ```bash
-pfwd address-control --mode cn
+pfwd address-control --enabled true --include-cn true
 ```
 
 后续机器具备外网时，再执行：

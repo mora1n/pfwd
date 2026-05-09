@@ -265,7 +265,6 @@ forwarder_render_to_stdout() {
     declare -A prerouting_seen=()
     declare -A postrouting_keys=()
     declare -A forward_keys=()
-    declare -A allow_targets_v4=()
     declare -A subchains=()
     local line proto listen_port ipver target_input resolved_target remote_port comment snat_mode snat_source mss_mode mss_value key
 
@@ -295,9 +294,6 @@ forwarder_render_to_stdout() {
         postrouting_keys["$key"]=1
         subchains["prerouting|$ipver|$proto"]=1
         subchains["postrouting|$ipver|$proto"]=1
-        if [ "$ipver" = "4" ]; then
-            allow_targets_v4["$resolved_target"]=1
-        fi
         if [ "$proto" = "tcp" ] && [ -n "$mss_mode" ]; then
             forward_keys["$key"]=1
             subchains["forward|$ipver|$proto"]=1
@@ -358,8 +354,8 @@ forwarder_render_to_stdout() {
     echo "    chain forward {"
     echo "        type filter hook forward priority 0; policy accept;"
     if [ "$(address_control_runtime_enabled)" = "true" ]; then
-        echo '        meta nfproto ipv6 drop comment "Address control denies IPv6 targets"'
-        echo '        ip daddr != @pfwd_addrctl_allow_v4 drop comment "Address control denies unmatched IPv4 targets"'
+        echo '        meta nfproto ipv6 drop comment "Inbound whitelist denies IPv6 sources"'
+        echo '        ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
     fi
     for ipver in 4 6; do
         for proto in tcp; do
