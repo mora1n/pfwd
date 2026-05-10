@@ -2575,6 +2575,36 @@ ui_print_guard_skip_port_list() {
     ui_table_render $'序号\t端口' "$(ui_guard_skip_port_rows "$start_index")" "2"
 }
 
+ui_render_guard_skip_ports_menu_page() {
+    ui_header "跳过端口"
+    ui_notice_render
+    ui_print_guard_skip_ports
+    echo
+    ui_menu_item 1 "增加端口"
+    ui_menu_item 2 "删除端口"
+    ui_menu_item 3 "修改端口"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_guard_skip_ports_delete_page() {
+    ui_header "删除跳过端口"
+    ui_notice_render
+    ui_print_guard_skip_ports
+    echo
+    ui_menu_item 0 "返回"
+    ui_menu_item 1 "所有端口"
+    ui_print_guard_skip_port_list 2
+}
+
+ui_render_guard_skip_ports_update_page() {
+    ui_header "修改跳过端口"
+    ui_notice_render
+    ui_print_guard_skip_ports
+    echo
+    ui_menu_item 0 "返回"
+    ui_print_guard_skip_port_list
+}
+
 ui_guard_skip_ports_apply_list() {
     local ports="$1"
     local cmd=()
@@ -2601,14 +2631,7 @@ ui_menu_guard_skip_ports_delete() {
         return 0
     fi
     while true; do
-        ui_render_page ui_render_guard_menu_page
-        ui_print_guard_skip_ports
-        echo
-        ui_print_line "删除跳过端口" "1;36"
-        ui_menu_item 0 "返回"
-        ui_menu_item 1 "所有端口"
-        ui_print_guard_skip_port_list 2
-        echo
+        ui_render_page ui_render_guard_skip_ports_delete_page
         ui_read "选择端口序号，可单/多/连续选择；1 表示删除全部" || return 1
         raw="$UI_REPLY"
         ui_multiselect_parse_indexes "$raw" "$((count + 1))" true || return 1
@@ -2654,13 +2677,7 @@ ui_menu_guard_skip_ports_update() {
         return 0
     fi
     while true; do
-        ui_render_page ui_render_guard_menu_page
-        ui_print_guard_skip_ports
-        echo
-        ui_print_line "修改跳过端口" "1;36"
-        ui_menu_item 0 "返回"
-        ui_print_guard_skip_port_list
-        echo
+        ui_render_page ui_render_guard_skip_ports_update_page
         ui_read "选择要修改的端口序号" || return 1
         [ "$UI_REPLY" = "0" ] && return 0
         [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
@@ -2701,13 +2718,7 @@ ui_menu_guard_skip_ports_update() {
 ui_menu_guard_skip_ports() {
     local forward_ids ports
     while true; do
-        ui_render_page ui_render_guard_menu_page
-        ui_print_guard_skip_ports
-        echo
-        ui_menu_item 1 "增加端口"
-        ui_menu_item 2 "删除端口"
-        ui_menu_item 3 "修改端口"
-        ui_menu_item 0 "返回"
+        ui_render_page ui_render_guard_skip_ports_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
