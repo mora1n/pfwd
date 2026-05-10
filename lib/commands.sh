@@ -891,12 +891,16 @@ cmd_guard() {
             ;;
         protocols)
             local http="__KEEP__" https="__KEEP__" tls="__KEEP__" socks="__KEEP__"
+            local skip_port="" replace_skip_ports="false" clear_skip_ports="false" tmp_ports
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --http) http="${2:-}"; shift 2 ;;
                     --https) https="${2:-}"; shift 2 ;;
                     --tls) tls="${2:-}"; shift 2 ;;
                     --socks) socks="${2:-}"; shift 2 ;;
+                    --skip-port) skip_port="${2:-}"; shift 2 ;;
+                    --replace-skip-ports) replace_skip_ports="true"; shift ;;
+                    --clear-skip-ports) clear_skip_ports="true"; shift ;;
                     *) pfwd_die "未知选项：$1" ;;
                 esac
             done
@@ -904,6 +908,7 @@ cmd_guard() {
             [ "$https" = "__KEEP__" ] || validate_bool "$https"
             [ "$tls" = "__KEEP__" ] || validate_bool "$tls"
             [ "$socks" = "__KEEP__" ] || validate_bool "$socks"
+            [ -z "$skip_port" ] || validate_port "$skip_port"
             if [ "$https" != "__KEEP__" ]; then
                 http="$https"
                 tls="$https"
@@ -912,6 +917,17 @@ cmd_guard() {
             [ "$tls" = "__KEEP__" ] && tls="$(guard_block_tls)"
             [ "$socks" = "__KEEP__" ] && socks="$(guard_block_socks)"
             guard_config_set_protocols "$http" "$tls" "$socks"
+            tmp_ports="$(mktemp)"
+            if [ "$clear_skip_ports" != "true" ]; then
+                if [ "$replace_skip_ports" != "true" ]; then
+                    guard_protocol_skip_ports_tsv > "$tmp_ports"
+                fi
+                if [ -n "$skip_port" ]; then
+                    printf '%s\n' "$skip_port" >> "$tmp_ports"
+                fi
+            fi
+            guard_config_set_protocol_skip_ports "$tmp_ports"
+            rm -f "$tmp_ports"
             cmd_refresh
             echo "guard 协议封锁已更新"
             ;;

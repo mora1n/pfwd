@@ -2541,6 +2541,67 @@ ui_select_user_forwards_multi() {
     UI_REPLY="$forward_ids"
 }
 
+ui_resolve_listen_ports_by_forward_ids() {
+    local forward_ids="$1"
+    jq -r --argjson ids "$(printf '%s\n' "$forward_ids" | jq -Rcs 'split("\n") | map(select(length > 0))')" '
+      [ .forwards[] | select(.id as $id | $ids | index($id)) | .listen_port ]
+      | unique
+      | .[]
+    ' "$PFWD_CONFIG_FILE"
+}
+
+ui_print_guard_skip_ports() {
+    local ports
+    ports="$(guard_protocol_skip_ports_tsv | paste -sd, -)"
+    if [ -n "$ports" ]; then
+        ui_print_line "当前跳过端口：$ports" "36"
+    else
+        ui_print_line "当前跳过端口：-" "2;37"
+    fi
+}
+
+ui_menu_guard_skip_ports() {
+    local forward_ids ports count
+    while true; do
+        ui_render_page ui_render_guard_menu_page
+        ui_print_guard_skip_ports
+        echo
+        ui_menu_item 1 "增加跳过端口"
+        ui_menu_item 2 "清空跳过端口"
+        ui_menu_item 0 "返回"
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_select_forwards_multi true || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                forward_ids="$UI_REPLY"
+                ports="$(ui_resolve_listen_ports_by_forward_ids "$forward_ids")"
+                [ -n "$ports" ] || { ui_warn "未解析到监听端口"; ui_pause; continue; }
+                while IFS= read -r port; do
+                    [ -n "$port" ] || continue
+                    ui_run cmd_guard protocols --skip-port "$port"
+                    [ "$UI_STATUS" -eq 0 ] || break
+                done <<< "$ports"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "32"
+                ui_maybe_pause success
+                ;;
+            2)
+                count="$(guard_protocol_skip_ports_count)"
+                if [ "$count" -eq 0 ]; then
+                    ui_warn "当前没有跳过端口"
+                    ui_pause
+                    continue
+                fi
+                ui_run cmd_guard protocols --clear-skip-ports
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "32"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
 ui_user_telegram_config() {
     local user_id="$1"
     config_init >/dev/null
@@ -3586,6 +3647,9 @@ ui_menu_guard() {
                 ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
                 ui_maybe_pause success
+                ;;
+            4)
+                ui_menu_guard_skip_ports
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;

@@ -53,6 +53,13 @@ struct {
 } guard_whitelist_v6 SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} guard_allow_tcp_ports SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, STAT_MAX);
     __type(key, __u32);
@@ -92,6 +99,14 @@ static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
     }
 
     value = bpf_map_lookup_elem(&guard_whitelist_v6, &key);
+    return value != 0;
+}
+
+static __always_inline int allow_port_match(__be16 port_be) {
+    __u32 port = (__u32)bpf_ntohs(port_be);
+    __u8 *value;
+
+    value = bpf_map_lookup_elem(&guard_allow_tcp_ports, &port);
     return value != 0;
 }
 
@@ -305,6 +320,10 @@ int ingress_guard(struct __sk_buff *skb) {
 
     if (bpf_skb_load_bytes(skb, l4_offset, &tcp, sizeof(tcp)) < 0) {
         stat_inc(STAT_PARSE_SKIP);
+        return TC_ACT_OK;
+    }
+
+    if (!allow_port_match(tcp.dest)) {
         return TC_ACT_OK;
     }
 

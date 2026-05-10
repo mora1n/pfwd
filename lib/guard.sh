@@ -169,6 +169,24 @@ guard_block_socks() {
     jq -r '.settings.guard.block_socks // false' "$(guard_config_file)"
 }
 
+guard_protocol_skip_ports_tsv() {
+    jq -r '.settings.guard.protocol_skip_ports // [] | .[]' "$(guard_config_file)"
+}
+
+guard_protocol_skip_ports_count() {
+    jq -r '.settings.guard.protocol_skip_ports // [] | length' "$(guard_config_file)"
+}
+
+guard_protocol_skip_ports_display() {
+    local ports
+    ports="$(guard_protocol_skip_ports_tsv | paste -sd, -)"
+    if [ -n "$ports" ]; then
+        printf '%s\n' "$ports"
+    else
+        printf '%s\n' "-"
+    fi
+}
+
 guard_bool_to_json() {
     case "$1" in
         true) echo true ;;
@@ -211,6 +229,49 @@ guard_config_set_protocols() {
     '
 }
 
+guard_config_set_protocol_skip_ports() {
+    local ports_file="$1"
+    [ -f "$ports_file" ] || guard_die "协议封锁跳过端口临时文件不存在：$ports_file"
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        validate_port "$port"
+    done < "$ports_file"
+    config_update --rawfile ports "$ports_file" '
+      (.settings.guard //= {})
+      | .settings.guard.protocol_skip_ports =
+          (($ports
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0) | tonumber)
+            | unique))
+    '
+}
+
+guard_active_port_specs() {
+    local today
+    today="$(pfwd_today)"
+    jq -r --arg today "$today" '
+      .forwards[]
+      | select(.enabled == true and (.stop_at == null or .stop_at > $today))
+      | [.listen_port, (.protocol // "tcp_udp")] | @tsv
+    ' "$(guard_config_file)"
+}
+
+guard_protocol_enforced_port_specs() {
+    local -A skipped=()
+    local port protocol
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        skipped["$port"]=1
+    done < <(guard_protocol_skip_ports_tsv)
+
+    while IFS=$'\t' read -r port protocol; do
+        [ -n "$port" ] || continue
+        [ -n "${skipped[$port]:-}" ] && continue
+        printf '%s\t%s\n' "$port" "$protocol"
+    done < <(guard_active_port_specs)
+}
+
 guard_binary_exists() {
     [ -x "$(guard_bin_path)" ]
 }
@@ -230,11 +291,15 @@ guard_apply_runtime() {
     iface="$(guard_tc_interface)"
     [ -n "$iface" ] || guard_die "无法确定 guard 网卡，请先设置 tc_interface"
 
+    local ports_arg
+    ports_arg="$(guard_protocol_enforced_port_specs)"
+
     guard_run "$(guard_bin_path)" apply \
       --iface "$iface" \
       --ingress-pin "$(guard_ingress_pin_path)" \
       --status-file "$(guard_status_file)" \
       --whitelist-enabled false \
+      --allow-ports "$ports_arg" \
       --block-http "$(guard_block_http)" \
       --block-tls "$(guard_block_tls)" \
       --block-socks "$(guard_block_socks)"
@@ -274,6 +339,8 @@ guard_status_json() {
       --argjson block_http "$(guard_bool_to_json "$(guard_block_http)")" \
       --argjson block_tls "$(guard_bool_to_json "$(guard_block_tls)")" \
       --argjson block_socks "$(guard_bool_to_json "$(guard_block_socks)")" \
+      --arg protocol_skip_ports "$(guard_protocol_skip_ports_display)" \
+      --argjson protocol_skip_ports_count "$(guard_protocol_skip_ports_count)" \
       '{
         script: $script,
         enabled: $enabled,
@@ -281,6 +348,8 @@ guard_status_json() {
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
+        protocol_skip_ports: $protocol_skip_ports,
+        protocol_skip_ports_count: $protocol_skip_ports_count,
         guard_binary: $bin,
         status_file: $status_file,
         ingress_pin: $ingress_pin
@@ -297,6 +366,7 @@ guard_render_status() {
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
+        ["跳过端口", .protocol_skip_ports],
         ["guard 二进制", .guard_binary],
         ["状态文件", .status_file]
       ]

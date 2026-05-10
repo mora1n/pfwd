@@ -16,7 +16,8 @@ config_default_json() {
       "tc_interface": "",
       "block_http": false,
       "block_tls": false,
-      "block_socks": false
+      "block_socks": false,
+      "protocol_skip_ports": []
     },
     "address_control": {
       "enabled": false,

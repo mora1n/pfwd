@@ -32,6 +32,7 @@ type bpfObjects struct {
 	GuardSettings    *ebpf.Map     `ebpf:"guard_settings"`
 	GuardWhitelistV4 *ebpf.Map     `ebpf:"guard_whitelist_v4"`
 	GuardWhitelistV6 *ebpf.Map     `ebpf:"guard_whitelist_v6"`
+	GuardAllowTCPPorts *ebpf.Map   `ebpf:"guard_allow_tcp_ports"`
 	GuardStats       *ebpf.Map     `ebpf:"guard_stats"`
 }
 
@@ -50,6 +51,9 @@ func (o *bpfObjects) Close() {
 	}
 	if o.GuardWhitelistV6 != nil {
 		_ = o.GuardWhitelistV6.Close()
+	}
+	if o.GuardAllowTCPPorts != nil {
+		_ = o.GuardAllowTCPPorts.Close()
 	}
 	if o.GuardStats != nil {
 		_ = o.GuardStats.Close()
@@ -79,6 +83,7 @@ type applyOptions struct {
 	StatusFile       string
 	WhitelistFile    string
 	WhitelistEnabled bool
+	AllowPorts       string
 	BlockHTTP        bool
 	BlockTLS         bool
 	BlockSOCKS       bool
@@ -100,6 +105,7 @@ type statusFilePayload struct {
 	WhitelistEnabled  bool   `json:"whitelist_enabled"`
 	WhitelistFile     string `json:"whitelist_file"`
 	WhitelistEntries  int    `json:"whitelist_entries"`
+	AllowTCPPorts     int    `json:"allow_tcp_ports"`
 	BlockHTTP         bool   `json:"block_http"`
 	BlockTLS          bool   `json:"block_tls"`
 	BlockSOCKS        bool   `json:"block_socks"`
@@ -150,6 +156,7 @@ func runApplyCommand(args []string) error {
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json path")
 	fs.StringVar(&opts.WhitelistFile, "whitelist-file", "", "whitelist file path")
 	fs.StringVar(&whitelistEnabled, "whitelist-enabled", "false", "true|false")
+	fs.StringVar(&opts.AllowPorts, "allow-ports", "", "allowed forwarding ports list")
 	fs.StringVar(&blockHTTP, "block-http", "false", "true|false")
 	fs.StringVar(&blockTLS, "block-tls", "false", "true|false")
 	fs.StringVar(&blockSOCKS, "block-socks", "false", "true|false")
@@ -279,6 +286,10 @@ func applyGuard(opts applyOptions) error {
 			return err
 		}
 	}
+	allowPortsEntries, err := loadAllowPorts(objs.GuardAllowTCPPorts, opts.AllowPorts)
+	if err != nil {
+		return err
+	}
 
 	attachMode, err := attachGuard(iface, objs.IngressGuard, opts.IngressPin)
 	if err != nil {
@@ -296,6 +307,7 @@ func applyGuard(opts applyOptions) error {
 		WhitelistEnabled: opts.WhitelistEnabled,
 		WhitelistFile:    opts.WhitelistFile,
 		WhitelistEntries: whitelistEntries,
+		AllowTCPPorts:    allowPortsEntries,
 		BlockHTTP:        opts.BlockHTTP,
 		BlockTLS:         opts.BlockTLS,
 		BlockSOCKS:       opts.BlockSOCKS,
@@ -434,6 +446,43 @@ func loadWhitelistFile(whitelistMapV4 *ebpf.Map, whitelistMapV6 *ebpf.Map, fileP
 		if err := file.Close(); err != nil {
 			return 0, fmt.Errorf("关闭白名单文件失败: %w", err)
 		}
+	}
+	return count, nil
+}
+
+func loadAllowPorts(portMap *ebpf.Map, raw string) (int, error) {
+	if portMap == nil {
+		return 0, fmt.Errorf("guard_allow_tcp_ports map 未加载")
+	}
+	count := 0
+	seen := make(map[uint32]struct{})
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) == 0 || fields[0] == "" {
+			continue
+		}
+		portValue, err := netip.ParseAddrPort("0.0.0.0:" + fields[0])
+		if err != nil {
+			return 0, fmt.Errorf("解析监听端口失败: %s", line)
+		}
+		port := uint32(portValue.Port())
+		if _, ok := seen[port]; ok {
+			continue
+		}
+		val := uint8(1)
+		if err := portMap.Update(&port, &val, ebpf.UpdateAny); err != nil {
+			return 0, fmt.Errorf("写入监听端口失败 (%d): %w", port, err)
+		}
+		seen[port] = struct{}{}
+		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("读取监听端口失败: %w", err)
 	}
 	return count, nil
 }
