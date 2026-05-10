@@ -2560,14 +2560,153 @@ ui_print_guard_skip_ports() {
     fi
 }
 
-ui_menu_guard_skip_ports() {
-    local forward_ids ports count
+ui_guard_skip_port_rows() {
+    local start_index="${1:-1}"
+    local idx="$start_index"
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        printf '%s\t%s\n' "$idx" "$port"
+        idx=$((idx + 1))
+    done < <(guard_protocol_skip_ports_tsv)
+}
+
+ui_print_guard_skip_port_list() {
+    local start_index="${1:-1}"
+    ui_table_render $'序号\t端口' "$(ui_guard_skip_port_rows "$start_index")" "2"
+}
+
+ui_guard_skip_ports_apply_list() {
+    local ports="$1"
+    local cmd=()
+    local port
+    if [ -z "$ports" ]; then
+        ui_run cmd_guard protocols --clear-skip-ports
+        return 0
+    fi
+    cmd=(cmd_guard protocols --replace-skip-ports)
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        cmd+=(--skip-port "$port")
+    done <<< "$ports"
+    ui_run "${cmd[@]}"
+    [ "$UI_STATUS" -eq 0 ] || return 1
+}
+
+ui_menu_guard_skip_ports_delete() {
+    local count raw indexes delete_indexes remaining_ports port idx delete_all
+    count="$(guard_protocol_skip_ports_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "当前没有跳过端口"
+        ui_pause
+        return 0
+    fi
     while true; do
         ui_render_page ui_render_guard_menu_page
         ui_print_guard_skip_ports
         echo
-        ui_menu_item 1 "增加跳过端口"
-        ui_menu_item 2 "清空跳过端口"
+        ui_print_line "删除跳过端口" "1;36"
+        ui_menu_item 0 "返回"
+        ui_menu_item 1 "所有端口"
+        ui_print_guard_skip_port_list 2
+        echo
+        ui_read "选择端口序号，可单/多/连续选择；1 表示删除全部" || return 1
+        raw="$UI_REPLY"
+        ui_multiselect_parse_indexes "$raw" "$((count + 1))" true || return 1
+        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+        indexes="$UI_REPLY"
+        delete_all=0
+        if printf '%s\n' "$indexes" | grep -qx '1'; then
+            if [ "$(printf '%s\n' "$indexes" | sed '/^$/d' | wc -l | tr -d ' ')" != "1" ]; then
+                ui_warn "删除全部时不能和其他序号混合选择"
+                ui_pause
+                continue
+            fi
+            delete_all=1
+        fi
+        if [ "$delete_all" -eq 1 ]; then
+            ui_run cmd_guard protocols --clear-skip-ports
+            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "32"
+            return 0
+        fi
+        delete_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
+        [ -n "$delete_indexes" ] || { ui_warn "请选择要删除的端口"; ui_pause; continue; }
+        remaining_ports=""
+        idx=1
+        while IFS= read -r port; do
+            [ -n "$port" ] || continue
+            if ! printf '%s\n' "$delete_indexes" | grep -qx "$idx"; then
+                remaining_ports="${remaining_ports}${remaining_ports:+$'\n'}$port"
+            fi
+            idx=$((idx + 1))
+        done < <(guard_protocol_skip_ports_tsv)
+        ui_guard_skip_ports_apply_list "$remaining_ports"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已删除" "32"
+        return 0
+    done
+}
+
+ui_menu_guard_skip_ports_update() {
+    local count selected current_port new_port updated_ports port idx
+    count="$(guard_protocol_skip_ports_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "当前没有跳过端口"
+        ui_pause
+        return 0
+    fi
+    while true; do
+        ui_render_page ui_render_guard_menu_page
+        ui_print_guard_skip_ports
+        echo
+        ui_print_line "修改跳过端口" "1;36"
+        ui_menu_item 0 "返回"
+        ui_print_guard_skip_port_list
+        echo
+        ui_read "选择要修改的端口序号" || return 1
+        [ "$UI_REPLY" = "0" ] && return 0
+        [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
+        selected="$UI_REPLY"
+        [ "$selected" -ge 1 ] && [ "$selected" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; continue; }
+        current_port="$(guard_protocol_skip_ports_tsv | sed -n "${selected}p")"
+        [ -n "$current_port" ] || { ui_warn "端口序号不存在"; ui_pause; continue; }
+        ui_form_set "修改跳过端口" "输入新的监听端口；仅用于跳过协议封锁。"
+        ui_form_add_kv "当前端口" "$current_port"
+        ui_form_read "新端口" "$current_port" || { ui_form_reset; return 0; }
+        new_port="$UI_REPLY"
+        [ -n "$new_port" ] || { ui_form_reset; ui_warn "必须提供端口"; ui_pause; continue; }
+        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+            ui_form_reset
+            ui_warn "无效端口：$new_port"
+            ui_pause
+            continue
+        fi
+        updated_ports=""
+        idx=1
+        while IFS= read -r port; do
+            [ -n "$port" ] || continue
+            if [ "$idx" -eq "$selected" ]; then
+                port="$new_port"
+            fi
+            if ! printf '%s\n' "$updated_ports" | sed '/^$/d' | grep -qx "$port"; then
+                updated_ports="${updated_ports}${updated_ports:+$'\n'}$port"
+            fi
+            idx=$((idx + 1))
+        done < <(guard_protocol_skip_ports_tsv)
+        ui_guard_skip_ports_apply_list "$updated_ports"
+        ui_form_reset
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "32"
+        return 0
+    done
+}
+
+ui_menu_guard_skip_ports() {
+    local forward_ids ports
+    while true; do
+        ui_render_page ui_render_guard_menu_page
+        ui_print_guard_skip_ports
+        echo
+        ui_menu_item 1 "增加端口"
+        ui_menu_item 2 "删除端口"
+        ui_menu_item 3 "修改端口"
         ui_menu_item 0 "返回"
         ui_read "选择" || return 0
         case "$UI_REPLY" in
@@ -2586,14 +2725,11 @@ ui_menu_guard_skip_ports() {
                 ui_maybe_pause success
                 ;;
             2)
-                count="$(guard_protocol_skip_ports_count)"
-                if [ "$count" -eq 0 ]; then
-                    ui_warn "当前没有跳过端口"
-                    ui_pause
-                    continue
-                fi
-                ui_run cmd_guard protocols --clear-skip-ports
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "32"
+                ui_menu_guard_skip_ports_delete
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_menu_guard_skip_ports_update
                 ui_maybe_pause success
                 ;;
             0) return 0 ;;
@@ -3827,6 +3963,7 @@ ui_render_guard_menu_page() {
     ui_menu_item 1 "启用 guard"
     ui_menu_item 2 "停用 guard"
     ui_menu_item 3 "设置封锁协议"
+    ui_menu_item 4 "跳过端口"
     ui_menu_item 0 "返回"
 }
 

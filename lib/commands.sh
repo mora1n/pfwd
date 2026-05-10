@@ -891,14 +891,19 @@ cmd_guard() {
             ;;
         protocols)
             local http="__KEEP__" https="__KEEP__" tls="__KEEP__" socks="__KEEP__"
-            local skip_port="" replace_skip_ports="false" clear_skip_ports="false" tmp_ports
+            local skip_port="" replace_skip_ports="false" clear_skip_ports="false" tmp_ports skip_ports_input=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --http) http="${2:-}"; shift 2 ;;
                     --https) https="${2:-}"; shift 2 ;;
                     --tls) tls="${2:-}"; shift 2 ;;
                     --socks) socks="${2:-}"; shift 2 ;;
-                    --skip-port) skip_port="${2:-}"; shift 2 ;;
+                    --skip-port)
+                        skip_port="${2:-}"
+                        shift 2
+                        [ -n "$skip_port" ] || pfwd_die "缺少 --skip-port 值"
+                        skip_ports_input+=$'\n'"$skip_port"
+                        ;;
                     --replace-skip-ports) replace_skip_ports="true"; shift ;;
                     --clear-skip-ports) clear_skip_ports="true"; shift ;;
                     *) pfwd_die "未知选项：$1" ;;
@@ -908,7 +913,15 @@ cmd_guard() {
             [ "$https" = "__KEEP__" ] || validate_bool "$https"
             [ "$tls" = "__KEEP__" ] || validate_bool "$tls"
             [ "$socks" = "__KEEP__" ] || validate_bool "$socks"
-            [ -z "$skip_port" ] || validate_port "$skip_port"
+            if [ -n "$skip_ports_input" ]; then
+                while IFS= read -r skip_port; do
+                    [ -n "$skip_port" ] || continue
+                    while IFS= read -r expanded_port; do
+                        [ -n "$expanded_port" ] || continue
+                        validate_port "$expanded_port"
+                    done < <(expand_port_spec "$skip_port")
+                done <<< "$skip_ports_input"
+            fi
             if [ "$https" != "__KEEP__" ]; then
                 http="$https"
                 tls="$https"
@@ -922,8 +935,11 @@ cmd_guard() {
                 if [ "$replace_skip_ports" != "true" ]; then
                     guard_protocol_skip_ports_tsv > "$tmp_ports"
                 fi
-                if [ -n "$skip_port" ]; then
-                    printf '%s\n' "$skip_port" >> "$tmp_ports"
+                if [ -n "$skip_ports_input" ]; then
+                    while IFS= read -r skip_port; do
+                        [ -n "$skip_port" ] || continue
+                        expand_port_spec "$skip_port" >> "$tmp_ports"
+                    done <<< "$skip_ports_input"
                 fi
             fi
             guard_config_set_protocol_skip_ports "$tmp_ports"
