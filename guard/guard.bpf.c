@@ -29,6 +29,16 @@ struct whitelist_key_v6 {
     __u8 addr[16];
 };
 
+struct flow_key {
+    __u8 family;
+    __u8 pad1;
+    __u16 pad2;
+    __u8 saddr[16];
+    __u8 daddr[16];
+    __be16 sport;
+    __be16 dport;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -58,6 +68,13 @@ struct {
     __type(key, __u32);
     __type(value, __u8);
 } guard_allow_tcp_ports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);
+    __type(value, __u8);
+} guard_allowed_flows SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -108,6 +125,43 @@ static __always_inline int allow_port_match(__be16 port_be) {
 
     value = bpf_map_lookup_elem(&guard_allow_tcp_ports, &port);
     return value != 0;
+}
+
+static __always_inline void flow_key_copy_ipv4(__u8 dst[16], __be32 addr) {
+    const __u8 *src = (const __u8 *)&addr;
+    int i;
+
+#pragma unroll
+    for (i = 0; i < 16; i++) {
+        dst[i] = 0;
+    }
+
+#pragma unroll
+    for (i = 0; i < 4; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static __always_inline void flow_key_copy_ipv6(__u8 dst[16], const __u8 src[16]) {
+    int i;
+
+#pragma unroll
+    for (i = 0; i < 16; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static __always_inline int allowed_flow_match(const struct flow_key *key) {
+    __u8 *value;
+
+    value = bpf_map_lookup_elem(&guard_allowed_flows, key);
+    return value != 0;
+}
+
+static __always_inline void allowed_flow_store(const struct flow_key *key) {
+    __u8 value = 1;
+
+    bpf_map_update_elem(&guard_allowed_flows, key, &value, BPF_ANY);
 }
 
 static __always_inline int match_http(const __u8 *payload, __u32 len) {
@@ -259,11 +313,13 @@ int ingress_guard(struct __sk_buff *skb) {
     __u32 settings_key = 0;
     struct guard_settings *settings;
     struct ethhdr eth;
+    struct flow_key flow = {};
     __u16 ether_type;
     __u32 l4_offset;
     __u32 payload_offset;
     __u32 payload_len;
     struct tcphdr_min tcp;
+    int verdict;
 
     stat_inc(STAT_TOTAL);
 
@@ -293,6 +349,9 @@ int ingress_guard(struct __sk_buff *skb) {
             stat_inc(STAT_WHITELIST_HIT);
             return TC_ACT_OK;
         }
+        flow.family = 4;
+        flow_key_copy_ipv4(flow.saddr, ip4.saddr);
+        flow_key_copy_ipv4(flow.daddr, ip4.daddr);
         ip_header_len = (__u32)(ip4.version_ihl & 0x0f) * 4;
         if (ip_header_len < sizeof(ip4)) {
             stat_inc(STAT_PARSE_SKIP);
@@ -313,6 +372,9 @@ int ingress_guard(struct __sk_buff *skb) {
             stat_inc(STAT_WHITELIST_HIT);
             return TC_ACT_OK;
         }
+        flow.family = 6;
+        flow_key_copy_ipv6(flow.saddr, ip6.saddr);
+        flow_key_copy_ipv6(flow.daddr, ip6.daddr);
         l4_offset = ETH_HLEN + sizeof(ip6);
     } else {
         return TC_ACT_OK;
@@ -326,6 +388,11 @@ int ingress_guard(struct __sk_buff *skb) {
     if (!allow_port_match(tcp.dest)) {
         return TC_ACT_OK;
     }
+    flow.sport = tcp.source;
+    flow.dport = tcp.dest;
+    if (allowed_flow_match(&flow)) {
+        return TC_ACT_OK;
+    }
 
     payload_offset = l4_offset + ((__u32)(tcp.doff_res >> 4) * 4);
     if (payload_offset <= l4_offset) {
@@ -337,5 +404,9 @@ int ingress_guard(struct __sk_buff *skb) {
     }
 
     payload_len = skb->len - payload_offset;
-    return inspect_tcp_payload(skb, payload_offset, payload_len, settings);
+    verdict = inspect_tcp_payload(skb, payload_offset, payload_len, settings);
+    if (verdict == TC_ACT_OK && payload_len > 0) {
+        allowed_flow_store(&flow);
+    }
+    return verdict;
 }

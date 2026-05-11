@@ -76,6 +76,103 @@ stats_forward_snapshot_json() {
     '
 }
 
+stats_usage_from_snapshot() {
+    local snapshot="$1"
+    jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" --slurpfile state "$PFWD_STATS_FILE" --argjson snap "$snapshot" '
+      def mode_factor($mode):
+        if $mode == "one-way" then 1 else 2 end;
+      def billed_usage($mode; $ratio; $in_bytes; $out_bytes):
+        ((((($in_bytes * $ratio) | floor) + (($out_bytes * $ratio) | floor))) * mode_factor($mode));
+      def fstate($id): $state[0].forwards[$id] // {};
+      def ustate($id): $state[0].users[$id] // {};
+      def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
+      def seeded_one_way_display($f):
+        (fstate($f.id)) as $s |
+        if ($s | has("one_way_display_bytes")) then
+          ($s.one_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "one-way") then
+          billed_usage("one-way"; ($f.traffic_ratio // 1); ($s.input_total_bytes // 0); ($s.output_total_bytes // 0))
+        else
+          0
+        end;
+      def seeded_two_way_display($f):
+        (fstate($f.id)) as $s |
+        if ($s | has("two_way_display_bytes")) then
+          ($s.two_way_display_bytes // 0)
+        elif (($f.traffic_mode // "two-way") == "two-way") then
+          billed_usage("two-way"; ($f.traffic_ratio // 1); ($s.input_total_bytes // 0); ($s.output_total_bytes // 0))
+        else
+          0
+        end;
+      def pending_input_bytes($id):
+        (fstate($id)) as $s |
+        (snap_forward($id)) as $c |
+        (($c.input_bytes - ($s.input_base_bytes // 0)) | if . < 0 then $c.input_bytes else . end);
+      def pending_output_bytes($id):
+        (fstate($id)) as $s |
+        (snap_forward($id)) as $c |
+        (($c.output_bytes - ($s.output_base_bytes // 0)) | if . < 0 then $c.output_bytes else . end);
+      def forward_totals($id):
+        (fstate($id)) as $s |
+        {
+          input_bytes: (($s.input_total_bytes // 0) + pending_input_bytes($id)),
+          output_bytes: (($s.output_total_bytes // 0) + pending_output_bytes($id))
+        };
+      def current_forward_billing($f):
+        (fstate($f.id)) as $s |
+        (($s.billing_used_bytes // 0) + billed_usage(($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)));
+      def current_forward_one_way_display($f):
+        seeded_one_way_display($f) + (if ($f.traffic_mode // "two-way") == "one-way" then billed_usage("one-way"; ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)) else 0 end);
+      def current_forward_two_way_display($f):
+        seeded_two_way_display($f) + (if ($f.traffic_mode // "two-way") == "two-way" then billed_usage("two-way"; ($f.traffic_ratio // 1); pending_input_bytes($f.id); pending_output_bytes($f.id)) else 0 end);
+      def user_snapshot($id):
+        ($cfg[0].forwards | map(select(.user_id == $id))) as $items |
+        {
+          input_bytes: ($items | map(forward_totals(.id).input_bytes) | add // 0),
+          output_bytes: ($items | map(forward_totals(.id).output_bytes) | add // 0)
+        };
+      def user_one_way_display($user_id):
+        [ $cfg[0].forwards[] | select(.user_id == $user_id) | current_forward_one_way_display(.) ] | add // 0;
+      def user_two_way_display($user_id):
+        [ $cfg[0].forwards[] | select(.user_id == $user_id) | current_forward_two_way_display(.) ] | add // 0;
+      def user_billing($u):
+        (ustate($u.id)) as $s |
+        ([ $cfg[0].forwards[] | select(.user_id == $u.id) | current_forward_billing(.) ] | add // 0) as $forward_used |
+        ($s.billing_offset_bytes // 0) as $offset |
+        (($forward_used + $offset) | if . < 0 then 0 else . end);
+      {
+        forwards: [
+          $cfg[0].forwards[] |
+          . as $f |
+          (forward_totals($f.id)) as $t |
+          . + {
+            input_bytes: $t.input_bytes,
+            output_bytes: $t.output_bytes,
+            one_way_bytes: current_forward_one_way_display($f),
+            two_way_bytes: current_forward_two_way_display($f),
+            total_bytes: (current_forward_one_way_display($f) + current_forward_two_way_display($f)),
+            billing_used_bytes: current_forward_billing($f)
+          }
+        ],
+        users: [
+          $cfg[0].users[] |
+          . as $u |
+          (user_snapshot($u.id)) as $c |
+          (user_one_way_display($u.id)) as $one_way_used |
+          (user_two_way_display($u.id)) as $two_way_used |
+          . + {
+            input_bytes: $c.input_bytes,
+            output_bytes: $c.output_bytes,
+            one_way_bytes: $one_way_used,
+            two_way_bytes: $two_way_used,
+            billing_used_bytes: user_billing($u),
+            reset_day: (ustate($u.id).reset_day // null)
+          }
+        ]
+      }
+    '
+}
+
 stats_rollup_counters() {
     local snapshot="$1"
     stats_init >/dev/null
@@ -160,9 +257,29 @@ stats_current_snapshot() {
     stats_forward_snapshot_json "$nft_output"
 }
 
+stats_usage_json() {
+    stats_init >/dev/null
+    stats_usage_from_snapshot "$(stats_current_snapshot)"
+}
+
+stats_rollup_needed() {
+    local snapshot="$1"
+    jq -n --argjson snap "$snapshot" --slurpfile state "$PFWD_STATS_FILE" '
+      any($snap[]?;
+        (
+          (($state[0].forwards[.id].input_base_bytes // 0) != (.input_bytes // 0)) or
+          (($state[0].forwards[.id].output_base_bytes // 0) != (.output_bytes // 0))
+        )
+      )
+    ' | grep -qx 'true'
+}
+
 stats_rollup_current() {
     command -v nft >/dev/null 2>&1 || return 0
-    stats_rollup_counters "$(stats_current_snapshot)"
+    local snapshot
+    snapshot="$(stats_current_snapshot)"
+    stats_rollup_needed "$snapshot" || return 0
+    stats_rollup_counters "$snapshot"
 }
 
 stats_set_user_used() {

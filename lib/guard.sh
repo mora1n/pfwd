@@ -187,6 +187,37 @@ guard_protocol_skip_ports_display() {
     fi
 }
 
+guard_protocol_filters_enabled() {
+    if [ "$(guard_block_http)" = "true" ] || [ "$(guard_block_tls)" = "true" ] || [ "$(guard_block_socks)" = "true" ]; then
+        printf 'true\n'
+    else
+        printf 'false\n'
+    fi
+}
+
+guard_runtime_config_hash() {
+    local iface="$1"
+    local ports_arg="$2"
+    local payload
+    payload="$(cat <<EOF
+iface=$iface
+http=$(guard_block_http)
+tls=$(guard_block_tls)
+socks=$(guard_block_socks)
+ports:
+$ports_arg
+EOF
+)"
+    printf '%s' "$payload" | cksum | awk '{print $1}'
+}
+
+guard_runtime_status_config_hash() {
+    local status_file
+    status_file="$(guard_status_file)"
+    [ -f "$status_file" ] || return 0
+    jq -r '.config_hash // empty' "$status_file" 2>/dev/null || true
+}
+
 guard_bool_to_json() {
     case "$1" in
         true) echo true ;;
@@ -291,13 +322,31 @@ guard_apply_runtime() {
     iface="$(guard_tc_interface)"
     [ -n "$iface" ] || guard_die "无法确定 guard 网卡，请先设置 tc_interface"
 
-    local ports_arg
+    local ports_arg config_hash current_hash
     ports_arg="$(guard_protocol_enforced_port_specs)"
+    if [ "$(guard_protocol_filters_enabled)" != "true" ] || [ -z "$ports_arg" ]; then
+        guard_remove_runtime true
+        if [ "$quiet" != "true" ]; then
+            echo "guard 已跳过：当前没有生效的协议封锁端口"
+        fi
+        return 0
+    fi
+
+    config_hash="$(guard_runtime_config_hash "$iface" "$ports_arg")"
+    current_hash="$(guard_runtime_status_config_hash)"
+    if [ -n "$current_hash" ] && [ "$config_hash" = "$current_hash" ]; then
+        if [ "$quiet" != "true" ]; then
+            printf 'guard 已应用：iface=%s http=%s tls=%s socks=%s (unchanged)\n' \
+              "$iface" "$(guard_block_http)" "$(guard_block_tls)" "$(guard_block_socks)"
+        fi
+        return 0
+    fi
 
     guard_run "$(guard_bin_path)" apply \
       --iface "$iface" \
       --ingress-pin "$(guard_ingress_pin_path)" \
       --status-file "$(guard_status_file)" \
+      --config-hash "$config_hash" \
       --whitelist-enabled false \
       --allow-ports "$ports_arg" \
       --block-http "$(guard_block_http)" \

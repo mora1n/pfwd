@@ -33,7 +33,8 @@ type bpfObjects struct {
 	GuardWhitelistV4 *ebpf.Map     `ebpf:"guard_whitelist_v4"`
 	GuardWhitelistV6 *ebpf.Map     `ebpf:"guard_whitelist_v6"`
 	GuardAllowTCPPorts *ebpf.Map   `ebpf:"guard_allow_tcp_ports"`
-	GuardStats       *ebpf.Map     `ebpf:"guard_stats"`
+	GuardAllowedFlows  *ebpf.Map   `ebpf:"guard_allowed_flows"`
+	GuardStats         *ebpf.Map   `ebpf:"guard_stats"`
 }
 
 func (o *bpfObjects) Close() {
@@ -54,6 +55,9 @@ func (o *bpfObjects) Close() {
 	}
 	if o.GuardAllowTCPPorts != nil {
 		_ = o.GuardAllowTCPPorts.Close()
+	}
+	if o.GuardAllowedFlows != nil {
+		_ = o.GuardAllowedFlows.Close()
 	}
 	if o.GuardStats != nil {
 		_ = o.GuardStats.Close()
@@ -81,6 +85,7 @@ type applyOptions struct {
 	Iface            string
 	IngressPin       string
 	StatusFile       string
+	ConfigHash       string
 	WhitelistFile    string
 	WhitelistEnabled bool
 	AllowPorts       string
@@ -102,6 +107,7 @@ type statusFilePayload struct {
 	Interface         string `json:"interface"`
 	InterfaceIndex    int    `json:"interface_index"`
 	IngressPin        string `json:"ingress_pin"`
+	ConfigHash        string `json:"config_hash,omitempty"`
 	WhitelistEnabled  bool   `json:"whitelist_enabled"`
 	WhitelistFile     string `json:"whitelist_file"`
 	WhitelistEntries  int    `json:"whitelist_entries"`
@@ -154,6 +160,7 @@ func runApplyCommand(args []string) error {
 	fs.StringVar(&opts.Iface, "iface", "", "network interface")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs pin path")
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json path")
+	fs.StringVar(&opts.ConfigHash, "config-hash", "", "runtime config hash")
 	fs.StringVar(&opts.WhitelistFile, "whitelist-file", "", "whitelist file path")
 	fs.StringVar(&whitelistEnabled, "whitelist-enabled", "false", "true|false")
 	fs.StringVar(&opts.AllowPorts, "allow-ports", "", "allowed forwarding ports list")
@@ -304,6 +311,7 @@ func applyGuard(opts applyOptions) error {
 		Interface:        iface.Name,
 		InterfaceIndex:   iface.Index,
 		IngressPin:       opts.IngressPin,
+		ConfigHash:       opts.ConfigHash,
 		WhitelistEnabled: opts.WhitelistEnabled,
 		WhitelistFile:    opts.WhitelistFile,
 		WhitelistEntries: whitelistEntries,

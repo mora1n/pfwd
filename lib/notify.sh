@@ -59,7 +59,7 @@ notify_rate_text() {
 notify_user_summary_json() {
     local user_id="$1"
     local stats
-    stats="$(stats_json "$user_id" "")"
+    stats="$(stats_usage_json)"
     jq -c --arg user "$user_id" '
       .users[]? | select(.id == $user)
     ' <<< "$stats"
@@ -70,7 +70,7 @@ notify_status_message() {
     local tg stats user_json server_name reset_day total_limit user_name user_rate
     tg="$(notify_user_config "$user_id")"
     [ -n "$tg" ] && [ "$tg" != "null" ] || pfwd_die "未找到该用户的 Telegram 配置：$user_id"
-    stats="$(stats_json "$user_id" "")"
+    stats="$(stats_usage_json)"
     user_json="$(notify_user_summary_json "$user_id")"
     [ -n "$user_json" ] && [ "$user_json" != "null" ] || pfwd_die "未找到该用户统计信息：$user_id"
 

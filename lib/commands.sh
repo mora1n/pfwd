@@ -5,8 +5,57 @@ cmd_init() {
     echo "已初始化：$PFWD_CONFIG_FILE"
 }
 
+cmd_runtime_skip_notice() {
+    echo "配置已保存；未检测到已安装运行态，跳过应用，请先执行 pfwd install"
+}
+
+cmd_runtime_ready() {
+    if ! service_runtime_installed; then
+        cmd_runtime_skip_notice
+        return 1
+    fi
+    return 0
+}
+
+cmd_apply_forwarding_bundle() {
+    config_init >/dev/null
+    forwarder_validate_config
+    cmd_runtime_ready || return 0
+    forwarder_apply_runtime
+    fw_apply_nft
+    fw_apply_tc
+    guard_apply_runtime true
+}
+
+cmd_apply_forwarder_runtime() {
+    config_init >/dev/null
+    forwarder_validate_config
+    cmd_runtime_ready || return 0
+    forwarder_apply_runtime
+}
+
+cmd_apply_firewall_runtime() {
+    config_init >/dev/null
+    cmd_runtime_ready || return 0
+    fw_apply_nft
+}
+
+cmd_apply_firewall_tc_runtime() {
+    config_init >/dev/null
+    cmd_runtime_ready || return 0
+    fw_apply_nft
+    fw_apply_tc
+}
+
+cmd_apply_guard_runtime() {
+    config_init >/dev/null
+    cmd_runtime_ready || return 0
+    guard_apply_runtime true
+}
+
 cmd_refresh_after_change() {
-    cmd_refresh
+    stats_rollup_current
+    cmd_apply_forwarding_bundle
 }
 
 cmd_rollup_before_traffic_semantics_change() {
@@ -366,7 +415,8 @@ cmd_add() {
     count="$(printf '%s\n' "$forward_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
     echo "转发已添加：$count 条"
     printf '%s\n' "$forward_ids" | sed '/^$/d' | sed 's/^/  /'
-    cmd_refresh_after_change
+    stats_rollup_current
+    cmd_apply_forwarding_bundle
 }
 
 cmd_list() {
@@ -410,14 +460,16 @@ cmd_toggle_forward() {
     [ "$#" -eq 1 ] || pfwd_die "用法：pfwd start|stop <forward_id>"
     config_set_forward_enabled "$1" "$enabled"
     echo "转发状态已更新：$1 enabled=$enabled"
-    cmd_refresh_after_change
+    stats_rollup_current
+    cmd_apply_forwarding_bundle
 }
 
 cmd_delete() {
     [ "$#" -eq 1 ] || pfwd_die "用法：pfwd delete <forward_id>"
     config_delete_forward "$1"
     echo "转发已删除：$1"
-    cmd_refresh_after_change
+    stats_rollup_current
+    cmd_apply_forwarding_bundle
 }
 
 cmd_expire() {
@@ -438,14 +490,16 @@ cmd_expire() {
             config_set_forward_expire "$id" "$stop_at"
             stop_at="$(jq -r --arg id "$id" '.forwards[] | select(.id == $id) | .stop_at' "$PFWD_CONFIG_FILE")"
             echo "转发到期时间已更新：$id stop_at=$stop_at"
-            cmd_refresh_after_change
+            stats_rollup_current
+            cmd_apply_forwarding_bundle
             ;;
         clear)
             local id="${1:-}"
             [ -n "$id" ] || pfwd_die "必须提供转发 id"
             config_clear_forward_expire "$id"
             echo "转发到期时间已清空：$id"
-            cmd_refresh_after_change
+            stats_rollup_current
+            cmd_apply_forwarding_bundle
             ;;
         user-set)
             local user_id="" stop_at=""
@@ -460,7 +514,8 @@ cmd_expire() {
             [ -n "$stop_at" ] || pfwd_die "必须提供 --stop-at"
             config_set_user_forwards_expire "$user_id" "$stop_at"
             echo "用户全部转发到期时间已更新：$(normalize_user_id "$user_id")"
-            cmd_refresh_after_change
+            stats_rollup_current
+            cmd_apply_forwarding_bundle
             ;;
         user-clear)
             local user_id=""
@@ -473,7 +528,8 @@ cmd_expire() {
             [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
             config_clear_user_forwards_expire "$user_id"
             echo "用户全部转发到期时间已清空：$(normalize_user_id "$user_id")"
-            cmd_refresh_after_change
+            stats_rollup_current
+            cmd_apply_forwarding_bundle
             ;;
         *)
             pfwd_die "用法：pfwd expire set|clear|user-set|user-clear"
@@ -500,16 +556,18 @@ cmd_limit() {
     [ -z "$traffic" ] || traffic_bytes="$(parse_size_bytes "$traffic")"
     [ -z "$rate" ] || normalized_rate="$(normalize_rate "$rate")"
     if [ -n "$forward_id" ] && [ -z "$user_id" ]; then
+        stats_rollup_current
         if [ -n "$mode" ]; then
             cmd_rollup_before_traffic_semantics_change
         fi
         config_set_forward_limit "$forward_id" "$traffic_bytes" "$normalized_rate" "$mode"
         echo "转发限制已更新：$forward_id"
-        cmd_refresh_after_change
+        cmd_apply_firewall_tc_runtime
     elif [ -n "$user_id" ] && [ -z "$forward_id" ]; then
+        stats_rollup_current
         config_set_user_limit "$user_id" "$traffic_bytes" "$normalized_rate" "$mode"
         echo "用户限制已更新：$user_id"
-        cmd_refresh_after_change
+        cmd_apply_firewall_tc_runtime
     else
         pfwd_die "只能设置 --forward-id 或 --user-id 其中一个"
     fi
@@ -517,6 +575,9 @@ cmd_limit() {
 
 cmd_forward_update() {
     local forward_id=""
+    local before current_comment current_listen_ip current_listen_port current_remote_host current_remote_port current_stop_at current_protocol current_traffic_mode current_traffic_ratio current_mss_mode current_mss_value current_snat_mode current_snat_source
+    local after updated_comment updated_listen_ip updated_listen_port updated_remote_host updated_remote_port updated_stop_at updated_protocol updated_traffic_mode updated_traffic_ratio updated_mss_mode updated_mss_value updated_snat_mode updated_snat_source
+    local changed_forwarding="false" changed_stats="false" changed_comment="false"
     local listen_ip="__KEEP__" listen_port="__KEEP__" remote_host="__KEEP__" remote_port="__KEEP__"
     local stop_at="__KEEP__" protocol="__KEEP__" traffic_mode="__KEEP__"
     local traffic_ratio="__KEEP__" comment="__KEEP__" mss_mode="__KEEP__" mss_value="__KEEP__" snat_mode="__KEEP__" snat_source="__KEEP__"
@@ -543,12 +604,56 @@ cmd_forward_update() {
         esac
     done
     [ -n "$forward_id" ] || pfwd_die "必须提供 --forward-id"
+    before="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
+    current_comment="$(jq -r '.comment // ""' <<< "$before")"
+    current_listen_ip="$(jq -r '.listen_ip // ""' <<< "$before")"
+    current_listen_port="$(jq -r '.listen_port | tostring' <<< "$before")"
+    current_remote_host="$(jq -r '.remote_host' <<< "$before")"
+    current_remote_port="$(jq -r '.remote_port | tostring' <<< "$before")"
+    current_stop_at="$(jq -r '.stop_at // ""' <<< "$before")"
+    current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$before")"
+    current_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$before")"
+    current_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$before")"
+    current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$before")"
+    current_mss_value="$(jq -r 'if (.nft.mss_value // null) == null then "" else (.nft.mss_value | tostring) end' <<< "$before")"
+    current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$before")"
+    current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$before")"
     if [ "$traffic_mode" != "__KEEP__" ] || [ "$traffic_ratio" != "__KEEP__" ]; then
         cmd_rollup_before_traffic_semantics_change
     fi
     config_update_forward "$forward_id" "$listen_ip" "$listen_port" "$remote_host" "$remote_port" "$stop_at" "$protocol" "$traffic_mode" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
+    after="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
+    updated_comment="$(jq -r '.comment // ""' <<< "$after")"
+    updated_listen_ip="$(jq -r '.listen_ip // ""' <<< "$after")"
+    updated_listen_port="$(jq -r '.listen_port | tostring' <<< "$after")"
+    updated_remote_host="$(jq -r '.remote_host' <<< "$after")"
+    updated_remote_port="$(jq -r '.remote_port | tostring' <<< "$after")"
+    updated_stop_at="$(jq -r '.stop_at // ""' <<< "$after")"
+    updated_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$after")"
+    updated_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$after")"
+    updated_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$after")"
+    updated_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$after")"
+    updated_mss_value="$(jq -r 'if (.nft.mss_value // null) == null then "" else (.nft.mss_value | tostring) end' <<< "$after")"
+    updated_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$after")"
+    updated_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$after")"
+    if [ "$current_comment" != "$updated_comment" ]; then
+        changed_comment="true"
+    fi
+    if [ "$current_traffic_mode" != "$updated_traffic_mode" ] || [ "$current_traffic_ratio" != "$updated_traffic_ratio" ]; then
+        changed_stats="true"
+    fi
+    if [ "$current_listen_ip" != "$updated_listen_ip" ] || [ "$current_listen_port" != "$updated_listen_port" ] || [ "$current_remote_host" != "$updated_remote_host" ] || [ "$current_remote_port" != "$updated_remote_port" ] || [ "$current_stop_at" != "$updated_stop_at" ] || [ "$current_protocol" != "$updated_protocol" ] || [ "$current_mss_mode" != "$updated_mss_mode" ] || [ "$current_mss_value" != "$updated_mss_value" ] || [ "$current_snat_mode" != "$updated_snat_mode" ] || [ "$current_snat_source" != "$updated_snat_source" ]; then
+        changed_forwarding="true"
+    fi
     echo "转发已更新：$forward_id"
-    cmd_refresh_after_change
+    if [ "$changed_forwarding" = "true" ]; then
+        stats_rollup_current
+        cmd_apply_forwarding_bundle
+    elif [ "$changed_stats" = "true" ]; then
+        cmd_apply_firewall_runtime
+    elif [ "$changed_comment" = "true" ]; then
+        :
+    fi
 }
 
 cmd_user_forwards_traffic_mode() {
@@ -565,7 +670,7 @@ cmd_user_forwards_traffic_mode() {
     cmd_rollup_before_traffic_semantics_change
     config_set_user_forwards_traffic_mode "$user_id" "$traffic_mode"
     echo "用户全部转发流量模式已更新：$(normalize_user_id "$user_id") mode=$traffic_mode"
-    cmd_refresh_after_change
+    cmd_apply_firewall_runtime
 }
 
 cmd_user_forwards_limit() {
@@ -591,7 +696,8 @@ cmd_user_forwards_limit() {
     fi
     config_set_user_forward_limits "$user_id" "$traffic_bytes" "$normalized_rate" "$mode"
     echo "用户全部转发限制已更新：$user_id"
-    cmd_refresh_after_change
+    stats_rollup_current
+    cmd_apply_firewall_tc_runtime
 }
 
 cmd_traffic() {
@@ -623,7 +729,7 @@ cmd_traffic() {
             else
                 pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
             fi
-            cmd_refresh_after_change
+            cmd_apply_firewall_runtime
             ;;
         reset-day)
             local scope="${1:-}"
@@ -667,7 +773,7 @@ cmd_traffic() {
             else
                 pfwd_die "只能设置 --user-id 或 --forward-id 其中一个"
             fi
-            cmd_refresh_after_change
+            cmd_apply_firewall_runtime
             ;;
         *) pfwd_die "用法：pfwd traffic used|reset-day|reset-now" ;;
     esac
@@ -677,7 +783,7 @@ stats_json() {
     local user_id="$1"
     local forward_id="$2"
     local counters
-    counters="$(fw_read_counters)"
+    counters="$(stats_usage_json)"
     jq --arg user "$user_id" --arg fwd "$forward_id" '
       .forwards |= map(select(($user == "" or .user_id == $user) and ($fwd == "" or .id == $fwd)))
       | .total_bytes = ([.forwards[].total_bytes] | add // 0)
@@ -722,11 +828,22 @@ cmd_doctor_benchmark() {
     echo "$label：avg=${elapsed_ms}ms max=${max_ms}ms loops=${loops}"
 }
 
+cmd_doctor_runner() {
+    local body="$1"
+    local script_dir script_path
+    script_dir="$(printf '%q' "$PFWD_SCRIPT_DIR")"
+    script_path="$(printf '%q' "$PFWD_SCRIPT_DIR/pfwd.sh")"
+    printf 'cd %s && tmp_root="$(mktemp -d /tmp/pfwd-bench.XXXXXX)" && trap '\''rm -rf "$tmp_root"'\'' EXIT && export PFWD_ROOT_PREFIX="$tmp_root" PFWD_SKIP_SHORTCUT=1 && { source %s help >/dev/null 2>&1 || true; config_init >/dev/null 2>&1; %s; }' "$script_dir" "$script_path" "$body"
+}
+
 cmd_doctor_benchmarks() {
-    cmd_doctor_benchmark "benchmark.fw_read_counters" "source ./pfwd.sh help >/dev/null 2>&1 || true; fw_read_counters >/dev/null"
-    cmd_doctor_benchmark "benchmark.ui_main_usage_json" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_main_usage_json >/dev/null"
-    cmd_doctor_benchmark "benchmark.main_page" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_render_main_menu_page >/dev/null"
-    cmd_doctor_benchmark "benchmark.forward_list" "source ./pfwd.sh help >/dev/null 2>&1 || true; UI_COLOR_ENABLED=0; ui_print_forward_list >/dev/null"
+    cmd_doctor_benchmark "benchmark.stats_current_snapshot" "$(cmd_doctor_runner 'stats_current_snapshot >/dev/null')"
+    cmd_doctor_benchmark "benchmark.stats_rollup_current" "$(cmd_doctor_runner 'stats_rollup_current >/dev/null')"
+    cmd_doctor_benchmark "benchmark.fw_read_counters" "$(cmd_doctor_runner 'fw_read_counters >/dev/null')"
+    cmd_doctor_benchmark "benchmark.forwarder_runtime_json" "$(cmd_doctor_runner 'forwarder_runtime_json true >/dev/null')"
+    cmd_doctor_benchmark "benchmark.ui_main_usage_json" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_main_usage_json >/dev/null')"
+    cmd_doctor_benchmark "benchmark.main_page" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_render_main_menu_page >/dev/null')"
+    cmd_doctor_benchmark "benchmark.forward_list" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_print_forward_list >/dev/null')"
 }
 
 cmd_render() {
@@ -753,23 +870,15 @@ cmd_render() {
 }
 
 cmd_apply_runtime() {
-    config_init >/dev/null
-    forwarder_validate_config
-    if ! service_runtime_installed; then
-        echo "配置已保存；未检测到已安装运行态，跳过应用，请先执行 pfwd install"
-        return 0
-    fi
-    forwarder_apply_runtime
-    fw_apply_nft
-    fw_apply_tc
-    guard_apply_runtime true
+    cmd_apply_forwarding_bundle
     echo "已刷新"
 }
 
 cmd_refresh() {
     config_init >/dev/null
     stats_rollup_current
-    cmd_apply_runtime
+    cmd_apply_forwarding_bundle
+    echo "已刷新"
 }
 
 cmd_reconcile() {
@@ -787,7 +896,8 @@ cmd_reconcile() {
         need_refresh=true
     fi
     if [ "$need_refresh" = "true" ]; then
-        cmd_refresh
+        stats_rollup_current
+        cmd_apply_forwarding_bundle
     fi
     sent="$(notify_reconcile_schedules)"
     echo "已同步：active_before=$before active_after=$after notify_sent=$sent"
@@ -847,10 +957,7 @@ cmd_install() {
 cmd_forward_boot() {
     config_init >/dev/null
     forwarder_validate_config
-    forwarder_apply_runtime
-    fw_apply_nft
-    fw_apply_tc
-    guard_apply_runtime true
+    cmd_apply_forwarding_bundle
     echo "boot restore complete"
 }
 
@@ -862,7 +969,7 @@ cmd_guard() {
         enable)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard enable"
             guard_config_set_enabled true
-            cmd_refresh
+            cmd_apply_guard_runtime
             echo "guard 已启用"
             ;;
         disable)
@@ -944,7 +1051,7 @@ cmd_guard() {
             fi
             guard_config_set_protocol_skip_ports "$tmp_ports"
             rm -f "$tmp_ports"
-            cmd_refresh
+            cmd_apply_guard_runtime
             echo "guard 协议封锁已更新"
             ;;
         *)
@@ -980,7 +1087,7 @@ cmd_address_control() {
 
     if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         address_control_prepare_runtime
-        cmd_refresh
+        cmd_apply_forwarder_runtime
         echo "白名单数据已刷新"
         return 0
     fi
@@ -1014,7 +1121,7 @@ cmd_address_control() {
     rm -f "$tmp_cidrs"
 
     address_control_prepare_runtime
-    cmd_refresh
+    cmd_apply_forwarder_runtime
     echo "协议封锁 / 白名单已更新"
 }
 
@@ -1039,14 +1146,14 @@ cmd_address_control_custom() {
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom clear"
             address_control_clear_custom_cidrs
             address_control_prepare_runtime
-            cmd_refresh
+            cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已清空"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd address-control-custom delete <index...>"
             address_control_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
             address_control_prepare_runtime
-            cmd_refresh
+            cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已删除"
             ;;
         update)
@@ -1054,7 +1161,7 @@ cmd_address_control_custom() {
             [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/IPv6 CIDR>"
             address_control_replace_custom_cidr_by_index "$index" "$cidr"
             address_control_prepare_runtime
-            cmd_refresh
+            cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已更新：$index -> $cidr"
             ;;
         *)

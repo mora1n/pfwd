@@ -454,6 +454,12 @@ forwarder_write_render_file() {
     mv "$tmp_file" "$PFWD_FORWARDER_RENDER_FILE"
 }
 
+forwarder_render_matches_runtime() {
+    local candidate="$1"
+    [ -f "$PFWD_FORWARDER_RENDER_FILE" ] || return 1
+    cmp -s "$candidate" "$PFWD_FORWARDER_RENDER_FILE"
+}
+
 forwarder_render_config() {
     local runtime_json
     runtime_json="$(forwarder_runtime_json true)"
@@ -514,6 +520,7 @@ forwarder_delete_table() {
 
 forwarder_apply_runtime() {
     local runtime_json
+    local tmp_render
     config_init >/dev/null
     forwarder_validate_config
     runtime_json="$(forwarder_runtime_json true)"
@@ -527,12 +534,21 @@ forwarder_apply_runtime() {
     fi
 
     pfwd_require_cmd nft
-    forwarder_write_render_file "$runtime_json"
-    forwarder_validate_render_file "$PFWD_FORWARDER_RENDER_FILE" || pfwd_die "forwarder nft 配置校验失败：$PFWD_FORWARDER_RENDER_FILE"
+    tmp_render="$(mktemp "${PFWD_FORWARDER_RENDER_FILE}.tmp.XXXXXX")"
+    forwarder_render_to_stdout "$runtime_json" > "$tmp_render"
+    forwarder_validate_render_file "$tmp_render" || {
+        rm -f "$tmp_render"
+        pfwd_die "forwarder nft 配置校验失败：$tmp_render"
+    }
     forwarder_ensure_ip_forwarding
     if forwarder_route_localnet_needed "$runtime_json"; then
         forwarder_ensure_route_localnet
     fi
+    if forwarder_table_exists && forwarder_render_matches_runtime "$tmp_render"; then
+        rm -f "$tmp_render"
+        return 0
+    fi
+    mv "$tmp_render" "$PFWD_FORWARDER_RENDER_FILE"
     forwarder_delete_table
     pfwd_run nft -f "$PFWD_FORWARDER_RENDER_FILE"
 }

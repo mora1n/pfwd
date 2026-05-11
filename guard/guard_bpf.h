@@ -16,6 +16,7 @@ typedef __u32 __be32;
 enum {
     BPF_MAP_TYPE_ARRAY = 2,
     BPF_MAP_TYPE_HASH = 1,
+    BPF_MAP_TYPE_LRU_HASH = 9,
     BPF_MAP_TYPE_LPM_TRIE = 11,
 };
 
