@@ -67,6 +67,18 @@ address_control_custom_cidrs_count() {
     jq -r '.settings.address_control.custom_cidrs // [] | length' "$PFWD_CONFIG_FILE"
 }
 
+address_control_family() {
+    printf '%s\n' "$PFWD_ADDRESS_CONTROL_FAMILY"
+}
+
+address_control_table() {
+    printf '%s\n' "$PFWD_ADDRESS_CONTROL_TABLE"
+}
+
+address_control_runtime_hash() {
+    jq -r '.settings.address_control.runtime_hash // ""' "$PFWD_CONFIG_FILE"
+}
+
 address_control_filter_ipv4_cidrs() {
     awk '
       function valid_octet(v) { return v ~ /^[0-9]+$/ && v >= 0 && v <= 255 }
@@ -341,6 +353,107 @@ address_control_prepare_runtime() {
 
 address_control_runtime_enabled() {
     [ "$(address_control_enabled)" = "true" ] && echo true || echo false
+}
+
+address_control_runtime_hash_compute() {
+    local payload
+    payload="$(cat <<EOF
+enabled=$(address_control_enabled)
+include_cn=$(address_control_include_cn)
+source=$(address_control_source_url)
+last_good_source=$(address_control_last_good_source)
+custom:
+$(address_control_custom_cidrs_tsv)
+ipv4:
+$(cat "$(address_control_allow_ipv4_file)" 2>/dev/null || true)
+ipv6:
+$(cat "$(address_control_allow_ipv6_file)" 2>/dev/null || true)
+EOF
+)"
+    printf '%s' "$payload" | cksum | awk '{print $1}'
+}
+
+address_control_update_runtime_hash() {
+    local runtime_hash="$1"
+    config_update --arg runtime_hash "$runtime_hash" '
+      (.settings.address_control //= {})
+      | .settings.address_control.runtime_hash = $runtime_hash
+    '
+}
+
+address_control_render_nft() {
+    local family table
+    family="$(address_control_family)"
+    table="$(address_control_table)"
+
+    echo "table $family $table {"
+    if [ "$(address_control_runtime_enabled)" = "true" ]; then
+        if [ -s "$(address_control_allow_ipv4_file)" ]; then
+            echo "    set pfwd_addrctl_allow_v4 {"
+            echo "        type ipv4_addr"
+            echo "        flags interval"
+            echo "        elements = {"
+            sed 's/^/            /;s/$/,/' "$(address_control_allow_ipv4_file)"
+            echo "        }"
+            echo "    }"
+            echo
+        fi
+        if [ -s "$(address_control_allow_ipv6_file)" ]; then
+            echo "    set pfwd_addrctl_allow_v6 {"
+            echo "        type ipv6_addr"
+            echo "        flags interval"
+            echo "        elements = {"
+            sed 's/^/            /;s/$/,/' "$(address_control_allow_ipv6_file)"
+            echo "        }"
+            echo "    }"
+            echo
+        fi
+    fi
+    echo "    chain forward {"
+    echo "        type filter hook forward priority 5; policy accept;"
+    if [ "$(address_control_runtime_enabled)" = "true" ]; then
+        if [ -s "$(address_control_allow_ipv4_file)" ]; then
+            echo '        ct status dnat ct state new meta nfproto ipv4 ip saddr != @pfwd_addrctl_allow_v4 drop comment "Inbound whitelist denies unmatched IPv4 sources"'
+        fi
+        if [ -s "$(address_control_allow_ipv6_file)" ]; then
+            echo '        ct status dnat ct state new meta nfproto ipv6 ip6 saddr != @pfwd_addrctl_allow_v6 drop comment "Inbound whitelist denies unmatched IPv6 sources"'
+        fi
+    fi
+    echo "    }"
+    echo "}"
+}
+
+address_control_table_exists() {
+    nft list table "$(address_control_family)" "$(address_control_table)" >/dev/null 2>&1
+}
+
+address_control_delete_table() {
+    if command -v nft >/dev/null 2>&1 && address_control_table_exists; then
+        pfwd_run nft delete table "$(address_control_family)" "$(address_control_table)"
+    fi
+}
+
+address_control_apply_runtime() {
+    local runtime_hash current_hash tmp_render
+    address_control_prepare_runtime
+    runtime_hash="$(address_control_runtime_hash_compute)"
+    current_hash="$(address_control_runtime_hash)"
+    if [ "$runtime_hash" = "$current_hash" ] && address_control_table_exists; then
+        return 0
+    fi
+
+    if [ "$(address_control_runtime_enabled)" != "true" ]; then
+        address_control_delete_table
+        address_control_update_runtime_hash "$runtime_hash"
+        return 0
+    fi
+
+    pfwd_require_cmd nft
+    tmp_render="$(mktemp "$PFWD_RUN_DIR/address-control.XXXXXX")"
+    address_control_render_nft > "$tmp_render"
+    pfwd_run nft -f "$tmp_render"
+    rm -f "$tmp_render"
+    address_control_update_runtime_hash "$runtime_hash"
 }
 
 address_control_status_json() {

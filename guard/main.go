@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
@@ -28,18 +29,23 @@ var guardBPFEL []byte
 const binaryVersion = "0.1.0"
 
 type bpfObjects struct {
-	IngressGuard     *ebpf.Program `ebpf:"ingress_guard"`
-	GuardSettings    *ebpf.Map     `ebpf:"guard_settings"`
-	GuardWhitelistV4 *ebpf.Map     `ebpf:"guard_whitelist_v4"`
-	GuardWhitelistV6 *ebpf.Map     `ebpf:"guard_whitelist_v6"`
-	GuardAllowTCPPorts *ebpf.Map   `ebpf:"guard_allow_tcp_ports"`
-	GuardAllowedFlows  *ebpf.Map   `ebpf:"guard_allowed_flows"`
-	GuardStats         *ebpf.Map   `ebpf:"guard_stats"`
+	XDPGuard            *ebpf.Program `ebpf:"xdp_guard"`
+	IngressGuard        *ebpf.Program `ebpf:"ingress_guard"`
+	GuardSettings       *ebpf.Map     `ebpf:"guard_settings"`
+	GuardWhitelistV4    *ebpf.Map     `ebpf:"guard_whitelist_v4"`
+	GuardWhitelistV6    *ebpf.Map     `ebpf:"guard_whitelist_v6"`
+	GuardAllPorts       *ebpf.Map     `ebpf:"guard_all_ports"`
+	GuardAllowTCPPorts  *ebpf.Map     `ebpf:"guard_allow_tcp_ports"`
+	GuardAllowedFlows   *ebpf.Map     `ebpf:"guard_allowed_flows"`
+	GuardStats          *ebpf.Map     `ebpf:"guard_stats"`
 }
 
 func (o *bpfObjects) Close() {
 	if o == nil {
 		return
+	}
+	if o.XDPGuard != nil {
+		_ = o.XDPGuard.Close()
 	}
 	if o.IngressGuard != nil {
 		_ = o.IngressGuard.Close()
@@ -52,6 +58,9 @@ func (o *bpfObjects) Close() {
 	}
 	if o.GuardWhitelistV6 != nil {
 		_ = o.GuardWhitelistV6.Close()
+	}
+	if o.GuardAllPorts != nil {
+		_ = o.GuardAllPorts.Close()
 	}
 	if o.GuardAllowTCPPorts != nil {
 		_ = o.GuardAllowTCPPorts.Close()
@@ -83,9 +92,13 @@ type whitelistKeyV6 struct {
 
 type applyOptions struct {
 	Iface            string
+	XDPMode          string
+	XDPPin           string
 	IngressPin       string
 	StatusFile       string
 	ConfigHash       string
+	XDPWhitelist     bool
+	AllowAnyPorts    string
 	WhitelistFile    string
 	WhitelistEnabled bool
 	AllowPorts       string
@@ -95,6 +108,7 @@ type applyOptions struct {
 }
 
 type removeOptions struct {
+	XDPPin     string
 	IngressPin string
 	StatusFile string
 }
@@ -103,13 +117,20 @@ type statusFilePayload struct {
 	Applied           bool   `json:"applied"`
 	BinaryVersion     string `json:"binary_version"`
 	AppliedAt         string `json:"applied_at"`
+	XDPMode           string `json:"xdp_mode,omitempty"`
+	XDPEffective      string `json:"xdp_effective,omitempty"`
+	XDPAttachKind     string `json:"xdp_attach_kind,omitempty"`
+	XDPReason         string `json:"xdp_reason,omitempty"`
 	AttachMode        string `json:"attach_mode"`
 	Interface         string `json:"interface"`
 	InterfaceIndex    int    `json:"interface_index"`
+	XDPPin            string `json:"xdp_pin,omitempty"`
 	IngressPin        string `json:"ingress_pin"`
 	ConfigHash        string `json:"config_hash,omitempty"`
 	WhitelistEnabled  bool   `json:"whitelist_enabled"`
 	WhitelistFile     string `json:"whitelist_file"`
+	XDPWhitelist      bool   `json:"xdp_whitelist"`
+	AllowAnyPorts     int    `json:"allow_any_ports"`
 	WhitelistEntries  int    `json:"whitelist_entries"`
 	AllowTCPPorts     int    `json:"allow_tcp_ports"`
 	BlockHTTP         bool   `json:"block_http"`
@@ -153,14 +174,19 @@ func runApplyCommand(args []string) error {
 
 	var opts applyOptions
 	var whitelistEnabled string
+	var xdpWhitelist string
 	var blockHTTP string
 	var blockTLS string
 	var blockSOCKS string
 
 	fs.StringVar(&opts.Iface, "iface", "", "network interface")
+	fs.StringVar(&opts.XDPMode, "xdp-mode", "auto", "off|auto|force")
+	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs pin path for xdp")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs pin path")
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json path")
 	fs.StringVar(&opts.ConfigHash, "config-hash", "", "runtime config hash")
+	fs.StringVar(&xdpWhitelist, "xdp-whitelist", "false", "true|false")
+	fs.StringVar(&opts.AllowAnyPorts, "allow-any-ports", "", "all forwarded ports list")
 	fs.StringVar(&opts.WhitelistFile, "whitelist-file", "", "whitelist file path")
 	fs.StringVar(&whitelistEnabled, "whitelist-enabled", "false", "true|false")
 	fs.StringVar(&opts.AllowPorts, "allow-ports", "", "allowed forwarding ports list")
@@ -179,6 +205,10 @@ func runApplyCommand(args []string) error {
 	opts.WhitelistEnabled, err = parseBoolValue(whitelistEnabled)
 	if err != nil {
 		return fmt.Errorf("解析 whitelist-enabled 失败: %w", err)
+	}
+	opts.XDPWhitelist, err = parseBoolValue(xdpWhitelist)
+	if err != nil {
+		return fmt.Errorf("解析 xdp-whitelist 失败: %w", err)
 	}
 	opts.BlockHTTP, err = parseBoolValue(blockHTTP)
 	if err != nil {
@@ -201,6 +231,7 @@ func runRemoveCommand(args []string) error {
 	fs.SetOutput(os.Stderr)
 
 	var opts removeOptions
+	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs pin path for xdp")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs pin path")
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json path")
 
@@ -252,11 +283,22 @@ func applyGuard(opts applyOptions) error {
 	if opts.Iface == "" {
 		return fmt.Errorf("缺少 --iface")
 	}
+	if opts.XDPMode == "" {
+		opts.XDPMode = "auto"
+	}
+	switch opts.XDPMode {
+	case "off", "auto", "force":
+	default:
+		return fmt.Errorf("无效 xdp-mode：%s", opts.XDPMode)
+	}
 	if opts.IngressPin == "" {
 		return fmt.Errorf("缺少 --ingress-pin")
 	}
 	if opts.StatusFile == "" {
 		return fmt.Errorf("缺少 --status-file")
+	}
+	if opts.XDPMode != "off" && opts.XDPPin == "" {
+		return fmt.Errorf("启用 XDP 时缺少 --xdp-pin")
 	}
 	if opts.WhitelistEnabled && opts.WhitelistFile == "" {
 		return fmt.Errorf("whitelist 已启用，但缺少 --whitelist-file")
@@ -270,6 +312,7 @@ func applyGuard(opts applyOptions) error {
 		return fmt.Errorf("移除 memlock 限制失败: %w", err)
 	}
 	if err := removeGuard(removeOptions{
+		XDPPin:     opts.XDPPin,
 		IngressPin: opts.IngressPin,
 		StatusFile: opts.StatusFile,
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -293,11 +336,19 @@ func applyGuard(opts applyOptions) error {
 			return err
 		}
 	}
-	allowPortsEntries, err := loadAllowPorts(objs.GuardAllowTCPPorts, opts.AllowPorts)
+	allowAnyPortsEntries, err := loadAllowPorts(objs.GuardAllPorts, opts.AllowAnyPorts, "guard_all_ports")
+	if err != nil {
+		return err
+	}
+	allowPortsEntries, err := loadAllowPorts(objs.GuardAllowTCPPorts, opts.AllowPorts, "guard_allow_tcp_ports")
 	if err != nil {
 		return err
 	}
 
+	xdpEffective, xdpAttachKind, xdpReason, err := attachXDPGuard(iface, objs.XDPGuard, opts)
+	if err != nil {
+		return err
+	}
 	attachMode, err := attachGuard(iface, objs.IngressGuard, opts.IngressPin)
 	if err != nil {
 		return err
@@ -307,13 +358,20 @@ func applyGuard(opts applyOptions) error {
 		Applied:          true,
 		BinaryVersion:    binaryVersion,
 		AppliedAt:        time.Now().UTC().Format(time.RFC3339),
+		XDPMode:          opts.XDPMode,
+		XDPEffective:     xdpEffective,
+		XDPAttachKind:    xdpAttachKind,
+		XDPReason:        xdpReason,
 		AttachMode:       attachMode,
 		Interface:        iface.Name,
 		InterfaceIndex:   iface.Index,
+		XDPPin:           opts.XDPPin,
 		IngressPin:       opts.IngressPin,
 		ConfigHash:       opts.ConfigHash,
 		WhitelistEnabled: opts.WhitelistEnabled,
 		WhitelistFile:    opts.WhitelistFile,
+		XDPWhitelist:     opts.XDPWhitelist,
+		AllowAnyPorts:    allowAnyPortsEntries,
 		WhitelistEntries: whitelistEntries,
 		AllowTCPPorts:    allowPortsEntries,
 		BlockHTTP:        opts.BlockHTTP,
@@ -332,6 +390,14 @@ func removeGuard(opts removeOptions) error {
 		return fmt.Errorf("缺少 --ingress-pin")
 	}
 	payload, _ := readStatusFile(opts.StatusFile)
+	xdpPin := opts.XDPPin
+	if xdpPin == "" {
+		xdpPin = payload.XDPPin
+	}
+	if xdpPin != "" {
+		_ = removePinnedLink(xdpPin)
+		_ = removePinnedProgram(xdpPin)
+	}
 	switch payload.AttachMode {
 	case "tc":
 		if payload.Interface != "" {
@@ -458,9 +524,9 @@ func loadWhitelistFile(whitelistMapV4 *ebpf.Map, whitelistMapV6 *ebpf.Map, fileP
 	return count, nil
 }
 
-func loadAllowPorts(portMap *ebpf.Map, raw string) (int, error) {
+func loadAllowPorts(portMap *ebpf.Map, raw string, mapName string) (int, error) {
 	if portMap == nil {
-		return 0, fmt.Errorf("guard_allow_tcp_ports map 未加载")
+		return 0, fmt.Errorf("%s map 未加载", mapName)
 	}
 	count := 0
 	seen := make(map[uint32]struct{})
@@ -493,6 +559,63 @@ func loadAllowPorts(portMap *ebpf.Map, raw string) (int, error) {
 		return 0, fmt.Errorf("读取监听端口失败: %w", err)
 	}
 	return count, nil
+}
+
+func attachXDPGuard(iface *net.Interface, prog *ebpf.Program, opts applyOptions) (string, string, string, error) {
+	if opts.XDPMode == "off" {
+		if opts.XDPPin != "" {
+			_ = removePinnedLink(opts.XDPPin)
+			_ = removePinnedProgram(opts.XDPPin)
+		}
+		return "off", "-", "", nil
+	}
+	if prog == nil {
+		if opts.XDPMode == "force" {
+			return "", "", "", fmt.Errorf("xdp_guard program 未加载")
+		}
+		return "disabled", "-", "program-missing", nil
+	}
+	if err := features.HaveProgramType(ebpf.XDP); err != nil {
+		if opts.XDPMode == "force" {
+			return "", "", "", fmt.Errorf("XDP 不可用: %w", err)
+		}
+		return "disabled", "-", "xdp-unsupported", nil
+	}
+	if err := os.MkdirAll(filepath.Dir(opts.XDPPin), 0o755); err != nil {
+		return "", "", "", fmt.Errorf("创建 XDP bpffs 目录失败: %w", err)
+	}
+	_ = removePinnedLink(opts.XDPPin)
+	_ = removePinnedProgram(opts.XDPPin)
+
+	tryAttach := func(flags link.XDPAttachFlags, kind string) (string, string, string, error) {
+		attached, err := link.AttachXDP(link.XDPOptions{
+			Program:   prog,
+			Interface: iface.Index,
+			Flags:     flags,
+		})
+		if err != nil {
+			return "", "", "", err
+		}
+		defer attached.Close()
+		if err := attached.Pin(opts.XDPPin); err != nil {
+			return "", "", "", fmt.Errorf("pin xdp link 失败: %w", err)
+		}
+		if err := attached.Close(); err != nil {
+			return "", "", "", fmt.Errorf("关闭 xdp link fd 失败: %w", err)
+		}
+		return "enabled", kind, "", nil
+	}
+
+	if effective, kind, reason, err := tryAttach(link.XDPDriverMode, "driver"); err == nil {
+		return effective, kind, reason, nil
+	}
+	if effective, kind, reason, err := tryAttach(link.XDPGenericMode, "generic"); err == nil {
+		return effective, kind, reason, nil
+	}
+	if opts.XDPMode == "force" {
+		return "", "", "", fmt.Errorf("XDP attach 失败")
+	}
+	return "disabled", "-", "attach-failed", nil
 }
 
 func attachGuard(iface *net.Interface, prog *ebpf.Program, pinPath string) (string, error) {
@@ -683,8 +806,8 @@ func usageError() error {
 
 func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "用法:")
-	_, _ = fmt.Fprintln(file, "  pfwd-guard apply --iface IFACE --ingress-pin PATH --status-file PATH [--whitelist-file FILE] --whitelist-enabled true|false --block-http true|false --block-tls true|false --block-socks true|false")
-	_, _ = fmt.Fprintln(file, "  pfwd-guard remove --ingress-pin PATH --status-file PATH")
+	_, _ = fmt.Fprintln(file, "  pfwd-guard apply --iface IFACE --xdp-mode off|auto|force --xdp-pin PATH --ingress-pin PATH --status-file PATH [--whitelist-file FILE] --whitelist-enabled true|false --xdp-whitelist true|false --allow-any-ports TSV --allow-ports TSV --block-http true|false --block-tls true|false --block-socks true|false")
+	_, _ = fmt.Fprintln(file, "  pfwd-guard remove --xdp-pin PATH --ingress-pin PATH --status-file PATH")
 	_, _ = fmt.Fprintln(file, "  pfwd-guard status --status-file PATH")
 	_, _ = fmt.Fprintln(file, "  pfwd-guard version")
 }

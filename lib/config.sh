@@ -14,6 +14,7 @@ config_default_json() {
     "guard": {
       "enabled": false,
       "tc_interface": "",
+      "xdp_mode": "auto",
       "block_http": false,
       "block_tls": false,
       "block_socks": false,
@@ -25,7 +26,8 @@ config_default_json() {
       "custom_cidrs": [],
       "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
       "last_good_source": "",
-      "last_good_updated_at": null
+      "last_good_updated_at": null,
+      "runtime_hash": ""
     }
   },
   "users": [],

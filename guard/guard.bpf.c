@@ -67,6 +67,13 @@ struct {
     __uint(max_entries, 1024);
     __type(key, __u32);
     __type(value, __u8);
+} guard_all_ports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
 } guard_allow_tcp_ports SEC(".maps");
 
 struct {
@@ -124,6 +131,14 @@ static __always_inline int allow_port_match(__be16 port_be) {
     __u8 *value;
 
     value = bpf_map_lookup_elem(&guard_allow_tcp_ports, &port);
+    return value != 0;
+}
+
+static __always_inline int all_port_match(__be16 port_be) {
+    __u32 port = (__u32)bpf_ntohs(port_be);
+    __u8 *value;
+
+    value = bpf_map_lookup_elem(&guard_all_ports, &port);
     return value != 0;
 }
 
@@ -306,6 +321,64 @@ static __always_inline int inspect_tcp_payload(struct __sk_buff *skb, __u32 payl
     }
 
     return TC_ACT_OK;
+}
+
+SEC("xdp")
+int xdp_guard(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+
+    if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IP) {
+        struct ipv4hdr_min *ip4 = (void *)(eth + 1);
+        __u32 ip_header_len;
+        struct tcphdr_min *tcp;
+
+        if ((void *)(ip4 + 1) > data_end) {
+            return XDP_PASS;
+        }
+        if (ip4->protocol != IPPROTO_TCP) {
+            return XDP_PASS;
+        }
+        ip_header_len = (__u32)(ip4->version_ihl & 0x0f) * 4;
+        if (ip_header_len < sizeof(*ip4)) {
+            return XDP_PASS;
+        }
+        tcp = (void *)ip4 + ip_header_len;
+        if ((void *)(tcp + 1) > data_end) {
+            return XDP_PASS;
+        }
+        if (!all_port_match(tcp->dest)) {
+            return XDP_PASS;
+        }
+        return XDP_PASS;
+    }
+
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
+        struct ipv6hdr_min *ip6 = (void *)(eth + 1);
+        struct tcphdr_min *tcp;
+
+        if ((void *)(ip6 + 1) > data_end) {
+            return XDP_PASS;
+        }
+        if (ip6->nexthdr != IPPROTO_TCP) {
+            return XDP_PASS;
+        }
+        tcp = (void *)(ip6 + 1);
+        if ((void *)(tcp + 1) > data_end) {
+            return XDP_PASS;
+        }
+        if (!all_port_match(tcp->dest)) {
+            return XDP_PASS;
+        }
+        return XDP_PASS;
+    }
+
+    return XDP_PASS;
 }
 
 SEC("tc")

@@ -22,6 +22,7 @@ cmd_apply_forwarding_bundle() {
     forwarder_validate_config
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
+    address_control_apply_runtime
     fw_apply_nft
     fw_apply_tc
     guard_apply_runtime true
@@ -32,6 +33,7 @@ cmd_apply_forwarder_runtime() {
     forwarder_validate_config
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
+    address_control_apply_runtime
 }
 
 cmd_apply_firewall_runtime() {
@@ -996,6 +998,19 @@ cmd_guard() {
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard status"
             guard_render_status
             ;;
+        xdp)
+            local mode=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --mode) mode="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$mode" ] || pfwd_die "用法：pfwd guard xdp --mode off|auto|force"
+            guard_config_set_xdp_mode "$mode"
+            cmd_apply_guard_runtime
+            echo "guard XDP 模式已更新：$mode"
+            ;;
         protocols)
             local http="__KEEP__" https="__KEEP__" tls="__KEEP__" socks="__KEEP__"
             local skip_port="" replace_skip_ports="false" clear_skip_ports="false" tmp_ports skip_ports_input=""
@@ -1055,7 +1070,7 @@ cmd_guard() {
             echo "guard 协议封锁已更新"
             ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|xdp|protocols"
             ;;
     esac
 }
@@ -1086,8 +1101,7 @@ cmd_address_control() {
     fi
 
     if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
-        address_control_prepare_runtime
-        cmd_apply_forwarder_runtime
+        address_control_apply_runtime
         echo "白名单数据已刷新"
         return 0
     fi
@@ -1120,7 +1134,7 @@ cmd_address_control() {
     address_control_config_set_custom_cidrs "$tmp_cidrs"
     rm -f "$tmp_cidrs"
 
-    address_control_prepare_runtime
+    address_control_apply_runtime
     cmd_apply_forwarder_runtime
     echo "协议封锁 / 白名单已更新"
 }
@@ -1138,21 +1152,21 @@ cmd_address_control_custom() {
             local cidr="${1:-}"
             [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom add <IPv4/IPv6 CIDR>"
             address_control_append_custom_cidr "$cidr"
-            address_control_prepare_runtime
-            cmd_refresh
+            address_control_apply_runtime
+            cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已添加：$cidr"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom clear"
             address_control_clear_custom_cidrs
-            address_control_prepare_runtime
+            address_control_apply_runtime
             cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已清空"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd address-control-custom delete <index...>"
             address_control_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
-            address_control_prepare_runtime
+            address_control_apply_runtime
             cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已删除"
             ;;
@@ -1160,7 +1174,7 @@ cmd_address_control_custom() {
             local index="${1:-}" cidr="${2:-}"
             [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/IPv6 CIDR>"
             address_control_replace_custom_cidr_by_index "$index" "$cidr"
-            address_control_prepare_runtime
+            address_control_apply_runtime
             cmd_apply_forwarder_runtime
             echo "自定义 CIDR 已更新：$index -> $cidr"
             ;;

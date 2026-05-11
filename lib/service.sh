@@ -218,6 +218,7 @@ service_cleanup_nft_tables() {
     command -v nft >/dev/null 2>&1 || return 0
     service_delete_nft_table "inet" "$forward_table"
     service_delete_nft_table "$firewall_family" "$firewall_table"
+    service_delete_nft_table "$PFWD_ADDRESS_CONTROL_FAMILY" "$PFWD_ADDRESS_CONTROL_TABLE"
 }
 
 service_cleanup_pfwd_tc() {

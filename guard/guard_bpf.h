@@ -33,6 +33,12 @@ enum {
     TC_ACT_SHOT = 2,
 };
 
+enum {
+    XDP_ABORTED = 0,
+    XDP_DROP = 1,
+    XDP_PASS = 2,
+};
+
 #define IPPROTO_TCP 6
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
@@ -65,6 +71,15 @@ struct __sk_buff {
     __u32 remote_port;
     __u32 local_port;
     __u32 data_meta;
+};
+
+struct xdp_md {
+    __u32 data;
+    __u32 data_end;
+    __u32 data_meta;
+    __u32 ingress_ifindex;
+    __u32 rx_queue_index;
+    __u32 egress_ifindex;
 };
 
 struct ethhdr {

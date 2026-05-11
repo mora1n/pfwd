@@ -100,6 +100,10 @@ guard_status_file() {
     printf '%s\n' "${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}"
 }
 
+guard_xdp_pin_path() {
+    printf '%s\n' "${PFWD_GUARD_XDP_PIN_PATH:-$RFWD_GUARD_XDP_PIN_PATH}"
+}
+
 guard_ingress_pin_path() {
     printf '%s\n' "${PFWD_GUARD_LINK_INGRESS_PATH:-$RFWD_GUARD_LINK_INGRESS_PATH}"
 }
@@ -157,6 +161,10 @@ guard_enabled() {
     jq -r '.settings.guard.enabled // false' "$(guard_config_file)"
 }
 
+guard_xdp_mode() {
+    jq -r '.settings.guard.xdp_mode // "auto"' "$(guard_config_file)"
+}
+
 guard_block_http() {
     jq -r '.settings.guard.block_http // false' "$(guard_config_file)"
 }
@@ -201,6 +209,7 @@ guard_runtime_config_hash() {
     local payload
     payload="$(cat <<EOF
 iface=$iface
+xdp_mode=$(guard_xdp_mode)
 http=$(guard_block_http)
 tls=$(guard_block_tls)
 socks=$(guard_block_socks)
@@ -239,6 +248,18 @@ guard_config_set_tc_interface() {
     config_update --arg iface "$iface" '
       (.settings.guard //= {})
       | .settings.guard.tc_interface = $iface
+    '
+}
+
+guard_config_set_xdp_mode() {
+    local mode="$1"
+    case "$mode" in
+        off|auto|force) ;;
+        *) guard_die "无效 xdp 模式：$mode" ;;
+    esac
+    config_update --arg mode "$mode" '
+      (.settings.guard //= {})
+      | .settings.guard.xdp_mode = $mode
     '
 }
 
@@ -288,6 +309,10 @@ guard_active_port_specs() {
     ' "$(guard_config_file)"
 }
 
+guard_active_ports_tsv() {
+    guard_active_port_specs | cut -f1 | awk 'NF && !seen[$1]++ { print $1 }'
+}
+
 guard_protocol_enforced_port_specs() {
     local -A skipped=()
     local port protocol
@@ -322,8 +347,9 @@ guard_apply_runtime() {
     iface="$(guard_tc_interface)"
     [ -n "$iface" ] || guard_die "无法确定 guard 网卡，请先设置 tc_interface"
 
-    local ports_arg config_hash current_hash
+    local ports_arg allow_any_ports config_hash current_hash
     ports_arg="$(guard_protocol_enforced_port_specs)"
+    allow_any_ports="$(guard_active_ports_tsv)"
     if [ "$(guard_protocol_filters_enabled)" != "true" ] || [ -z "$ports_arg" ]; then
         guard_remove_runtime true
         if [ "$quiet" != "true" ]; then
@@ -344,9 +370,13 @@ guard_apply_runtime() {
 
     guard_run "$(guard_bin_path)" apply \
       --iface "$iface" \
+      --xdp-mode "$(guard_xdp_mode)" \
+      --xdp-pin "$(guard_xdp_pin_path)" \
       --ingress-pin "$(guard_ingress_pin_path)" \
       --status-file "$(guard_status_file)" \
       --config-hash "$config_hash" \
+      --xdp-whitelist false \
+      --allow-any-ports "$allow_any_ports" \
       --whitelist-enabled false \
       --allow-ports "$ports_arg" \
       --block-http "$(guard_block_http)" \
@@ -364,13 +394,14 @@ guard_remove_runtime() {
     local egress_pin=""
     if guard_binary_exists; then
         guard_run "$(guard_bin_path)" remove \
+          --xdp-pin "$(guard_xdp_pin_path)" \
           --ingress-pin "$(guard_ingress_pin_path)" \
           --status-file "$(guard_status_file)"
     else
         rm -f "$(guard_status_file)" 2>/dev/null || true
     fi
     egress_pin="${PFWD_GUARD_LINK_EGRESS_PATH:-${RFWD_GUARD_LINK_EGRESS_PATH:-}}"
-    rm -f "$(guard_ingress_pin_path)" ${egress_pin:+"$egress_pin"}
+    rm -f "$(guard_xdp_pin_path)" "$(guard_ingress_pin_path)" ${egress_pin:+"$egress_pin"}
     if [ "$quiet" != "true" ]; then
         echo "guard 已移除"
     fi
@@ -378,12 +409,22 @@ guard_remove_runtime() {
 
 guard_status_json() {
     config_init >/dev/null
+    local runtime_status xdp_effective xdp_attach_kind xdp_reason
+    runtime_status="$(guard_run "$(guard_bin_path)" status --status-file "$(guard_status_file)" 2>/dev/null || true)"
+    xdp_effective="$(jq -r '.xdp_effective // "off"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    xdp_attach_kind="$(jq -r '.xdp_attach_kind // "-"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    xdp_reason="$(jq -r '.xdp_reason // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     jq -n \
       --arg script "$(guard_script_name)" \
       --arg iface "$(guard_tc_interface)" \
       --arg bin "$(guard_bin_path)" \
       --arg status_file "$(guard_status_file)" \
+      --arg xdp_pin "$(guard_xdp_pin_path)" \
       --arg ingress_pin "$(guard_ingress_pin_path)" \
+      --arg xdp_mode "$(guard_xdp_mode)" \
+      --arg xdp_effective "$xdp_effective" \
+      --arg xdp_attach_kind "$xdp_attach_kind" \
+      --arg xdp_reason "$xdp_reason" \
       --argjson enabled "$(guard_bool_to_json "$(guard_enabled)")" \
       --argjson block_http "$(guard_bool_to_json "$(guard_block_http)")" \
       --argjson block_tls "$(guard_bool_to_json "$(guard_block_tls)")" \
@@ -394,6 +435,10 @@ guard_status_json() {
         script: $script,
         enabled: $enabled,
         iface: $iface,
+        xdp_mode: $xdp_mode,
+        xdp_effective: $xdp_effective,
+        xdp_attach_kind: $xdp_attach_kind,
+        xdp_reason: $xdp_reason,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
@@ -401,6 +446,7 @@ guard_status_json() {
         protocol_skip_ports_count: $protocol_skip_ports_count,
         guard_binary: $bin,
         status_file: $status_file,
+        xdp_pin: $xdp_pin,
         ingress_pin: $ingress_pin
       }'
 }
@@ -412,10 +458,14 @@ guard_render_status() {
       [
         ["启用状态", (if .enabled then "已启用" else "已停用" end)],
         ["绑定网卡", (.iface // "-")],
+        ["XDP 模式", .xdp_mode],
+        ["XDP 实际状态", .xdp_effective],
+        ["XDP 挂载", .xdp_attach_kind],
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
         ["跳过端口", .protocol_skip_ports],
+        ["XDP Pin", .xdp_pin],
         ["guard 二进制", .guard_binary],
         ["状态文件", .status_file]
       ]

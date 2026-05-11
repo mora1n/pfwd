@@ -3776,6 +3776,20 @@ ui_menu_guard() {
                 ui_maybe_pause success
                 ;;
             3)
+                ui_form_set "XDP 模式" "off 为关闭 XDP；auto 自动探测并在不支持时回退；force 要求 XDP 成功。"
+                ui_form_select_read "XDP 模式" "2" "0) 返回" "1) off" "2) auto" "3) force" || { ui_form_reset; continue; }
+                case "$UI_REPLY" in
+                    0) ui_form_reset; continue ;;
+                    1) ui_run cmd_guard xdp --mode off ;;
+                    2) ui_run cmd_guard xdp --mode auto ;;
+                    3) ui_run cmd_guard xdp --mode force ;;
+                    *) ui_form_reset; ui_warn "无效选择"; ui_pause; continue ;;
+                esac
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard XDP 模式已更新" "32"
+                ui_maybe_pause success
+                ;;
+            4)
                 ui_form_set "协议封锁" "HTTPS 会同时开启 HTTP 和 TLS 封锁；仅覆盖 TCP 首包。"
                 ui_form_select_read "HTTP" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
                 local block_http="false" block_tls="false" block_socks="false"
@@ -3795,7 +3809,7 @@ ui_menu_guard() {
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
                 ui_maybe_pause success
                 ;;
-            4)
+            5)
                 ui_menu_guard_skip_ports
                 ;;
             0) return 0 ;;
@@ -3973,8 +3987,9 @@ ui_render_guard_menu_page() {
     echo
     ui_menu_item 1 "启用 guard"
     ui_menu_item 2 "停用 guard"
-    ui_menu_item 3 "设置封锁协议"
-    ui_menu_item 4 "跳过端口"
+    ui_menu_item 3 "XDP 模式"
+    ui_menu_item 4 "设置封锁协议"
+    ui_menu_item 5 "跳过端口"
     ui_menu_item 0 "返回"
 }
 
