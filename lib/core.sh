@@ -72,7 +72,7 @@ pfwd_today() {
 }
 
 pfwd_mkdirs() {
-    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$PFWD_ADDRESS_CONTROL_STATE_DIR"
+    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$PFWD_WHITELIST_STATE_DIR"
 }
 
 pfwd_write_atomic() {
