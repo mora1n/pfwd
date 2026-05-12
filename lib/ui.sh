@@ -1037,8 +1037,26 @@ ui_header() {
 }
 
 ui_title() {
+    local guard_status=""
+    if command -v guard_enabled >/dev/null 2>&1; then
+        if [ "$(guard_enabled)" = "true" ]; then
+            guard_status="guard: $(guard_xdp_mode)"
+        else
+            guard_status="guard: off"
+        fi
+    fi
+    local user_count forward_count
+    user_count="$(jq '.users | length' "$PFWD_CONFIG_FILE" 2>/dev/null || echo "?")"
+    forward_count="$(jq '[.forwards[] | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE" 2>/dev/null || echo "?")"
     printf '\n'
-    ui_print_line "pfwd v${PFWD_VERSION:-}" "$UI_C_TITLE"
+    ui_color "$UI_C_TITLE" "pfwd v${PFWD_VERSION:-}"
+    printf '  '
+    ui_color "$UI_C_DIM" "用户: $user_count  转发: $forward_count"
+    if [ -n "$guard_status" ]; then
+        printf '  '
+        ui_color "$UI_C_DIM_CYAN" "$guard_status"
+    fi
+    printf '\n'
     ui_print_line "操作流程：用户 → 添加转发 → 流量管理" "$UI_C_ACCENT"
     ui_rule "-" "$UI_C_DIM"
 }
@@ -1847,6 +1865,26 @@ ui_display_or_dash() {
     esac
 }
 
+ui_progress_bar() {
+    local used="$1" limit="$2" width="${3:-10}"
+    local pct i bar=""
+    if [ "$limit" = "null" ] || [ -z "$limit" ] || [ "$limit" = "0" ] || [ "$limit" = "-" ]; then
+        printf '[%s]' "$(printf '%*s' "$width" '' | tr ' ' '-')"
+        return
+    fi
+    pct=$((used * 100 / limit))
+    [ "$pct" -le 100 ] || pct=100
+    local filled=$((pct * width / 100))
+    for ((i = 0; i < width; i++)); do
+        if [ "$i" -lt "$filled" ]; then
+            bar+="="
+        else
+            bar+="-"
+        fi
+    done
+    printf '[%s] %d%%' "$bar" "$pct"
+}
+
 ui_format_limit() {
     local value="$1"
     if [ "$value" = "-" ] || [ -z "$value" ] || [ "$value" = "null" ]; then
@@ -2102,7 +2140,7 @@ ui_print_user_traffic_summary() {
 ui_print_main_user_summary() {
     local data="$1"
     local rows=""
-    ui_print_line \1 "$UI_C_HEADER"
+    ui_print_line "用户状态" "$UI_C_HEADER"
 
     if ! jq -e '.users | length > 0' <<< "$data" >/dev/null; then
         ui_print_line "暂无用户，请先到“用户管理”添加用户。"
@@ -2110,10 +2148,10 @@ ui_print_main_user_summary() {
     fi
 
     while IFS=$'\t' read -r user count used two_way one_way limit reset_day; do
-        rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
+        rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(ui_progress_bar "$used" "$limit")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
     done < <(ui_main_user_rows "$data")
     rows="${rows%$'\n'}"
-    ui_table_render $'用户名\t转发数\t计费用量\t双向计费\t单向计费\t总限额\t重置日' "$rows" "1,6,7"
+    ui_table_render $'用户名\t转发数\t计费用量\t用量进度\t双向计费\t单向计费\t总限额\t重置日' "$rows" "1,6,7"
 }
 
 ui_render_forward_groups() {
@@ -2140,7 +2178,7 @@ ui_render_forward_groups() {
         local render_rows=""
 
         [ -n "$block_rows" ] || return 0
-        ui_print_line \1 "$UI_C_HEADER"
+        ui_print_line "用户：$block_user" "$UI_C_HEADER"
         while IFS= read -r block_line; do
             [ -n "$block_line" ] || continue
             IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 block_col12 <<< "$block_line"
@@ -2222,7 +2260,7 @@ ui_render_forward_groups() {
 ui_print_main_forward_summary() {
     local data="$1"
     local rows=""
-    ui_print_line \1 "$UI_C_HEADER"
+    ui_print_line "当前转发" "$UI_C_HEADER"
 
     if ! jq -e '.forwards | length > 0' <<< "$data" >/dev/null; then
         ui_print_line "暂无转发，先按上面的流程添加转发。"
@@ -2838,7 +2876,7 @@ ui_user_telegram_server_name_default() {
 
 ui_print_telegram_configured_users() {
     config_init >/dev/null
-    ui_print_line \1 "$UI_C_HEADER"
+    ui_print_line "已配置用户" "$UI_C_HEADER"
     if ! jq -e '[.users[]? | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_print_line "暂无已配置用户"
         return
@@ -2913,7 +2951,7 @@ ui_render_user_forward_select_page() {
     if [ "$allow_zero" = "true" ]; then
         ui_print_line "0) 返回" "$UI_C_ACCENT"
     fi
-    ui_print_line \1 "$UI_C_HEADER"
+    ui_print_line "用户：$user_id" "$UI_C_HEADER"
     ui_select_user_forward_table "$user_id" false
 }
 
