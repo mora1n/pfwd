@@ -45,13 +45,6 @@ config_init() {
     if [ ! -f "$PFWD_CONFIG_FILE" ]; then
         config_default_json | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
     fi
-    if jq -e '.settings.address_control' "$PFWD_CONFIG_FILE" >/dev/null 2>&1; then
-        jq '(.settings.address_control // {}) as $old | del(.settings.address_control) | .settings.whitelist = $old' "$PFWD_CONFIG_FILE" | pfwd_write_atomic "$PFWD_CONFIG_FILE"
-    fi
-    local _old_state_dir="$PFWD_STATE_DIR/address_control"
-    if [ -d "$_old_state_dir" ] && [ ! -d "$PFWD_WHITELIST_STATE_DIR" ]; then
-        mv "$_old_state_dir" "$PFWD_WHITELIST_STATE_DIR"
-    fi
     config_validate_file "$PFWD_CONFIG_FILE"
     PFWD_CONFIG_INITIALIZED=1
 }

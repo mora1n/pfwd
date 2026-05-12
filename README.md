@@ -18,10 +18,10 @@
 
 ## Access Control
 
-`pfwd` 的入口侧访问控制统一收口到 `协议封锁 / 白名单`：
+`pfwd` 的入口侧访问控制统一收口到 `流量防护`（guard eBPF）：
 
-- 协议封锁：由 `guard` 负责，按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`，适合中转机快速拦截特征明显的高风险流量。
-- 白名单：由 `nftables` 负责，限制入站来源 IPv4 / IPv6 CIDR。默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
+- 协议封锁：由 guard TC ingress 负责，按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`，适合中转机快速拦截特征明显的高风险流量。
+- 白名单：由 guard XDP 负责，限制入站来源 IPv4 / IPv6 CIDR。默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。非白名单 IP 在 XDP 层直接丢弃，白名单 IP 继续进入 TC 协议检测。
 - 当前边界：协议封锁仅覆盖 TCP 首包识别；白名单支持 IPv4 / IPv6 CIDR。
 
 常用命令：
