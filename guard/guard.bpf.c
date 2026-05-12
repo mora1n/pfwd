@@ -328,8 +328,17 @@ int xdp_guard(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     struct ethhdr *eth = data;
+    __u32 settings_key = 0;
+    struct guard_settings *settings;
+    struct flow_key flow = {};
+    __u8 is_ours = 0;
 
     if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    settings = bpf_map_lookup_elem(&guard_settings, &settings_key);
+    if (!settings) {
         return XDP_PASS;
     }
 
@@ -355,10 +364,16 @@ int xdp_guard(struct xdp_md *ctx) {
         if (!all_port_match(tcp->dest)) {
             return XDP_PASS;
         }
-        return XDP_PASS;
-    }
-
-    if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
+        if (settings->whitelist_enabled && !whitelist_match_v4(ip4->saddr)) {
+            return XDP_DROP;
+        }
+        flow.family = 4;
+        flow_key_copy_ipv4(flow.saddr, ip4->saddr);
+        flow_key_copy_ipv4(flow.daddr, ip4->daddr);
+        flow.sport = tcp->source;
+        flow.dport = tcp->dest;
+        is_ours = 1;
+    } else if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
         struct ipv6hdr_min *ip6 = (void *)(eth + 1);
         struct tcphdr_min *tcp;
 
@@ -375,6 +390,18 @@ int xdp_guard(struct xdp_md *ctx) {
         if (!all_port_match(tcp->dest)) {
             return XDP_PASS;
         }
+        if (settings->whitelist_enabled && !whitelist_match_v6(ip6->saddr)) {
+            return XDP_DROP;
+        }
+        flow.family = 6;
+        flow_key_copy_ipv6(flow.saddr, ip6->saddr);
+        flow_key_copy_ipv6(flow.daddr, ip6->daddr);
+        flow.sport = tcp->source;
+        flow.dport = tcp->dest;
+        is_ours = 1;
+    }
+
+    if (is_ours && allowed_flow_match(&flow)) {
         return XDP_PASS;
     }
 
@@ -418,9 +445,12 @@ int ingress_guard(struct __sk_buff *skb) {
         if (ip4.protocol != IPPROTO_TCP) {
             return TC_ACT_OK;
         }
-        if (settings->whitelist_enabled && whitelist_match_v4(ip4.saddr)) {
-            stat_inc(STAT_WHITELIST_HIT);
-            return TC_ACT_OK;
+        if (settings->whitelist_enabled) {
+            if (whitelist_match_v4(ip4.saddr)) {
+                stat_inc(STAT_WHITELIST_HIT);
+            } else {
+                return TC_ACT_SHOT;
+            }
         }
         flow.family = 4;
         flow_key_copy_ipv4(flow.saddr, ip4.saddr);
@@ -441,9 +471,12 @@ int ingress_guard(struct __sk_buff *skb) {
         if (ip6.nexthdr != IPPROTO_TCP) {
             return TC_ACT_OK;
         }
-        if (settings->whitelist_enabled && whitelist_match_v6(ip6.saddr)) {
-            stat_inc(STAT_WHITELIST_HIT);
-            return TC_ACT_OK;
+        if (settings->whitelist_enabled) {
+            if (whitelist_match_v6(ip6.saddr)) {
+                stat_inc(STAT_WHITELIST_HIT);
+            } else {
+                return TC_ACT_SHOT;
+            }
         }
         flow.family = 6;
         flow_key_copy_ipv6(flow.saddr, ip6.saddr);

@@ -491,6 +491,7 @@ forwarder_delete_table() {
 forwarder_apply_runtime() {
     local runtime_json
     local tmp_render
+    pfwd_debug "forwarder_apply_runtime start"
     config_init >/dev/null
     forwarder_validate_config
     runtime_json="$(forwarder_runtime_json true)"

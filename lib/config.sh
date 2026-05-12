@@ -20,7 +20,7 @@ config_default_json() {
       "block_socks": false,
       "protocol_skip_ports": []
     },
-    "address_control": {
+    "whitelist": {
       "enabled": false,
       "include_cn": true,
       "custom_cidrs": [],
@@ -36,13 +36,28 @@ config_default_json() {
 EOF
 }
 
+PFWD_CONFIG_INITIALIZED=0
+
 config_init() {
+    [ "$PFWD_CONFIG_INITIALIZED" = "1" ] && [ -f "$PFWD_CONFIG_FILE" ] && return 0
     pfwd_require_jq
     pfwd_mkdirs
     if [ ! -f "$PFWD_CONFIG_FILE" ]; then
         config_default_json | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
     fi
+    if jq -e '.settings.address_control' "$PFWD_CONFIG_FILE" >/dev/null 2>&1; then
+        jq '(.settings.address_control // {}) as $old | del(.settings.address_control) | .settings.whitelist = $old' "$PFWD_CONFIG_FILE" | pfwd_write_atomic "$PFWD_CONFIG_FILE"
+    fi
+    local _old_state_dir="$PFWD_STATE_DIR/address_control"
+    if [ -d "$_old_state_dir" ] && [ ! -d "$PFWD_WHITELIST_STATE_DIR" ]; then
+        mv "$_old_state_dir" "$PFWD_WHITELIST_STATE_DIR"
+    fi
     config_validate_file "$PFWD_CONFIG_FILE"
+    PFWD_CONFIG_INITIALIZED=1
+}
+
+config_invalidate_cache() {
+    PFWD_CONFIG_INITIALIZED=0
 }
 
 config_load() {
@@ -111,11 +126,13 @@ config_import_bundle() {
 
     mv "$config_tmp" "$PFWD_CONFIG_FILE"
     mv "$stats_tmp" "$PFWD_STATS_FILE"
+    PFWD_CONFIG_INITIALIZED=1
     config_disable_expired "$(pfwd_today)"
 }
 
 config_update() {
     [ "$#" -ge 1 ] || pfwd_die "config_update 需要 jq filter"
+    pfwd_debug "config_update filter=${@: -1}"
     local args=("$@")
     local filter_index=$((${#args[@]} - 1))
     local filter="${args[$filter_index]}"
@@ -126,6 +143,36 @@ config_update() {
     jq "${args[@]}" "$filter" "$PFWD_CONFIG_FILE" > "$tmp"
     config_validate_file "$tmp"
     mv "$tmp" "$PFWD_CONFIG_FILE"
+    PFWD_CONFIG_INITIALIZED=1
+}
+
+PFWD_CONFIG_SNAPSHOT=""
+PFWD_CONFIG_SNAPSHOT_FILE=""
+
+config_snapshot_load() {
+    PFWD_CONFIG_SNAPSHOT="$(cat "$PFWD_CONFIG_FILE")"
+    if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
+        printf '%s' "$PFWD_CONFIG_SNAPSHOT" > "$PFWD_CONFIG_SNAPSHOT_FILE"
+    else
+        PFWD_CONFIG_SNAPSHOT_FILE="$(mktemp "${PFWD_RUN_DIR}/cfg_snap.XXXXXX")"
+        printf '%s' "$PFWD_CONFIG_SNAPSHOT" > "$PFWD_CONFIG_SNAPSHOT_FILE"
+    fi
+}
+
+config_snapshot_jq() {
+    jq "$@" <<< "$PFWD_CONFIG_SNAPSHOT"
+}
+
+config_snapshot_file() {
+    printf '%s' "$PFWD_CONFIG_SNAPSHOT_FILE"
+}
+
+config_snapshot_invalidate() {
+    PFWD_CONFIG_SNAPSHOT=""
+    if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
+        rm -f "$PFWD_CONFIG_SNAPSHOT_FILE"
+        PFWD_CONFIG_SNAPSHOT_FILE=""
+    fi
 }
 
 config_user_exists() {

@@ -22,7 +22,6 @@ cmd_apply_forwarding_bundle() {
     forwarder_validate_config
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
-    address_control_apply_runtime
     fw_apply_nft
     fw_apply_tc
     guard_apply_runtime true
@@ -33,7 +32,6 @@ cmd_apply_forwarder_runtime() {
     forwarder_validate_config
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
-    address_control_apply_runtime
 }
 
 cmd_apply_firewall_runtime() {
@@ -938,7 +936,7 @@ cmd_doctor() {
     guard_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard.%s：%s\n' "$key" "$value"
     done
-    address_control_render_status | while IFS=$'\t' read -r key value; do
+    whitelist_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard_whitelist.%s：%s\n' "$key" "$value"
     done
     cmd_doctor_benchmarks
@@ -1069,13 +1067,19 @@ cmd_guard() {
             cmd_apply_guard_runtime
             echo "guard 协议封锁已更新"
             ;;
+        whitelist)
+            cmd_guard_whitelist "$@"
+            ;;
+        whitelist-custom)
+            cmd_guard_whitelist_custom "$@"
+            ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|xdp|protocols"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|xdp|protocols|whitelist|whitelist-custom"
             ;;
     esac
 }
 
-cmd_address_control() {
+cmd_guard_whitelist() {
     config_init >/dev/null
     local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
     local refresh_requested="false" status_requested="false"
@@ -1096,12 +1100,12 @@ cmd_address_control() {
     done
 
     if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
-        address_control_render_status
+        whitelist_render_status
         return 0
     fi
 
     if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
-        address_control_apply_runtime
+        whitelist_apply_runtime
         echo "白名单数据已刷新"
         return 0
     fi
@@ -1113,73 +1117,73 @@ cmd_address_control() {
     fi
 
     if [ "$enabled" = "__KEEP__" ]; then
-        enabled="$(address_control_enabled)"
+        enabled="$(whitelist_enabled)"
     fi
     if [ "$include_cn" = "__KEEP__" ]; then
-        include_cn="$(address_control_include_cn)"
+        include_cn="$(whitelist_include_cn)"
     fi
-    [ -n "$source_url" ] || source_url="$(address_control_source_url)"
+    [ -n "$source_url" ] || source_url="$(whitelist_source_url)"
 
-    address_control_config_set_state "$enabled" "$include_cn" "$source_url"
+    whitelist_config_set_state "$enabled" "$include_cn" "$source_url"
 
     tmp_cidrs="$(mktemp)"
     if [ "$clear_custom" != "true" ]; then
         if [ "$replace_custom" != "true" ]; then
-            address_control_custom_cidrs_tsv > "$tmp_cidrs"
+            whitelist_custom_cidrs_tsv > "$tmp_cidrs"
         fi
         if [ -n "$cidr" ]; then
             printf '%s\n' "$cidr" >> "$tmp_cidrs"
         fi
     fi
-    address_control_config_set_custom_cidrs "$tmp_cidrs"
+    whitelist_config_set_custom_cidrs "$tmp_cidrs"
     rm -f "$tmp_cidrs"
 
-    address_control_apply_runtime
-    cmd_apply_forwarder_runtime
+    whitelist_apply_runtime
+    cmd_apply_guard_runtime
     echo "协议封锁 / 白名单已更新"
 }
 
-cmd_address_control_custom() {
+cmd_guard_whitelist_custom() {
     config_init >/dev/null
     local sub="${1:-}"
     shift || true
     case "$sub" in
         list)
-            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom list"
-            address_control_custom_cidrs_tsv
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-custom list"
+            whitelist_custom_cidrs_tsv
             ;;
         add)
             local cidr="${1:-}"
-            [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom add <IPv4/IPv6 CIDR>"
-            address_control_append_custom_cidr "$cidr"
-            address_control_apply_runtime
-            cmd_apply_forwarder_runtime
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom add <IPv4/IPv6 CIDR>"
+            whitelist_append_custom_cidr "$cidr"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
             echo "自定义 CIDR 已添加：$cidr"
             ;;
         clear)
-            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd address-control-custom clear"
-            address_control_clear_custom_cidrs
-            address_control_apply_runtime
-            cmd_apply_forwarder_runtime
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-custom clear"
+            whitelist_clear_custom_cidrs
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
             echo "自定义 CIDR 已清空"
             ;;
         delete)
-            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd address-control-custom delete <index...>"
-            address_control_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
-            address_control_apply_runtime
-            cmd_apply_forwarder_runtime
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-custom delete <index...>"
+            whitelist_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
             echo "自定义 CIDR 已删除"
             ;;
         update)
             local index="${1:-}" cidr="${2:-}"
-            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd address-control-custom update <index> <IPv4/IPv6 CIDR>"
-            address_control_replace_custom_cidr_by_index "$index" "$cidr"
-            address_control_apply_runtime
-            cmd_apply_forwarder_runtime
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom update <index> <IPv4/IPv6 CIDR>"
+            whitelist_replace_custom_cidr_by_index "$index" "$cidr"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
             echo "自定义 CIDR 已更新：$index -> $cidr"
             ;;
         *)
-            pfwd_die "用法：pfwd address-control-custom list|add|clear|delete|update"
+            pfwd_die "用法：pfwd guard whitelist-custom list|add|clear|delete|update"
             ;;
     esac
 }

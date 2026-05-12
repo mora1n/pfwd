@@ -24,69 +24,25 @@ guard_script_dir() {
     fi
 }
 
-guard_die() {
-    if command -v pfwd_die >/dev/null 2>&1; then
-        pfwd_die "$@"
-    else
-        rfwd_die "$@"
-    fi
-}
-
-guard_require_cmd() {
-    if command -v pfwd_require_cmd >/dev/null 2>&1; then
-        pfwd_require_cmd "$1"
-    else
-        rfwd_require_cmd "$1"
-    fi
-}
-
-guard_require_jq() {
-    if command -v pfwd_require_jq >/dev/null 2>&1; then
-        pfwd_require_jq
-    else
-        rfwd_require_jq
-    fi
-}
-
-guard_now_iso() {
-    if command -v pfwd_now_iso >/dev/null 2>&1; then
-        pfwd_now_iso
-    else
-        rfwd_now_iso
-    fi
-}
-
-guard_expand_path() {
-    if command -v pfwd_expand_path >/dev/null 2>&1; then
-        pfwd_expand_path "$1"
-    else
-        rfwd_expand_path "$1"
-    fi
-}
-
-guard_write_atomic() {
-    if command -v pfwd_write_atomic >/dev/null 2>&1; then
-        pfwd_write_atomic "$1"
-    else
-        rfwd_write_atomic "$1"
-    fi
-}
-
-guard_run() {
-    if command -v pfwd_run >/dev/null 2>&1; then
-        pfwd_run "$@"
-    else
-        rfwd_run "$@"
-    fi
-}
-
-guard_mkdirs() {
-    if command -v pfwd_mkdirs >/dev/null 2>&1; then
-        pfwd_mkdirs
-    else
-        rfwd_mkdirs
-    fi
-}
+if command -v pfwd_die >/dev/null 2>&1; then
+    guard_die()          { pfwd_die "$@"; }
+    guard_require_cmd()  { pfwd_require_cmd "$@"; }
+    guard_require_jq()   { pfwd_require_jq; }
+    guard_now_iso()      { pfwd_now_iso; }
+    guard_expand_path()  { pfwd_expand_path "$@"; }
+    guard_write_atomic() { pfwd_write_atomic "$@"; }
+    guard_run()          { pfwd_run "$@"; }
+    guard_mkdirs()       { pfwd_mkdirs; }
+else
+    guard_die()          { rfwd_die "$@"; }
+    guard_require_cmd()  { rfwd_require_cmd "$@"; }
+    guard_require_jq()   { rfwd_require_jq; }
+    guard_now_iso()      { rfwd_now_iso; }
+    guard_expand_path()  { rfwd_expand_path "$@"; }
+    guard_write_atomic() { rfwd_write_atomic "$@"; }
+    guard_run()          { rfwd_run "$@"; }
+    guard_mkdirs()       { rfwd_mkdirs; }
+fi
 
 guard_config_file() {
     printf '%s\n' "${PFWD_CONFIG_FILE:-$RFWD_CONFIG_FILE}"
@@ -195,8 +151,14 @@ guard_protocol_skip_ports_display() {
     fi
 }
 
+guard_read_settings() {
+    jq -r '{enabled: (.settings.guard.enabled // false), xdp_mode: (.settings.guard.xdp_mode // "auto"), block_http: (.settings.guard.block_http // false), block_tls: (.settings.guard.block_tls // false), block_socks: (.settings.guard.block_socks // false)}' "$(guard_config_file)"
+}
+
 guard_protocol_filters_enabled() {
-    if [ "$(guard_block_http)" = "true" ] || [ "$(guard_block_tls)" = "true" ] || [ "$(guard_block_socks)" = "true" ]; then
+    local settings
+    settings="$(guard_read_settings)"
+    if [ "$(jq -r '.block_http' <<< "$settings")" = "true" ] || [ "$(jq -r '.block_tls' <<< "$settings")" = "true" ] || [ "$(jq -r '.block_socks' <<< "$settings")" = "true" ]; then
         printf 'true\n'
     else
         printf 'false\n'
@@ -206,13 +168,20 @@ guard_protocol_filters_enabled() {
 guard_runtime_config_hash() {
     local iface="$1"
     local ports_arg="$2"
+    local settings
+    settings="$(guard_read_settings)"
+    local http tls socks xdp_mode
+    xdp_mode="$(jq -r '.xdp_mode' <<< "$settings")"
+    http="$(jq -r '.block_http' <<< "$settings")"
+    tls="$(jq -r '.block_tls' <<< "$settings")"
+    socks="$(jq -r '.block_socks' <<< "$settings")"
     local payload
     payload="$(cat <<EOF
 iface=$iface
-xdp_mode=$(guard_xdp_mode)
-http=$(guard_block_http)
-tls=$(guard_block_tls)
-socks=$(guard_block_socks)
+xdp_mode=$xdp_mode
+http=$http
+tls=$tls
+socks=$socks
 ports:
 $ports_arg
 EOF
@@ -338,6 +307,10 @@ guard_apply_runtime() {
     guard_mkdirs
     guard_binary_exists || guard_die "缺少 guard 预编译二进制：$(guard_bin_path)"
 
+    if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
+        whitelist_prepare_runtime
+    fi
+
     if [ "$(guard_enabled)" != "true" ]; then
         guard_remove_runtime "$quiet"
         return 0
@@ -368,6 +341,22 @@ guard_apply_runtime() {
         return 0
     fi
 
+    local whitelist_state="false"
+    local whitelist_files=""
+    if command -v whitelist_enabled >/dev/null 2>&1; then
+        whitelist_state="$(whitelist_enabled)"
+    fi
+    if [ "$whitelist_state" = "true" ]; then
+        local v4_file="${PFWD_WHITELIST_ALLOW_IPV4_FILE:-}"
+        local v6_file="${PFWD_WHITELIST_ALLOW_IPV6_FILE:-}"
+        if [ -n "$v4_file" ] && [ -f "$v4_file" ]; then
+            whitelist_files="$v4_file"
+        fi
+        if [ -n "$v6_file" ] && [ -f "$v6_file" ]; then
+            whitelist_files="${whitelist_files:+$whitelist_files:}$v6_file"
+        fi
+    fi
+
     guard_run "$(guard_bin_path)" apply \
       --iface "$iface" \
       --xdp-mode "$(guard_xdp_mode)" \
@@ -375,9 +364,10 @@ guard_apply_runtime() {
       --ingress-pin "$(guard_ingress_pin_path)" \
       --status-file "$(guard_status_file)" \
       --config-hash "$config_hash" \
-      --xdp-whitelist false \
+      --xdp-whitelist "$whitelist_state" \
+      --whitelist-enabled "$whitelist_state" \
+      ${whitelist_files:+--whitelist-file "$whitelist_files"} \
       --allow-any-ports "$allow_any_ports" \
-      --whitelist-enabled false \
       --allow-ports "$ports_arg" \
       --block-http "$(guard_block_http)" \
       --block-tls "$(guard_block_tls)" \
@@ -414,6 +404,20 @@ guard_status_json() {
     xdp_effective="$(jq -r '.xdp_effective // "off"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_attach_kind="$(jq -r '.xdp_attach_kind // "-"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_reason="$(jq -r '.xdp_reason // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+
+    local settings skip_ports skip_count
+    settings="$(guard_read_settings)"
+    skip_ports="$(guard_protocol_skip_ports_display)"
+    skip_count="$(guard_protocol_skip_ports_count)"
+
+    local wl_enabled="false" wl_include_cn="false" wl_entries=0 wl_custom_count=0
+    if command -v whitelist_enabled >/dev/null 2>&1; then
+        wl_enabled="$(whitelist_enabled)"
+        wl_include_cn="$(whitelist_include_cn)"
+        wl_entries="$(whitelist_entry_count)"
+        wl_custom_count="$(whitelist_custom_cidrs_count)"
+    fi
+
     jq -n \
       --arg script "$(guard_script_name)" \
       --arg iface "$(guard_tc_interface)" \
@@ -421,16 +425,20 @@ guard_status_json() {
       --arg status_file "$(guard_status_file)" \
       --arg xdp_pin "$(guard_xdp_pin_path)" \
       --arg ingress_pin "$(guard_ingress_pin_path)" \
-      --arg xdp_mode "$(guard_xdp_mode)" \
+      --arg xdp_mode "$(jq -r '.xdp_mode' <<< "$settings")" \
       --arg xdp_effective "$xdp_effective" \
       --arg xdp_attach_kind "$xdp_attach_kind" \
       --arg xdp_reason "$xdp_reason" \
-      --argjson enabled "$(guard_bool_to_json "$(guard_enabled)")" \
-      --argjson block_http "$(guard_bool_to_json "$(guard_block_http)")" \
-      --argjson block_tls "$(guard_bool_to_json "$(guard_block_tls)")" \
-      --argjson block_socks "$(guard_bool_to_json "$(guard_block_socks)")" \
-      --arg protocol_skip_ports "$(guard_protocol_skip_ports_display)" \
-      --argjson protocol_skip_ports_count "$(guard_protocol_skip_ports_count)" \
+      --argjson enabled "$(jq -r '.enabled' <<< "$settings")" \
+      --argjson block_http "$(jq -r '.block_http' <<< "$settings")" \
+      --argjson block_tls "$(jq -r '.block_tls' <<< "$settings")" \
+      --argjson block_socks "$(jq -r '.block_socks' <<< "$settings")" \
+      --arg protocol_skip_ports "$skip_ports" \
+      --argjson protocol_skip_ports_count "$skip_count" \
+      --argjson wl_enabled "$wl_enabled" \
+      --argjson wl_include_cn "$wl_include_cn" \
+      --argjson wl_entries "$wl_entries" \
+      --argjson wl_custom_count "$wl_custom_count" \
       '{
         script: $script,
         enabled: $enabled,
@@ -444,6 +452,10 @@ guard_status_json() {
         block_socks: $block_socks,
         protocol_skip_ports: $protocol_skip_ports,
         protocol_skip_ports_count: $protocol_skip_ports_count,
+        wl_enabled: $wl_enabled,
+        wl_include_cn: $wl_include_cn,
+        wl_entries: $wl_entries,
+        wl_custom_count: $wl_custom_count,
         guard_binary: $bin,
         status_file: $status_file,
         xdp_pin: $xdp_pin,
@@ -465,6 +477,10 @@ guard_render_status() {
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
         ["跳过端口", .protocol_skip_ports],
+        ["启用白名单", (if .wl_enabled then "开" else "关" end)],
+        ["包含国内 IP", (if .wl_enabled then (if .wl_include_cn then "开" else "关" end) else "-" end)],
+        ["自定义 CIDR", (.wl_custom_count | tostring)],
+        ["白名单条目", (.wl_entries | tostring)],
         ["XDP Pin", .xdp_pin],
         ["guard 二进制", .guard_binary],
         ["状态文件", .status_file]

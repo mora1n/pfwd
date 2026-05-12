@@ -31,12 +31,30 @@ UI_FORM_HINT=""
 declare -ag UI_FORM_LINES=()
 declare -ag UI_FORM_OPTION_LINES=()
 declare -ag UI_PAGE_LINES=()
+declare -ag UI_PAGE_PREV_LINES=()
+UI_PAGE_PREV_OFFSET=0
 declare -ag UI_DRY_RUN_LINES=()
 UI_DATA_CACHE=""
 UI_DATA_CACHE_KEY=""
 
+# Color theme
+UI_C_TITLE="1;96"
+UI_C_HEADER="1;36"
+UI_C_DIM="2;37"
+UI_C_DIM_CYAN="2;36"
+UI_C_ACCENT="36"
+UI_C_MENU_NUM="32"
+UI_C_MENU_LABEL="36"
+UI_C_SUCCESS="1;32"
+UI_C_ACTIVE="1;32"
+UI_C_PAUSED="1;33"
+UI_C_WARN="33"
+UI_C_ERROR="31"
+UI_C_STOPPED="1;31"
+UI_C_BRIGHT="1;37"
+
 ui_main_status_title() {
-    ui_color "1;96" "端口转发"
+    ui_color "$UI_C_TITLE" "端口转发"
 }
 
 ui_use_color() {
@@ -65,6 +83,24 @@ ui_color() {
     else
         printf '%s' "$*"
     fi
+}
+
+ui_progress_bar() {
+    local used="$1"
+    local limit="$2"
+    local width="${3:-10}"
+    local pct=0 bar filled empty
+    if [ "$limit" -gt 0 ] && [ "$used" -ge 0 ]; then
+        pct=$((used * 100 / limit))
+        [ "$pct" -gt 100 ] && pct=100
+        filled=$((pct * width / 100))
+        empty=$((width - filled))
+    fi
+    bar=""
+    local i
+    for ((i = 0; i < filled; i++)); do bar+="="; done
+    for ((i = 0; i < empty; i++)); do bar+="-"; done
+    printf '[%s] %d%%' "$bar" "$pct"
 }
 
 ui_clear_screen() {
@@ -150,7 +186,7 @@ ui_notice_render() {
         printf '\n'
     fi
     if [ "${#UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
-        ui_print_line "最近 dry-run：" "2;37"
+        ui_print_line "最近 dry-run：" "$UI_C_DIM"
         printf '%s\n' "${UI_DRY_RUN_LINES[@]}"
         printf '\n'
     fi
@@ -167,6 +203,7 @@ ui_render_page() {
     ui_page_prepare_frame "$frame"
     if [ "$renderer_key" != "$previous_key" ]; then
         ui_page_apply_default_anchor "$renderer_key"
+        UI_PAGE_PREV_LINES=()
     fi
     ui_page_draw
     ui_data_cache_clear
@@ -267,7 +304,7 @@ ui_page_draw() {
     local prompt="${1:-}"
     local default="${2:-}"
     local buffer="${3:-}"
-    local view_height max_offset start_line end_line i status_text
+    local view_height max_offset start_line end_line i status_text line_changed
 
     ui_page_clamp_offset
     view_height="$(ui_page_view_height)"
@@ -275,14 +312,51 @@ ui_page_draw() {
     start_line="$UI_PAGE_OFFSET"
     end_line=$((start_line + view_height))
 
-    ui_clear_screen
+    local prev_count="${#UI_PAGE_PREV_LINES[@]}"
+    local use_diff=0
+    if [ "$prev_count" -gt 0 ] && [ "$UI_PAGE_PREV_OFFSET" = "$start_line" ]; then
+        use_diff=1
+    fi
+
+    printf '\033[H'
     for ((i = start_line; i < end_line && i < UI_PAGE_LINE_COUNT; i++)); do
-        printf '%s\n' "${UI_PAGE_LINES[$i]}"
+        local screen_row=$((i - start_line))
+        if [ "$use_diff" = "1" ] && [ "$screen_row" -lt "$prev_count" ]; then
+            if [ "${UI_PAGE_LINES[$i]}" = "${UI_PAGE_PREV_LINES[$screen_row]}" ]; then
+                printf '\033[B'
+                continue
+            fi
+        fi
+        if [ "$use_diff" = "1" ] && [ "$screen_row" -gt 0 ]; then
+            printf '\033[%d;1H' "$((screen_row + 1))"
+        elif [ "$use_diff" = "0" ] && [ "$screen_row" -gt 0 ]; then
+            :
+        fi
+        printf '%s\033[K\n' "${UI_PAGE_LINES[$i]}"
     done
+
+    local written_rows=$((end_line < UI_PAGE_LINE_COUNT ? end_line - start_line : UI_PAGE_LINE_COUNT - start_line))
+    if [ "$written_rows" -lt "$view_height" ]; then
+        for ((i = written_rows; i < view_height; i++)); do
+            printf '\033[K\n'
+        done
+    fi
+
+    if [ "$use_diff" = "1" ] && [ "$view_height" -lt "$prev_count" ]; then
+        printf '\033[%d;1H\033[J' "$((view_height + 1))"
+    elif [ "$use_diff" = "0" ]; then
+        printf '\033[J'
+    fi
+
+    UI_PAGE_PREV_LINES=()
+    for ((i = start_line; i < end_line && i < UI_PAGE_LINE_COUNT; i++)); do
+        UI_PAGE_PREV_LINES+=("${UI_PAGE_LINES[$i]}")
+    done
+    UI_PAGE_PREV_OFFSET="$start_line"
 
     if [ "$UI_PAGE_SCROLLABLE" = "1" ]; then
         status_text="滚动 $((start_line + 1))-$(( end_line < UI_PAGE_LINE_COUNT ? end_line : UI_PAGE_LINE_COUNT ))/$UI_PAGE_LINE_COUNT  鼠标滚轮/↑↓/PgUp/PgDn/j/k"
-        ui_print_line "$status_text" "2;37"
+        ui_print_line "$status_text" "$UI_C_DIM"
     fi
 
     if [ -n "$prompt" ]; then
@@ -299,12 +373,14 @@ ui_page_deactivate() {
     UI_PAGE_SCROLLABLE=0
     UI_PAGE_LINE_COUNT=0
     UI_PAGE_LINES=()
+    UI_PAGE_PREV_LINES=()
 }
 
 ui_page_scroll_lines() {
     local delta="$1"
     UI_PAGE_OFFSET=$((UI_PAGE_OFFSET + delta))
     ui_page_clamp_offset
+    UI_PAGE_PREV_LINES=()
 }
 
 ui_page_scroll_wheel() {
@@ -740,7 +816,7 @@ ui_table_print_border() {
         fi
     done
     line+="$right"
-    ui_print_line "$line" "2;37"
+    ui_print_line "$line" "$UI_C_DIM"
 }
 
 ui_table_print_row() {
@@ -834,7 +910,7 @@ ui_table_render() {
     term_width="$(ui_term_width)"
     ui_table_fit_widths widths "$shrink_csv" "$term_width"
     ui_table_print_border "┌" "┬" "┐" "${widths[@]}"
-    ui_table_print_row widths headers headers "1;37"
+    ui_table_print_row widths headers headers "$UI_C_BRIGHT"
     ui_table_print_border "├" "┼" "┤" "${widths[@]}"
     for line in "${row_lines[@]}"; do
         IFS=$'\t' read -r -a cells <<< "$line"
@@ -846,18 +922,18 @@ ui_table_render() {
 ui_forward_state_text() {
     case "$1" in
         active|true|启用|已启用) printf '●' ;;
-        paused|false|停用|暂停|已停用) printf '■' ;;
-        stopped|停止) printf '■' ;;
-        *) printf '■' ;;
+        paused|false|停用|暂停|已停用) printf '◉' ;;
+        stopped|停止) printf '○' ;;
+        *) printf '○' ;;
     esac
 }
 
 ui_forward_state_color() {
     case "$1" in
-        active|true|启用|已启用) echo "1;32" ;;
-        paused|false|停用|暂停|已停用) echo "1;33" ;;
-        stopped|停止) echo "1;31" ;;
-        *) echo "1;33" ;;
+        active|true|启用|已启用) echo "$UI_C_ACTIVE" ;;
+        paused|false|停用|暂停|已停用) echo "$UI_C_PAUSED" ;;
+        stopped|停止) echo "$UI_C_STOPPED" ;;
+        *) echo "$UI_C_PAUSED" ;;
     esac
 }
 
@@ -923,8 +999,8 @@ ui_guard_summary_rows() {
     done <<< "$rows"
 }
 
-ui_address_control_summary_rows() {
-    address_control_render_status
+ui_whitelist_summary_rows() {
+    whitelist_render_status
 }
 
 ui_forward_line() {
@@ -956,41 +1032,36 @@ ui_maybe_pause() {
 
 ui_header() {
     printf '\n'
-    ui_color "1;36" "== $* =="
+    ui_color "$UI_C_HEADER" "== $* =="
     printf '\n'
 }
 
 ui_title() {
     printf '\n'
-    ui_rule "=" "2;36"
-    ui_print_line "pfwd" "1;96"
-    ui_main_status_title
-    printf '\n'
-    ui_print_line "状态总览" "1;37"
-    ui_rule "=" "2;36"
-    ui_print_line "操作流程：用户 -> 添加转发 -> 流量管理" "36"
-    ui_rule "-" "2;37"
+    ui_print_line "pfwd v${PFWD_VERSION:-}" "$UI_C_TITLE"
+    ui_print_line "操作流程：用户 → 添加转发 → 流量管理" "$UI_C_ACCENT"
+    ui_rule "-" "$UI_C_DIM"
 }
 
 ui_menu_item() {
     local number="$1"
     local label="$2"
-    ui_color "32" "$number."
+    ui_color "$UI_C_MENU_NUM" "$number."
     printf ' %s\n' "$label"
 }
 
 ui_success() {
-    ui_color "32" "$*"
+    ui_color "$UI_C_MENU_NUM" "$*"
     printf '\n'
 }
 
 ui_warn() {
-    ui_color "33" "$*"
+    ui_color "$UI_C_WARN" "$*"
     printf '\n'
 }
 
 ui_error() {
-    ui_color "31" "$*"
+    ui_color "$UI_C_ERROR" "$*"
     printf '\n'
 }
 
@@ -1089,7 +1160,7 @@ ui_render_form_page() {
     local hint="${2:-}"
     shift 2 || true
     ui_header "$title"
-    [ -n "$hint" ] && ui_print_line "$hint" "2;37"
+    [ -n "$hint" ] && ui_print_line "$hint" "$UI_C_DIM"
     if [ -n "$UI_NOTICE_TEXT" ]; then
         printf '\n'
         ui_print_line "$UI_NOTICE_TEXT" "${UI_NOTICE_COLOR:-36}"
@@ -1106,7 +1177,7 @@ ui_render_form_page() {
     fi
     if [ "${#UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
         printf '\n'
-        ui_print_line "最近 dry-run：" "2;37"
+        ui_print_line "最近 dry-run：" "$UI_C_DIM"
         printf '%s\n' "${UI_DRY_RUN_LINES[@]}"
     fi
 }
@@ -1173,7 +1244,7 @@ ui_form_select_read() {
         fi
 
         if [ -n "$UI_FORM_TITLE" ]; then
-            ui_notice_set "无效选择，请重新输入。" "33"
+            ui_notice_set "无效选择，请重新输入。" "$UI_C_WARN"
         else
             ui_warn "无效选择，请重新输入。"
         fi
@@ -1342,7 +1413,7 @@ ui_select_mss_mode() {
                 if [ "$source" = "fallback" ]; then
                     ui_warn "未探测到链路 MTU，已使用通用推荐值：$recommended"
                 else
-                    ui_print_line "固定 MSS 推荐值：$recommended" "36"
+                    ui_print_line "固定 MSS 推荐值：$recommended" "$UI_C_ACCENT"
                 fi
             fi
             ui_form_read "固定 MSS 值" "$recommended" || return 1
@@ -1402,7 +1473,7 @@ ui_select_mss_mode_edit() {
             if [ -n "$current_value" ]; then
                 fixed_default="$current_value"
                 if [ -n "$recommended" ] && [ "$recommended" != "$current_value" ]; then
-                    ui_print_line "当前固定 MSS：$current_value；推荐值：$recommended" "36"
+                    ui_print_line "当前固定 MSS：$current_value；推荐值：$recommended" "$UI_C_ACCENT"
                 fi
             else
                 fixed_default="$recommended"
@@ -1410,7 +1481,7 @@ ui_select_mss_mode_edit() {
                     if [ "$source" = "fallback" ]; then
                         ui_warn "未探测到链路 MTU，已使用通用推荐值：$recommended"
                     else
-                        ui_print_line "固定 MSS 推荐值：$recommended" "36"
+                        ui_print_line "固定 MSS 推荐值：$recommended" "$UI_C_ACCENT"
                     fi
                 fi
             fi
@@ -2031,7 +2102,7 @@ ui_print_user_traffic_summary() {
 ui_print_main_user_summary() {
     local data="$1"
     local rows=""
-    ui_print_line "用户状态" "1;36"
+    ui_print_line \1 "$UI_C_HEADER"
 
     if ! jq -e '.users | length > 0' <<< "$data" >/dev/null; then
         ui_print_line "暂无用户，请先到“用户管理”添加用户。"
@@ -2069,7 +2140,7 @@ ui_render_forward_groups() {
         local render_rows=""
 
         [ -n "$block_rows" ] || return 0
-        ui_print_line "用户：$block_user" "1;36"
+        ui_print_line \1 "$UI_C_HEADER"
         while IFS= read -r block_line; do
             [ -n "$block_line" ] || continue
             IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 block_col12 <<< "$block_line"
@@ -2151,7 +2222,7 @@ ui_render_forward_groups() {
 ui_print_main_forward_summary() {
     local data="$1"
     local rows=""
-    ui_print_line "当前转发" "1;36"
+    ui_print_line \1 "$UI_C_HEADER"
 
     if ! jq -e '.forwards | length > 0' <<< "$data" >/dev/null; then
         ui_print_line "暂无转发，先按上面的流程添加转发。"
@@ -2170,12 +2241,13 @@ ui_print_main_forward_summary() {
 
 ui_print_main_forwards() {
     config_init >/dev/null
+    config_snapshot_load
     local data
     data="$(ui_main_usage_json)"
     ui_print_main_user_summary "$data"
-    ui_rule "-" "2;37"
+    ui_rule "-" "$UI_C_DIM"
     ui_print_main_forward_summary "$data"
-    ui_rule "-" "2;37"
+    ui_rule "-" "$UI_C_DIM"
 }
 
 ui_print_forward_list() {
@@ -2305,7 +2377,7 @@ ui_render_telegram_user_select_page_config() {
     local rows="$1"
     ui_header "选择用户"
     ui_notice_render
-    ui_print_line "1 表示所有用户；也支持多选具体用户。" "36"
+    ui_print_line "1 表示所有用户；也支持多选具体用户。" "$UI_C_ACCENT"
     ui_table_render $'序号\t用户' "$rows" "2"
 }
 
@@ -2329,7 +2401,7 @@ ui_render_telegram_user_select_page_configured() {
         ui_warn "暂无已配置用户，请先配置 Telegram。"
         ui_table_render $'序号\t操作' "$rows" "2"
     else
-        ui_print_line "支持多选：1,3,5 或 1-3" "36"
+        ui_print_line "支持多选：1,3,5 或 1-3" "$UI_C_ACCENT"
         ui_table_render $'序号\t用户\t状态\t定时发送' "$rows" "2,4"
     fi
 }
@@ -2516,7 +2588,7 @@ ui_select_forwards_multi() {
 ui_batch_print_result() {
     local ok="$1"
     local fail="$2"
-    ui_print_line "完成：成功 $ok 项，失败 $fail 项" "36"
+    ui_print_line "完成：成功 $ok 项，失败 $fail 项" "$UI_C_ACCENT"
 }
 
 ui_select_user_forwards_multi() {
@@ -2554,9 +2626,9 @@ ui_print_guard_skip_ports() {
     local ports
     ports="$(guard_protocol_skip_ports_tsv | paste -sd, -)"
     if [ -n "$ports" ]; then
-        ui_print_line "当前跳过端口：$ports" "36"
+        ui_print_line "当前跳过端口：$ports" "$UI_C_ACCENT"
     else
-        ui_print_line "当前跳过端口：-" "2;37"
+        ui_print_line "当前跳过端口：-" "$UI_C_DIM"
     fi
 }
 
@@ -2648,7 +2720,7 @@ ui_menu_guard_skip_ports_delete() {
         fi
         if [ "$delete_all" -eq 1 ]; then
             ui_run cmd_guard protocols --clear-skip-ports
-            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "32"
+            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "$UI_C_MENU_NUM"
             return 0
         fi
         delete_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
@@ -2663,7 +2735,7 @@ ui_menu_guard_skip_ports_delete() {
             idx=$((idx + 1))
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$remaining_ports"
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已删除" "32"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已删除" "$UI_C_MENU_NUM"
         return 0
     done
 }
@@ -2710,7 +2782,7 @@ ui_menu_guard_skip_ports_update() {
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$updated_ports"
         ui_form_reset
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "32"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
         return 0
     done
 }
@@ -2732,7 +2804,7 @@ ui_menu_guard_skip_ports() {
                     ui_run cmd_guard protocols --skip-port "$port"
                     [ "$UI_STATUS" -eq 0 ] || break
                 done <<< "$ports"
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
@@ -2766,7 +2838,7 @@ ui_user_telegram_server_name_default() {
 
 ui_print_telegram_configured_users() {
     config_init >/dev/null
-    ui_print_line "已配置用户" "1;36"
+    ui_print_line \1 "$UI_C_HEADER"
     if ! jq -e '[.users[]? | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
         ui_print_line "暂无已配置用户"
         return
@@ -2797,7 +2869,7 @@ ui_render_forward_select_page() {
     ui_header "选择转发"
     ui_notice_render
     if [ "$allow_zero" = "true" ]; then
-        ui_print_line "0) 返回" "36"
+        ui_print_line "0) 返回" "$UI_C_ACCENT"
     fi
     ui_select_forward_table false
 }
@@ -2839,9 +2911,9 @@ ui_render_user_forward_select_page() {
     ui_header "选择转发"
     ui_notice_render
     if [ "$allow_zero" = "true" ]; then
-        ui_print_line "0) 返回" "36"
+        ui_print_line "0) 返回" "$UI_C_ACCENT"
     fi
-    ui_print_line "用户：$user_id" "1;36"
+    ui_print_line \1 "$UI_C_HEADER"
     ui_select_user_forward_table "$user_id" false
 }
 
@@ -2899,7 +2971,7 @@ ui_menu_users() {
                 [ -n "$UI_REPLY" ] || { ui_warn "用户名不能为空"; ui_pause; continue; }
                 ui_run cmd_user add "$UI_REPLY"
                 if [ "$UI_STATUS" -eq 0 ]; then
-                    ui_notice_set "用户已添加：$UI_REPLY" "32"
+                    ui_notice_set "用户已添加：$UI_REPLY" "$UI_C_MENU_NUM"
                 fi
                 ui_maybe_pause success
                 ;;
@@ -2912,7 +2984,7 @@ ui_menu_users() {
                     user_list+="${user_id}"$'\n'
                 done <<< "$user_ids"
                 user_list="${user_list%$'\n'}"
-                ui_print_line "将删除以下用户：" "33"
+                ui_print_line "将删除以下用户：" "$UI_C_WARN"
                 printf '%s\n' "$user_list"
                 if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
                     local ok=0 fail=0
@@ -3023,7 +3095,7 @@ ui_menu_forwards() {
         case "$UI_REPLY" in
             1)
                 ui_menu_add_forward
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
@@ -3171,7 +3243,7 @@ ui_menu_forwards() {
                 else
                     ui_form_reset
                     ui_run cmd_forward_update "${args[@]}"
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "32"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "$UI_C_MENU_NUM"
                 fi
                 ui_form_reset
                 ui_maybe_pause success
@@ -3222,7 +3294,7 @@ ui_menu_forwards() {
                     )"$'\n'
                 done <<< "$delete_ids"
                 summary="${summary%$'\n'}"
-                ui_print_line "将删除以下转发：" "33"
+                ui_print_line "将删除以下转发：" "$UI_C_WARN"
                 printf '%s\n' "$summary"
                 if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
                     local ok=0 fail=0
@@ -3592,7 +3664,7 @@ ui_menu_telegram() {
                 fi
                 ui_form_reset
                 if [ "$user_id" = "__ALL_USERS__" ]; then
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新：全部用户" "32"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Telegram 配置已更新：全部用户" "$UI_C_MENU_NUM"
                 else
                     ui_notice_set "Telegram 配置更新完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 fi
@@ -3622,7 +3694,7 @@ ui_menu_telegram() {
                 fi
                 ui_run cmd_notify_schedule --user-id "$schedule_user" --interval-minutes "$interval_value" --daily-time "$daily_time"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "定时发送已更新：$schedule_user" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "定时发送已更新：$schedule_user" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             3)
@@ -3680,7 +3752,7 @@ ui_menu_telegram() {
                 ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local delete_ids="$UI_REPLY"
-                ui_print_line "将删除以下通知配置（Bot Token、Chat ID、服务器名称、间隔/定时设置）：" "33"
+                ui_print_line "将删除以下通知配置（Bot Token、Chat ID、服务器名称、间隔/定时设置）：" "$UI_C_WARN"
                 printf '%s\n' "$delete_ids"
                 if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
                     local ok=0 fail=0
@@ -3715,7 +3787,7 @@ ui_menu_export_import() {
                 ui_edit_read "导出文件路径" "$(pfwd_default_export_path)" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 ui_run cmd_export "$UI_REPLY"
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导出：$UI_REPLY" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导出：$UI_REPLY" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
@@ -3729,7 +3801,7 @@ ui_menu_export_import() {
                 local import_path="$UI_REPLY"
                 if ui_confirm_text "import" "输入 import 确认覆盖当前配置"; then
                     ui_run cmd_import "$import_path"
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导入：$import_path" "32"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "配置已导入：$import_path" "$UI_C_MENU_NUM"
                 else
                     ui_warn "已取消"
                 fi
@@ -3752,7 +3824,7 @@ ui_menu_update() {
         return 0
     fi
     ui_run cmd_update
-    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "pfwd 已更新" "32"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "pfwd 已更新" "$UI_C_MENU_NUM"
     ui_maybe_pause success
 }
 
@@ -3761,18 +3833,19 @@ ui_print_guard_summary() {
 }
 
 ui_menu_guard() {
+    local include_cn
     while true; do
         ui_render_page ui_render_guard_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
                 ui_run cmd_guard enable
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已启用" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已启用" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
                 ui_run cmd_guard disable
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已停用" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 已停用" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             3)
@@ -3786,7 +3859,7 @@ ui_menu_guard() {
                     *) ui_form_reset; ui_warn "无效选择"; ui_pause; continue ;;
                 esac
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard XDP 模式已更新" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard XDP 模式已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             4)
@@ -3806,11 +3879,40 @@ ui_menu_guard() {
                 ui_form_add_kv "SOCKS" "$( [ "$block_socks" = "true" ] && echo 开启 || echo 关闭 )"
                 ui_run cmd_guard protocols --http "$block_http" --tls "$block_tls" --socks "$block_socks"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             5)
                 ui_menu_guard_skip_ports
+                ;;
+            6)
+                ui_run cmd_guard_whitelist --enabled true
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            7)
+                ui_run cmd_guard_whitelist --enabled false
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            8)
+                include_cn="$(whitelist_include_cn)"
+                if [ "$include_cn" = "true" ]; then
+                    ui_run cmd_guard_whitelist --include-cn false
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从白名单移出国内 IP 段" "$UI_C_MENU_NUM"
+                else
+                    ui_run cmd_guard_whitelist --include-cn true
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入白名单" "$UI_C_MENU_NUM"
+                fi
+                ui_maybe_pause success
+                ;;
+            9)
+                ui_menu_whitelist_cidrs
+                ;;
+            10)
+                ui_run cmd_guard_whitelist refresh
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -3818,8 +3920,8 @@ ui_menu_guard() {
     done
 }
 
-ui_print_address_control_summary() {
-    ui_table_render $'项目\t值' "$(ui_address_control_summary_rows)" "2"
+ui_print_whitelist_summary() {
+    ui_table_render $'项目\t值' "$(ui_whitelist_summary_rows)" "2"
 }
 
 ui_custom_cidr_rows() {
@@ -3829,7 +3931,7 @@ ui_custom_cidr_rows() {
         [ -n "$cidr" ] || continue
         printf '%s\t%s\n' "$idx" "$cidr"
         idx=$((idx + 1))
-    done < <(address_control_custom_cidrs_tsv)
+    done < <(whitelist_custom_cidrs_tsv)
 }
 
 ui_print_custom_cidr_list() {
@@ -3838,7 +3940,7 @@ ui_print_custom_cidr_list() {
 
 ui_menu_whitelist_cidrs_delete() {
     local count raw indexes cidr_indexes resolved_indexes
-    count="$(address_control_custom_cidrs_count)"
+    count="$(whitelist_custom_cidrs_count)"
     if [ "$count" -eq 0 ]; then
         ui_warn "暂无自定义 CIDR"
         ui_pause
@@ -3850,14 +3952,14 @@ ui_menu_whitelist_cidrs_delete() {
     ui_multiselect_parse_indexes "$raw" "$((count + 1))" false || return 1
     indexes="$UI_REPLY"
     if printf '%s\n' "$indexes" | grep -qx '1'; then
-        ui_run cmd_address_control_custom clear
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
+        ui_run cmd_guard_whitelist_custom clear
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "$UI_C_MENU_NUM"
         return 0
     fi
     resolved_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
     [ -n "$resolved_indexes" ] || { ui_warn "请选择要删除的自定义 CIDR"; return 1; }
-    ui_run cmd_address_control_custom delete $resolved_indexes
-    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已删除" "32"
+    ui_run cmd_guard_whitelist_custom delete $resolved_indexes
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已删除" "$UI_C_MENU_NUM"
 }
 
 ui_render_whitelist_cidrs_menu_page() {
@@ -3879,17 +3981,17 @@ ui_menu_whitelist_cidrs() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_run cmd_address_control_custom clear
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "32"
+                ui_run cmd_guard_whitelist_custom clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
                 ui_form_set "增加自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR；会和允许国内 IP 共同组成白名单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
-                ui_run cmd_address_control_custom add "$UI_REPLY"
+                ui_run cmd_guard_whitelist_custom add "$UI_REPLY"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已添加" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已添加" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             3)
@@ -3897,7 +3999,7 @@ ui_menu_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             4)
-                count="$(address_control_custom_cidrs_count)"
+                count="$(whitelist_custom_cidrs_count)"
                 if [ "$count" -eq 0 ]; then
                     ui_warn "暂无自定义 CIDR"
                     ui_pause
@@ -3909,69 +4011,15 @@ ui_menu_whitelist_cidrs() {
                 display_index="$UI_REPLY"
                 [ "$display_index" -ge 2 ] && [ "$display_index" -le $((count + 1)) ] || { ui_warn "序号超出范围"; ui_pause; continue; }
                 real_index=$((display_index - 1))
-                current_cidr="$(address_control_custom_cidr_by_index "$real_index")"
+                current_cidr="$(whitelist_custom_cidr_by_index "$real_index")"
                 [ -n "$current_cidr" ] || { ui_warn "自定义 CIDR 序号不存在"; ui_pause; continue; }
                 ui_form_set "修改自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR。"
                 ui_form_add_kv "当前 CIDR" "$current_cidr"
                 ui_form_read "新 CIDR" "$current_cidr" || { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
-                ui_run cmd_address_control_custom update "$real_index" "$UI_REPLY"
+                ui_run cmd_guard_whitelist_custom update "$real_index" "$UI_REPLY"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已更新" "32"
-                ui_maybe_pause success
-                ;;
-            0) return 0 ;;
-            *) ui_warn "无效选择"; ui_pause ;;
-        esac
-    done
-}
-
-ui_render_whitelist_menu_page() {
-    ui_header "白名单管理"
-    ui_notice_render
-    ui_print_address_control_summary
-    echo
-    ui_menu_item 1 "启动白名单"
-    ui_menu_item 2 "关闭白名单"
-    ui_menu_item 3 "允许国内IP"
-    ui_menu_item 4 "自定义 CIDR"
-    ui_menu_item 5 "刷新白名单数据"
-    ui_menu_item 0 "返回"
-}
-
-ui_menu_whitelist() {
-    local include_cn
-    while true; do
-        ui_render_page ui_render_whitelist_menu_page
-        ui_read "选择" || return 0
-        case "$UI_REPLY" in
-            1)
-                ui_run cmd_address_control --enabled true
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "32"
-                ui_maybe_pause success
-                ;;
-            2)
-                ui_run cmd_address_control --enabled false
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "32"
-                ui_maybe_pause success
-                ;;
-            3)
-                include_cn="$(address_control_include_cn)"
-                if [ "$include_cn" = "true" ]; then
-                    ui_run cmd_address_control --include-cn false
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从白名单移出国内 IP 段" "32"
-                else
-                    ui_run cmd_address_control --include-cn true
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入白名单" "32"
-                fi
-                ui_maybe_pause success
-                ;;
-            4)
-                ui_menu_whitelist_cidrs
-                ;;
-            5)
-                ui_run cmd_address_control refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "32"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             0) return 0 ;;
@@ -3981,7 +4029,7 @@ ui_menu_whitelist() {
 }
 
 ui_render_guard_menu_page() {
-    ui_header "协议封锁"
+    ui_header "流量防护"
     ui_notice_render
     ui_print_guard_summary
     echo
@@ -3990,6 +4038,11 @@ ui_render_guard_menu_page() {
     ui_menu_item 3 "XDP 模式"
     ui_menu_item 4 "设置封锁协议"
     ui_menu_item 5 "跳过端口"
+    ui_menu_item 6 "启用白名单"
+    ui_menu_item 7 "关闭白名单"
+    ui_menu_item 8 "允许国内 IP"
+    ui_menu_item 9 "自定义 CIDR"
+    ui_menu_item 10 "刷新白名单数据"
     ui_menu_item 0 "返回"
 }
 
@@ -4002,11 +4055,10 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "协议封锁"
-    ui_menu_item 6 "白名单管理"
-    ui_menu_item 7 "配置导入导出"
-    ui_menu_item 8 "更新"
-    ui_menu_item 9 "卸载"
+    ui_menu_item 5 "流量防护"
+    ui_menu_item 6 "配置导入导出"
+    ui_menu_item 7 "更新"
+    ui_menu_item 8 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -4118,10 +4170,9 @@ cmd_menu() {
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
             5) ui_menu_guard ;;
-            6) ui_menu_whitelist ;;
-            7) ui_menu_export_import ;;
-            8) ui_menu_update ;;
-            9) ui_menu_uninstall ;;
+            6) ui_menu_export_import ;;
+            7) ui_menu_update ;;
+            8) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

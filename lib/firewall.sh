@@ -170,19 +170,25 @@ fw_render_nft() {
     echo "}"
 }
 
+FW_NFT_RENDER_FILE="${PFWD_RUN_DIR}/firewall.nft"
+
 fw_apply_nft() {
     pfwd_require_cmd nft
     local tmp
     tmp="$(mktemp "$PFWD_RUN_DIR/nft.XXXXXX")"
     fw_render_nft > "$tmp"
+    if [ -f "$FW_NFT_RENDER_FILE" ] && cmp -s "$tmp" "$FW_NFT_RENDER_FILE"; then
+        rm -f "$tmp"
+        return 0
+    fi
     local family table
     family="$(fw_family)"
     table="$(fw_table)"
     if nft list table "$family" "$table" >/dev/null 2>&1; then
         pfwd_run nft delete table "$family" "$table"
     fi
-    pfwd_run nft -f "$tmp"
-    rm -f "$tmp"
+    mv "$tmp" "$FW_NFT_RENDER_FILE"
+    pfwd_run nft -f "$FW_NFT_RENDER_FILE"
 }
 
 fw_effective_rate_count() {

@@ -29,10 +29,10 @@
 ```bash
 pfwd guard enable
 pfwd guard protocols --https true --socks true
-pfwd address-control --enabled true --include-cn true
-pfwd address-control --cidr 203.0.113.0/24
+pfwd guard whitelist --enabled true --include-cn true
+pfwd guard whitelist --cidr 203.0.113.0/24
 pfwd guard status
-pfwd address-control status
+pfwd guard whitelist status
 ```
 
 ## Requirements
@@ -84,7 +84,7 @@ pfwd
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
 │       ├── validate.sh         # 参数校验、端口/地址/速率解析
-│       ├── address_control.sh  # 白名单数据准备与状态展示
+│       ├── whitelist.sh       # 白名单数据准备与状态展示
 │       ├── forwarder.sh        # nft 转发表运行态解析与渲染
 │       ├── firewall.sh         # 流量统计、限额、tc 渲染
 │       ├── stats.sh            # 流量状态快照与汇总
@@ -99,7 +99,7 @@ pfwd
 ├── /var/lib/pfwd/
 │   ├── stats.json              # 流量统计状态文件
 │   ├── bbr-state.env           # BBR / optimize 状态文件
-│   ├── address_control/
+│   ├── whitelist/
 │   │   ├── allow_ipv4.txt      # 入站来源 IPv4 白名单运行态
 │   │   └── allow_ipv6.txt      # 入站来源 IPv6 白名单运行态
 │   └── guard/
@@ -154,13 +154,13 @@ ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
 5. 如需离线启用国内 IP 白名单，可直接执行：
 
 ```bash
-pfwd address-control --enabled true --include-cn true
+pfwd guard whitelist --enabled true --include-cn true
 ```
 
 后续机器具备外网时，再执行：
 
 ```bash
-pfwd address-control refresh
+pfwd guard whitelist refresh
 ```
 
 6. 完成后可先检查：

@@ -9,13 +9,17 @@ stats_default_json() {
 EOF
 }
 
+PFWD_STATS_INITIALIZED=0
+
 stats_init() {
+    [ "$PFWD_STATS_INITIALIZED" = "1" ] && [ -f "$PFWD_STATS_FILE" ] && return 0
     pfwd_require_jq
     pfwd_mkdirs
     if [ ! -f "$PFWD_STATS_FILE" ]; then
         stats_default_json | jq '.' | pfwd_write_atomic "$PFWD_STATS_FILE"
     fi
     stats_validate_file "$PFWD_STATS_FILE"
+    PFWD_STATS_INITIALIZED=1
 }
 
 stats_validate_file() {
@@ -39,46 +43,79 @@ stats_update() {
     jq "${args[@]}" "$filter" "$PFWD_STATS_FILE" > "$tmp"
     stats_validate_file "$tmp"
     mv "$tmp" "$PFWD_STATS_FILE"
+    PFWD_STATS_INITIALIZED=1
 }
 
+PFWD_STATS_SNAPSHOT_CACHE=""
+PFWD_STATS_SNAPSHOT_TIME=0
+
 stats_forward_snapshot_json() {
-    local nft_text="$1"
-    jq -n --arg text "$nft_text" --slurpfile cfg "$PFWD_CONFIG_FILE" '
-      def counters_map:
-        reduce ($text | split("\n")[]) as $line (
-          {current: null, values: {}};
-          if ($line | test("^\\s*counter [^ ]+ \\{$")) then
-            .current = (($line | capture("^\\s*counter (?<name>[^ ]+) \\{$")).name)
-          elif .current != null and ($line | test("bytes [0-9]+")) then
-            .values[.current] = (($line | capture("bytes (?<b>[0-9]+)").b) | tonumber)
-          elif .current != null and ($line | test("^\\s*\\}$")) then
-            .current = null
-          else
-            .
-          end
-        ) | .values;
-      (counters_map) as $counters |
-      def counter_bytes($name):
-        ($counters[$name] // 0);
-      [
-        $cfg[0].forwards[]? |
-        . as $f |
-        ($f.id | gsub("-"; "_")) as $safe |
-        {
-          id: $f.id,
-          user_id: $f.user_id,
-          traffic_mode: ($f.traffic_mode // "two-way"),
-          traffic_ratio: ($f.traffic_ratio // 1),
-          input_bytes: counter_bytes("fwd_" + $safe + "_in"),
-          output_bytes: counter_bytes("fwd_" + $safe + "_out")
-        }
-      ]
-    '
+    local nft_input="$1"
+    local cfg_file="${2:-$PFWD_CONFIG_FILE}"
+    local nft_json="${3:-}"
+    if [ -n "$nft_json" ]; then
+        jq --slurpfile cfg "$cfg_file" '
+          def counters_map:
+            [.nftables[]? | select(.counter) | {(.counter.name // (.counter | keys[0])): .counter.packets}] | add // {};
+          [.nftables[]? | select(.counter)]
+          | map({name: (.counter.name // "unknown"), bytes: (.counter.bytes // 0)})
+          | map({key: .name, value: .bytes})
+          | from_entries
+          | . as $counters
+          | [
+              $cfg[0].forwards[]? |
+              . as $f |
+              ($f.id | gsub("-"; "_")) as $safe |
+              {
+                id: $f.id,
+                user_id: $f.user_id,
+                traffic_mode: ($f.traffic_mode // "two-way"),
+                traffic_ratio: ($f.traffic_ratio // 1),
+                input_bytes: ($counters["fwd_" + $safe + "_in"] // 0),
+                output_bytes: ($counters["fwd_" + $safe + "_out"] // 0)
+              }
+            ]
+        ' <<< "$nft_json"
+    else
+        jq -n --arg text "$nft_input" --slurpfile cfg "$cfg_file" '
+          def counters_map:
+            reduce ($text | split("\n")[]) as $line (
+              {current: null, values: {}};
+              if ($line | test("^\\s*counter [^ ]+ \\{$")) then
+                .current = (($line | capture("^\\s*counter (?<name>[^ ]+) \\{$")).name)
+              elif .current != null and ($line | test("bytes [0-9]+")) then
+                .values[.current] = (($line | capture("bytes (?<b>[0-9]+)").b) | tonumber)
+              elif .current != null and ($line | test("^\\s*\\}$")) then
+                .current = null
+              else
+                .
+              end
+            ) | .values;
+          (counters_map) as $counters |
+          def counter_bytes($name):
+            ($counters[$name] // 0);
+          [
+            $cfg[0].forwards[]? |
+            . as $f |
+            ($f.id | gsub("-"; "_")) as $safe |
+            {
+              id: $f.id,
+              user_id: $f.user_id,
+              traffic_mode: ($f.traffic_mode // "two-way"),
+              traffic_ratio: ($f.traffic_ratio // 1),
+              input_bytes: counter_bytes("fwd_" + $safe + "_in"),
+              output_bytes: counter_bytes("fwd_" + $safe + "_out")
+            }
+          ]
+        '
+    fi
 }
 
 stats_usage_from_snapshot() {
     local snapshot="$1"
-    jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" --slurpfile state "$PFWD_STATS_FILE" --argjson snap "$snapshot" '
+    local cfg_file="${2:-$PFWD_CONFIG_FILE}"
+    local stats_file="${3:-$PFWD_STATS_FILE}"
+    jq -n --slurpfile cfg "$cfg_file" --slurpfile state "$stats_file" --argjson snap "$snapshot" '
       def mode_factor($mode):
         if $mode == "one-way" then 1 else 2 end;
       def billed_usage($mode; $ratio; $in_bytes; $out_bytes):
@@ -250,16 +287,31 @@ stats_rollup_counters() {
 
 stats_current_snapshot() {
     config_init >/dev/null
-    local family table nft_output
-    family="$(fw_family)"
-    table="$(fw_table)"
-    nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
-    stats_forward_snapshot_json "$nft_output"
+    local family table nft_output nft_json cfg_file
+    cfg_file="$PFWD_CONFIG_FILE"
+    if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
+        cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
+    fi
+    family="$(jq -r '.settings.nft_family // "inet"' "$cfg_file")"
+    table="$(jq -r '.settings.nft_table // "pfwd"' "$cfg_file")"
+    nft_json="$(nft -j list table "$family" "$table" 2>/dev/null || true)"
+    if [ -n "$nft_json" ]; then
+        stats_forward_snapshot_json "" "$cfg_file" "$nft_json"
+    else
+        nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
+        stats_forward_snapshot_json "$nft_output" "$cfg_file"
+    fi
 }
 
 stats_usage_json() {
     stats_init >/dev/null
-    stats_usage_from_snapshot "$(stats_current_snapshot)"
+    local cfg_file stats_file
+    cfg_file="$PFWD_CONFIG_FILE"
+    stats_file="$PFWD_STATS_FILE"
+    if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
+        cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
+    fi
+    stats_usage_from_snapshot "$(stats_current_snapshot)" "$cfg_file" "$stats_file"
 }
 
 stats_rollup_needed() {
@@ -276,6 +328,7 @@ stats_rollup_needed() {
 
 stats_rollup_current() {
     command -v nft >/dev/null 2>&1 || return 0
+    pfwd_debug "stats_rollup_current start"
     local snapshot
     snapshot="$(stats_current_snapshot)"
     stats_rollup_needed "$snapshot" || return 0
