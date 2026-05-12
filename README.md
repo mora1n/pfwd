@@ -12,6 +12,7 @@
 | Protocol | 支持 `TCP`、`UDP`、`TCP+UDP`，默认 `TCP+UDP` |
 | nft Options | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 支持到期日、流量统计、总流量限制、速率限制 |
+| Guard | eBPF 流量防护：XDP 白名单、TC 协议封锁（`HTTP`/`TLS`/`SOCKS`） |
 | Notify | 支持 Telegram 通知与定时发送 |
 | Ops | 支持安装、更新、刷新、排查、导出、导入、卸载 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
@@ -76,7 +77,7 @@ pfwd
 │   ├── pfwd.sh                 # pfwd 主脚本
 │   ├── bbr.sh                  # BBR / optimize 主脚本
 │   ├── bin/
-│   │   └── pfwd-guard          # 协议封锁预编译 guard
+│   │   └── pfwd-guard          # 流量防护预编译 guard (eBPF)
 │   ├── assets/
 │   │   ├── cn-aggregated.zone     # 国内 IPv4 白名单离线种子
 │   │   └── cn-aggregated-v6.zone  # 国内 IPv6 白名单离线种子
@@ -84,7 +85,7 @@ pfwd
 │       ├── core.sh             # 核心路径、通用工具、文件写入
 │       ├── config.sh           # 配置读写、导入导出、规则持久化
 │       ├── validate.sh         # 参数校验、端口/地址/速率解析
-│       ├── whitelist.sh       # 白名单数据准备与状态展示
+│       ├── whitelist.sh        # 白名单数据准备与状态展示
 │       ├── forwarder.sh        # nft 转发表运行态解析与渲染
 │       ├── firewall.sh         # 流量统计、限额、tc 渲染
 │       ├── stats.sh            # 流量状态快照与汇总
@@ -114,7 +115,7 @@ pfwd
     ├── pfwd.service            # 到期停转、通知、状态同步
     ├── pfwd.timer              # 定时触发 pfwd.service
     ├── pfwd-bbr.service        # 开机恢复 BBR / optimize 运行态
-    └── pfwd-guard.service      # 开机恢复协议封锁运行态
+    └── pfwd-guard.service      # 开机恢复流量防护运行态
 ```
 
 建议的离线安装步骤：
