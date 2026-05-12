@@ -830,6 +830,56 @@ config_set_user_forwards_traffic_mode() {
     '
 }
 
+config_keep_or_apply() {
+    local raw="$1"
+    local current="$2"
+    local apply_mode="${3:-raw}"
+    local apply_func="${4:-}"
+
+    if [ "$raw" = "__KEEP__" ] || [ -z "$raw" ]; then
+        printf '%s\n' "$current"
+        return 0
+    fi
+    if [ -n "$apply_func" ]; then
+        if [ "$apply_mode" = "transform" ]; then
+            "$apply_func" "$raw"
+        else
+            "$apply_func" "$raw" >/dev/null
+            printf '%s\n' "$raw"
+        fi
+        return 0
+    fi
+    printf '%s\n' "$raw"
+}
+
+config_keep_or_clear_or_apply() {
+    local raw="$1"
+    local current="$2"
+    local apply_mode="${3:-raw}"
+    local apply_func="${4:-}"
+
+    case "$raw" in
+        __KEEP__)
+            printf '%s\n' "$current"
+            ;;
+        __CLEAR__|"")
+            printf '\n'
+            ;;
+        *)
+            if [ -n "$apply_func" ]; then
+                if [ "$apply_mode" = "transform" ]; then
+                    "$apply_func" "$raw"
+                else
+                    "$apply_func" "$raw" >/dev/null
+                    printf '%s\n' "$raw"
+                fi
+            else
+                printf '%s\n' "$raw"
+            fi
+            ;;
+    esac
+}
+
 config_update_forward() {
     local forward_id="$1"
     local listen_ip_raw="$2"
@@ -870,31 +920,21 @@ config_update_forward() {
     current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
     current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$current")"
 
-    if [ "$listen_ip_raw" = "__KEEP__" ]; then
-        new_listen_ip="$current_listen_ip"
-    else
+    new_listen_ip="$(config_keep_or_apply "$listen_ip_raw" "$current_listen_ip")"
+    if [ "$listen_ip_raw" != "__KEEP__" ]; then
         validate_listen_ip "$listen_ip_raw"
-        new_listen_ip="$listen_ip_raw"
     fi
 
-    if [ "$listen_port_raw" = "__KEEP__" ]; then
-        new_listen_port="$current_listen_port"
-    else
+    new_listen_port="$(config_keep_or_apply "$listen_port_raw" "$current_listen_port")"
+    if [ "$listen_port_raw" != "__KEEP__" ]; then
         validate_port "$listen_port_raw"
-        new_listen_port="$listen_port_raw"
     fi
 
-    if [ "$remote_host_raw" = "__KEEP__" ]; then
-        new_remote_host="$current_remote_host"
-    else
-        new_remote_host="$remote_host_raw"
-    fi
+    new_remote_host="$(config_keep_or_apply "$remote_host_raw" "$current_remote_host")"
 
-    if [ "$remote_port_raw" = "__KEEP__" ]; then
-        new_remote_port="$current_remote_port"
-    else
+    new_remote_port="$(config_keep_or_apply "$remote_port_raw" "$current_remote_port")"
+    if [ "$remote_port_raw" != "__KEEP__" ]; then
         validate_port "$remote_port_raw"
-        new_remote_port="$remote_port_raw"
     fi
 
     if [[ "$new_remote_host" == *:* ]]; then
@@ -916,95 +956,14 @@ config_update_forward() {
             ;;
     esac
 
-    case "$protocol_raw" in
-        __KEEP__|"")
-            new_protocol="$current_protocol"
-            ;;
-        *)
-            validate_forward_protocol "$protocol_raw"
-            new_protocol="$protocol_raw"
-            ;;
-    esac
-
-    case "$traffic_mode_raw" in
-        __KEEP__|"")
-            new_traffic_mode="$current_traffic_mode"
-            ;;
-        *)
-            validate_traffic_mode "$traffic_mode_raw"
-            new_traffic_mode="$traffic_mode_raw"
-            ;;
-    esac
-
-    case "$traffic_ratio_raw" in
-        __KEEP__|"")
-            new_traffic_ratio="$current_traffic_ratio"
-            ;;
-        *)
-            new_traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio_raw")"
-            ;;
-    esac
-
-    case "$comment_raw" in
-        __KEEP__)
-            new_comment="$current_comment"
-            ;;
-        __CLEAR__)
-            new_comment=""
-            ;;
-        *)
-            new_comment="$comment_raw"
-            ;;
-    esac
-
-    case "$mss_mode_raw" in
-        __KEEP__)
-            new_mss_mode="$current_mss_mode"
-            ;;
-        __CLEAR__|"")
-            new_mss_mode=""
-            ;;
-        *)
-            validate_mss_mode "$mss_mode_raw"
-            new_mss_mode="$mss_mode_raw"
-            ;;
-    esac
-
-    case "$mss_value_raw" in
-        __KEEP__)
-            new_mss_value="$current_mss_value"
-            ;;
-        __CLEAR__|"")
-            new_mss_value=""
-            ;;
-        *)
-            validate_mss_value "$mss_value_raw"
-            new_mss_value="$mss_value_raw"
-            ;;
-    esac
-
-    case "$snat_mode_raw" in
-        __KEEP__)
-            new_snat_mode="$current_snat_mode"
-            ;;
-        *)
-            validate_snat_mode "$snat_mode_raw"
-            new_snat_mode="$snat_mode_raw"
-            ;;
-    esac
-
-    case "$snat_source_raw" in
-        __KEEP__)
-            new_snat_source="$current_snat_source"
-            ;;
-        __CLEAR__|"")
-            new_snat_source=""
-            ;;
-        *)
-            validate_ip_literal "$snat_source_raw"
-            new_snat_source="$snat_source_raw"
-            ;;
-    esac
+    new_protocol="$(config_keep_or_apply "$protocol_raw" "$current_protocol" validate validate_forward_protocol)"
+    new_traffic_mode="$(config_keep_or_apply "$traffic_mode_raw" "$current_traffic_mode" validate validate_traffic_mode)"
+    new_traffic_ratio="$(config_keep_or_apply "$traffic_ratio_raw" "$current_traffic_ratio" transform normalize_traffic_ratio_input)"
+    new_comment="$(config_keep_or_clear_or_apply "$comment_raw" "$current_comment")"
+    new_mss_mode="$(config_keep_or_clear_or_apply "$mss_mode_raw" "$current_mss_mode" validate validate_mss_mode)"
+    new_mss_value="$(config_keep_or_clear_or_apply "$mss_value_raw" "$current_mss_value" validate validate_mss_value)"
+    new_snat_mode="$(config_keep_or_apply "$snat_mode_raw" "$current_snat_mode" validate validate_snat_mode)"
+    new_snat_source="$(config_keep_or_clear_or_apply "$snat_source_raw" "$current_snat_source" validate validate_ip_literal)"
 
     if [ "$new_mss_mode" = "set" ]; then
         [ -n "$new_mss_value" ] || pfwd_die "固定 MSS 模式必须提供 mss_value"

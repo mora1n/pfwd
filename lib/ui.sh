@@ -85,22 +85,22 @@ ui_color() {
     fi
 }
 
-ui_progress_bar() {
-    local used="$1"
-    local limit="$2"
-    local width="${3:-10}"
-    local pct=0 bar filled empty
-    if [ "$limit" -gt 0 ] && [ "$used" -ge 0 ]; then
-        pct=$((used * 100 / limit))
-        [ "$pct" -gt 100 ] && pct=100
-        filled=$((pct * width / 100))
-        empty=$((width - filled))
+ui_apply_color() {
+    local code="$1"
+    local text="$2"
+    if [ -n "$code" ]; then
+        ui_color "$code" "$text"
+    else
+        printf '%s' "$text"
     fi
-    bar=""
-    local i
-    for ((i = 0; i < filled; i++)); do bar+="="; done
-    for ((i = 0; i < empty; i++)); do bar+="-"; done
-    printf '[%s] %d%%' "$bar" "$pct"
+}
+
+ui_empty_users_text() {
+    printf '暂无用户，请先添加用户'
+}
+
+ui_empty_forwards_text() {
+    printf '暂无转发，请先添加转发'
 }
 
 ui_clear_screen() {
@@ -847,9 +847,7 @@ ui_table_print_row() {
             rendered="$(ui_forward_state_text "$display_state")"
             UI_CELL_COLOR="$(ui_forward_state_color "$display_state")"
             ui_display_width_value "$rendered"
-            if [ -n "$UI_CELL_COLOR" ] && ui_use_color; then
-                rendered=$'\033['"${UI_CELL_COLOR}"'m'"$rendered"$'\033[0m'
-            fi
+            rendered="$(ui_apply_color "$UI_CELL_COLOR" "$rendered")"
         elif [ -z "$code" ] && [ "${headers_ref[$i]:-}" = "值" ] && [ "${headers_ref[0]:-}" = "项目" ]; then
             UI_CELL_COLOR=""
             local guard_label="" guard_state=""
@@ -859,9 +857,7 @@ ui_table_print_row() {
                 rendered="$(ui_forward_state_text "$guard_state")"
                 UI_CELL_COLOR="$(ui_forward_state_color "$guard_state")"
                 ui_display_width_value "$rendered"
-                if [ -n "$UI_CELL_COLOR" ] && ui_use_color; then
-                    rendered=$'\033['"${UI_CELL_COLOR}"'m'"$rendered"$'\033[0m'
-                fi
+                rendered="$(ui_apply_color "$UI_CELL_COLOR" "$rendered")"
             fi
         fi
         line+=" "
@@ -1397,11 +1393,17 @@ ui_recommended_mss_value() {
 ui_select_mss_mode() {
     local prompt="$1"
     local remote_host="${2:-}"
+    local current_mode="${3:-}"
+    local current_value="${4:-}"
+    local allow_clear="${5:-false}"
     local recommended=""
     local source="fallback"
+    local fixed_default=""
+    local default_choice="1"
 
     UI_MSS_MODE=""
     UI_MSS_VALUE=""
+    UI_EDIT_ABORTED=0
 
     if [ -n "$remote_host" ]; then
         ui_recommended_mss_value "$remote_host"
@@ -1409,7 +1411,12 @@ ui_select_mss_mode() {
         source="$UI_MSS_RECOMMEND_SOURCE"
     fi
 
-    ui_form_select_read "$prompt" "1" \
+    case "$current_mode" in
+        clamp) default_choice="2" ;;
+        set) default_choice="3" ;;
+    esac
+
+    ui_form_select_read "$prompt" "$default_choice" \
         "1) 不设置" \
         "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" \
         "2) MSS Clamp" \
@@ -1417,74 +1424,35 @@ ui_select_mss_mode() {
         "3) 固定 MSS" \
         "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1
     case "$UI_REPLY" in
-        1|"")
+        "")
             UI_MSS_MODE=""
             UI_MSS_VALUE=""
             ;;
-        2)
-            UI_MSS_MODE="clamp"
-            UI_MSS_VALUE=""
-            ;;
-        3)
-            UI_MSS_MODE="set"
-            if [ -n "$recommended" ]; then
-                if [ "$source" = "fallback" ]; then
-                    ui_warn "未探测到链路 MTU，已使用通用推荐值：$recommended"
-                else
-                    ui_print_line "固定 MSS 推荐值：$recommended" "$UI_C_ACCENT"
-                fi
+        1)
+            if [ "$allow_clear" = "true" ]; then
+                UI_MSS_MODE="__CLEAR__"
+                UI_MSS_VALUE="__CLEAR__"
+            else
+                UI_MSS_MODE=""
+                UI_MSS_VALUE=""
             fi
-            ui_form_read "固定 MSS 值" "$recommended" || return 1
-            [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
-            validate_mss_value "$UI_REPLY"
-            UI_MSS_VALUE="$UI_REPLY"
             ;;
-        *)
+        0)
+            if [ "$allow_clear" = "true" ]; then
+                UI_EDIT_ABORTED=1
+                return 0
+            fi
             ui_warn "无效选择，已使用不设置"
             UI_MSS_MODE=""
             UI_MSS_VALUE=""
             ;;
-    esac
-}
-
-ui_select_mss_mode_edit() {
-    local prompt="$1"
-    local current_mode="$2"
-    local current_value="$3"
-    local remote_host="${4:-}"
-    local recommended="" source="fallback" fixed_default=""
-
-    UI_MSS_MODE=""
-    UI_MSS_VALUE=""
-    UI_EDIT_ABORTED=0
-
-    ui_recommended_mss_value "$remote_host"
-    recommended="$UI_MSS_RECOMMENDED"
-    source="$UI_MSS_RECOMMEND_SOURCE"
-
-    case "$current_mode" in
-        clamp) ui_form_select_read "$prompt" "2" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
-        set) ui_form_select_read "$prompt" "3" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
-        *) ui_form_select_read "$prompt" "1" "1) 不设置" "   默认值，不主动改 TCP MSS；适合常规公网转发、大多数直连链路。" "2) MSS Clamp" "   按路径 MTU 自动调整 TCP MSS；适合 PPPoE、VPN、隧道、跨境链路。" "3) 固定 MSS" "   手动写死 TCP MSS；适合已知链路 MTU、上游有统一要求或 clamp 效果不稳定。" || return 1 ;;
-    esac
-
-    case "$UI_REPLY" in
-        0)
-            UI_EDIT_ABORTED=1
-            return 0
-            ;;
-        "")
-            UI_MSS_MODE=""
-            UI_MSS_VALUE=""
-            return 0
-            ;;
-        1)
-            UI_MSS_MODE="__CLEAR__"
-            UI_MSS_VALUE="__CLEAR__"
-            ;;
         2)
             UI_MSS_MODE="clamp"
-            UI_MSS_VALUE="__CLEAR__"
+            if [ "$allow_clear" = "true" ]; then
+                UI_MSS_VALUE="__CLEAR__"
+            else
+                UI_MSS_VALUE=""
+            fi
             ;;
         3)
             UI_MSS_MODE="set"
@@ -1503,37 +1471,85 @@ ui_select_mss_mode_edit() {
                     fi
                 fi
             fi
-            ui_form_edit_read "固定 MSS 值" "$fixed_default" || return 1
-            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            if [ "$allow_clear" = "true" ]; then
+                ui_form_edit_read "固定 MSS 值" "$fixed_default" || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            else
+                ui_form_read "固定 MSS 值" "$fixed_default" || return 1
+            fi
             [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
             validate_mss_value "$UI_REPLY"
             UI_MSS_VALUE="$UI_REPLY"
             ;;
         *)
-            ui_warn "无效选择"
-            return 1
+            ui_warn "无效选择，已使用不设置"
+            UI_MSS_MODE=""
+            UI_MSS_VALUE=""
             ;;
     esac
 }
 
+ui_select_mss_mode_edit() {
+    ui_select_mss_mode "$1" "${4:-}" "$2" "$3" true
+}
+
 ui_select_snat_mode() {
     local prompt="$1"
+    local current_mode="${2:-masquerade}"
+    local current_source="${3:-}"
+    local allow_clear="${4:-false}"
+
     UI_SNAT_MODE="masquerade"
     UI_SNAT_SOURCE=""
+    UI_EDIT_ABORTED=0
 
-    ui_form_select_read "$prompt" "1" \
-        "1) Masquerade" \
-        "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" \
-        "2) 固定 SNAT 源地址" \
-        "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1
+    if [ "$current_mode" = "snat" ]; then
+        ui_form_select_read "$prompt" "2" \
+            "1) Masquerade" \
+            "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" \
+            "2) 固定 SNAT 源地址" \
+            "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1
+    else
+        ui_form_select_read "$prompt" "1" \
+            "1) Masquerade" \
+            "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" \
+            "2) 固定 SNAT 源地址" \
+            "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1
+    fi
     case "$UI_REPLY" in
-        1|"")
+        "")
+            UI_SNAT_MODE="$current_mode"
+            if [ "$allow_clear" = "true" ]; then
+                UI_SNAT_SOURCE=""
+            else
+                UI_SNAT_SOURCE="$current_source"
+            fi
+            ;;
+        0)
+            if [ "$allow_clear" = "true" ]; then
+                UI_EDIT_ABORTED=1
+                return 0
+            fi
+            ui_warn "无效选择，已使用 masquerade"
             UI_SNAT_MODE="masquerade"
             UI_SNAT_SOURCE=""
             ;;
+        1)
+            UI_SNAT_MODE="masquerade"
+            if [ "$allow_clear" = "true" ]; then
+                UI_SNAT_SOURCE="__CLEAR__"
+            else
+                UI_SNAT_SOURCE=""
+            fi
+            ;;
         2)
             UI_SNAT_MODE="snat"
-            ui_form_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
+            if [ "$allow_clear" = "true" ]; then
+                ui_form_edit_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" "$current_source" || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            else
+                ui_form_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
+            fi
             [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
             validate_ip_literal "$UI_REPLY"
             UI_SNAT_SOURCE="$UI_REPLY"
@@ -1547,45 +1563,7 @@ ui_select_snat_mode() {
 }
 
 ui_select_snat_mode_edit() {
-    local prompt="$1"
-    local current_mode="$2"
-    local current_source="$3"
-
-    UI_SNAT_MODE=""
-    UI_SNAT_SOURCE=""
-    UI_EDIT_ABORTED=0
-
-    case "$current_mode" in
-        snat) ui_form_select_read "$prompt" "2" "1) Masquerade" "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" "2) 固定 SNAT 源地址" "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1 ;;
-        *) ui_form_select_read "$prompt" "1" "1) Masquerade" "   默认值，出站源地址跟随本机出口地址；适合动态公网 IP、普通单出口转发。" "2) 固定 SNAT 源地址" "   把出站源地址固定改写为指定 IP；适合本机有额外内网 IP、多地址出口、后端白名单来源 IP。" || return 1 ;;
-    esac
-    case "$UI_REPLY" in
-        0)
-            UI_EDIT_ABORTED=1
-            return 0
-            ;;
-        "")
-            UI_SNAT_MODE=""
-            UI_SNAT_SOURCE=""
-            return 0
-            ;;
-        1)
-            UI_SNAT_MODE="masquerade"
-            UI_SNAT_SOURCE="__CLEAR__"
-            ;;
-        2)
-            UI_SNAT_MODE="snat"
-            ui_form_edit_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" "$current_source" || return 1
-            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
-            [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
-            validate_ip_literal "$UI_REPLY"
-            UI_SNAT_SOURCE="$UI_REPLY"
-            ;;
-        *)
-            ui_warn "无效选择"
-            return 1
-            ;;
-    esac
+    ui_select_snat_mode "$1" "$2" "$3" true
 }
 
 ui_config_value() {
@@ -1633,19 +1611,8 @@ ui_protocol_label() {
 
 ui_select_protocol() {
     local prompt="$1"
-    UI_REPLY=""
-    ui_form_select_read "$prompt" "3" "1) TCP" "2) UDP" "3) TCP+UDP" || return 1
-    case "$UI_REPLY" in
-        1) UI_REPLY="tcp" ;;
-        2) UI_REPLY="udp" ;;
-        3|"") UI_REPLY="tcp_udp" ;;
-        *) ui_warn "无效选择，已使用 TCP+UDP"; UI_REPLY="tcp_udp" ;;
-    esac
-}
-
-ui_select_protocol_edit() {
-    local prompt="$1"
     local current_protocol="${2:-tcp_udp}"
+    local allow_clear="${3:-false}"
     UI_EDIT_ABORTED=0
     UI_REPLY=""
     case "$current_protocol" in
@@ -1655,81 +1622,83 @@ ui_select_protocol_edit() {
     esac
     case "$UI_REPLY" in
         0)
-            UI_EDIT_ABORTED=1
-            return 0
+            if [ "$allow_clear" = "true" ]; then
+                UI_EDIT_ABORTED=1
+                return 0
+            fi
+            ui_warn "无效选择，已使用 TCP+UDP"
+            UI_REPLY="tcp_udp"
             ;;
         "")
-            UI_REPLY=""
-            return 0
+            if [ "$allow_clear" = "true" ]; then
+                UI_REPLY=""
+            else
+                UI_REPLY="tcp_udp"
+            fi
             ;;
         1) UI_REPLY="tcp" ;;
         2) UI_REPLY="udp" ;;
         3) UI_REPLY="tcp_udp" ;;
-        *) ui_warn "无效选择"; return 1 ;;
+        *) ui_warn "无效选择，已使用 TCP+UDP"; UI_REPLY="tcp_udp" ;;
     esac
+}
+
+ui_select_protocol_edit() {
+    ui_select_protocol "$1" "${2:-tcp_udp}" true
 }
 
 ui_select_traffic_mode() {
     local prompt="$1"
     local allow_empty="${2:-false}"
-    UI_TRAFFIC_MODE=""
-    ui_form_select_read "$prompt" "2" \
-        "1) 单向计费" \
-        "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" \
-        "2) 双向计费" \
-        "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1
-    if [ "$allow_empty" = "true" ] && [ -z "$UI_REPLY" ]; then
-        UI_TRAFFIC_MODE=""
-        return 0
-    fi
-    case "$UI_REPLY" in
-        1) UI_TRAFFIC_MODE="one-way" ;;
-        2|"") UI_TRAFFIC_MODE="two-way" ;;
-        *) ui_warn "无效选择，已使用双向"; UI_TRAFFIC_MODE="two-way" ;;
-    esac
-}
-
-ui_select_traffic_mode_edit() {
-    local prompt="$1"
-    local current_mode="${2:-}"
+    local current_mode="${3:-}"
+    local allow_clear="${4:-false}"
     UI_TRAFFIC_MODE=""
     UI_EDIT_ABORTED=0
     case "$current_mode" in
         one-way) ui_form_select_read "$prompt" "1" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
         two-way) ui_form_select_read "$prompt" "2" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
-        *) ui_form_select_read "$prompt" "" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
+        *) ui_form_select_read "$prompt" "2" "1) 单向计费" "   按 (上行+下行) x 倍率 计费；适合一倍总流量结算。" "2) 双向计费" "   按 (上行+下行) x 倍率 x 2 计费；适合双倍流量结算。" || return 1 ;;
     esac
-    case "$UI_REPLY" in
-        0)
-            UI_EDIT_ABORTED=1
-            return 0
-            ;;
-        "")
+    if [ "$allow_clear" = "true" ] && [ "$UI_REPLY" = "0" ]; then
+        UI_EDIT_ABORTED=1
+        return 0
+    fi
+    if [ -z "$UI_REPLY" ]; then
+        if [ "$allow_clear" = "true" ] || [ "$allow_empty" = "true" ]; then
             UI_TRAFFIC_MODE=""
-            return 0
-            ;;
+        else
+            UI_TRAFFIC_MODE="two-way"
+        fi
+        return 0
+    fi
+    case "$UI_REPLY" in
         1) UI_TRAFFIC_MODE="one-way" ;;
         2) UI_TRAFFIC_MODE="two-way" ;;
-        *) ui_warn "无效选择"; return 1 ;;
+        *) ui_warn "无效选择，已使用双向"; UI_TRAFFIC_MODE="two-way" ;;
     esac
+}
+
+ui_select_traffic_mode_edit() {
+    ui_select_traffic_mode "$1" false "${2:-}" true
 }
 
 ui_read_traffic_ratio() {
     local prompt="$1"
     local default="${2:-1.0}"
+    local allow_clear="${3:-false}"
     UI_TRAFFIC_RATIO=""
-    ui_form_read "$prompt" "$default" || return 1
+    UI_EDIT_ABORTED=0
+    if [ "$allow_clear" = "true" ]; then
+        ui_form_edit_read "$prompt" "$default" || return 1
+        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    else
+        ui_form_read "$prompt" "$default" || return 1
+    fi
     UI_TRAFFIC_RATIO="$(normalize_traffic_ratio_input "$UI_REPLY")"
 }
 
 ui_read_traffic_ratio_edit() {
-    local prompt="$1"
-    local default="${2:-1.0}"
-    UI_TRAFFIC_RATIO=""
-    UI_EDIT_ABORTED=0
-    ui_form_edit_read "$prompt" "$default" || return 1
-    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
-    UI_TRAFFIC_RATIO="$(normalize_traffic_ratio_input "$UI_REPLY")"
+    ui_read_traffic_ratio "$1" "${2:-1.0}" true
 }
 
 ui_missing_dependencies() {
@@ -2143,7 +2112,7 @@ ui_print_main_user_summary() {
     ui_print_line "用户状态" "$UI_C_HEADER"
 
     if ! jq -e '.users | length > 0' <<< "$data" >/dev/null; then
-        ui_print_line "暂无用户，请先到“用户管理”添加用户。"
+        ui_print_line "$(ui_empty_users_text)"
         return
     fi
 
@@ -2263,7 +2232,7 @@ ui_print_main_forward_summary() {
     ui_print_line "当前转发" "$UI_C_HEADER"
 
     if ! jq -e '.forwards | length > 0' <<< "$data" >/dev/null; then
-        ui_print_line "暂无转发，先按上面的流程添加转发。"
+        ui_print_line "$(ui_empty_forwards_text)"
         return
     fi
 
@@ -2274,7 +2243,7 @@ ui_print_main_forward_summary() {
         rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(format_ratio "$ratio")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(ui_main_forward_rows "$data")
     rows="${rows%$'\n'}"
-    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注' "4,9,2,7,3" "暂无转发，先按上面的流程添加转发。"
+    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注' "4,9,2,7,3" "$(ui_empty_forwards_text)"
 }
 
 ui_print_main_forwards() {
@@ -2291,17 +2260,17 @@ ui_print_main_forwards() {
 ui_print_forward_list() {
     config_init >/dev/null
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        echo "暂无转发"
+        ui_empty_forwards_text
         return
     fi
-    ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注' "4,12,2,7,8,10,3" "暂无转发"
+    ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注' "4,12,2,7,8,10,3" "$(ui_empty_forwards_text)"
 }
 
 ui_print_user_list() {
     local allow_zero="${1:-false}"
     config_init >/dev/null
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        echo "暂无用户"
+        ui_empty_users_text
         return
     fi
     ui_table_render $'序号\t用户名' "$(ui_user_list_rows "$allow_zero")" "2"
@@ -2312,7 +2281,7 @@ ui_select_user() {
     UI_EDIT_ABORTED=0
     config_init >/dev/null
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无用户，请先添加用户"
+        ui_warn "$(ui_empty_users_text)"
         return 1
     fi
     ui_render_page ui_render_user_select_page "$allow_zero"
@@ -2340,7 +2309,7 @@ ui_select_user_for_telegram_config() {
     local rows=$'0\t返回\n1\t所有用户'
     local index=2 user_id
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无用户，请先添加用户"
+        ui_warn "$(ui_empty_users_text)"
         return 1
     fi
     while IFS= read -r user_id; do
@@ -2370,7 +2339,7 @@ ui_select_users_for_telegram_config_multi() {
     config_init >/dev/null
     UI_EDIT_ABORTED=0
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无用户，请先添加用户"
+        ui_warn "$(ui_empty_users_text)"
         return 1
     fi
     local rows=$'0\t返回\n1\t所有用户'
@@ -2586,7 +2555,7 @@ ui_select_users_multi() {
     UI_EDIT_ABORTED=0
     config_init >/dev/null
     if ! jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无用户，请先添加用户"
+        ui_warn "$(ui_empty_users_text)"
         return 1
     fi
     local count raw indexes user_ids
@@ -2607,7 +2576,7 @@ ui_select_forwards_multi() {
     UI_EDIT_ABORTED=0
     config_init >/dev/null
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无转发，请先添加转发"
+        ui_warn "$(ui_empty_forwards_text)"
         return 1
     fi
     local count raw indexes forward_ids
@@ -2878,7 +2847,7 @@ ui_print_telegram_configured_users() {
     config_init >/dev/null
     ui_print_line "已配置用户" "$UI_C_HEADER"
     if ! jq -e '[.users[]? | select((.telegram.bot_token // "") != "" and (.telegram.chat_id // "") != "")] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_print_line "暂无已配置用户"
+        ui_print_line "暂无已配置用户，请先配置 Telegram。"
         return
     fi
     ui_table_render $'用户\t状态\t定时发送' "$(ui_telegram_configured_user_rows)" "1,3"
@@ -2896,10 +2865,10 @@ ui_select_forward_table() {
     local allow_zero="${1:-false}"
     config_init >/dev/null
     if ! jq -e '.forwards | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
-        ui_warn "暂无转发，请先添加转发"
+        ui_warn "$(ui_empty_forwards_text)"
         return 1
     fi
-    ui_render_forward_groups "$(ui_forward_select_rows "$allow_zero")" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "暂无转发，请先添加转发"
+    ui_render_forward_groups "$(ui_forward_select_rows "$allow_zero")" $'序号\t用户\t监听\t目标\t协议\t状态\t到期' "4,2,7,3" "$(ui_empty_forwards_text)"
 }
 
 ui_render_forward_select_page() {

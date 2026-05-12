@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.1.2"
+PFWD_VERSION="0.1.3"
 
 pfwd_detect_script_source() {
     local candidate=""

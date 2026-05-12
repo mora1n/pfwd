@@ -30,12 +30,19 @@ notify_send_telegram() {
     [ -n "$chat_id" ] || pfwd_die "该用户的 Telegram chat id 为空：$user_id"
 
     pfwd_require_cmd curl
-    local response
-    response="$(curl -fsS --connect-timeout 5 --max-time 15 \
+    local response curl_status curl_stderr_file curl_stderr
+    curl_stderr_file="$(mktemp "${TMPDIR:-/tmp}/pfwd-telegram-curl.XXXXXX")"
+    if ! response="$(curl -fsS --connect-timeout 5 --max-time 15 \
         -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         --data-urlencode "text=${message}" \
-        --data-urlencode "parse_mode=HTML")" || pfwd_die "Telegram 请求失败"
+        --data-urlencode "parse_mode=HTML" 2>"$curl_stderr_file")"; then
+        curl_status=$?
+        curl_stderr="$(tr '\n' ' ' < "$curl_stderr_file" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+        rm -f "$curl_stderr_file"
+        pfwd_die "Telegram 请求失败：curl exit=$curl_status${curl_stderr:+，$curl_stderr}"
+    fi
+    rm -f "$curl_stderr_file"
     echo "$response" | jq -e '.ok == true' >/dev/null || pfwd_die "Telegram API 返回失败：$response"
 }
 

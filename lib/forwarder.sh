@@ -65,6 +65,7 @@ forwarder_protocol_rows() {
 }
 
 FORWARDER_TSV_FIELDS=()
+FORWARDER_LAST_RESOLVE_ERROR=""
 
 forwarder_split_tsv_line() {
     local line="$1"
@@ -86,6 +87,9 @@ forwarder_resolve_targets() {
     local target="$1"
     local ip_ver="${2:-46}"
     local target_kind resolved_lines resolved_v4="" resolved_v6=""
+    local getent_status=0 getent_output=""
+
+    FORWARDER_LAST_RESOLVE_ERROR=""
 
     target_kind="$(forwarder_target_kind "$target")"
     case "$target_kind" in
@@ -107,7 +111,14 @@ forwarder_resolve_targets() {
                     return 0
                     ;;
             esac
-            resolved_lines="$(getent ahosts "$target" 2>/dev/null || true)"
+            getent_output="$(getent ahosts "$target" 2>&1)" || getent_status=$?
+            if [ "$getent_status" -ne 0 ]; then
+                FORWARDER_LAST_RESOLVE_ERROR="$(printf 'getent ahosts exit=%s: %s' "$getent_status" "$(printf '%s' "$getent_output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')")"
+                pfwd_debug "forwarder_resolve_targets target=$target error=$FORWARDER_LAST_RESOLVE_ERROR"
+                resolved_lines=""
+            else
+                resolved_lines="$getent_output"
+            fi
             resolved_v4="$(awk '/STREAM/ && $1 ~ /^[0-9]+\./ { print $1; exit }' <<< "$resolved_lines")"
             resolved_v6="$(awk '/STREAM/ && $1 ~ /:/ { print $1; exit }' <<< "$resolved_lines")"
             if [ -n "$resolved_v4" ] && [ "$ip_ver" != "6" ]; then
@@ -115,6 +126,9 @@ forwarder_resolve_targets() {
             fi
             if [ -n "$resolved_v6" ] && [ "$ip_ver" != "4" ]; then
                 printf 'ip6|6|%s\n' "$resolved_v6"
+            fi
+            if [ -z "$resolved_v4" ] && [ -z "$resolved_v6" ] && [ -z "$FORWARDER_LAST_RESOLVE_ERROR" ]; then
+                FORWARDER_LAST_RESOLVE_ERROR="getent ahosts 未返回可用地址"
             fi
             ;;
         *)
@@ -175,7 +189,7 @@ forwarder_runtime_json() {
             target_rows="$(forwarder_resolve_targets "$remote_host" "$ipver" || true)"
             if [ -z "$target_rows" ]; then
                 if [ "$strict" = "true" ] && [ "$(forwarder_target_kind "$remote_host")" = "domain" ]; then
-                    pfwd_die "无法解析目标地址：$remote_host (IPv$ipver)"
+                    pfwd_die "无法解析目标地址：$remote_host (IPv$ipver)${FORWARDER_LAST_RESOLVE_ERROR:+：$FORWARDER_LAST_RESOLVE_ERROR}"
                 fi
                 continue
             fi
