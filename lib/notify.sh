@@ -70,7 +70,7 @@ notify_status_message() {
     local tg stats user_json server_name reset_day total_limit user_name user_rate
     tg="$(notify_user_config "$user_id")"
     [ -n "$tg" ] && [ "$tg" != "null" ] || pfwd_die "未找到该用户的 Telegram 配置：$user_id"
-    stats="$(stats_usage_json)"
+    stats="$(stats_json "$user_id" "")"
     user_json="$(notify_user_summary_json "$user_id")"
     [ -n "$user_json" ] && [ "$user_json" != "null" ] || pfwd_die "未找到该用户统计信息：$user_id"
 
