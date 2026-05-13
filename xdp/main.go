@@ -94,6 +94,11 @@ type snapshotOptions struct {
 	RuleCounterPin string
 }
 
+type statsOptions struct {
+	StatusFile string
+	StatsPin   string
+}
+
 type runtimeFile struct {
 	Rules      []runtimeRule     `json:"rules"`
 	Users      []runtimeUser     `json:"users"`
@@ -259,6 +264,8 @@ func run(args []string) error {
 		return runStatus(args[1:])
 	case "snapshot":
 		return runSnapshot(args[1:])
+	case "stats":
+		return runStats(args[1:])
 	case "version", "--version":
 		fmt.Println(binaryVersion)
 		return nil
@@ -356,6 +363,21 @@ func runSnapshot(args []string) error {
 		return fmt.Errorf("snapshot 不接受额外参数")
 	}
 	return snapshotCounters(opts)
+}
+
+func runStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var opts statsOptions
+	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
+	fs.StringVar(&opts.StatsPin, "stats-pin", "", "bpffs stats map pin")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("stats 不接受额外参数")
+	}
+	return dumpStats(opts)
 }
 
 func applyRuntime(opts applyOptions) error {
@@ -477,8 +499,14 @@ func loadObjects() (*bpfObjects, error) {
 		return nil, fmt.Errorf("加载 eBPF spec 失败: %w", err)
 	}
 	var objs bpfObjects
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return nil, fmt.Errorf("加载 eBPF 对象失败: %w", err)
+	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch},
+	}); err != nil {
+		var verifierErr *ebpf.VerifierError
+		if errors.As(err, &verifierErr) {
+			return nil, fmt.Errorf("加载 eBPF 对象失败: %+v", verifierErr)
+		}
+		return nil, fmt.Errorf("加载 eBPF 对象失败: %+v", err)
 	}
 	return &objs, nil
 }
@@ -818,6 +846,51 @@ func snapshotCounters(opts snapshotOptions) error {
 	return enc.Encode(rows)
 }
 
+func dumpStats(opts statsOptions) error {
+	if opts.StatusFile != "" {
+		payload, err := readStatus(opts.StatusFile)
+		if err == nil && opts.StatsPin == "" {
+			opts.StatsPin = payload.StatsPin
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("读取 status 失败: %w", err)
+		}
+	}
+	if opts.StatsPin == "" {
+		opts.StatsPin = "/sys/fs/bpf/pfwd_stats"
+	}
+	statsMap, err := ebpf.LoadPinnedMap(opts.StatsPin, nil)
+	if err != nil {
+		return fmt.Errorf("读取 XDP stats map 失败 (%s): %w", opts.StatsPin, err)
+	}
+	defer statsMap.Close()
+
+	var payload struct {
+		Passed           uint64 `json:"passed"`
+		Dropped          uint64 `json:"dropped"`
+		Forwarded        uint64 `json:"forwarded"`
+		QuotaDropped     uint64 `json:"quota_dropped"`
+		WhitelistDropped uint64 `json:"whitelist_dropped"`
+		ProtocolDropped  uint64 `json:"protocol_dropped"`
+		ParseSkipped     uint64 `json:"parse_skipped"`
+	}
+	values := []*uint64{
+		&payload.Passed,
+		&payload.Dropped,
+		&payload.Forwarded,
+		&payload.QuotaDropped,
+		&payload.WhitelistDropped,
+		&payload.ProtocolDropped,
+		&payload.ParseSkipped,
+	}
+	for i, dst := range values {
+		key := uint32(i)
+		_ = statsMap.Lookup(&key, dst)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
+
 func loadWhitelistFiles(mapV4 *ebpf.Map, mapV6 *ebpf.Map, files []string) error {
 	for _, filePath := range files {
 		filePath = strings.TrimSpace(filePath)
@@ -845,7 +918,7 @@ func loadWhitelistFiles(mapV4 *ebpf.Map, mapV6 *ebpf.Map, files []string) error 
 			value := uint8(1)
 			if prefix.Addr().Is4() {
 				addr := prefix.Addr().As4()
-				key := whitelistKeyV4{PrefixLen: uint32(prefix.Bits()), Addr: binary.BigEndian.Uint32(addr[:])}
+				key := whitelistKeyV4{PrefixLen: uint32(prefix.Bits()), Addr: ipv4LPMTrieAddr(addr)}
 				if err := mapV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
 					_ = file.Close()
 					return fmt.Errorf("写入 IPv4 白名单失败: %w", err)
@@ -888,6 +961,12 @@ func addrTo16(addr netip.Addr) [16]byte {
 		return out
 	}
 	return addr.As16()
+}
+
+func ipv4LPMTrieAddr(addr [4]byte) uint32 {
+	// The XDP side looks up ip4->saddr directly, so the key bytes after prefixlen
+	// must stay in network order when marshaled as a uint32 on little-endian hosts.
+	return binary.LittleEndian.Uint32(addr[:])
 }
 
 func htons(value uint16) uint16 {
@@ -1022,4 +1101,5 @@ func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH --ingress-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")
 }

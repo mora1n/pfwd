@@ -554,33 +554,40 @@ static __always_inline int inspect_payload(struct __sk_buff *skb, __u32 offset, 
 }
 
 static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_end, __u16 value) {
-    __u8 *ptr = (__u8 *)(tcp + 1);
-    __u8 *end = (__u8 *)tcp + ((__u32)(tcp->doff_res >> 4) * 4);
+    __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+    __u32 opt_off = sizeof(*tcp);
     if (value == 0 || (tcp->flags & 0x02) == 0) {
         return;
     }
-    if ((void *)end > data_end) {
+    if (tcp_len < sizeof(*tcp)) {
         return;
     }
 #pragma unroll
     for (int i = 0; i < 6; i++) {
-        if (ptr + 4 > end) {
+        __u8 *opt = (__u8 *)tcp + opt_off;
+        if (opt_off + 1 > tcp_len || (void *)(opt + 1) > data_end) {
             return;
         }
-        __u8 kind = ptr[0];
+        __u8 kind = opt[0];
         if (kind == 0) {
             return;
         }
         if (kind == 1) {
-            ptr++;
+            opt_off += 1;
             continue;
         }
-        __u8 len = ptr[1];
-        if (len < 2 || ptr + len > end) {
+        if (opt_off + 2 > tcp_len || (void *)(opt + 2) > data_end) {
+            return;
+        }
+        __u8 len = opt[1];
+        if (len < 2 || opt_off + len > tcp_len) {
             return;
         }
         if (kind == 2 && len == 4) {
-            __be16 *mss = (__be16 *)(ptr + 2);
+            __be16 *mss = (__be16 *)(opt + 2);
+            if ((void *)(mss + 1) > data_end) {
+                return;
+            }
             __be16 old = *mss;
             __be16 new_value = bpf_htons(value);
             if (bpf_ntohs(old) > value) {
@@ -589,7 +596,7 @@ static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_en
             }
             return;
         }
-        ptr += len;
+        opt_off += len;
     }
 }
 
