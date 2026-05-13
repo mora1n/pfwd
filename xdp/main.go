@@ -884,11 +884,27 @@ func dumpStats(opts statsOptions) error {
 	}
 	for i, dst := range values {
 		key := uint32(i)
-		_ = statsMap.Lookup(&key, dst)
+		total, err := lookupPerCPUUint64(statsMap, key)
+		if err != nil {
+			return fmt.Errorf("读取 XDP stats 失败 (key=%d): %w", key, err)
+		}
+		*dst = total
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(payload)
+}
+
+func lookupPerCPUUint64(m *ebpf.Map, key uint32) (uint64, error) {
+	var values []uint64
+	if err := m.Lookup(&key, &values); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, value := range values {
+		total += value
+	}
+	return total, nil
 }
 
 func loadWhitelistFiles(mapV4 *ebpf.Map, mapV6 *ebpf.Map, files []string) error {

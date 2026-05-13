@@ -180,7 +180,7 @@ struct {
 } pfwd_user_counters SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, PFWD_STAT_MAX);
     __type(key, __u32);
     __type(value, __u64);
@@ -219,7 +219,7 @@ struct {
 static __always_inline void stat_inc(__u32 index) {
     __u64 *value = bpf_map_lookup_elem(&pfwd_stats, &index);
     if (value) {
-        __sync_fetch_and_add(value, 1);
+        *value += 1;
     }
 }
 
@@ -681,7 +681,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 count_drop(rule, packet_len);
                 return XDP_DROP;
             }
-            if (traffic_over_limit(rule, packet_len, 0)) {
+            if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -716,22 +716,24 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_DROP;
                 }
             }
-            scratch->conn.rule_id = rule->rule_id;
-            scratch->conn.user_id = rule->user_id;
-            copy_ipv4_to16(scratch->conn.client_addr, old_saddr);
-            copy_ipv4_to16(scratch->conn.listen_addr, old_daddr);
-            copy_ipv4_to16(scratch->conn.source_addr, new_saddr);
-            scratch->conn.client_port = old_sport;
-            scratch->conn.source_port = new_sport;
-            scratch->conn.listen_port = old_dport;
-            scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
-            scratch->conn.traffic_mode = rule->traffic_mode;
-            scratch->conn.packets = 1;
-            scratch->conn.bytes = packet_len;
-            bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
-            scratch->reverse_key.source_port = new_sport;
-            copy_ipv4_to16(scratch->reverse_key.source_addr, new_saddr);
-            bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+            if (!existing_conn) {
+                scratch->conn.rule_id = rule->rule_id;
+                scratch->conn.user_id = rule->user_id;
+                copy_ipv4_to16(scratch->conn.client_addr, old_saddr);
+                copy_ipv4_to16(scratch->conn.listen_addr, old_daddr);
+                copy_ipv4_to16(scratch->conn.source_addr, new_saddr);
+                scratch->conn.client_port = old_sport;
+                scratch->conn.source_port = new_sport;
+                scratch->conn.listen_port = old_dport;
+                scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
+                scratch->conn.traffic_mode = rule->traffic_mode;
+                scratch->conn.packets = 1;
+                scratch->conn.bytes = packet_len;
+                bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
+                scratch->reverse_key.source_port = new_sport;
+                copy_ipv4_to16(scratch->reverse_key.source_addr, new_saddr);
+                bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+            }
             ip4->saddr = new_saddr;
             ip4->daddr = new_daddr;
             ip4->check = csum_replace32(ip4->check, old_saddr, new_saddr);
@@ -870,7 +872,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 count_drop(rule, packet_len);
                 return XDP_DROP;
             }
-            if (traffic_over_limit(rule, packet_len, 0)) {
+            if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -912,20 +914,22 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_DROP;
                 }
             }
-            scratch->conn.rule_id = rule->rule_id;
-            scratch->conn.user_id = rule->user_id;
-            pfwd_memcpy16(scratch->conn.client_addr, scratch->addr_a);
-            pfwd_memcpy16(scratch->conn.listen_addr, scratch->addr_b);
-            pfwd_memcpy16(scratch->conn.source_addr, scratch->addr_c);
-            scratch->conn.client_port = sport;
-            scratch->conn.source_port = new_sport;
-            scratch->conn.listen_port = dport;
-            scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
-            scratch->conn.traffic_mode = rule->traffic_mode;
-            bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
-            scratch->reverse_key.source_port = new_sport;
-            pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
-            bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+            if (!existing_conn) {
+                scratch->conn.rule_id = rule->rule_id;
+                scratch->conn.user_id = rule->user_id;
+                pfwd_memcpy16(scratch->conn.client_addr, scratch->addr_a);
+                pfwd_memcpy16(scratch->conn.listen_addr, scratch->addr_b);
+                pfwd_memcpy16(scratch->conn.source_addr, scratch->addr_c);
+                scratch->conn.client_port = sport;
+                scratch->conn.source_port = new_sport;
+                scratch->conn.listen_port = dport;
+                scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
+                scratch->conn.traffic_mode = rule->traffic_mode;
+                bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
+                scratch->reverse_key.source_port = new_sport;
+                pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
+                bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+            }
             pfwd_memcpy16(ip6->saddr, scratch->addr_c);
             pfwd_memcpy16(ip6->daddr, rule->target_addr);
             if (protocol == IPPROTO_TCP) {
