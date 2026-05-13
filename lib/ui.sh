@@ -103,6 +103,21 @@ ui_empty_forwards_text() {
     printf '暂无转发，请先添加转发'
 }
 
+ui_has_users() {
+    config_init >/dev/null
+    jq -e '.users | length > 0' "$PFWD_CONFIG_FILE" >/dev/null
+}
+
+ui_require_users() {
+    if ui_has_users; then
+        return 0
+    fi
+    UI_STATUS=1
+    UI_EDIT_ABORTED=1
+    ui_warn "请先添加用户"
+    return 1
+}
+
 ui_clear_screen() {
     [ -t 1 ] || return 0
     UI_TERM_WIDTH_CACHE=""
@@ -1704,7 +1719,6 @@ ui_read_traffic_ratio_edit() {
 ui_missing_dependencies() {
     local missing=()
     command -v jq >/dev/null 2>&1 || missing+=(jq)
-    command -v nft >/dev/null 2>&1 || missing+=(nft)
     command -v tc >/dev/null 2>&1 || missing+=(tc)
     command -v systemctl >/dev/null 2>&1 || missing+=(systemctl)
     printf '%s\n' "${missing[@]}"
@@ -1731,30 +1745,30 @@ ui_install_system_dependencies() {
     case "$pm" in
         apt-get)
             pfwd_run apt-get update
-            pfwd_run apt-get install -y jq nftables iproute2 systemd curl tar
+            pfwd_run apt-get install -y jq iproute2 systemd curl tar
             ;;
         dnf)
-            pfwd_run dnf install -y jq nftables iproute systemd curl tar
+            pfwd_run dnf install -y jq iproute systemd curl tar
             ;;
         yum)
-            pfwd_run yum install -y jq nftables iproute systemd curl tar
+            pfwd_run yum install -y jq iproute systemd curl tar
             ;;
         pacman)
-            pfwd_run pacman -Sy --noconfirm jq nftables iproute2 systemd curl tar
+            pfwd_run pacman -Sy --noconfirm jq iproute2 systemd curl tar
             ;;
         apk)
-            pfwd_run apk add jq nftables iproute2 curl tar
+            pfwd_run apk add jq iproute2 curl tar
             ui_warn "Alpine 默认不提供 systemd/systemctl，pfwd 的服务管理需要 systemd。"
             ;;
         *)
-            ui_warn "未识别包管理器，请手动安装 jq、nftables、iproute2、systemd、curl、tar。"
+            ui_warn "未识别包管理器，请手动安装 jq、iproute2、systemd、curl、tar。"
             return 1
             ;;
     esac
 }
 
 ui_install_forwarder() {
-    ui_info "pfwd 已内置 nft 后端 helper；无需额外安装转发内核。"
+    ui_info "pfwd 已内置 XDP 数据面 helper；无需额外安装转发内核。"
 }
 
 ui_install_missing_dependencies() {
@@ -1877,12 +1891,6 @@ ui_main_usage_json() {
 }
 
 ui_forward_usage_json() {
-    if ! command -v nft >/dev/null 2>&1; then
-        jq -n --slurpfile cfg "$PFWD_CONFIG_FILE" '
-          {forwards: ($cfg[0].forwards | map(. + {total_bytes: "-"}))}
-        '
-        return
-    fi
     ui_main_usage_json
 }
 
@@ -1980,17 +1988,17 @@ ui_forward_list_rows() {
           (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
           ((.value.traffic_ratio // 1) | tostring),
           (
-            if (.value.nft.mss_mode // "") == "set" then
-              ((.value.nft.mss_value // "-") | tostring)
-            elif (.value.nft.mss_mode // "") == "clamp" then
+            if (.value.xdp.mss_mode // "") == "set" then
+              ((.value.xdp.mss_value // "-") | tostring)
+            elif (.value.xdp.mss_mode // "") == "clamp" then
               "clamp"
             else
               "-"
             end
           ),
           (
-            if (.value.nft.snat_mode // "masquerade") == "snat" and (.value.nft.snat_source // "") != "" then
-              .value.nft.snat_source
+            if (.value.xdp.snat_mode // "masquerade") == "snat" and (.value.xdp.snat_source // "") != "" then
+              .value.xdp.snat_source
             else
               "masquerade"
             end
@@ -3101,11 +3109,13 @@ ui_menu_forwards() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
+                ui_require_users || { ui_pause; continue; }
                 ui_menu_add_forward
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
+                ui_require_users || { ui_pause; continue; }
                 ui_select_forward true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_ratio="" current_comment=""
@@ -3121,10 +3131,10 @@ ui_menu_forwards() {
                 current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
                 current_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
                 current_comment="$(jq -r '.comment // ""' <<< "$current")"
-                current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$current")"
-                current_mss_value="$(jq -r '.nft.mss_value // ""' <<< "$current")"
-                current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
-                current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$current")"
+                current_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$current")"
+                current_mss_value="$(jq -r '.xdp.mss_value // ""' <<< "$current")"
+                current_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$current")"
+                current_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$current")"
 
                 ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
                 ui_form_add_kv "转发 ID" "$forward_id"
@@ -3256,6 +3266,7 @@ ui_menu_forwards() {
                 ui_maybe_pause success
                 ;;
             3)
+                ui_require_users || { ui_pause; continue; }
                 ui_select_forwards_multi || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local stop_ids="$UI_REPLY" ok=0 fail=0
@@ -3272,6 +3283,7 @@ ui_menu_forwards() {
                 ui_notice_set "批量暂停完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ;;
             4)
+                ui_require_users || { ui_pause; continue; }
                 ui_select_forwards_multi || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local start_ids="$UI_REPLY" ok=0 fail=0
@@ -3288,6 +3300,7 @@ ui_menu_forwards() {
                 ui_notice_set "批量恢复完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
                 ;;
             5)
+                ui_require_users || { ui_pause; continue; }
                 ui_select_forwards_multi || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local delete_ids="$UI_REPLY" summary=""
@@ -3330,6 +3343,12 @@ ui_menu_expire_limit() {
     while true; do
         ui_render_page ui_render_traffic_select_user_page
         ui_read "选择用户序号" || return 0
+        if ! ui_has_users; then
+            case "$UI_REPLY" in
+                0) return 0 ;;
+                *) ui_require_users; ui_pause; continue ;;
+            esac
+        fi
         case "$UI_REPLY" in
             0) return 0 ;;
             '')
@@ -3856,7 +3875,7 @@ ui_menu_guard() {
                 ui_maybe_pause success
                 ;;
             3)
-                ui_form_set "XDP 模式" "off 为关闭 XDP；auto 自动探测并在不支持时回退；force 要求 XDP 成功。"
+                ui_form_set "XDP 模式" "off 为关闭 XDP；auto 自动尝试 driver/generic 挂载，失败会报错；force 只允许 driver 挂载成功。"
                 ui_form_select_read "XDP 模式" "2" "0) 返回" "1) off" "2) auto" "3) force" || { ui_form_reset; continue; }
                 case "$UI_REPLY" in
                     0) ui_form_reset; continue ;;
@@ -4109,6 +4128,10 @@ ui_render_traffic_select_user_page() {
     ui_header "流量管理"
     ui_notice_render
     ui_print_user_list true
+    if ! ui_has_users; then
+        echo
+        ui_menu_item 0 "返回"
+    fi
 }
 
 ui_render_telegram_menu_page() {
@@ -4138,14 +4161,14 @@ ui_render_export_import_menu_page() {
 ui_menu_uninstall() {
     ui_clear_screen
     ui_header "卸载"
-    echo "步骤 1：停用 pfwd boot restore，只停止并禁用 pfwd-forward.service。"
-    if ui_confirm_text "yes" "输入 yes 确认停用 pfwd-forward.service，留空跳过"; then
+    echo "步骤 1：停用 pfwd XDP boot restore，只停止并禁用 pfwd-xdp.service。"
+    if ui_confirm_text "yes" "输入 yes 确认停用 pfwd-xdp.service，留空跳过"; then
         ui_run service_disable_forwarder
     else
-        ui_warn "已跳过停用 pfwd-forward.service"
+        ui_warn "已跳过停用 pfwd-xdp.service"
     fi
     echo
-    echo "步骤 2：完整卸载 pfwd 脚本、systemd、nftables、配置和状态。"
+    echo "步骤 2：完整卸载 pfwd 脚本、systemd、XDP 状态、配置和状态。"
     if ui_confirm_text "uninstall" "输入 uninstall 确认完整卸载"; then
         ui_run cmd_uninstall
     else

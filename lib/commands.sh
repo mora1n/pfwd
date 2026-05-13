@@ -22,9 +22,7 @@ cmd_apply_forwarding_bundle() {
     forwarder_validate_config
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
-    fw_apply_nft
     fw_apply_tc
-    guard_apply_runtime true
 }
 
 cmd_apply_forwarder_runtime() {
@@ -37,20 +35,20 @@ cmd_apply_forwarder_runtime() {
 cmd_apply_firewall_runtime() {
     config_init >/dev/null
     cmd_runtime_ready || return 0
-    fw_apply_nft
+    forwarder_apply_runtime
 }
 
 cmd_apply_firewall_tc_runtime() {
     config_init >/dev/null
     cmd_runtime_ready || return 0
-    fw_apply_nft
+    forwarder_apply_runtime
     fw_apply_tc
 }
 
 cmd_apply_guard_runtime() {
     config_init >/dev/null
     cmd_runtime_ready || return 0
-    guard_apply_runtime true
+    forwarder_apply_runtime
 }
 
 cmd_refresh_after_change() {
@@ -436,8 +434,8 @@ cmd_list() {
             end;
           .forwards[]?
           | select(.user_id == $id)
-          | (.nft.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.nft.mss_mode // "-"),(if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | (.xdp.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.xdp.mss_mode // "-"),(if $snat_source == "" then (.xdp.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     else
@@ -447,8 +445,8 @@ cmd_list() {
             else $host + ":" + ($port | tostring)
             end;
           .forwards[]?
-          | (.nft.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.nft.mss_mode // "-"),(if $snat_source == "" then (.nft.snat_mode // "masquerade") else $snat_source end)]
+          | (.xdp.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.xdp.mss_mode // "-"),(if $snat_source == "" then (.xdp.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     fi
@@ -614,10 +612,10 @@ cmd_forward_update() {
     current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$before")"
     current_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$before")"
     current_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$before")"
-    current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$before")"
-    current_mss_value="$(jq -r 'if (.nft.mss_value // null) == null then "" else (.nft.mss_value | tostring) end' <<< "$before")"
-    current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$before")"
-    current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$before")"
+    current_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$before")"
+    current_mss_value="$(jq -r 'if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end' <<< "$before")"
+    current_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$before")"
+    current_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$before")"
     if [ "$traffic_mode" != "__KEEP__" ] || [ "$traffic_ratio" != "__KEEP__" ]; then
         cmd_rollup_before_traffic_semantics_change
     fi
@@ -632,10 +630,10 @@ cmd_forward_update() {
     updated_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$after")"
     updated_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$after")"
     updated_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$after")"
-    updated_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$after")"
-    updated_mss_value="$(jq -r 'if (.nft.mss_value // null) == null then "" else (.nft.mss_value | tostring) end' <<< "$after")"
-    updated_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$after")"
-    updated_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$after")"
+    updated_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$after")"
+    updated_mss_value="$(jq -r 'if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end' <<< "$after")"
+    updated_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$after")"
+    updated_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$after")"
     if [ "$current_comment" != "$updated_comment" ]; then
         changed_comment="true"
     fi
@@ -839,33 +837,30 @@ cmd_doctor_runner() {
 cmd_doctor_benchmarks() {
     cmd_doctor_benchmark "benchmark.stats_current_snapshot" "$(cmd_doctor_runner 'stats_current_snapshot >/dev/null')"
     cmd_doctor_benchmark "benchmark.stats_rollup_current" "$(cmd_doctor_runner 'stats_rollup_current >/dev/null')"
-    cmd_doctor_benchmark "benchmark.fw_read_counters" "$(cmd_doctor_runner 'fw_read_counters >/dev/null')"
-    cmd_doctor_benchmark "benchmark.forwarder_runtime_json" "$(cmd_doctor_runner 'forwarder_runtime_json true >/dev/null')"
+    cmd_doctor_benchmark "benchmark.xdp_read_counters" "$(cmd_doctor_runner 'fw_read_counters >/dev/null')"
+    cmd_doctor_benchmark "benchmark.xdp_runtime_json" "$(cmd_doctor_runner 'forwarder_runtime_json true >/dev/null')"
     cmd_doctor_benchmark "benchmark.ui_main_usage_json" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_main_usage_json >/dev/null')"
     cmd_doctor_benchmark "benchmark.main_page" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_render_main_menu_page >/dev/null')"
     cmd_doctor_benchmark "benchmark.forward_list" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_print_forward_list >/dev/null')"
 }
 
 cmd_render() {
-    local target="${1:-forwarder}"
+    local target="${1:-xdp}"
     case "$target" in
-        forwarder) forwarder_render_config ;;
-        nft) fw_render_nft ;;
+        xdp|forwarder) forwarder_render_config ;;
         tc) fw_render_tc ;;
         guard) guard_render_status ;;
         units)
-            echo "# pfwd-forward.service"
-            forwarder_service_unit
             echo "# pfwd.service"
             service_manager_unit
             echo "# pfwd.timer"
             service_timer_unit
             echo "# pfwd-bbr.service"
             bbr_service_unit
-            echo "# pfwd-guard.service"
+            echo "# pfwd-xdp.service"
             guard_service_unit
             ;;
-        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|guard|units]" ;;
+        *) pfwd_die "用法：pfwd render [xdp|tc|guard|units]" ;;
     esac
 }
 
@@ -920,17 +915,16 @@ cmd_doctor() {
     config_init >/dev/null
     echo "配置文件：$PFWD_CONFIG_FILE"
     jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
-    echo "转发表：inet $(forwarder_table)"
+    echo "数据面：XDP"
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
-    if command -v nft >/dev/null 2>&1; then echo "nft：$(command -v nft)"; else echo "nft：缺失"; fi
+    if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
     if command -v systemctl >/dev/null 2>&1; then echo "systemctl：正常"; else echo "systemctl：缺失"; fi
     if guard_binary_exists; then echo "guard：$(guard_bin_path)"; else echo "guard：缺失"; fi
     echo "运行态安装：$(service_runtime_status_label)"
-    if service_unit_exists pfwd-forward.service; then echo "pfwd-forward.service：已安装"; else echo "pfwd-forward.service：未安装"; fi
     if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
     if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
-    if service_unit_exists pfwd-guard.service; then echo "pfwd-guard.service：已安装"; else echo "pfwd-guard.service：未安装"; fi
+    if service_unit_exists pfwd-xdp.service; then echo "pfwd-xdp.service：已安装"; else echo "pfwd-xdp.service：未安装"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
     guard_render_status | while IFS=$'\t' read -r key value; do
@@ -946,9 +940,6 @@ cmd_install() {
     config_init
     service_install_files
     service_enable
-    if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl enable pfwd-guard.service
-    fi
     cmd_apply_runtime
     echo "已安装：$PFWD_BIN_PATH"
     echo "BBR 管理入口：$PFWD_BBR_ALIAS_BIN_PATH"
@@ -986,7 +977,7 @@ cmd_guard() {
                     *) pfwd_die "未知选项：$1" ;;
                 esac
             done
-            guard_apply_runtime "$quiet"
+            cmd_apply_guard_runtime
             ;;
         remove)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard remove"

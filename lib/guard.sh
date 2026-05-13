@@ -49,11 +49,11 @@ guard_config_file() {
 }
 
 guard_bin_path() {
-    printf '%s\n' "${PFWD_GUARD_BIN_PATH:-$RFWD_GUARD_BIN_PATH}"
+    printf '%s\n' "$PFWD_XDP_BIN_PATH"
 }
 
 guard_status_file() {
-    printf '%s\n' "${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}"
+    printf '%s\n' "${PFWD_XDP_STATUS_FILE:-${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}}"
 }
 
 guard_xdp_pin_path() {
@@ -74,14 +74,14 @@ guard_asset_name() {
     case "$arch" in
         x86_64|amd64)
             if [ "$(guard_script_name)" = "pfwd" ]; then
-                echo "pfwd-guard-linux-amd64"
+                echo "pfwd-xdp-linux-amd64"
             else
                 echo "rfwd-guard-linux-amd64"
             fi
             ;;
         aarch64|arm64)
             if [ "$(guard_script_name)" = "pfwd" ]; then
-                echo "pfwd-guard-linux-arm64"
+                echo "pfwd-xdp-linux-arm64"
             else
                 echo "rfwd-guard-linux-arm64"
             fi
@@ -118,7 +118,7 @@ guard_enabled() {
 }
 
 guard_xdp_mode() {
-    jq -r '.settings.guard.xdp_mode // "auto"' "$(guard_config_file)"
+    jq -r '.settings.xdp.mode // .settings.guard.xdp_mode // "auto"' "$(guard_config_file)"
 }
 
 guard_block_http() {
@@ -152,7 +152,7 @@ guard_protocol_skip_ports_display() {
 }
 
 guard_read_settings() {
-    jq -r '{enabled: (.settings.guard.enabled // false), xdp_mode: (.settings.guard.xdp_mode // "auto"), block_http: (.settings.guard.block_http // false), block_tls: (.settings.guard.block_tls // false), block_socks: (.settings.guard.block_socks // false)}' "$(guard_config_file)"
+    jq -r '{enabled: (.settings.guard.enabled // false), xdp_mode: (.settings.xdp.mode // .settings.guard.xdp_mode // "auto"), block_http: (.settings.guard.block_http // false), block_tls: (.settings.guard.block_tls // false), block_socks: (.settings.guard.block_socks // false)}' "$(guard_config_file)"
 }
 
 guard_protocol_filters_enabled() {
@@ -228,7 +228,9 @@ guard_config_set_xdp_mode() {
     esac
     config_update --arg mode "$mode" '
       (.settings.guard //= {})
+      | (.settings.xdp //= {})
       | .settings.guard.xdp_mode = $mode
+      | .settings.xdp.mode = $mode
     '
 }
 
@@ -305,7 +307,7 @@ guard_apply_runtime() {
     local quiet="${1:-false}"
     config_init >/dev/null
     guard_mkdirs
-    guard_binary_exists || guard_die "缺少 guard 预编译二进制：$(guard_bin_path)"
+    guard_binary_exists || guard_die "缺少 XDP 预编译二进制：$(guard_bin_path)"
 
     if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
         whitelist_prepare_runtime
@@ -357,41 +359,30 @@ guard_apply_runtime() {
         fi
     fi
 
-    guard_run "$(guard_bin_path)" apply \
-      --iface "$iface" \
-      --xdp-mode "$(guard_xdp_mode)" \
-      --xdp-pin "$(guard_xdp_pin_path)" \
-      --ingress-pin "$(guard_ingress_pin_path)" \
-      --status-file "$(guard_status_file)" \
-      --config-hash "$config_hash" \
-      --xdp-whitelist "$whitelist_state" \
-      --whitelist-enabled "$whitelist_state" \
-      ${whitelist_files:+--whitelist-file "$whitelist_files"} \
-      --allow-any-ports "$allow_any_ports" \
-      --allow-ports "$ports_arg" \
-      --block-http "$(guard_block_http)" \
-      --block-tls "$(guard_block_tls)" \
-      --block-socks "$(guard_block_socks)"
+    if command -v forwarder_apply_runtime >/dev/null 2>&1; then
+        forwarder_apply_runtime
+    fi
 
     if [ "$quiet" != "true" ]; then
-        printf 'guard 已应用：iface=%s http=%s tls=%s socks=%s\n' \
+        printf 'guard 已应用到 XDP 数据面：iface=%s http=%s tls=%s socks=%s\n' \
           "$iface" "$(guard_block_http)" "$(guard_block_tls)" "$(guard_block_socks)"
     fi
 }
 
 guard_remove_runtime() {
     local quiet="${1:-false}"
-    local egress_pin=""
     if guard_binary_exists; then
         guard_run "$(guard_bin_path)" remove \
           --xdp-pin "$(guard_xdp_pin_path)" \
           --ingress-pin "$(guard_ingress_pin_path)" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
           --status-file "$(guard_status_file)"
     else
         rm -f "$(guard_status_file)" 2>/dev/null || true
     fi
-    egress_pin="${PFWD_GUARD_LINK_EGRESS_PATH:-${RFWD_GUARD_LINK_EGRESS_PATH:-}}"
-    rm -f "$(guard_xdp_pin_path)" "$(guard_ingress_pin_path)" ${egress_pin:+"$egress_pin"}
+    rm -f "$(guard_xdp_pin_path)" "$(guard_ingress_pin_path)"
     if [ "$quiet" != "true" ]; then
         echo "guard 已移除"
     fi
@@ -482,7 +473,7 @@ guard_render_status() {
         ["自定义 CIDR", (.wl_custom_count | tostring)],
         ["白名单条目", (.wl_entries | tostring)],
         ["XDP Pin", .xdp_pin],
-        ["guard 二进制", .guard_binary],
+        ["XDP 二进制", .guard_binary],
         ["状态文件", .status_file]
       ]
       | map(@tsv)

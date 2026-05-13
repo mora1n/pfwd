@@ -4,13 +4,14 @@ config_default_json() {
     cat <<EOF
 {
   "settings": {
-    "nft_family": "inet",
-    "nft_table": "pfwd",
-    "forward_table": "port_forward",
     "domain_refresh_interval": "60s",
     "tc_interface": "",
     "default_listen_ip": "::",
     "default_random_port_range": "20000-30000",
+    "xdp": {
+      "interface": "",
+      "mode": "auto"
+    },
     "guard": {
       "enabled": false,
       "tc_interface": "",
@@ -573,7 +574,7 @@ config_add_forward() {
         "traffic_mode": $traffic_mode,
         "traffic_ratio": ($traffic_ratio | tonumber),
         "comment": (if $comment == "" then null else $comment end),
-        "nft": {
+        "xdp": {
           "mss_mode": (if $mss_mode == "" then null else $mss_mode end),
           "mss_value": (if $mss_value == "" then null else ($mss_value | tonumber) end),
           "snat_mode": $snat_mode,
@@ -648,7 +649,7 @@ config_add_forward_batch() {
             "traffic_mode": $traffic_mode,
             "traffic_ratio": ($traffic_ratio | tonumber),
             "comment": (if $comment == "" then null else $comment end),
-            "nft": {
+            "xdp": {
               "mss_mode": (if $mss_mode == "" then null else $mss_mode end),
               "mss_value": (if $mss_value == "" then null else ($mss_value | tonumber) end),
               "snat_mode": $snat_mode,
@@ -915,10 +916,10 @@ config_update_forward() {
     local current_comment current_mss_mode current_mss_value current_snat_mode current_snat_source
     local new_comment new_mss_mode new_mss_value new_snat_mode new_snat_source
     current_comment="$(jq -r '.comment // ""' <<< "$current")"
-    current_mss_mode="$(jq -r '.nft.mss_mode // ""' <<< "$current")"
-    current_mss_value="$(jq -r '.nft.mss_value // ""' <<< "$current")"
-    current_snat_mode="$(jq -r '.nft.snat_mode // "masquerade"' <<< "$current")"
-    current_snat_source="$(jq -r '.nft.snat_source // ""' <<< "$current")"
+    current_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$current")"
+    current_mss_value="$(jq -r '.xdp.mss_value // ""' <<< "$current")"
+    current_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$current")"
+    current_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$current")"
 
     new_listen_ip="$(config_keep_or_apply "$listen_ip_raw" "$current_listen_ip")"
     if [ "$listen_ip_raw" != "__KEEP__" ]; then
@@ -1015,7 +1016,7 @@ config_update_forward() {
           | .traffic_mode = $traffic_mode
           | .traffic_ratio = ($traffic_ratio | tonumber)
           | .comment = (if $comment == "" then null else $comment end)
-          | .nft = {
+          | .xdp = {
               "mss_mode": (if $mss_mode == "" then null else $mss_mode end),
               "mss_value": (if $mss_value == "" then null else ($mss_value | tonumber) end),
               "snat_mode": $snat_mode,

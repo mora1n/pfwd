@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.1.3"
+PFWD_VERSION="0.1.4"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -30,12 +30,12 @@ PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
 PFWD_LIB_FILES=(core config validate whitelist forwarder firewall stats notify guard service commands ui)
 
-pfwd_bootstrap_guard_asset_name() {
+pfwd_bootstrap_xdp_asset_name() {
     local arch
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64) echo "pfwd-guard-linux-amd64" ;;
-        aarch64|arm64) echo "pfwd-guard-linux-arm64" ;;
+        x86_64|amd64) echo "pfwd-xdp-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-xdp-linux-arm64" ;;
         *) return 1 ;;
     esac
 }
@@ -79,24 +79,24 @@ pfwd_bootstrap_download() {
 }
 
 pfwd_bootstrap_install() {
-    local install_dir bin_path systemd_dir lib_dir guard_bin_dir guard_asset
+    local install_dir bin_path systemd_dir lib_dir xdp_bin_dir xdp_asset
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
-    guard_bin_dir="$install_dir/bin"
+    xdp_bin_dir="$install_dir/bin"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$guard_bin_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$xdp_bin_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
     chmod +x "$install_dir/bbr.sh"
-    guard_asset="$(pfwd_bootstrap_guard_asset_name)" || {
-        echo "错误：当前架构暂不支持 guard 预编译二进制：$(uname -m)" >&2
+    xdp_asset="$(pfwd_bootstrap_xdp_asset_name)" || {
+        echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
     }
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$guard_asset" "$guard_bin_dir/pfwd-guard"
-    chmod +x "$guard_bin_dir/pfwd-guard"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$xdp_bin_dir/pfwd-xdp"
+    chmod +x "$xdp_bin_dir/pfwd-xdp"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
 
@@ -193,7 +193,7 @@ pfwd_main() {
 
 pfwd_help() {
     cat <<'EOF'
-pfwd - nft 端口转发管理脚本
+pfwd - XDP 端口转发管理脚本
 
 用法：
   pfwd
@@ -223,7 +223,7 @@ pfwd - nft 端口转发管理脚本
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]
   pfwd import <file>
-  pfwd render [forwarder|nft|tc|units]
+  pfwd render [xdp|tc|guard|units]
   pfwd refresh
   pfwd reconcile
   pfwd notify-test --user-id ID
@@ -247,10 +247,10 @@ pfwd - nft 端口转发管理脚本
 
 无参数运行时默认进入交互菜单；使用 pfwd help 查看命令列表。
 端口支持单个端口、逗号列表和范围，例如 443、443,553、1000-1005。
-监听 IP 默认使用 :: 双栈监听；当前 nft 后端仅支持 :: / 0.0.0.0 这类通配监听地址。
+监听 IP 默认使用 :: 双栈监听；当前 XDP 后端仅支持 :: / 0.0.0.0 这类通配监听地址。
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
-  MSS 和固定 SNAT 通过 `.forwards[].nft` 字段持久化。
+  MSS 和固定 SNAT 通过 `.forwards[].xdp` 字段持久化。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
   流量防护（协议封锁 + 白名单）由 `guard` 子命令管理；白名单配置通过 `guard whitelist` 子命令管理。

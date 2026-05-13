@@ -1,4 +1,4 @@
-module github.com/mora1n/pfwd/guard
+module github.com/mora1n/pfwd/xdp
 
 go 1.26.0
 

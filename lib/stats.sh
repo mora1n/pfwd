@@ -73,67 +73,27 @@ EOF
 
 PFWD_STATS_SNAPSHOT_CACHE=""
 PFWD_STATS_SNAPSHOT_TIME=0
+PFWD_STATS_LAST_SNAPSHOT_ERROR=""
 
-stats_forward_snapshot_json() {
-    local nft_input="$1"
-    local cfg_file="${2:-$PFWD_CONFIG_FILE}"
-    local nft_json="${3:-}"
-    if [ -n "$nft_json" ]; then
-        jq --slurpfile cfg "$cfg_file" '
-          def counters_map:
-            [.nftables[]? | select(.counter) | {(.counter.name // (.counter | keys[0])): .counter.packets}] | add // {};
-          [.nftables[]? | select(.counter)]
-          | map({name: (.counter.name // "unknown"), bytes: (.counter.bytes // 0)})
-          | map({key: .name, value: .bytes})
-          | from_entries
-          | . as $counters
-          | [
-              $cfg[0].forwards[]? |
-              . as $f |
-              ($f.id | gsub("-"; "_")) as $safe |
-              {
-                id: $f.id,
-                user_id: $f.user_id,
-                traffic_mode: ($f.traffic_mode // "two-way"),
-                traffic_ratio: ($f.traffic_ratio // 1),
-                input_bytes: ($counters["fwd_" + $safe + "_in"] // 0),
-                output_bytes: ($counters["fwd_" + $safe + "_out"] // 0)
-              }
-            ]
-        ' <<< "$nft_json"
-    else
-        jq -n --arg text "$nft_input" --slurpfile cfg "$cfg_file" '
-          def counters_map:
-            reduce ($text | split("\n")[]) as $line (
-              {current: null, values: {}};
-              if ($line | test("^\\s*counter [^ ]+ \\{$")) then
-                .current = (($line | capture("^\\s*counter (?<name>[^ ]+) \\{$")).name)
-              elif .current != null and ($line | test("bytes [0-9]+")) then
-                .values[.current] = (($line | capture("bytes (?<b>[0-9]+)").b) | tonumber)
-              elif .current != null and ($line | test("^\\s*\\}$")) then
-                .current = null
-              else
-                .
-              end
-            ) | .values;
-          (counters_map) as $counters |
-          def counter_bytes($name):
-            ($counters[$name] // 0);
-          [
-            $cfg[0].forwards[]? |
-            . as $f |
-            ($f.id | gsub("-"; "_")) as $safe |
-            {
-              id: $f.id,
-              user_id: $f.user_id,
-              traffic_mode: ($f.traffic_mode // "two-way"),
-              traffic_ratio: ($f.traffic_ratio // 1),
-              input_bytes: counter_bytes("fwd_" + $safe + "_in"),
-              output_bytes: counter_bytes("fwd_" + $safe + "_out")
-            }
-          ]
-        '
-    fi
+stats_zero_snapshot_json() {
+    local cfg_file="${1:-$PFWD_CONFIG_FILE}"
+    jq -r '
+      [
+        .forwards[]? |
+        {
+          id: .id,
+          user_id: .user_id,
+          traffic_mode: (.traffic_mode // "two-way"),
+          traffic_ratio: (.traffic_ratio // 1),
+          input_bytes: 0,
+          output_bytes: 0,
+          input_packets: 0,
+          output_packets: 0,
+          dropped_bytes: 0,
+          dropped_packets: 0
+        }
+      ]
+    ' "$cfg_file"
 }
 
 stats_usage_from_snapshot() {
@@ -286,20 +246,33 @@ $jq_filter"
 
 stats_current_snapshot() {
     config_init >/dev/null
-    local family table nft_output nft_json cfg_file
+    stats_init >/dev/null
+    local cfg_file snapshot
     cfg_file="$PFWD_CONFIG_FILE"
     if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
         cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
-    family="$(jq -r '.settings.nft_family // "inet"' "$cfg_file")"
-    table="$(jq -r '.settings.nft_table // "pfwd"' "$cfg_file")"
-    nft_json="$(nft -j list table "$family" "$table" 2>/dev/null || true)"
-    if [ -n "$nft_json" ]; then
-        stats_forward_snapshot_json "" "$cfg_file" "$nft_json"
-    else
-        nft_output="$(nft list table "$family" "$table" 2>/dev/null || true)"
-        stats_forward_snapshot_json "$nft_output" "$cfg_file"
+    PFWD_STATS_LAST_SNAPSHOT_ERROR=""
+    if [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_FORWARDER_RUNTIME_FILE" ]; then
+        local snapshot_error snapshot_status=0
+        snapshot_error="$(mktemp "${PFWD_RUN_DIR}/snapshot.err.XXXXXX")"
+        snapshot="$("$(forwarder_bin_path)" snapshot \
+          --runtime-file "$PFWD_FORWARDER_RUNTIME_FILE" \
+          --state-file "$PFWD_STATS_FILE" \
+          --status-file "$PFWD_XDP_STATUS_FILE" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" 2>"$snapshot_error")" || snapshot_status=$?
+        if [ -n "$snapshot" ] && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$snapshot"; then
+            rm -f "$snapshot_error"
+            printf '%s\n' "$snapshot"
+            return 0
+        fi
+        PFWD_STATS_LAST_SNAPSHOT_ERROR="$(tr '\n' ' ' < "$snapshot_error" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+        rm -f "$snapshot_error"
+        if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
+            pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
+        fi
     fi
+    stats_zero_snapshot_json "$cfg_file"
 }
 
 stats_usage_json() {
@@ -315,6 +288,7 @@ stats_usage_json() {
 
 stats_rollup_needed() {
     local snapshot="$1"
+    stats_init >/dev/null
     jq -n --argjson snap "$snapshot" --slurpfile state "$PFWD_STATS_FILE" '
       any($snap[]?;
         (
@@ -326,8 +300,8 @@ stats_rollup_needed() {
 }
 
 stats_rollup_current() {
-    command -v nft >/dev/null 2>&1 || return 0
     pfwd_debug "stats_rollup_current start"
+    stats_init >/dev/null
     local snapshot
     snapshot="$(stats_current_snapshot)"
     stats_rollup_needed "$snapshot" || return 0

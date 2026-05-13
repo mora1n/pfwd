@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 
-forwarder_table() {
-    if [ -f "$PFWD_CONFIG_FILE" ]; then
-        jq -r '.settings.forward_table // "port_forward"' "$PFWD_CONFIG_FILE"
-    else
-        echo "port_forward"
-    fi
-}
-
 forwarder_target_kind() {
     local target="$1"
     if [[ "$target" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
@@ -34,33 +26,19 @@ forwarder_infer_ip_version() {
     fi
 
     case "$listen_ip" in
-        ""|"::")
-            echo "46"
-            ;;
-        "0.0.0.0")
-            echo "4"
-            ;;
-        *:*)
-            echo "6"
-            ;;
-        *)
-            echo "4"
-            ;;
+        ""|"::") echo "46" ;;
+        "0.0.0.0") echo "4" ;;
+        *:*) echo "6" ;;
+        *) echo "4" ;;
     esac
 }
 
 forwarder_protocol_rows() {
     local protocol="${1:-tcp_udp}"
     case "$protocol" in
-        tcp_udp)
-            printf 'tcp\nudp\n'
-            ;;
-        tcp|udp)
-            printf '%s\n' "$protocol"
-            ;;
-        *)
-            pfwd_die "无效协议：$protocol"
-            ;;
+        tcp_udp) printf 'tcp\nudp\n' ;;
+        tcp|udp) printf '%s\n' "$protocol" ;;
+        *) pfwd_die "无效协议：$protocol" ;;
     esac
 }
 
@@ -137,292 +115,239 @@ forwarder_resolve_targets() {
     esac
 }
 
+forwarder_iface() {
+    local iface
+    iface="$(jq -r '.settings.xdp.interface // .settings.tc_interface // ""' "$PFWD_CONFIG_FILE")"
+    if [ -n "$iface" ]; then
+        echo "$iface"
+        return
+    fi
+    ip route show default 2>/dev/null | awk '{print $5; exit}'
+}
+
+forwarder_xdp_mode() {
+    jq -r '.settings.xdp.mode // "auto"' "$PFWD_CONFIG_FILE"
+}
+
+forwarder_protocol_filters_enabled() {
+    if [ "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
+       [ "$(jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
+       [ "$(jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE")" = "true" ]; then
+        echo true
+    else
+        echo false
+    fi
+}
+
+forwarder_whitelist_files_json() {
+    local files=()
+    if command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
+        if [ -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" ]; then
+            files+=("$PFWD_WHITELIST_ALLOW_IPV4_FILE")
+        fi
+        if [ -f "$PFWD_WHITELIST_ALLOW_IPV6_FILE" ]; then
+            files+=("$PFWD_WHITELIST_ALLOW_IPV6_FILE")
+        fi
+    fi
+    if [ "${#files[@]}" -eq 0 ]; then
+        printf '[]\n'
+        return 0
+    fi
+    printf '%s\n' "${files[@]}" | jq -R . | jq -s .
+}
+
 forwarder_runtime_json() {
     local strict="${1:-true}"
     config_init >/dev/null
-    local today rows
+    stats_init >/dev/null
+
+    local today rows rules_json="[]" users_json settings_json rule_index_json user_index_json
     today="$(pfwd_today)"
     rows="$(jq -r --arg today "$today" '
       .forwards[]
       | select(.enabled == true and (.stop_at == null or .stop_at > $today))
       | [
           .id,
+          .user_id,
           (.listen_ip // "::"),
           (.listen_port | tostring),
           .remote_host,
           (.remote_port | tostring),
           (.protocol // "tcp_udp"),
           (.comment // ""),
-          (.nft.snat_mode // "masquerade"),
-          (.nft.snat_source // ""),
-          (.nft.mss_mode // ""),
-          (if (.nft.mss_value // null) == null then "" else (.nft.mss_value | tostring) end)
+          (.xdp.snat_mode // "masquerade"),
+          (.xdp.snat_source // ""),
+          (.xdp.mss_mode // ""),
+          (if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end),
+          (.traffic_mode // "two-way"),
+          ((.traffic_ratio // 1) | tostring),
+          (.limits.traffic_bytes // 0 | tostring)
         ]
       | @tsv
     ' "$PFWD_CONFIG_FILE")"
 
-    if [ -z "$rows" ]; then
-        printf '[]\n'
-        return 0
-    fi
+    user_index_json="$(jq -r '
+      reduce (.users[]? | .id) as $id ({};
+        .[$id] = (keys | length)
+      )
+    ' "$PFWD_CONFIG_FILE")"
+    rule_index_json="$(jq -r '
+      reduce (.forwards[]? | .id) as $id ({};
+        .[$id] = (keys | length)
+      )
+    ' "$PFWD_CONFIG_FILE")"
 
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        forwarder_split_tsv_line "$line"
-        local id listen_ip listen_port remote_host remote_port protocol comment snat_mode snat_source mss_mode mss_value
-        id="${FORWARDER_TSV_FIELDS[0]:-}"
-        listen_ip="${FORWARDER_TSV_FIELDS[1]:-}"
-        listen_port="${FORWARDER_TSV_FIELDS[2]:-}"
-        remote_host="${FORWARDER_TSV_FIELDS[3]:-}"
-        remote_port="${FORWARDER_TSV_FIELDS[4]:-}"
-        protocol="${FORWARDER_TSV_FIELDS[5]:-}"
-        comment="${FORWARDER_TSV_FIELDS[6]:-}"
-        snat_mode="${FORWARDER_TSV_FIELDS[7]:-}"
-        snat_source="${FORWARDER_TSV_FIELDS[8]:-}"
-        mss_mode="${FORWARDER_TSV_FIELDS[9]:-}"
-        mss_value="${FORWARDER_TSV_FIELDS[10]:-}"
-        [ -n "$listen_port" ] || continue
-        local ip_versions target_rows ipver proto family resolved_ip family_ipver
-        ip_versions="$(forwarder_infer_ip_version "$listen_ip" "$snat_mode" "$snat_source")"
-        while IFS= read -r ipver; do
-            [ -n "$ipver" ] || continue
-            target_rows="$(forwarder_resolve_targets "$remote_host" "$ipver" || true)"
-            if [ -z "$target_rows" ]; then
-                if [ "$strict" = "true" ] && [ "$(forwarder_target_kind "$remote_host")" = "domain" ]; then
-                    pfwd_die "无法解析目标地址：$remote_host (IPv$ipver)${FORWARDER_LAST_RESOLVE_ERROR:+：$FORWARDER_LAST_RESOLVE_ERROR}"
-                fi
-                continue
-            fi
-            while IFS= read -r proto; do
-                [ -n "$proto" ] || continue
-                while IFS='|' read -r family _ resolved_ip; do
-                    [ -n "$resolved_ip" ] || continue
-                    if [ "$family" = "ip6" ]; then
-                        family_ipver=6
-                    else
-                        family_ipver=4
+    users_json="$(jq -n \
+      --slurpfile cfg "$PFWD_CONFIG_FILE" \
+      --slurpfile stats "$PFWD_STATS_FILE" \
+      --argjson user_index "$user_index_json" '
+      [
+        $cfg[0].users[]? |
+        {
+          id: .id,
+          index: ($user_index[.id] // 0),
+          traffic_limit_bytes: (.limits.traffic_bytes // 0),
+          billing_used_base_bytes: ($stats[0].users[.id].billing_used_bytes // 0)
+        }
+      ]
+    ')"
+
+    if [ -n "$rows" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            forwarder_split_tsv_line "$line"
+            local id user_id listen_ip listen_port remote_host remote_port protocol comment snat_mode snat_source mss_mode mss_value traffic_mode traffic_ratio rule_limit
+            id="${FORWARDER_TSV_FIELDS[0]:-}"
+            user_id="${FORWARDER_TSV_FIELDS[1]:-}"
+            listen_ip="${FORWARDER_TSV_FIELDS[2]:-}"
+            listen_port="${FORWARDER_TSV_FIELDS[3]:-}"
+            remote_host="${FORWARDER_TSV_FIELDS[4]:-}"
+            remote_port="${FORWARDER_TSV_FIELDS[5]:-}"
+            protocol="${FORWARDER_TSV_FIELDS[6]:-}"
+            comment="${FORWARDER_TSV_FIELDS[7]:-}"
+            snat_mode="${FORWARDER_TSV_FIELDS[8]:-}"
+            snat_source="${FORWARDER_TSV_FIELDS[9]:-}"
+            mss_mode="${FORWARDER_TSV_FIELDS[10]:-}"
+            mss_value="${FORWARDER_TSV_FIELDS[11]:-}"
+            traffic_mode="${FORWARDER_TSV_FIELDS[12]:-two-way}"
+            traffic_ratio="${FORWARDER_TSV_FIELDS[13]:-1}"
+            rule_limit="${FORWARDER_TSV_FIELDS[14]:-0}"
+            [ -n "$listen_port" ] || continue
+            local ip_versions target_rows ipver proto family resolved_ip family_ipver user_limit user_index rule_index billing_used user_billing_used
+            ip_versions="$(forwarder_infer_ip_version "$listen_ip" "$snat_mode" "$snat_source")"
+            user_limit="$(jq -r --arg id "$user_id" '.users[]? | select(.id == $id) | (.limits.traffic_bytes // 0)' "$PFWD_CONFIG_FILE")"
+            user_index="$(jq -r --arg id "$user_id" --argjson idx "$user_index_json" '$idx[$id] // 0' <<< '{}')"
+            rule_index="$(jq -r --arg id "$id" --argjson idx "$rule_index_json" '$idx[$id] // 0' <<< '{}')"
+            billing_used="$(jq -r --arg id "$id" '.forwards[$id].billing_used_bytes // 0' "$PFWD_STATS_FILE")"
+            user_billing_used="$(jq -r --arg id "$user_id" '.users[$id].billing_used_bytes // 0' "$PFWD_STATS_FILE")"
+            while IFS= read -r ipver; do
+                [ -n "$ipver" ] || continue
+                target_rows="$(forwarder_resolve_targets "$remote_host" "$ipver" || true)"
+                if [ -z "$target_rows" ]; then
+                    if [ "$strict" = "true" ] && [ "$(forwarder_target_kind "$remote_host")" = "domain" ]; then
+                        pfwd_die "无法解析目标地址：$remote_host (IPv$ipver)${FORWARDER_LAST_RESOLVE_ERROR:+：$FORWARDER_LAST_RESOLVE_ERROR}"
                     fi
-                    jq -cn \
-                      --arg id "$id" \
-                      --arg listen_ip "$listen_ip" \
-                      --argjson listen_port "$listen_port" \
-                      --arg protocol "$proto" \
-                      --arg remote_input "$remote_host" \
-                      --arg resolved_target "$resolved_ip" \
-                      --argjson remote_port "$remote_port" \
-                      --arg family "$family" \
-                      --argjson ip_version "$family_ipver" \
-                      --arg comment "$comment" \
-                      --arg snat_mode "$snat_mode" \
-                      --arg snat_source "$snat_source" \
-                      --arg mss_mode "$mss_mode" \
-                      --arg mss_value "$mss_value" '
-                      {
-                        id: $id,
-                        listen_ip: $listen_ip,
-                        listen_port: $listen_port,
-                        protocol: $protocol,
-                        remote_input: $remote_input,
-                        resolved_target: $resolved_target,
-                        remote_port: $remote_port,
-                        family: $family,
-                        ip_version: $ip_version,
-                        comment: (if $comment == "" then null else $comment end),
-                        snat_mode: $snat_mode,
-                        snat_source: (if $snat_source == "" then null else $snat_source end),
-                        mss_mode: (if $mss_mode == "" then null else $mss_mode end),
-                        mss_value: (if $mss_value == "" then null else ($mss_value | tonumber) end)
-                      }
-                    '
-                done <<< "$target_rows"
-            done < <(forwarder_protocol_rows "$protocol")
-        done <<< "$ip_versions"
-    done <<< "$rows" | jq -s '.'
-}
-
-forwarder_subchain_name() {
-    local section="$1"
-    local proto="$2"
-    local ipver="$3"
-    printf 'pfwd_%s_%s%s' "$section" "$proto" "$ipver"
-}
-
-forwarder_dispatch_tokens() {
-    local proto="$1"
-    local ipver="$2"
-    if [ "$ipver" = "6" ]; then
-        printf 'ip6 nexthdr %s' "$proto"
-    else
-        printf 'ip protocol %s' "$proto"
-    fi
-}
-
-forwarder_ports_to_expr() {
-    local ports_csv="$1"
-    if [[ "$ports_csv" == *,* ]]; then
-        printf '{ %s }' "${ports_csv//,/\, }"
-    else
-        printf '%s' "$ports_csv"
-    fi
-}
-
-forwarder_render_to_stdout() {
-    local runtime_json="$1"
-    local table
-    table="$(forwarder_table)"
-
-    if [ "$(printf '%s\n' "$runtime_json" | jq 'length')" = "0" ]; then
-        return 0
-    fi
-
-    declare -A prerouting_ports=()
-    declare -A prerouting_seen=()
-    declare -A postrouting_keys=()
-    declare -A forward_keys=()
-    declare -A subchains=()
-    local line proto listen_port ipver target_input resolved_target remote_port comment snat_mode snat_source mss_mode mss_value key
-
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        forwarder_split_tsv_line "$line"
-        proto="${FORWARDER_TSV_FIELDS[0]:-}"
-        listen_port="${FORWARDER_TSV_FIELDS[1]:-}"
-        ipver="${FORWARDER_TSV_FIELDS[2]:-}"
-        target_input="${FORWARDER_TSV_FIELDS[3]:-}"
-        resolved_target="${FORWARDER_TSV_FIELDS[4]:-}"
-        remote_port="${FORWARDER_TSV_FIELDS[5]:-}"
-        comment="${FORWARDER_TSV_FIELDS[6]:-}"
-        snat_mode="${FORWARDER_TSV_FIELDS[7]:-}"
-        snat_source="${FORWARDER_TSV_FIELDS[8]:-}"
-        mss_mode="${FORWARDER_TSV_FIELDS[9]:-}"
-        mss_value="${FORWARDER_TSV_FIELDS[10]:-}"
-        key="${proto}|${ipver}|${resolved_target}|${remote_port}|${snat_mode}|${snat_source}|${mss_mode}|${mss_value}"
-        if [ -z "${prerouting_seen["$key|$listen_port"]:-}" ]; then
-            if [ -n "${prerouting_ports[$key]:-}" ]; then
-                prerouting_ports["$key"]+=",${listen_port}"
-            else
-                prerouting_ports["$key"]="$listen_port"
-            fi
-            prerouting_seen["$key|$listen_port"]=1
-        fi
-        postrouting_keys["$key"]=1
-        subchains["prerouting|$ipver|$proto"]=1
-        subchains["postrouting|$ipver|$proto"]=1
-        if [ "$proto" = "tcp" ] && [ -n "$mss_mode" ]; then
-            forward_keys["$key"]=1
-            subchains["forward|$ipver|$proto"]=1
-        fi
-    done < <(
-        printf '%s\n' "$runtime_json" | jq -r '
-          .[]
-          | [
-              .protocol,
-              (.listen_port | tostring),
-              (.ip_version | tostring),
-              .remote_input,
-              .resolved_target,
-              (.remote_port | tostring),
-              (.comment // ""),
-              (.snat_mode // "masquerade"),
-              (.snat_source // ""),
-              (.mss_mode // ""),
-              (if (.mss_value // null) == null then "" else (.mss_value | tostring) end)
-            ]
-          | @tsv
-        '
-    )
-
-    echo "table inet $table {"
-    echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority dstnat; policy accept;"
-    for ipver in 4 6; do
-        for proto in tcp udp; do
-            [ -n "${subchains["prerouting|$ipver|$proto"]:-}" ] || continue
-            echo "        $(forwarder_dispatch_tokens "$proto" "$ipver") jump $(forwarder_subchain_name prerouting "$proto" "$ipver")"
-        done
-    done
-    echo "    }"
-    echo
-
-    echo "    chain postrouting {"
-    echo "        type nat hook postrouting priority srcnat; policy accept;"
-    for ipver in 4 6; do
-        for proto in tcp udp; do
-            [ -n "${subchains["postrouting|$ipver|$proto"]:-}" ] || continue
-            echo "        ct status dnat $(forwarder_dispatch_tokens "$proto" "$ipver") jump $(forwarder_subchain_name postrouting "$proto" "$ipver")"
-        done
-    done
-    echo "    }"
-    echo
-
-    echo "    chain forward {"
-    echo "        type filter hook forward priority 0; policy accept;"
-    echo "        ct state established,related accept"
-    for ipver in 4 6; do
-        for proto in tcp; do
-            [ -n "${subchains["forward|$ipver|$proto"]:-}" ] || continue
-            echo "        $(forwarder_dispatch_tokens "$proto" "$ipver") jump $(forwarder_subchain_name forward "$proto" "$ipver")"
-        done
-    done
-    echo "    }"
-    echo
-
-    echo "    chain input {"
-    echo "        type filter hook input priority filter - 10; policy accept;"
-    echo '        ip daddr 127.0.0.0/8 ct status dnat counter accept comment "Allow DNAT to localhost"'
-    echo '        ip6 daddr ::1 ct status dnat counter accept comment "Allow DNAT to localhost"'
-    echo "    }"
-    echo
-
-    for ipver in 4 6; do
-        for proto in tcp udp; do
-            echo "    chain $(forwarder_subchain_name prerouting "$proto" "$ipver") {"
-            while IFS= read -r key; do
-                [ -n "$key" ] || continue
-                IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-                [ "$key_proto" = "$proto" ] || continue
-                [ "$key_ipver" = "$ipver" ] || continue
-                if [ "$ipver" = "6" ]; then
-                    echo "        $proto dport $(forwarder_ports_to_expr "${prerouting_ports[$key]}") dnat ip6 to [$key_target]:$key_remote_port"
-                else
-                    echo "        $proto dport $(forwarder_ports_to_expr "${prerouting_ports[$key]}") dnat ip to $key_target:$key_remote_port"
+                    continue
                 fi
-            done < <(printf '%s\n' "${!prerouting_ports[@]}" | sort)
-            echo "    }"
-            echo
+                while IFS= read -r proto; do
+                    [ -n "$proto" ] || continue
+                    while IFS='|' read -r family _ resolved_ip; do
+                        [ -n "$resolved_ip" ] || continue
+                        if [ "$family" = "ip6" ]; then
+                            family_ipver=6
+                        else
+                            family_ipver=4
+                        fi
+                        rules_json="$(jq -c \
+                          --argjson rules "$rules_json" \
+                          --arg id "$id" \
+                          --argjson index "$rule_index" \
+                          --arg user_id "$user_id" \
+                          --argjson user_index "$user_index" \
+                          --arg listen_ip "$listen_ip" \
+                          --argjson listen_port "$listen_port" \
+                          --arg protocol "$proto" \
+                          --arg remote_input "$remote_host" \
+                          --arg resolved_target "$resolved_ip" \
+                          --argjson remote_port "$remote_port" \
+                          --argjson ip_version "$family_ipver" \
+                          --arg comment "$comment" \
+                          --arg snat_mode "$snat_mode" \
+                          --arg snat_source "$snat_source" \
+                          --arg mss_mode "$mss_mode" \
+                          --arg mss_value "$mss_value" \
+                          --arg traffic_mode "$traffic_mode" \
+                          --arg traffic_ratio "$traffic_ratio" \
+                          --argjson rule_limit "$rule_limit" \
+                          --argjson user_limit "${user_limit:-0}" \
+                          --argjson billing_used "$billing_used" \
+                          --argjson user_billing_used "$user_billing_used" '
+                          $rules + [{
+                            id: $id,
+                            index: $index,
+                            user_id: $user_id,
+                            user_index: $user_index,
+                            listen_ip: $listen_ip,
+                            listen_port: $listen_port,
+                            protocol: $protocol,
+                            remote_input: $remote_input,
+                            resolved_target: $resolved_target,
+                            remote_port: $remote_port,
+                            ip_version: $ip_version,
+                            comment: (if $comment == "" then null else $comment end),
+                            snat_mode: $snat_mode,
+                            snat_source: (if $snat_source == "" then null else $snat_source end),
+                            mss_mode: (if $mss_mode == "" then null else $mss_mode end),
+                            mss_value: (if $mss_value == "" then null else ($mss_value | tonumber) end),
+                            traffic_mode: $traffic_mode,
+                            traffic_ratio: ($traffic_ratio | tonumber),
+                            traffic_limit_bytes: $rule_limit,
+                            user_limit_bytes: $user_limit,
+                            billing_used_base_bytes: $billing_used,
+                            user_billing_used_base_bytes: $user_billing_used
+                          }]
+                        ' <<< '{}')"
+                    done <<< "$target_rows"
+                done < <(forwarder_protocol_rows "$protocol")
+            done <<< "$ip_versions"
+        done <<< "$rows"
+    fi
 
-            echo "    chain $(forwarder_subchain_name postrouting "$proto" "$ipver") {"
-            while IFS= read -r key; do
-                [ -n "$key" ] || continue
-                IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-                [ "$key_proto" = "$proto" ] || continue
-                [ "$key_ipver" = "$ipver" ] || continue
-                if [ "$key_snat_mode" = "snat" ] && [ -n "$key_snat_source" ]; then
-                    echo "        ct status dnat $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target $proto dport $key_remote_port snat to $key_snat_source"
-                else
-                    echo "        ct status dnat $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target $proto dport $key_remote_port masquerade"
-                fi
-            done < <(printf '%s\n' "${!postrouting_keys[@]}" | sort)
-            echo "    }"
-            echo
-        done
+    settings_json="$(jq -n \
+      --arg mode "$(forwarder_xdp_mode)" \
+      --arg iface "$(forwarder_iface)" \
+      --argjson whitelist_enabled "$(command -v whitelist_enabled >/dev/null 2>&1 && whitelist_enabled || echo false)" \
+      --argjson block_http "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" \
+      --argjson block_tls "$(jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE")" \
+      --argjson block_socks "$(jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE")" \
+      --argjson files "$(forwarder_whitelist_files_json)" '
+      {
+        xdp_mode: $mode,
+        interface: $iface,
+        whitelist_enabled: $whitelist_enabled,
+        block_http: $block_http,
+        block_tls: $block_tls,
+        block_socks: $block_socks,
+        whitelist_files: $files
+      }
+    ')"
 
-        echo "    chain $(forwarder_subchain_name forward tcp "$ipver") {"
-        while IFS= read -r key; do
-            [ -n "$key" ] || continue
-            IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
-            [ "$key_proto" = "tcp" ] || continue
-            [ "$key_ipver" = "$ipver" ] || continue
-            if [ "$key_mss_mode" = "clamp" ]; then
-                echo "        $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target tcp dport $key_remote_port tcp flags syn / syn,rst tcp option maxseg size set rt mtu"
-            elif [ "$key_mss_mode" = "set" ] && [ -n "$key_mss_value" ]; then
-                echo "        $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target tcp dport $key_remote_port tcp flags syn / syn,rst tcp option maxseg size set $key_mss_value"
-            fi
-        done < <(printf '%s\n' "${!forward_keys[@]}" | sort)
-        echo "    }"
-        echo
-    done
-    echo "}"
+    jq -n \
+      --arg generated_at "$(pfwd_now_iso)" \
+      --argjson settings "$settings_json" \
+      --argjson users "$users_json" \
+      --argjson rules "$rules_json" \
+      --argjson rule_index "$rule_index_json" \
+      --argjson user_index "$user_index_json" '
+      {
+        generated_at: $generated_at,
+        settings: $settings,
+        users: $users,
+        rules: $rules,
+        rule_index: $rule_index,
+        user_index: $user_index
+      }
+    '
 }
 
 forwarder_write_runtime_file() {
@@ -430,46 +355,8 @@ forwarder_write_runtime_file() {
     printf '%s\n' "$runtime_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_RUNTIME_FILE"
 }
 
-forwarder_write_render_file() {
-    local runtime_json="$1"
-    local tmp_file
-    tmp_file="$(mktemp "${PFWD_FORWARDER_RENDER_FILE}.tmp.XXXXXX")"
-    forwarder_render_to_stdout "$runtime_json" > "$tmp_file"
-    mv "$tmp_file" "$PFWD_FORWARDER_RENDER_FILE"
-}
-
-forwarder_render_matches_runtime() {
-    local candidate="$1"
-    [ -f "$PFWD_FORWARDER_RENDER_FILE" ] || return 1
-    cmp -s "$candidate" "$PFWD_FORWARDER_RENDER_FILE"
-}
-
 forwarder_render_config() {
-    local runtime_json
-    runtime_json="$(forwarder_runtime_json true)"
-    forwarder_render_to_stdout "$runtime_json"
-}
-
-forwarder_table_exists() {
-    local table
-    table="$(forwarder_table)"
-    nft list table inet "$table" >/dev/null 2>&1
-}
-
-forwarder_validate_render_file() {
-    local table validate_table validate_file render_file
-    table="$(forwarder_table)"
-    validate_table="pfwd_validate_$$"
-    render_file="$1"
-    validate_file="$(mktemp "${render_file}.validate.XXXXXX")"
-    sed "s/^table inet $table /table inet $validate_table /" "$render_file" > "$validate_file"
-    nft -c -f "$validate_file" >/dev/null 2>&1
-    rm -f "$validate_file"
-}
-
-forwarder_route_localnet_needed() {
-    local runtime_json="$1"
-    printf '%s\n' "$runtime_json" | jq -e '.[]? | select(.resolved_target | test("^127\\."))' >/dev/null
+    forwarder_runtime_json true | jq '.'
 }
 
 forwarder_ensure_ip_forwarding() {
@@ -484,58 +371,37 @@ forwarder_ensure_ip_forwarding() {
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
 }
 
-forwarder_ensure_route_localnet() {
-    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
-        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.all.route_localnet=1"
-        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.default.route_localnet=1"
-        return 0
-    fi
-    sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.conf.default.route_localnet=1 >/dev/null 2>&1 || true
-}
-
-forwarder_delete_table() {
-    local table
-    table="$(forwarder_table)"
-    if forwarder_table_exists; then
-        pfwd_run nft delete table inet "$table"
-    fi
-}
-
 forwarder_apply_runtime() {
     local runtime_json
-    local tmp_render
     pfwd_debug "forwarder_apply_runtime start"
     config_init >/dev/null
     forwarder_validate_config
+    if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
+        whitelist_prepare_runtime
+    fi
     runtime_json="$(forwarder_runtime_json true)"
     forwarder_write_runtime_file "$runtime_json"
-    if [ "$(printf '%s\n' "$runtime_json" | jq 'length')" = "0" ]; then
-        if command -v nft >/dev/null 2>&1; then
-            forwarder_delete_table
-        fi
-        : > "$PFWD_FORWARDER_RENDER_FILE"
+    if [ "$(printf '%s\n' "$runtime_json" | jq '.rules | length')" = "0" ]; then
+        forwarder_stop_runtime
         return 0
     fi
-
-    pfwd_require_cmd nft
-    tmp_render="$(mktemp "${PFWD_FORWARDER_RENDER_FILE}.tmp.XXXXXX")"
-    forwarder_render_to_stdout "$runtime_json" > "$tmp_render"
-    forwarder_validate_render_file "$tmp_render" || {
-        rm -f "$tmp_render"
-        pfwd_die "forwarder nft 配置校验失败：$tmp_render"
-    }
+    pfwd_require_cmd "$(forwarder_bin_path)"
+    local iface
+    iface="$(forwarder_iface)"
+    [ -n "$iface" ] || pfwd_die "无法确定 XDP 网卡，请设置 settings.xdp.interface 或 settings.tc_interface"
     forwarder_ensure_ip_forwarding
-    if forwarder_route_localnet_needed "$runtime_json"; then
-        forwarder_ensure_route_localnet
-    fi
-    if forwarder_table_exists && forwarder_render_matches_runtime "$tmp_render"; then
-        rm -f "$tmp_render"
-        return 0
-    fi
-    mv "$tmp_render" "$PFWD_FORWARDER_RENDER_FILE"
-    forwarder_delete_table
-    pfwd_run nft -f "$PFWD_FORWARDER_RENDER_FILE"
+    pfwd_run "$(forwarder_bin_path)" apply \
+      --runtime-file "$PFWD_FORWARDER_RUNTIME_FILE" \
+      --state-file "$PFWD_STATS_FILE" \
+      --status-file "$PFWD_XDP_STATUS_FILE" \
+      --iface "$iface" \
+      --xdp-mode "$(forwarder_xdp_mode)" \
+      --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+      --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+      --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+      --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+      --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
+      --quiet
 }
 
 forwarder_run_maintenance() {
@@ -543,10 +409,15 @@ forwarder_run_maintenance() {
 }
 
 forwarder_stop_runtime() {
-    if command -v nft >/dev/null 2>&1; then
-        forwarder_delete_table
+    if [ -x "$(forwarder_bin_path)" ]; then
+        pfwd_run "$(forwarder_bin_path)" remove \
+          --status-file "$PFWD_XDP_STATUS_FILE" \
+          --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+          --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" || true
     fi
-    : > "$PFWD_FORWARDER_RENDER_FILE"
     printf '[]\n' | pfwd_write_atomic "$PFWD_FORWARDER_RUNTIME_FILE"
 }
 
@@ -562,8 +433,8 @@ forwarder_validate_config() {
 forwarder_service_unit() {
     cat <<EOF
 [Unit]
-Description=pfwd boot restore
-After=network-online.target nftables.service systemd-sysctl.service ufw.service
+Description=pfwd XDP boot restore
+After=network-online.target systemd-sysctl.service
 Wants=network-online.target
 
 [Service]
