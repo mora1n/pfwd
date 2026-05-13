@@ -75,6 +75,14 @@ guard_service_unit() {
     xdp_service_unit
 }
 
+service_write_unit_files() {
+    mkdir -p "$PFWD_SYSTEMD_DIR"
+    service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
+    service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
+    bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
+    xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
+}
+
 service_install_files() {
     pfwd_mkdirs
     mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_XDP_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
@@ -110,10 +118,7 @@ service_install_files() {
     ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
     ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
-    service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
-    service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
-    bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
-    xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
+    service_write_unit_files
 }
 
 service_ensure_shortcut() {

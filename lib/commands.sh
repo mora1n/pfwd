@@ -138,8 +138,8 @@ cmd_update_finalize() {
 
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
-    if ! service_install_files; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "更新收尾失败"
+    if ! service_write_unit_files; then
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "同步 systemd unit 失败"
     fi
     if ! service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" "$guard_enabled"; then
         cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "恢复服务启用状态失败"
