@@ -966,7 +966,7 @@ cmd_guard() {
         disable)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard disable"
             guard_config_set_enabled false
-            guard_remove_runtime
+            cmd_apply_guard_runtime
             echo "guard 已停用"
             ;;
         apply)
@@ -981,7 +981,9 @@ cmd_guard() {
             ;;
         remove)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard remove"
-            guard_remove_runtime
+            guard_config_set_enabled false
+            cmd_apply_guard_runtime
+            echo "guard 已移除"
             ;;
         status)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard status"

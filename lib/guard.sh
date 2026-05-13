@@ -390,11 +390,13 @@ guard_remove_runtime() {
 
 guard_status_json() {
     config_init >/dev/null
-    local runtime_status xdp_effective xdp_attach_kind xdp_reason
+    local runtime_status xdp_effective xdp_attach_kind xdp_reason ingress_kind protocol_guard
     runtime_status="$(guard_run "$(guard_bin_path)" status --status-file "$(guard_status_file)" 2>/dev/null || true)"
     xdp_effective="$(jq -r '.xdp_effective // "off"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_attach_kind="$(jq -r '.xdp_attach_kind // "-"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_reason="$(jq -r '.xdp_reason // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    ingress_kind="$(jq -r '.ingress_kind // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    protocol_guard="$(jq -r '.protocol_guard // false' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
 
     local settings skip_ports skip_count
     settings="$(guard_read_settings)"
@@ -420,6 +422,8 @@ guard_status_json() {
       --arg xdp_effective "$xdp_effective" \
       --arg xdp_attach_kind "$xdp_attach_kind" \
       --arg xdp_reason "$xdp_reason" \
+      --arg ingress_kind "$ingress_kind" \
+      --argjson protocol_guard "$protocol_guard" \
       --argjson enabled "$(jq -r '.enabled' <<< "$settings")" \
       --argjson block_http "$(jq -r '.block_http' <<< "$settings")" \
       --argjson block_tls "$(jq -r '.block_tls' <<< "$settings")" \
@@ -438,6 +442,8 @@ guard_status_json() {
         xdp_effective: $xdp_effective,
         xdp_attach_kind: $xdp_attach_kind,
         xdp_reason: $xdp_reason,
+        ingress_kind: $ingress_kind,
+        protocol_guard: $protocol_guard,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
@@ -464,6 +470,7 @@ guard_render_status() {
         ["XDP 模式", .xdp_mode],
         ["XDP 实际状态", .xdp_effective],
         ["XDP 挂载", .xdp_attach_kind],
+        ["TC 协议封锁", (if .protocol_guard then (if (.ingress_kind // "") != "" then .ingress_kind else "xdp-only" end) else "关" end)],
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],

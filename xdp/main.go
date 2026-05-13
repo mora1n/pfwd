@@ -46,6 +46,7 @@ type bpfObjects struct {
 	PFWDWhitelistV4 *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
 	PFWDWhitelistV6 *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
 	PFWDFlows       *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
+	PFWDSkipPorts   *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
 	PFWDScratch     *ebpf.Map     `ebpf:"pfwd_scratch"`
 }
 
@@ -55,7 +56,7 @@ func (o *bpfObjects) Close() {
 	}
 	for _, closer := range []interface{ Close() error }{
 		o.PFWDXDP, o.PFWDIngress, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
-		o.PFWDRuleCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6, o.PFWDFlows, o.PFWDScratch,
+		o.PFWDRuleCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6, o.PFWDFlows, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
 			_ = closer.Close()
@@ -110,13 +111,16 @@ type runtimeFile struct {
 }
 
 type runtimeSettings struct {
-	XDPMode          string   `json:"xdp_mode"`
-	Interface        string   `json:"interface"`
-	WhitelistEnabled bool     `json:"whitelist_enabled"`
-	BlockHTTP        bool     `json:"block_http"`
-	BlockTLS         bool     `json:"block_tls"`
-	BlockSOCKS       bool     `json:"block_socks"`
-	WhitelistFiles   []string `json:"whitelist_files,omitempty"`
+	XDPMode           string   `json:"xdp_mode"`
+	Interface         string   `json:"interface"`
+	GuardEnabled      bool     `json:"guard_enabled"`
+	WhitelistEnabled  bool     `json:"whitelist_enabled"`
+	BlockHTTP         bool     `json:"block_http"`
+	BlockTLS          bool     `json:"block_tls"`
+	BlockSOCKS        bool     `json:"block_socks"`
+	ProtocolSkipPorts []uint16 `json:"protocol_skip_ports,omitempty"`
+	WhitelistFiles    []string `json:"whitelist_files,omitempty"`
+	GuardIngressMode  string   `json:"guard_ingress_mode,omitempty"`
 }
 
 type runtimeUser struct {
@@ -161,6 +165,8 @@ type statusPayload struct {
 	XDPEffective   string `json:"xdp_effective,omitempty"`
 	XDPAttachKind  string `json:"xdp_attach_kind,omitempty"`
 	XDPReason      string `json:"xdp_reason,omitempty"`
+	IngressKind    string `json:"ingress_kind,omitempty"`
+	ProtocolGuard  bool   `json:"protocol_guard,omitempty"`
 	RuntimeFile    string `json:"runtime_file,omitempty"`
 	StateFile      string `json:"state_file,omitempty"`
 	ConfigHash     string `json:"config_hash,omitempty"`
@@ -178,7 +184,8 @@ type xdpSettings struct {
 	BlockHTTP        uint8
 	BlockTLS         uint8
 	BlockSOCKS       uint8
-	Pad              [4]uint8
+	GuardEnabled     uint8
+	Pad              [3]uint8
 }
 
 type ruleKey struct {
@@ -242,6 +249,11 @@ type whitelistKeyV4 struct {
 type whitelistKeyV6 struct {
 	PrefixLen uint32
 	Addr      [16]byte
+}
+
+type portKey struct {
+	Port uint16
+	Pad  [4]byte
 }
 
 func main() {
@@ -458,12 +470,18 @@ func applyRuntime(opts applyOptions) error {
 	if err := pinRuntimeMaps(objs, opts); err != nil {
 		return err
 	}
+	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
 	xdpEffective, xdpKind, xdpReason, err := attachXDP(iface, objs.PFWDXDP, opts)
 	if err != nil {
 		return err
 	}
-	ingressKind, err := attachIngress(iface, objs.PFWDIngress, opts.IngressPin)
-	if err != nil {
+	ingressKind := ""
+	if protocolGuard && guardIngressEnabled(runtimeData.Settings) {
+		ingressKind, err = attachIngress(iface, objs.PFWDIngress, opts.IngressPin)
+		if err != nil {
+			return err
+		}
+	} else if err := removeIngressRuntime(opts.IngressPin, iface.Name); err != nil {
 		return err
 	}
 	if ingressKind != "" && !opts.Quiet {
@@ -479,6 +497,8 @@ func applyRuntime(opts applyOptions) error {
 		XDPEffective:   xdpEffective,
 		XDPAttachKind:  xdpKind,
 		XDPReason:      xdpReason,
+		IngressKind:    ingressKind,
+		ProtocolGuard:  protocolGuard,
 		RuntimeFile:    opts.RuntimeFile,
 		StateFile:      opts.StateFile,
 		ConfigHash:     runtimeData.ConfigHash,
@@ -542,10 +562,14 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		BlockHTTP:        boolToUint8(runtimeData.Settings.BlockHTTP),
 		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
 		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
+		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
 	}
 	key := uint32(0)
 	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("写入 settings 失败: %w", err)
+	}
+	if err := loadProtocolSkipPorts(objs.PFWDSkipPorts, runtimeData.Settings.ProtocolSkipPorts); err != nil {
+		return err
 	}
 	files := runtimeData.Settings.WhitelistFiles
 	if opts.WhitelistFile != "" {
@@ -586,6 +610,31 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		_ = os.Remove(path)
 		if err := m.Pin(path); err != nil {
 			return fmt.Errorf("pin map 失败 (%s): %w", path, err)
+		}
+	}
+	return nil
+}
+
+func protocolGuardEnabled(settings runtimeSettings) bool {
+	return settings.GuardEnabled && (settings.BlockHTTP || settings.BlockTLS || settings.BlockSOCKS)
+}
+
+func guardIngressEnabled(settings runtimeSettings) bool {
+	return strings.EqualFold(strings.TrimSpace(settings.GuardIngressMode), "tc")
+}
+
+func loadProtocolSkipPorts(skipMap *ebpf.Map, ports []uint16) error {
+	if skipMap == nil {
+		return fmt.Errorf("协议封锁 skip-port map 未加载")
+	}
+	value := uint8(1)
+	for _, port := range ports {
+		if port == 0 {
+			return fmt.Errorf("无效协议封锁跳过端口：%d", port)
+		}
+		key := portKey{Port: htons(port)}
+		if err := skipMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入协议封锁跳过端口失败 (%d): %w", port, err)
 		}
 	}
 	return nil
@@ -749,6 +798,18 @@ func attachIngress(iface *net.Interface, prog *ebpf.Program, pin string) (string
 	return "tc", nil
 }
 
+func removeIngressRuntime(pin string, ifaceName string) error {
+	if pin != "" {
+		_ = removePinnedLink(pin)
+		_ = removePinnedProgram(pin)
+	}
+	if ifaceName != "" {
+		_ = runTC("filter", "delete", "dev", ifaceName, "ingress")
+		_ = runTC("qdisc", "delete", "dev", ifaceName, "clsact")
+	}
+	return nil
+}
+
 func removeRuntime(opts removeOptions) error {
 	payload, _ := readStatus(opts.StatusFile)
 	xdpPin := firstNonEmpty(opts.XDPPin, payload.XDPPin)
@@ -760,12 +821,9 @@ func removeRuntime(opts removeOptions) error {
 		_ = removePinnedLink(xdpPin)
 	}
 	if ingressPin != "" {
-		_ = removePinnedLink(ingressPin)
-		_ = removePinnedProgram(ingressPin)
-	}
-	if payload.Interface != "" {
-		_ = runTC("filter", "delete", "dev", payload.Interface, "ingress")
-		_ = runTC("qdisc", "delete", "dev", payload.Interface, "clsact")
+		_ = removeIngressRuntime(ingressPin, payload.Interface)
+	} else if payload.Interface != "" {
+		_ = removeIngressRuntime("", payload.Interface)
 	}
 	if opts.StatusFile != "" {
 		if err := os.Remove(opts.StatusFile); err != nil && !errors.Is(err, os.ErrNotExist) {

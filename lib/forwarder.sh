@@ -130,7 +130,9 @@ forwarder_xdp_mode() {
 }
 
 forwarder_protocol_filters_enabled() {
-    if [ "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
+    if [ "$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")" != "true" ]; then
+        echo false
+    elif [ "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
        [ "$(jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
        [ "$(jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE")" = "true" ]; then
         echo true
@@ -139,9 +141,15 @@ forwarder_protocol_filters_enabled() {
     fi
 }
 
+forwarder_guard_ingress_mode() {
+    echo off
+}
+
 forwarder_whitelist_files_json() {
     local files=()
-    if command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
+    if [ "$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")" = "true" ] &&
+       command -v whitelist_enabled >/dev/null 2>&1 &&
+       [ "$(whitelist_enabled)" = "true" ]; then
         if [ -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" ]; then
             files+=("$PFWD_WHITELIST_ALLOW_IPV4_FILE")
         fi
@@ -154,6 +162,10 @@ forwarder_whitelist_files_json() {
         return 0
     fi
     printf '%s\n' "${files[@]}" | jq -R . | jq -s .
+}
+
+forwarder_protocol_skip_ports_json() {
+    jq -c '.settings.guard.protocol_skip_ports // []' "$PFWD_CONFIG_FILE"
 }
 
 forwarder_runtime_json() {
@@ -313,21 +325,35 @@ forwarder_runtime_json() {
         done <<< "$rows"
     fi
 
+    local guard_enabled whitelist_enabled protocol_filters_enabled
+    guard_enabled="$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")"
+    whitelist_enabled="false"
+    if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
+        whitelist_enabled="true"
+    fi
+    protocol_filters_enabled="$(forwarder_protocol_filters_enabled)"
+
     settings_json="$(jq -n \
       --arg mode "$(forwarder_xdp_mode)" \
       --arg iface "$(forwarder_iface)" \
-      --argjson whitelist_enabled "$(command -v whitelist_enabled >/dev/null 2>&1 && whitelist_enabled || echo false)" \
-      --argjson block_http "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" \
-      --argjson block_tls "$(jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE")" \
-      --argjson block_socks "$(jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE")" \
+      --arg guard_ingress_mode "$(forwarder_guard_ingress_mode)" \
+      --argjson guard_enabled "$guard_enabled" \
+      --argjson whitelist_enabled "$whitelist_enabled" \
+      --argjson block_http "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
+      --argjson block_tls "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
+      --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
+      --argjson skip_ports "$(forwarder_protocol_skip_ports_json)" \
       --argjson files "$(forwarder_whitelist_files_json)" '
       {
         xdp_mode: $mode,
         interface: $iface,
+        guard_ingress_mode: $guard_ingress_mode,
+        guard_enabled: $guard_enabled,
         whitelist_enabled: $whitelist_enabled,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
+        protocol_skip_ports: $skip_ports,
         whitelist_files: $files
       }
     ')"

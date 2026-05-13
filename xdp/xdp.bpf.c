@@ -26,11 +26,23 @@ enum pfwd_mss_mode {
     PFWD_MSS_SET = 2,
 };
 
+enum pfwd_inspect_result {
+    PFWD_INSPECT_ALLOW = 0,
+    PFWD_INSPECT_DROP = 1,
+    PFWD_INSPECT_NEED_MORE = 2,
+};
+
 struct pfwd_settings {
     __u8 whitelist_enabled;
     __u8 block_http;
     __u8 block_tls;
     __u8 block_socks;
+    __u8 guard_enabled;
+    __u8 pad[3];
+};
+
+struct pfwd_port_key {
+    __be16 port;
     __u8 pad[4];
 };
 
@@ -208,6 +220,13 @@ struct {
     __type(key, struct pfwd_flow_key);
     __type(value, __u8);
 } pfwd_allowed_flows SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_port_key);
+    __type(value, __u8);
+} pfwd_protocol_skip_ports SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -499,12 +518,16 @@ static __always_inline int fib_redirect_v6(struct xdp_md *ctx, struct ethhdr *et
 }
 
 static __always_inline int match_http(const __u8 *payload, __u32 len) {
+    if (len >= 8 && payload[0] == 'O' && payload[1] == 'P' && payload[2] == 'T' && payload[3] == 'I' && payload[4] == 'O' && payload[5] == 'N' && payload[6] == 'S' && payload[7] == ' ') return 1;
     if (len >= 4 && payload[0] == 'G' && payload[1] == 'E' && payload[2] == 'T' && payload[3] == ' ') return 1;
     if (len >= 5 && payload[0] == 'P' && payload[1] == 'O' && payload[2] == 'S' && payload[3] == 'T' && payload[4] == ' ') return 1;
     if (len >= 5 && payload[0] == 'H' && payload[1] == 'E' && payload[2] == 'A' && payload[3] == 'D' && payload[4] == ' ') return 1;
     if (len >= 4 && payload[0] == 'P' && payload[1] == 'U' && payload[2] == 'T' && payload[3] == ' ') return 1;
+    if (len >= 6 && payload[0] == 'P' && payload[1] == 'A' && payload[2] == 'T' && payload[3] == 'C' && payload[4] == 'H' && payload[5] == ' ') return 1;
+    if (len >= 6 && payload[0] == 'T' && payload[1] == 'R' && payload[2] == 'A' && payload[3] == 'C' && payload[4] == 'E' && payload[5] == ' ') return 1;
     if (len >= 7 && payload[0] == 'D' && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'E' && payload[4] == 'T' && payload[5] == 'E' && payload[6] == ' ') return 1;
     if (len >= 8 && payload[0] == 'C' && payload[1] == 'O' && payload[2] == 'N' && payload[3] == 'N' && payload[4] == 'E' && payload[5] == 'C' && payload[6] == 'T' && payload[7] == ' ') return 1;
+    if (len >= 8 && payload[0] == 'P' && payload[1] == 'R' && payload[2] == 'I' && payload[3] == ' ' && payload[4] == '*' && payload[5] == ' ' && payload[6] == 'H' && payload[7] == 'T') return 1;
     return 0;
 }
 
@@ -518,39 +541,195 @@ static __always_inline int match_socks(const __u8 *payload, __u32 len) {
     return 0;
 }
 
+static __always_inline int inspect_payload_bytes_xdp(const __u8 *payload, __u32 len, const struct pfwd_settings *settings) {
+    if (settings->block_http && match_http(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    if (settings->block_tls && match_tls_client_hello(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    if (settings->block_socks && match_socks(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    return PFWD_INSPECT_ALLOW;
+}
+
+static __always_inline int inspect_payload_bytes_ingress(const __u8 *payload, __u32 len, const struct pfwd_settings *settings) {
+    if (settings->block_http && match_http(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    if (settings->block_tls && match_tls_client_hello(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    if (settings->block_socks && match_socks(payload, len)) {
+        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
+        return PFWD_INSPECT_DROP;
+    }
+    return PFWD_INSPECT_ALLOW;
+}
+
 static __always_inline int flow_allowed(struct pfwd_flow_key *key) {
     __u8 *value = bpf_map_lookup_elem(&pfwd_allowed_flows, key);
     return value != 0;
 }
 
-static __always_inline void flow_store(struct pfwd_flow_key *key) {
+static __always_inline void flow_store_allow(struct pfwd_flow_key *key) {
     __u8 value = 1;
     bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
+}
+
+static __always_inline int inspect_payload_xdp(void *payload_start, void *data_end, __u32 len, const struct pfwd_settings *settings) {
+    __u8 *p = payload_start;
+    __u8 payload[8] = {};
+    __u32 read_len = len >= 8 ? 8 : len;
+
+    if (read_len < 3) {
+        return PFWD_INSPECT_NEED_MORE;
+    }
+    if (read_len >= 1) {
+        if ((void *)(p + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[0] = p[0];
+    }
+    if (read_len >= 2) {
+        if ((void *)(p + 2) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[1] = p[1];
+    }
+    if (read_len >= 3) {
+        if ((void *)(p + 3) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[2] = p[2];
+    }
+    if (read_len >= 4) {
+        if ((void *)(p + 4) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[3] = p[3];
+    }
+    if (read_len >= 5) {
+        if ((void *)(p + 5) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[4] = p[4];
+    }
+    if (read_len >= 6) {
+        if ((void *)(p + 6) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[5] = p[5];
+    }
+    if (read_len >= 7) {
+        if ((void *)(p + 7) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[6] = p[6];
+    }
+    if (read_len >= 8) {
+        if ((void *)(p + 8) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[7] = p[7];
+    }
+    return inspect_payload_bytes_xdp(payload, read_len, settings);
+}
+
+static __always_inline int port_skipped(__be16 port) {
+    struct pfwd_port_key key = {
+        .port = port,
+    };
+    __u8 *value = bpf_map_lookup_elem(&pfwd_protocol_skip_ports, &key);
+    return value != 0;
+}
+
+static __always_inline int tcp_forward_rule_exists(__u8 family, __be16 listen_port, const __u8 listen_addr[16]) {
+    struct pfwd_rule_key key = {
+        .family = family,
+        .protocol = IPPROTO_TCP,
+        .listen_port = listen_port,
+    };
+    struct pfwd_rule_val *rule;
+
+    pfwd_memcpy16(key.listen_addr, listen_addr);
+    rule = bpf_map_lookup_elem(&pfwd_rules, &key);
+    if (rule) {
+        return 1;
+    }
+    zero_addr16(key.listen_addr);
+    rule = bpf_map_lookup_elem(&pfwd_rules, &key);
+    return rule != 0;
 }
 
 static __always_inline int inspect_payload(struct __sk_buff *skb, __u32 offset, __u32 len, const struct pfwd_settings *settings) {
     __u8 payload[8];
     __u32 read_len = len >= 8 ? 8 : len;
     if (read_len < 3) {
-        return TC_ACT_OK;
+        return PFWD_INSPECT_NEED_MORE;
     }
     if (bpf_skb_load_bytes(skb, offset, payload, read_len) < 0) {
         stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
+        return PFWD_INSPECT_NEED_MORE;
     }
-    if (settings->block_http && match_http(payload, read_len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return TC_ACT_SHOT;
+    return inspect_payload_bytes_ingress(payload, read_len, settings);
+}
+
+static __always_inline int protocol_guard_active(const struct pfwd_settings *settings) {
+    return settings && settings->guard_enabled && (settings->block_http || settings->block_tls || settings->block_socks);
+}
+
+static __always_inline int inspect_xdp_tcp_flow(
+    void *payload_start,
+    void *data_end,
+    __u32 payload_len,
+    const struct pfwd_settings *settings,
+    struct pfwd_rule_val *rule,
+    __u64 packet_len,
+    __u8 family,
+    const __u8 saddr[16],
+    const __u8 daddr[16],
+    __be16 sport,
+    __be16 dport
+) {
+    struct pfwd_flow_key flow = {};
+    int verdict;
+
+    if (!protocol_guard_active(settings) || port_skipped(dport)) {
+        return XDP_PASS;
     }
-    if (settings->block_tls && match_tls_client_hello(payload, read_len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return TC_ACT_SHOT;
+    flow.family = family;
+    flow.protocol = IPPROTO_TCP;
+    flow.sport = sport;
+    flow.dport = dport;
+    pfwd_memcpy16(flow.saddr, saddr);
+    pfwd_memcpy16(flow.daddr, daddr);
+    if (flow_allowed(&flow)) {
+        return XDP_PASS;
     }
-    if (settings->block_socks && match_socks(payload, read_len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return TC_ACT_SHOT;
+    verdict = inspect_payload_xdp(payload_start, data_end, payload_len, settings);
+    if (verdict == PFWD_INSPECT_DROP) {
+        count_drop(rule, packet_len);
+        return XDP_DROP;
     }
-    return TC_ACT_OK;
+    if (verdict == PFWD_INSPECT_ALLOW) {
+        flow_store_allow(&flow);
+    }
+    return XDP_PASS;
 }
 
 static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_end, __u16 value) {
@@ -667,7 +846,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
         if (rule) {
             __u32 scratch_key = 0;
             struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
-            struct pfwd_conn_val *existing_conn;
+            struct pfwd_conn_val *existing_conn = 0;
             __be32 old_saddr = ip4->saddr;
             __be32 old_daddr = ip4->daddr;
             __be16 old_sport = sport;
@@ -680,6 +859,24 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
+            }
+            if (protocol == IPPROTO_TCP) {
+                struct tcphdr_min *tcp = (void *)ip4 + ihl;
+                __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+                void *payload_start = (void *)tcp + tcp_len;
+                __u32 payload_len = 0;
+                __u8 src16[16];
+                __u8 dst16[16];
+                if (tcp_len < sizeof(*tcp) || payload_start > data_end) {
+                    stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                    return XDP_PASS;
+                }
+                payload_len = (__u32)(data_end - payload_start);
+                copy_ipv4_to16(src16, ip4->saddr);
+                copy_ipv4_to16(dst16, ip4->daddr);
+                if (inspect_xdp_tcp_flow(payload_start, data_end, payload_len, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
+                    return XDP_DROP;
+                }
             }
             if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -865,12 +1062,26 @@ int pfwd_xdp(struct xdp_md *ctx) {
         if (rule) {
             __u32 scratch_key = 0;
             struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
-            struct pfwd_conn_val *existing_conn;
+            struct pfwd_conn_val *existing_conn = 0;
             __be16 new_sport = sport;
             if (settings && settings->whitelist_enabled && !whitelist_match_v6(ip6->saddr)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
+            }
+            if (protocol == IPPROTO_TCP) {
+                struct tcphdr_min *tcp = (void *)(ip6 + 1);
+                __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+                void *payload_start = (void *)tcp + tcp_len;
+                __u32 payload_len = 0;
+                if (tcp_len < sizeof(*tcp) || payload_start > data_end) {
+                    stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                    return XDP_PASS;
+                }
+                payload_len = (__u32)(data_end - payload_start);
+                if (inspect_xdp_tcp_flow(payload_start, data_end, payload_len, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                    return XDP_DROP;
+                }
             }
             if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -1025,12 +1236,13 @@ int pfwd_ingress(struct __sk_buff *skb) {
     __u32 settings_key = 0;
     struct pfwd_settings *settings = bpf_map_lookup_elem(&pfwd_settings, &settings_key);
     struct pfwd_flow_key flow = {};
+    __u8 listen_addr[16] = {};
     __u32 l4_offset = 0;
     __u32 payload_offset = 0;
     __u32 payload_len = 0;
     struct tcphdr_min tcp;
 
-    if (!settings || (!settings->block_http && !settings->block_tls && !settings->block_socks)) {
+    if (!settings || !settings->guard_enabled || (!settings->block_http && !settings->block_tls && !settings->block_socks)) {
         return TC_ACT_OK;
     }
     if (bpf_skb_load_bytes(skb, 0, &eth, sizeof(eth)) < 0) {
@@ -1056,6 +1268,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
         flow.protocol = IPPROTO_TCP;
         copy_ipv4_to16(flow.saddr, ip4.saddr);
         copy_ipv4_to16(flow.daddr, ip4.daddr);
+        copy_ipv4_to16(listen_addr, ip4.daddr);
         l4_offset = ETH_HLEN + ihl;
     } else if (bpf_ntohs(eth.h_proto) == ETH_P_IPV6) {
         struct ipv6hdr_min ip6;
@@ -1070,6 +1283,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
         flow.protocol = IPPROTO_TCP;
         pfwd_memcpy16(flow.saddr, ip6.saddr);
         pfwd_memcpy16(flow.daddr, ip6.daddr);
+        pfwd_memcpy16(listen_addr, ip6.daddr);
         l4_offset = ETH_HLEN + sizeof(ip6);
     } else {
         return TC_ACT_OK;
@@ -1080,6 +1294,12 @@ int pfwd_ingress(struct __sk_buff *skb) {
     }
     flow.sport = tcp.source;
     flow.dport = tcp.dest;
+    if (port_skipped(tcp.dest)) {
+        return TC_ACT_OK;
+    }
+    if (!tcp_forward_rule_exists(flow.family, tcp.dest, listen_addr)) {
+        return TC_ACT_OK;
+    }
     if (flow_allowed(&flow)) {
         return TC_ACT_OK;
     }
@@ -1088,11 +1308,12 @@ int pfwd_ingress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     payload_len = skb->len - payload_offset;
-    if (inspect_payload(skb, payload_offset, payload_len, settings) == TC_ACT_SHOT) {
+    int verdict = inspect_payload(skb, payload_offset, payload_len, settings);
+    if (verdict == PFWD_INSPECT_DROP) {
         return TC_ACT_SHOT;
     }
-    if (payload_len > 0) {
-        flow_store(&flow);
+    if (verdict == PFWD_INSPECT_ALLOW) {
+        flow_store_allow(&flow);
     }
     return TC_ACT_OK;
 }
