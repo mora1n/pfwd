@@ -54,6 +54,24 @@ pfwd guard whitelist status
 wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
 ```
 
+### XDP 分支
+
+`main` 分支使用 nftables 数据面；如需使用 XDP/eBPF 数据面，可安装 `xdp` 分支：
+
+```bash
+wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/xdp/pfwd.sh | bash -s -- install
+```
+
+从旧版本导出的配置导入 XDP 分支前，需要把转发规则里的 `"nft":` 字段转换为 `"xdp":` 字段。不要使用 `sed 's/nft/xdp/g'` 这类全局字符串替换，避免误改 `nft_table`、`nft_family`、备注文本或其他非转发规则字段。
+
+```bash
+sed -E 's/"nft"[[:space:]]*:/"xdp":/g' \
+  pfwd-export-old.json > pfwd-export-xdp.json
+
+jq -e . pfwd-export-xdp.json >/dev/null
+pfwd import pfwd-export-xdp.json
+```
+
 安装完成后(root权限下)直接运行：
 
 ```bash
