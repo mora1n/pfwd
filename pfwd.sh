@@ -163,6 +163,7 @@ pfwd_main() {
         start) cmd_toggle_forward true "$@" ;;
         stop) cmd_toggle_forward false "$@" ;;
         delete) cmd_delete "$@" ;;
+        forward) cmd_forward "$@" ;;
         expire) cmd_expire "$@" ;;
         limit) cmd_limit "$@" ;;
         user-forwards-limit) cmd_user_forwards_limit "$@" ;;

@@ -571,6 +571,15 @@ cmd_limit() {
     fi
 }
 
+cmd_forward() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        update) cmd_forward_update "$@" ;;
+        *) pfwd_die "用法：pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]" ;;
+    esac
+}
+
 cmd_forward_update() {
     local forward_id=""
     local before current_comment current_listen_ip current_listen_port current_remote_host current_remote_port current_stop_at current_protocol current_traffic_mode current_traffic_ratio current_mss_mode current_mss_value current_snat_mode current_snat_source

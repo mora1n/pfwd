@@ -370,7 +370,7 @@ ui_page_draw() {
     UI_PAGE_PREV_OFFSET="$start_line"
 
     if [ "$UI_PAGE_SCROLLABLE" = "1" ]; then
-        status_text="滚动 $((start_line + 1))-$(( end_line < UI_PAGE_LINE_COUNT ? end_line : UI_PAGE_LINE_COUNT ))/$UI_PAGE_LINE_COUNT  鼠标滚轮/↑↓/PgUp/PgDn/j/k"
+        status_text="滚动 $((start_line + 1))-$(( end_line < UI_PAGE_LINE_COUNT ? end_line : UI_PAGE_LINE_COUNT ))/$UI_PAGE_LINE_COUNT  鼠标滚轮/↑↓/PgUp/PgDn"
         ui_print_line "$status_text" "$UI_C_DIM"
     fi
 
@@ -492,11 +492,11 @@ ui_page_read_line() {
                     current_timeout=""
                 fi
                 ;;
-            $'\033[A'|$'\033OA'|k)
+            $'\033[A'|$'\033OA')
                 ui_page_scroll_lines -1
                 current_timeout="$timeout_seconds"
                 ;;
-            $'\033[B'|$'\033OB'|j)
+            $'\033[B'|$'\033OB')
                 ui_page_scroll_lines 1
                 current_timeout="$timeout_seconds"
                 ;;
