@@ -237,6 +237,7 @@ service_ensure_shortcut() {
     [ "${PFWD_SKIP_SHORTCUT:-0}" != "1" ] || return 0
     [ "$(basename "$PFWD_SCRIPT_PATH")" = "pfwd.sh" ] || return 0
     [ "$PFWD_SCRIPT_PATH" != "$PFWD_BIN_PATH" ] || return 0
+    [ "$PFWD_SCRIPT_PATH" = "$PFWD_INSTALL_DIR/pfwd.sh" ] || return 0
     if [ -z "${PFWD_ROOT_PREFIX:-}" ] && [ "${PFWD_DRY_RUN:-0}" != "1" ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
         return 0
     fi
@@ -342,8 +343,7 @@ service_remove_installation_artifacts() {
     service_remove_unit_files
     service_remove_binary_artifacts
     service_remove_asset_artifacts
-    rm -rf "$PFWD_INSTALL_DIR/lib"
-    rmdir "$PFWD_INSTALL_DIR/bin" 2>/dev/null || true
+    rm -rf "$PFWD_INSTALL_DIR"
 }
 
 service_uninstall_files() {

@@ -36,13 +36,20 @@ enum pfwd_inspect_result {
     PFWD_INSPECT_NEED_MORE = 2,
 };
 
+enum pfwd_cache_verdict {
+    PFWD_CACHE_UNKNOWN = 0,
+    PFWD_CACHE_ALLOW = 1,
+    PFWD_CACHE_DROP = 2,
+};
+
 struct pfwd_settings {
     __u8 whitelist_enabled;
     __u8 block_http;
     __u8 block_tls;
     __u8 block_socks;
     __u8 guard_enabled;
-    __u8 pad[3];
+    __u8 has_skip_ports;
+    __u8 pad[2];
     __u32 external_ifindex;
     __u32 loopback_ifindex;
 };
@@ -75,7 +82,9 @@ struct pfwd_rule_val {
     __u64 rule_billing_used_base_bytes;
     __u64 user_billing_used_base_bytes;
     __u8 traffic_mode;
-    __u8 pad[7];
+    __u8 user_limit_enabled;
+    __u8 billing_enabled;
+    __u8 pad[5];
 };
 
 struct pfwd_conn_key {
@@ -101,7 +110,9 @@ struct pfwd_conn_val {
     __u16 pad16;
     __u64 traffic_ratio_scaled;
     __u8 traffic_mode;
-    __u8 pad8[7];
+    __u8 user_limit_enabled;
+    __u8 billing_enabled;
+    __u8 pad8[5];
     __u64 packets;
     __u64 bytes;
 };
@@ -351,11 +362,14 @@ static __always_inline int whitelist_match_v4(__be32 addr) {
 
 static __always_inline int whitelist_cache_hit_v4(__be32 addr) {
     __u8 *value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v4, &addr);
-    return value != 0;
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
 }
 
-static __always_inline void whitelist_cache_store_v4(__be32 addr) {
-    __u8 value = 1;
+static __always_inline void whitelist_cache_store_v4(__be32 addr, __u8 verdict) {
+    __u8 value = verdict;
     bpf_map_update_elem(&pfwd_whitelist_cache_v4, &addr, &value, BPF_ANY);
 }
 
@@ -374,36 +388,46 @@ static __always_inline int whitelist_cache_hit_v6(const __u8 addr[16]) {
     __u8 *value;
     pfwd_memcpy16(key.addr, addr);
     value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v6, &key);
-    return value != 0;
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
 }
 
-static __always_inline void whitelist_cache_store_v6(const __u8 addr[16]) {
+static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 verdict) {
     struct pfwd_whitelist_cache_key_v6 key = {};
-    __u8 value = 1;
+    __u8 value = verdict;
     pfwd_memcpy16(key.addr, addr);
     bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
 static __always_inline int whitelist_allowed_v4(__be32 addr) {
-    if (whitelist_cache_hit_v4(addr)) {
-        return 1;
+    int verdict = whitelist_cache_hit_v4(addr);
+
+    if (verdict != PFWD_CACHE_UNKNOWN) {
+        return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!whitelist_match_v4(addr)) {
-        return 0;
-    }
-    whitelist_cache_store_v4(addr);
-    return 1;
+    verdict = whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    whitelist_cache_store_v4(addr, verdict);
+    return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
-    if (whitelist_cache_hit_v6(addr)) {
-        return 1;
+    int verdict = whitelist_cache_hit_v6(addr);
+
+    if (verdict != PFWD_CACHE_UNKNOWN) {
+        return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!whitelist_match_v6(addr)) {
-        return 0;
+    verdict = whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    whitelist_cache_store_v6(addr, verdict);
+    return verdict == PFWD_CACHE_ALLOW;
+}
+
+static __always_inline __u64 scaled_bytes(__u64 bytes, __u64 ratio) {
+    if (ratio == 0 || ratio == PFWD_RATIO_SCALE) {
+        return bytes;
     }
-    whitelist_cache_store_v6(addr);
-    return 1;
+    return (bytes * ratio) / PFWD_RATIO_SCALE;
 }
 
 static __always_inline int traffic_over_limit(const struct pfwd_rule_val *rule, __u64 input_delta, __u64 output_delta) {
@@ -415,28 +439,29 @@ static __always_inline int traffic_over_limit(const struct pfwd_rule_val *rule, 
     __u32 rule_id = rule->rule_id;
     __u32 user_id = rule->user_id;
     __u64 ratio = rule->traffic_ratio_scaled;
-    if (ratio == 0) {
-        ratio = PFWD_RATIO_SCALE;
-    }
-    billed_delta = ((input_delta * ratio) / PFWD_RATIO_SCALE) + ((output_delta * ratio) / PFWD_RATIO_SCALE);
+    billed_delta = scaled_bytes(input_delta, ratio) + scaled_bytes(output_delta, ratio);
     if (rule->traffic_mode != 1) {
         billed_delta *= 2;
     }
-    rule_counter = bpf_map_lookup_elem(&pfwd_rule_counters, &rule_id);
-    current_rule = rule->rule_billing_used_base_bytes;
-    if (rule_counter) {
-        current_rule += rule_counter->billing_bytes;
+    if (rule->rule_limit_bytes > 0) {
+        rule_counter = bpf_map_lookup_elem(&pfwd_rule_counters, &rule_id);
+        current_rule = rule->rule_billing_used_base_bytes;
+        if (rule_counter) {
+            current_rule += rule_counter->billing_bytes;
+        }
+        if (current_rule + billed_delta > rule->rule_limit_bytes) {
+            return 1;
+        }
     }
-    user_counter = bpf_map_lookup_elem(&pfwd_user_counters, &user_id);
-    current_user = rule->user_billing_used_base_bytes;
-    if (user_counter) {
-        current_user += user_counter->billing_bytes;
-    }
-    if (rule->rule_limit_bytes > 0 && current_rule + billed_delta > rule->rule_limit_bytes) {
-        return 1;
-    }
-    if (rule->user_limit_bytes > 0 && current_user + billed_delta > rule->user_limit_bytes) {
-        return 1;
+    if (rule->user_limit_bytes > 0) {
+        user_counter = bpf_map_lookup_elem(&pfwd_user_counters, &user_id);
+        current_user = rule->user_billing_used_base_bytes;
+        if (user_counter) {
+            current_user += user_counter->billing_bytes;
+        }
+        if (current_user + billed_delta > rule->user_limit_bytes) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -444,54 +469,64 @@ static __always_inline int traffic_over_limit(const struct pfwd_rule_val *rule, 
 static __always_inline void count_input(const struct pfwd_rule_val *rule, __u64 bytes, __u64 packets) {
     struct pfwd_counter *counter;
     __u32 key = rule->rule_id;
-    __u64 ratio = rule->traffic_ratio_scaled;
-    __u64 billed;
-    if (ratio == 0) {
-        ratio = PFWD_RATIO_SCALE;
-    }
-    billed = (bytes * ratio) / PFWD_RATIO_SCALE;
-    if (rule->traffic_mode != 1) {
-        billed *= 2;
+    __u64 billed = 0;
+
+    if (rule->billing_enabled) {
+        billed = scaled_bytes(bytes, rule->traffic_ratio_scaled);
+        if (rule->traffic_mode != 1) {
+            billed *= 2;
+        }
     }
     counter = bpf_map_lookup_elem(&pfwd_rule_counters, &key);
     if (counter) {
         __sync_fetch_and_add(&counter->input_bytes, bytes);
         __sync_fetch_and_add(&counter->input_packets, packets);
-        __sync_fetch_and_add(&counter->billing_bytes, billed);
+        if (rule->billing_enabled) {
+            __sync_fetch_and_add(&counter->billing_bytes, billed);
+        }
     }
     key = rule->user_id;
-    counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
-    if (counter) {
-        __sync_fetch_and_add(&counter->input_bytes, bytes);
-        __sync_fetch_and_add(&counter->input_packets, packets);
-        __sync_fetch_and_add(&counter->billing_bytes, billed);
+    if (rule->user_limit_enabled) {
+        counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
+        if (counter) {
+            __sync_fetch_and_add(&counter->input_bytes, bytes);
+            __sync_fetch_and_add(&counter->input_packets, packets);
+            if (rule->billing_enabled) {
+                __sync_fetch_and_add(&counter->billing_bytes, billed);
+            }
+        }
     }
 }
 
 static __always_inline void count_output(const struct pfwd_conn_val *conn, __u64 bytes, __u64 packets) {
     struct pfwd_counter *counter;
     __u32 key = conn->rule_id;
-    __u64 ratio = conn->traffic_ratio_scaled;
-    __u64 billed;
-    if (ratio == 0) {
-        ratio = PFWD_RATIO_SCALE;
-    }
-    billed = (bytes * ratio) / PFWD_RATIO_SCALE;
-    if (conn->traffic_mode != 1) {
-        billed *= 2;
+    __u64 billed = 0;
+
+    if (conn->billing_enabled) {
+        billed = scaled_bytes(bytes, conn->traffic_ratio_scaled);
+        if (conn->traffic_mode != 1) {
+            billed *= 2;
+        }
     }
     counter = bpf_map_lookup_elem(&pfwd_rule_counters, &key);
     if (counter) {
         __sync_fetch_and_add(&counter->output_bytes, bytes);
         __sync_fetch_and_add(&counter->output_packets, packets);
-        __sync_fetch_and_add(&counter->billing_bytes, billed);
+        if (conn->billing_enabled) {
+            __sync_fetch_and_add(&counter->billing_bytes, billed);
+        }
     }
     key = conn->user_id;
-    counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
-    if (counter) {
-        __sync_fetch_and_add(&counter->output_bytes, bytes);
-        __sync_fetch_and_add(&counter->output_packets, packets);
-        __sync_fetch_and_add(&counter->billing_bytes, billed);
+    if (conn->user_limit_enabled) {
+        counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
+        if (counter) {
+            __sync_fetch_and_add(&counter->output_bytes, bytes);
+            __sync_fetch_and_add(&counter->output_packets, packets);
+            if (conn->billing_enabled) {
+                __sync_fetch_and_add(&counter->billing_bytes, billed);
+            }
+        }
     }
 }
 
@@ -667,6 +702,28 @@ static __always_inline int inspect_payload_bytes_xdp(const __u8 *payload, __u32 
 }
 
 static __always_inline int inspect_guard_prefix(const struct pfwd_guard_prefix_val *prefix, const struct pfwd_settings *settings) {
+    int http_possible = 0;
+    int tls_possible = 0;
+    int socks_possible = 0;
+
+    if (prefix->seen_len >= 3) {
+        if (settings->block_http) {
+            http_possible = match_http(prefix->prefix, prefix->seen_len);
+        }
+        if (settings->block_socks) {
+            socks_possible = match_socks(prefix->prefix, prefix->seen_len);
+        }
+    }
+    if (prefix->seen_len >= 6 && settings->block_tls) {
+        tls_possible = match_tls_client_hello(prefix->prefix, prefix->seen_len);
+    }
+    if (prefix->seen_len >= 3 && (!settings->block_tls || prefix->seen_len >= 6)) {
+        if ((!settings->block_http || !http_possible) &&
+            (!settings->block_socks || !socks_possible) &&
+            (!settings->block_tls || !tls_possible)) {
+            return PFWD_INSPECT_ALLOW;
+        }
+    }
     int verdict = inspect_payload_bytes_xdp(prefix->prefix, prefix->seen_len, settings);
     if (verdict == PFWD_INSPECT_DROP) {
         return verdict;
@@ -677,14 +734,25 @@ static __always_inline int inspect_guard_prefix(const struct pfwd_guard_prefix_v
     return PFWD_INSPECT_ALLOW;
 }
 
-static __always_inline int flow_allowed(struct pfwd_flow_key *key) {
+static __always_inline int flow_cached_verdict(struct pfwd_flow_key *key) {
     __u8 *value = bpf_map_lookup_elem(&pfwd_allowed_flows, key);
-    return value != 0;
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
+}
+
+static __always_inline void flow_store_verdict(struct pfwd_flow_key *key, __u8 verdict) {
+    __u8 value = verdict;
+    bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
 }
 
 static __always_inline void flow_store_allow(struct pfwd_flow_key *key) {
-    __u8 value = 1;
-    bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
+    flow_store_verdict(key, PFWD_CACHE_ALLOW);
+}
+
+static __always_inline void flow_store_drop(struct pfwd_flow_key *key) {
+    flow_store_verdict(key, PFWD_CACHE_DROP);
 }
 
 static __always_inline int inspect_payload_xdp(void *payload_start, void *data_end, __u32 len, const struct pfwd_settings *settings) {
@@ -695,16 +763,61 @@ static __always_inline int inspect_payload_xdp(void *payload_start, void *data_e
     if (read_len < 3) {
         return PFWD_INSPECT_NEED_MORE;
     }
-    if ((void *)(p + read_len) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return PFWD_INSPECT_NEED_MORE;
-    }
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if ((__u32)i >= read_len) {
-            break;
+    if (read_len > 0) {
+        if ((void *)(p + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
         }
-        payload[i] = p[i];
+        payload[0] = p[0];
+    }
+    if (read_len > 1) {
+        if ((void *)(p + 2) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[1] = p[1];
+    }
+    if (read_len > 2) {
+        if ((void *)(p + 3) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[2] = p[2];
+    }
+    if (read_len > 3) {
+        if ((void *)(p + 4) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[3] = p[3];
+    }
+    if (read_len > 4) {
+        if ((void *)(p + 5) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[4] = p[4];
+    }
+    if (read_len > 5) {
+        if ((void *)(p + 6) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[5] = p[5];
+    }
+    if (read_len > 6) {
+        if ((void *)(p + 7) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[6] = p[6];
+    }
+    if (read_len > 7) {
+        if ((void *)(p + 8) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return PFWD_INSPECT_NEED_MORE;
+        }
+        payload[7] = p[7];
     }
     return inspect_payload_bytes_xdp(payload, read_len, settings);
 }
@@ -794,42 +907,171 @@ static __always_inline int append_guard_prefix(
     __u32 payload_len,
     struct pfwd_guard_prefix_val *state
 ) {
-    __u32 offset = state->seen_len;
+    __u32 offset;
     __u32 copy_len = payload_len;
 
+    if (!state) {
+        return -1;
+    }
+    offset = state->seen_len;
     if (offset >= 8 || copy_len == 0) {
         return 0;
     }
     if (copy_len > 8 - offset) {
         copy_len = 8 - offset;
     }
-    if ((void *)(payload + copy_len) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return -1;
-    }
-    if (copy_len > 0) {
-        state->prefix[offset] = payload[0];
-    }
-    if (copy_len > 1) {
-        state->prefix[offset + 1] = payload[1];
-    }
-    if (copy_len > 2) {
-        state->prefix[offset + 2] = payload[2];
-    }
-    if (copy_len > 3) {
-        state->prefix[offset + 3] = payload[3];
-    }
-    if (copy_len > 4) {
-        state->prefix[offset + 4] = payload[4];
-    }
-    if (copy_len > 5) {
-        state->prefix[offset + 5] = payload[5];
-    }
-    if (copy_len > 6) {
-        state->prefix[offset + 6] = payload[6];
-    }
-    if (copy_len > 7) {
-        state->prefix[offset + 7] = payload[7];
+    if (offset == 0) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[0] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[1] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[2] = payload[2];
+        }
+        if (copy_len > 3) {
+            if ((void *)(payload + 4) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[3] = payload[3];
+        }
+        if (copy_len > 4) {
+            if ((void *)(payload + 5) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[4] = payload[4];
+        }
+        if (copy_len > 5) {
+            if ((void *)(payload + 6) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[5];
+        }
+        if (copy_len > 6) {
+            if ((void *)(payload + 7) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[6];
+        }
+        if (copy_len > 7) {
+            if ((void *)(payload + 8) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[7];
+        }
+    } else if (offset == 1) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[1] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[2] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[3] = payload[2];
+        }
+        if (copy_len > 3) {
+            if ((void *)(payload + 4) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[4] = payload[3];
+        }
+        if (copy_len > 4) {
+            if ((void *)(payload + 5) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[4];
+        }
+        if (copy_len > 5) {
+            if ((void *)(payload + 6) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[5];
+        }
+        if (copy_len > 6) {
+            if ((void *)(payload + 7) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[6];
+        }
+    } else if (offset == 2) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[2] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[3] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[4] = payload[2];
+        }
+        if (copy_len > 3) {
+            if ((void *)(payload + 4) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[3];
+        }
+        if (copy_len > 4) {
+            if ((void *)(payload + 5) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[4];
+        }
+        if (copy_len > 5) {
+            if ((void *)(payload + 6) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[5];
+        }
+    } else if (offset == 3) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[3] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[4] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[2];
+        }
+        if (copy_len > 3) {
+            if ((void *)(payload + 4) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[3];
+        }
+        if (copy_len > 4) {
+            if ((void *)(payload + 5) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[4];
+        }
+    } else if (offset == 4) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[4] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[2];
+        }
+        if (copy_len > 3) {
+            if ((void *)(payload + 4) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[3];
+        }
+    } else if (offset == 5) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[5] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[1];
+        }
+        if (copy_len > 2) {
+            if ((void *)(payload + 3) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[2];
+        }
+    } else if (offset == 6) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[6] = payload[0];
+        }
+        if (copy_len > 1) {
+            if ((void *)(payload + 2) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[1];
+        }
+    } else if (offset == 7) {
+        if (copy_len > 0) {
+            if ((void *)(payload + 1) > data_end) { stat_inc(PFWD_STAT_PARSE_SKIPPED); return -1; }
+            state->prefix[7] = payload[0];
+        }
     }
     state->seen_len = offset + copy_len;
     return 0;
@@ -850,10 +1092,10 @@ static __always_inline int inspect_xdp_tcp_flow(
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
     struct pfwd_guard_prefix_val *stored_prefix;
-    __u32 payload_len = tcp_payload_prefix_len((const __u8 *)payload_start, data_end);
+    __u32 payload_len;
     int verdict;
 
-    if (!protocol_guard_active(settings) || port_skipped(dport) || payload_len == 0) {
+    if (!protocol_guard_active(settings)) {
         return XDP_PASS;
     }
     flow.family = family;
@@ -862,14 +1104,26 @@ static __always_inline int inspect_xdp_tcp_flow(
     flow.dport = dport;
     pfwd_memcpy16(flow.saddr, saddr);
     pfwd_memcpy16(flow.daddr, daddr);
-    if (flow_allowed(&flow)) {
-        bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
+    verdict = flow_cached_verdict(&flow);
+    if (verdict == PFWD_CACHE_ALLOW) {
+        return XDP_PASS;
+    }
+    if (verdict == PFWD_CACHE_DROP) {
+        count_drop(rule, packet_len);
+        return XDP_DROP;
+    }
+    if (settings->has_skip_ports && port_skipped(dport)) {
+        return XDP_PASS;
+    }
+    payload_len = tcp_payload_prefix_len((const __u8 *)payload_start, data_end);
+    if (payload_len == 0) {
         return XDP_PASS;
     }
     stored_prefix = bpf_map_lookup_elem(&pfwd_guard_prefixes, &flow);
     if (!stored_prefix && payload_len >= 8) {
         verdict = inspect_payload_xdp(payload_start, data_end, payload_len, settings);
         if (verdict == PFWD_INSPECT_DROP) {
+            flow_store_drop(&flow);
             count_drop(rule, packet_len);
             return XDP_DROP;
         }
@@ -884,7 +1138,7 @@ static __always_inline int inspect_xdp_tcp_flow(
     }
     verdict = inspect_guard_prefix(&next_prefix, settings);
     if (verdict == PFWD_INSPECT_DROP) {
-        bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
+        flow_store_drop(&flow);
         count_drop(rule, packet_len);
         return XDP_DROP;
     }
@@ -893,7 +1147,6 @@ static __always_inline int inspect_xdp_tcp_flow(
         return XDP_PASS;
     }
     flow_store_allow(&flow);
-    bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
     return XDP_PASS;
 }
 
@@ -1042,6 +1295,8 @@ static __always_inline int prepare_local_conn_v4(
     scratch->conn.listen_port = listen_port;
     scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
     scratch->conn.traffic_mode = rule->traffic_mode;
+    scratch->conn.user_limit_enabled = rule->user_limit_enabled;
+    scratch->conn.billing_enabled = rule->billing_enabled;
     scratch->conn.packets = 1;
     scratch->conn.bytes = packet_len;
     bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1111,6 +1366,8 @@ static __always_inline int prepare_local_conn_v6(
     scratch->conn.listen_port = listen_port;
     scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
     scratch->conn.traffic_mode = rule->traffic_mode;
+    scratch->conn.user_limit_enabled = rule->user_limit_enabled;
+    scratch->conn.billing_enabled = rule->billing_enabled;
     scratch->conn.packets = 1;
     scratch->conn.bytes = packet_len;
     bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1373,6 +1630,8 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 scratch->conn.listen_port = old_dport;
                 scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
                 scratch->conn.traffic_mode = rule->traffic_mode;
+                scratch->conn.user_limit_enabled = rule->user_limit_enabled;
+                scratch->conn.billing_enabled = rule->billing_enabled;
                 scratch->conn.packets = 1;
                 scratch->conn.bytes = packet_len;
                 bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1594,6 +1853,8 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 scratch->conn.listen_port = dport;
                 scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
                 scratch->conn.traffic_mode = rule->traffic_mode;
+                scratch->conn.user_limit_enabled = rule->user_limit_enabled;
+                scratch->conn.billing_enabled = rule->billing_enabled;
                 bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
                 scratch->reverse_key.source_port = new_sport;
                 pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
@@ -1760,7 +2021,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
             }
-            if (!rule || !protocol_guard_active(settings) || port_skipped(dport)) {
+            if (!rule || !protocol_guard_active(settings) || (settings->has_skip_ports && port_skipped(dport))) {
                 return TC_ACT_OK;
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
@@ -1821,7 +2082,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
             }
-            if (!rule || !protocol_guard_active(settings) || port_skipped(dport)) {
+            if (!rule || !protocol_guard_active(settings) || (settings->has_skip_ports && port_skipped(dport))) {
                 return TC_ACT_OK;
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;

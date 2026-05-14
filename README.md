@@ -48,7 +48,7 @@ pfwd guard whitelist status
 
 ## 源码构建
 
-`xdp` 分支合并到 `main` 后，`main` 就是唯一的源码入口。需要重新生成可分发的 `pfwd-xdp` 预编译资产时，直接在仓库根目录执行：
+需要预编译 `pfwd-xdp` 时，直接在仓库根目录执行：
 
 ```bash
 ./xdp/build.sh
@@ -63,7 +63,7 @@ pfwd guard whitelist status
 
 > 以下操作默认root权限下进行
 
-在线安装（`xdp` 合并后统一从 `main` 拉取）：
+在线安装：
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
@@ -215,7 +215,7 @@ pfwd add \
 - 同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 - 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 固定走 `nftables`。
 - 当 XDP 不可用时，符合条件的规则会自动回退到 `nftables`。
-- MSS 和固定 SNAT 持久化在 `.forwards[].xdp`。
+- MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 

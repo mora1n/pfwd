@@ -434,8 +434,8 @@ cmd_list() {
             end;
           .forwards[]?
           | select(.user_id == $id)
-          | (.xdp.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.xdp.mss_mode // "-"),(if $snat_source == "" then (.xdp.snat_mode // "masquerade") else $snat_source end)]
+          | (.net.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.net.mss_mode // "-"),(if $snat_source == "" then (.net.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     else
@@ -445,8 +445,8 @@ cmd_list() {
             else $host + ":" + ($port | tostring)
             end;
           .forwards[]?
-          | (.xdp.snat_source // "") as $snat_source
-          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.xdp.mss_mode // "-"),(if $snat_source == "" then (.xdp.snat_mode // "masquerade") else $snat_source end)]
+          | (.net.snat_source // "") as $snat_source
+          | [.id,.user_id,.enabled,.listen_port,hostport(.remote_host; .remote_port),(.protocol // "tcp_udp"),(.stop_at // "-"),.traffic_mode,((.traffic_ratio // 1) | tostring),(.net.mss_mode // "-"),(if $snat_source == "" then (.net.snat_mode // "masquerade") else $snat_source end)]
           | @tsv
         ' "$PFWD_CONFIG_FILE"
     fi
@@ -612,10 +612,10 @@ cmd_forward_update() {
     current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$before")"
     current_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$before")"
     current_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$before")"
-    current_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$before")"
-    current_mss_value="$(jq -r 'if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end' <<< "$before")"
-    current_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$before")"
-    current_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$before")"
+    current_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$before")"
+    current_mss_value="$(jq -r 'if (.net.mss_value // null) == null then "" else (.net.mss_value | tostring) end' <<< "$before")"
+    current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$before")"
+    current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$before")"
     if [ "$traffic_mode" != "__KEEP__" ] || [ "$traffic_ratio" != "__KEEP__" ]; then
         cmd_rollup_before_traffic_semantics_change
     fi
@@ -630,10 +630,10 @@ cmd_forward_update() {
     updated_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$after")"
     updated_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$after")"
     updated_traffic_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$after")"
-    updated_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$after")"
-    updated_mss_value="$(jq -r 'if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end' <<< "$after")"
-    updated_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$after")"
-    updated_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$after")"
+    updated_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$after")"
+    updated_mss_value="$(jq -r 'if (.net.mss_value // null) == null then "" else (.net.mss_value | tostring) end' <<< "$after")"
+    updated_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$after")"
+    updated_snat_source="$(jq -r '.net.snat_source // ""' <<< "$after")"
     if [ "$current_comment" != "$updated_comment" ]; then
         changed_comment="true"
     fi

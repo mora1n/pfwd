@@ -88,10 +88,10 @@ runtime_compiled_json() {
           (.remote_port | tostring),
           (.protocol // "tcp_udp"),
           (.comment // ""),
-          (.xdp.snat_mode // "masquerade"),
-          (.xdp.snat_source // ""),
-          (.xdp.mss_mode // ""),
-          (if (.xdp.mss_value // null) == null then "" else (.xdp.mss_value | tostring) end),
+          (.net.snat_mode // "masquerade"),
+          (.net.snat_source // ""),
+          (.net.mss_mode // ""),
+          (if (.net.mss_value // null) == null then "" else (.net.mss_value | tostring) end),
           (.traffic_mode // "two-way"),
           ((.traffic_ratio // 1) | tostring),
           (.limits.traffic_bytes // 0 | tostring)
@@ -504,12 +504,18 @@ runtime_remove_runtime_state_dirs() {
 }
 
 runtime_clear_nft_runtime() {
-    fw_delete_forward_table || true
+    if [ -f "$PFWD_CONFIG_FILE" ]; then
+        fw_delete_forward_table || true
+    fi
+    mkdir -p "$(dirname "$PFWD_FORWARDER_NFT_RENDER_FILE")"
     : > "$PFWD_FORWARDER_NFT_RENDER_FILE"
 }
 
 runtime_clear_accounting_runtime() {
-    fw_cleanup_nft_table "$(fw_family)" "$(fw_table)" || true
+    if [ -f "$PFWD_CONFIG_FILE" ]; then
+        fw_cleanup_nft_table "$(fw_family)" "$(fw_table)" || true
+    fi
+    mkdir -p "$(dirname "$FW_NFT_ACCOUNTING_RENDER_FILE")"
     : > "$FW_NFT_ACCOUNTING_RENDER_FILE"
 }
 
@@ -558,7 +564,7 @@ runtime_apply_xdp_runtime() {
 
     iface="$(jq -r '.settings.interface // empty' <<< "$runtime_json")"
     [ -n "$iface" ] || iface="$(runtime_iface)"
-    [ -n "$iface" ] || pfwd_die "无法确定 XDP 网卡，请设置 settings.xdp.interface 或 settings.tc_interface"
+    [ -n "$iface" ] || pfwd_die "无法确定转发网卡，请设置 settings.forward.interface 或 settings.tc_interface"
 
     if [ ! -x "$(forwarder_bin_path)" ]; then
         RUNTIME_XDP_ERROR="pfwd-xdp 不可执行：$(forwarder_bin_path)"

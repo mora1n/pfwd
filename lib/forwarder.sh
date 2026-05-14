@@ -121,7 +121,7 @@ forwarder_resolve_targets() {
 
 forwarder_iface() {
     local iface
-    iface="$(jq -r '.settings.xdp.interface // .settings.tc_interface // ""' "$PFWD_CONFIG_FILE")"
+    iface="$(jq -r '.settings.forward.interface // .settings.tc_interface // ""' "$PFWD_CONFIG_FILE")"
     if [ -n "$iface" ]; then
         echo "$iface"
         return

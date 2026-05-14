@@ -28,7 +28,7 @@ import (
 //go:embed xdp_bpfel.o
 var xdpBPFEL []byte
 
-const binaryVersion = "0.2.0"
+const binaryVersion = "0.2.3"
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
@@ -120,6 +120,44 @@ type runtimeFile struct {
 	RuleIndex  map[string]uint32 `json:"rule_index,omitempty"`
 	UserIndex  map[string]uint32 `json:"user_index,omitempty"`
 	ConfigHash string            `json:"config_hash,omitempty"`
+}
+
+type whitelistContentHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
+type runtimeSemanticSettings struct {
+	Interface         string   `json:"interface"`
+	GuardEnabled      bool     `json:"guard_enabled"`
+	WhitelistEnabled  bool     `json:"whitelist_enabled"`
+	BlockHTTP         bool     `json:"block_http"`
+	BlockTLS          bool     `json:"block_tls"`
+	BlockSOCKS        bool     `json:"block_socks"`
+	ProtocolSkipPorts []uint16 `json:"protocol_skip_ports,omitempty"`
+	GuardIngressMode  string   `json:"guard_ingress_mode,omitempty"`
+}
+
+type runtimeSemanticRule struct {
+	Index               uint32  `json:"index"`
+	UserIndex           uint32  `json:"user_index"`
+	ListenIP            string  `json:"listen_ip"`
+	ListenPort          uint16  `json:"listen_port"`
+	Protocol            string  `json:"protocol"`
+	IPVersion           uint8   `json:"ip_version"`
+	ResolvedTarget      string  `json:"resolved_target"`
+	RemotePort          uint16  `json:"remote_port"`
+	SNATMode            string  `json:"snat_mode"`
+	SNATSource          string  `json:"snat_source,omitempty"`
+	MSSMode             string  `json:"mss_mode,omitempty"`
+	MSSValue            uint16  `json:"mss_value,omitempty"`
+	TrafficMode         string  `json:"traffic_mode"`
+	TrafficRatio        float64 `json:"traffic_ratio"`
+	RuleLimit           uint64  `json:"traffic_limit_bytes"`
+	UserLimit           uint64  `json:"user_limit_bytes"`
+	BillingUsedBase     uint64  `json:"billing_used_base_bytes,omitempty"`
+	UserBillingUsedBase uint64  `json:"user_billing_used_base_bytes,omitempty"`
+	XDPDisabled         bool    `json:"xdp_disabled,omitempty"`
 }
 
 type runtimeSettings struct {
@@ -218,7 +256,8 @@ type xdpSettings struct {
 	BlockTLS         uint8
 	BlockSOCKS       uint8
 	GuardEnabled     uint8
-	Pad              [3]uint8
+	HasSkipPorts     uint8
+	Pad              [2]uint8
 	ExternalIfindex  uint32
 	LoopbackIfindex  uint32
 }
@@ -246,7 +285,9 @@ type ruleVal struct {
 	RuleBillingUsedBaseBytes uint64
 	UserBillingUsedBaseBytes uint64
 	TrafficMode              uint8
-	Pad                      [7]uint8
+	UserLimitEnabled         uint8
+	BillingEnabled           uint8
+	Pad                      [5]uint8
 }
 
 type counterVal struct {
@@ -282,7 +323,9 @@ type connVal struct {
 	Pad16              uint16
 	TrafficRatioScaled uint64
 	TrafficMode        uint8
-	Pad8               [7]uint8
+	UserLimitEnabled   uint8
+	BillingEnabled     uint8
+	Pad8               [5]uint8
 	Packets            uint64
 	Bytes              uint64
 }
@@ -541,6 +584,17 @@ func applyRuntime(opts applyOptions) error {
 	currentStatus, _ := readStatus(opts.StatusFile)
 	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
 	needIngress := opts.GuardMode == "ingress" || (protocolGuard && guardIngressEnabled(runtimeData.Settings))
+	runtimeSemanticConfigHash, err := runtimeSemanticHash(runtimeData)
+	if err != nil {
+		return err
+	}
+	if currentStatus.Applied &&
+		currentStatus.BinaryVersion == binaryVersion &&
+		currentStatus.ConfigHash == runtimeSemanticConfigHash &&
+		currentStatus.GuardMode == opts.GuardMode &&
+		currentStatus.Interface == iface.Name {
+		return nil
+	}
 	if canIncrementalApply(currentStatus, runtimeData, opts, iface, needIngress) {
 		if err := applyIncrementalRuntime(currentStatus, runtimeData, opts, iface, protocolGuard); err == nil {
 			return nil
@@ -624,7 +678,7 @@ func applyRuntime(opts applyOptions) error {
 		ProtocolGuard:  protocolGuard,
 		RuntimeFile:    opts.RuntimeFile,
 		StateFile:      opts.StateFile,
-		ConfigHash:     runtimeData.ConfigHash,
+		ConfigHash:     runtimeSemanticConfigHash,
 		Rules:          len(runtimeData.Rules),
 		Users:          len(runtimeData.Users),
 		XDPPin:         opts.XDPPin,
@@ -704,6 +758,68 @@ func loadRuntime(path string) (*runtimeFile, error) {
 	return &runtimeData, nil
 }
 
+func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
+	if runtimeData == nil {
+		return "", fmt.Errorf("runtime 为空")
+	}
+	hashes, err := whitelistFileHashes(runtimeData.Settings.WhitelistFiles)
+	if err != nil {
+		return "", err
+	}
+	settings := runtimeSemanticSettings{
+		Interface:         runtimeData.Settings.Interface,
+		GuardEnabled:      runtimeData.Settings.GuardEnabled,
+		WhitelistEnabled:  runtimeData.Settings.WhitelistEnabled,
+		BlockHTTP:         runtimeData.Settings.BlockHTTP,
+		BlockTLS:          runtimeData.Settings.BlockTLS,
+		BlockSOCKS:        runtimeData.Settings.BlockSOCKS,
+		ProtocolSkipPorts: runtimeData.Settings.ProtocolSkipPorts,
+		GuardIngressMode:  runtimeData.Settings.GuardIngressMode,
+	}
+	rules := make([]runtimeSemanticRule, 0, len(runtimeData.Rules))
+	for _, rule := range runtimeData.Rules {
+		semanticRule := runtimeSemanticRule{
+			Index:          rule.Index,
+			UserIndex:      rule.UserIndex,
+			ListenIP:       rule.ListenIP,
+			ListenPort:     rule.ListenPort,
+			Protocol:       rule.Protocol,
+			IPVersion:      rule.IPVersion,
+			ResolvedTarget: rule.ResolvedTarget,
+			RemotePort:     rule.RemotePort,
+			SNATMode:       rule.SNATMode,
+			SNATSource:     rule.SNATSource,
+			MSSMode:        rule.MSSMode,
+			MSSValue:       rule.MSSValue,
+			TrafficMode:    rule.TrafficMode,
+			TrafficRatio:   rule.TrafficRatio,
+			RuleLimit:      rule.RuleLimit,
+			UserLimit:      rule.UserLimit,
+			XDPDisabled:    rule.XDPDisabled,
+		}
+		if rule.RuleLimit > 0 || rule.UserLimit > 0 {
+			semanticRule.BillingUsedBase = rule.BillingUsedBase
+			semanticRule.UserBillingUsedBase = rule.UserBillingUsedBase
+		}
+		rules = append(rules, semanticRule)
+	}
+	payload := struct {
+		Settings        runtimeSemanticSettings `json:"settings"`
+		Rules           []runtimeSemanticRule   `json:"rules"`
+		WhitelistHashes []whitelistContentHash `json:"whitelist_hashes"`
+	}{
+		Settings:        settings,
+		Rules:           rules,
+		WhitelistHashes: hashes,
+	}
+	content, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("序列化 runtime 语义 hash 失败: %w", err)
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func runtimePinNamespace(ruleCounterPin string) string {
 	base := filepath.Base(strings.TrimSpace(ruleCounterPin))
 	if base == "" || base == "." || base == string(filepath.Separator) {
@@ -769,6 +885,7 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
 		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
 		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
+		HasSkipPorts:     boolToUint8(len(runtimeData.Settings.ProtocolSkipPorts) > 0),
 		ExternalIfindex:  externalIfindex,
 		LoopbackIfindex:  0,
 	}
@@ -1093,6 +1210,10 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 }
 
 func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {
+	runtimeSemanticConfigHash, err := runtimeSemanticHash(runtimeData)
+	if err != nil {
+		return err
+	}
 	objs, err := loadPinnedRuntimeMaps(runtimeMapPinsFromApplyOptions(opts))
 	if err != nil {
 		return err
@@ -1114,7 +1235,7 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.ProtocolGuard = protocolGuard
 	updated.RuntimeFile = opts.RuntimeFile
 	updated.StateFile = opts.StateFile
-	updated.ConfigHash = runtimeData.ConfigHash
+	updated.ConfigHash = runtimeSemanticConfigHash
 	updated.Rules = len(runtimeData.Rules)
 	updated.Users = len(runtimeData.Users)
 	updated.XDPPin = opts.XDPPin
@@ -1266,6 +1387,12 @@ func makeRuleVal(rule runtimeRule) (ruleVal, error) {
 	value.UserBillingUsedBaseBytes = rule.UserBillingUsedBase
 	if rule.TrafficMode == "one-way" {
 		value.TrafficMode = 1
+	}
+	if rule.UserLimit > 0 {
+		value.UserLimitEnabled = 1
+	}
+	if rule.RuleLimit > 0 || rule.UserLimit > 0 {
+		value.BillingEnabled = 1
 	}
 	if rule.XDPDisabled {
 		value.Flags |= ruleFlagXDPDisabled
@@ -1626,6 +1753,29 @@ func loadWhitelistFiles(mapV4 *ebpf.Map, mapV6 *ebpf.Map, files []string) error 
 		}
 	}
 	return nil
+}
+
+func whitelistFileHashes(files []string) ([]whitelistContentHash, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	hashes := make([]whitelistContentHash, 0, len(files))
+	for _, filePath := range files {
+		filePath = strings.TrimSpace(filePath)
+		if filePath == "" {
+			continue
+		}
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("读取白名单文件失败 (%s): %w", filePath, err)
+		}
+		sum := sha256.Sum256(content)
+		hashes = append(hashes, whitelistContentHash{
+			Path: filePath,
+			Hash: hex.EncodeToString(sum[:]),
+		})
+	}
+	return hashes, nil
 }
 
 func protocolNumber(value string) (uint8, error) {

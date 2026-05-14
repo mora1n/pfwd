@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.1.4"
+PFWD_VERSION="0.1.5"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -250,7 +250,7 @@ pfwd - XDP 端口转发管理脚本
 监听 IP 默认使用 :: 双栈监听；非 localhost 规则优先走 XDP，localhost/::1 自动走 nftables，XDP 不可用时会自动回退到 nftables。
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
-  MSS 和固定 SNAT 通过 `.forwards[].xdp` 字段持久化。
+  MSS 和固定 SNAT 通过 `.forwards[].net` 字段持久化；转发网卡通过 `settings.forward.interface` 指定。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
   流量防护（协议封锁 + 白名单）由 `guard` 子命令管理；白名单配置通过 `guard whitelist` 子命令管理。

@@ -112,7 +112,7 @@ validate_listen_ip() {
     case "$value" in
         ""|"::"|"0.0.0.0") ;;
         *)
-            pfwd_die "当前 XDP 后端仅支持通配监听地址（:: 或 0.0.0.0），不支持具体 listen_ip：$value"
+            pfwd_die "当前转发快路径仅支持通配监听地址（:: 或 0.0.0.0），不支持具体 listen_ip：$value"
             ;;
     esac
 }

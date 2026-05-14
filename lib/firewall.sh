@@ -16,7 +16,7 @@ fw_forward_table() {
 
 fw_tc_interface() {
     local iface
-    iface="$(jq -r '.settings.tc_interface // .settings.xdp.interface // ""' "$PFWD_CONFIG_FILE")"
+    iface="$(jq -r '.settings.tc_interface // .settings.forward.interface // ""' "$PFWD_CONFIG_FILE")"
     if [ -n "$iface" ]; then
         echo "$iface"
         return

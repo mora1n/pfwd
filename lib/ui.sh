@@ -1988,17 +1988,17 @@ ui_forward_list_rows() {
           (if (.value.traffic_mode // "two-way") == "one-way" then "单向" else "双向" end),
           ((.value.traffic_ratio // 1) | tostring),
           (
-            if (.value.xdp.mss_mode // "") == "set" then
-              ((.value.xdp.mss_value // "-") | tostring)
-            elif (.value.xdp.mss_mode // "") == "clamp" then
+            if (.value.net.mss_mode // "") == "set" then
+              ((.value.net.mss_value // "-") | tostring)
+            elif (.value.net.mss_mode // "") == "clamp" then
               "clamp"
             else
               "-"
             end
           ),
           (
-            if (.value.xdp.snat_mode // "masquerade") == "snat" and (.value.xdp.snat_source // "") != "" then
-              .value.xdp.snat_source
+            if (.value.net.snat_mode // "masquerade") == "snat" and (.value.net.snat_source // "") != "" then
+              .value.net.snat_source
             else
               "masquerade"
             end
@@ -3131,10 +3131,10 @@ ui_menu_forwards() {
                 current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
                 current_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
                 current_comment="$(jq -r '.comment // ""' <<< "$current")"
-                current_mss_mode="$(jq -r '.xdp.mss_mode // ""' <<< "$current")"
-                current_mss_value="$(jq -r '.xdp.mss_value // ""' <<< "$current")"
-                current_snat_mode="$(jq -r '.xdp.snat_mode // "masquerade"' <<< "$current")"
-                current_snat_source="$(jq -r '.xdp.snat_source // ""' <<< "$current")"
+                current_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$current")"
+                current_mss_value="$(jq -r '.net.mss_value // ""' <<< "$current")"
+                current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$current")"
+                current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$current")"
 
                 ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
                 ui_form_add_kv "转发 ID" "$forward_id"
