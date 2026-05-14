@@ -8,9 +8,15 @@ fw_family() {
     jq -r '.settings.nft_family // "inet"' "$PFWD_CONFIG_FILE"
 }
 
+FW_NFT_ACCOUNTING_RENDER_FILE="${PFWD_RUN_DIR}/firewall.nft"
+
+fw_forward_table() {
+    jq -r '.settings.forward_table // "port_forward"' "$PFWD_CONFIG_FILE"
+}
+
 fw_tc_interface() {
     local iface
-    iface="$(jq -r '.settings.tc_interface // ""' "$PFWD_CONFIG_FILE")"
+    iface="$(jq -r '.settings.tc_interface // .settings.forward.interface // ""' "$PFWD_CONFIG_FILE")"
     if [ -n "$iface" ]; then
         echo "$iface"
         return
@@ -18,18 +24,55 @@ fw_tc_interface() {
     ip route show default 2>/dev/null | awk '{print $5; exit}'
 }
 
-fw_forward_usage_expr() {
-    local mode="$1"
-    local ratio="${2:-1}"
-    local in_bytes="$3"
-    local out_bytes="$4"
-    awk -v mode="$mode" -v ratio="$ratio" -v in_bytes="$in_bytes" -v out_bytes="$out_bytes" '
-        BEGIN {
-            factor = (mode == "one-way") ? 1 : 2
-            billed = int(in_bytes * ratio) + int(out_bytes * ratio)
-            printf "%.0f\n", billed * factor
-        }
-    '
+fw_cleanup_nft_table() {
+    local family="$1"
+    local table="$2"
+    [ -n "$family" ] || return 0
+    [ -n "$table" ] || return 0
+    case "$family:$table" in
+        ip:filter|ip:nat|ip:mangle|ip6:filter|ip6:nat|ip6:mangle|inet:filter|inet:nat|inet:mangle)
+            return 0
+            ;;
+    esac
+    nft list table "$family" "$table" >/dev/null 2>&1 || return 0
+    pfwd_run nft delete table "$family" "$table"
+}
+
+fw_cleanup_legacy_nft() {
+    command -v nft >/dev/null 2>&1 || return 0
+    config_init >/dev/null
+
+    local nft_family nft_table forward_table current_account_pair current_forward_pair pairs seen="" pair family table
+    nft_family="$(jq -r '.settings.nft_family // "inet"' "$PFWD_CONFIG_FILE")"
+    nft_table="$(jq -r '.settings.nft_table // "pfwd"' "$PFWD_CONFIG_FILE")"
+    forward_table="$(jq -r '.settings.forward_table // "port_forward"' "$PFWD_CONFIG_FILE")"
+    current_account_pair="${nft_family}:${nft_table}"
+    current_forward_pair="${nft_family}:${forward_table}"
+
+    pairs=(
+        "inet:pfwd"
+        "inet:port_forward"
+        "ip:port_forward"
+        "ip6:port_forward"
+        "$nft_family:$nft_table"
+        "inet:$forward_table"
+        "ip:$forward_table"
+        "ip6:$forward_table"
+    )
+
+    for pair in "${pairs[@]}"; do
+        [ -n "$pair" ] || continue
+        if [ "$pair" = "$current_account_pair" ] || [ "$pair" = "$current_forward_pair" ]; then
+            continue
+        fi
+        case " $seen " in
+            *" $pair "*) continue ;;
+        esac
+        seen="$seen $pair"
+        family="${pair%%:*}"
+        table="${pair#*:}"
+        fw_cleanup_nft_table "$family" "$table"
+    done
 }
 
 fw_counter_names() {
@@ -48,74 +91,314 @@ fw_safe_object_name() {
     printf '%s_%s_%s' "$prefix" "$sum" "$safe"
 }
 
-fw_active_forwards_tsv() {
-    local fields="$1"
-    local extra_filter="${2:-true}"
-    local today
-    today="$(pfwd_today)"
-    jq -r --arg today "$today" --argjson fields "$fields" --arg extra "$extra_filter" '
-      .forwards[]
-      | select(.enabled == true and (.stop_at == null or .stop_at > $today))
-      | select(if $extra == "two-way" then .traffic_mode == "two-way" else true end)
-      | [.[ $fields[] ]] | @tsv
-    ' "$PFWD_CONFIG_FILE"
+fw_forward_usage_expr() {
+    local mode="$1"
+    local ratio="${2:-1}"
+    local in_bytes="$3"
+    local out_bytes="$4"
+    awk -v mode="$mode" -v ratio="$ratio" -v in_bytes="$in_bytes" -v out_bytes="$out_bytes" '
+        BEGIN {
+            factor = (mode == "one-way") ? 1 : 2
+            billed = int(in_bytes * ratio) + int(out_bytes * ratio)
+            printf "%.0f\n", billed * factor
+        }
+    '
+}
+
+fw_runtime_rule_rows() {
+    local runtime_json="$1"
+    jq -r '
+      .rules[]? |
+      [
+        .id,
+        .user_id,
+        (.listen_ip // "::"),
+        (.listen_port | tostring),
+        (.protocol // "tcp_udp"),
+        (.remote_input // ""),
+        .resolved_target,
+        (.remote_port | tostring),
+        (.ip_version | tostring),
+        (.comment // ""),
+        (.snat_mode // "masquerade"),
+        (.snat_source // ""),
+        (.mss_mode // ""),
+        (if (.mss_value // null) == null then "" else (.mss_value | tostring) end),
+        (.traffic_mode // "two-way"),
+        ((.traffic_ratio // 1) | tostring),
+        ((.traffic_limit_bytes // 0) | tostring),
+        ((.user_limit_bytes // 0) | tostring)
+      ] | @tsv
+    ' <<< "$runtime_json"
+}
+
+fw_ports_to_expr() {
+    local ports_csv="$1"
+    if [[ "$ports_csv" == *,* ]]; then
+        printf '{ %s }' "${ports_csv//,/\, }"
+    else
+        printf '%s' "$ports_csv"
+    fi
+}
+
+fw_subchain_name() {
+    local section="$1"
+    local proto="$2"
+    local ipver="$3"
+    printf 'pfwd_%s_%s%s' "$section" "$proto" "$ipver"
+}
+
+fw_dispatch_tokens() {
+    local proto="$1"
+    local ipver="$2"
+    if [ "$ipver" = "6" ]; then
+        printf 'ip6 nexthdr %s' "$proto"
+    else
+        printf 'ip protocol %s' "$proto"
+    fi
+}
+
+fw_rule_matches_snapshot() {
+    local render_file="$1"
+    [ -f "$PFWD_FORWARDER_NFT_RENDER_FILE" ] || return 1
+    cmp -s "$render_file" "$PFWD_FORWARDER_NFT_RENDER_FILE"
+}
+
+fw_route_localnet_needed() {
+    local runtime_json="$1"
+    jq -e '.rules[]? | select(.resolved_target | test("^127\\."))' >/dev/null <<< "$runtime_json"
+}
+
+fw_ensure_route_localnet() {
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.all.route_localnet=1"
+        ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv4.conf.default.route_localnet=1"
+        return 0
+    fi
+    sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.route_localnet=1 >/dev/null 2>&1 || true
+}
+
+fw_delete_forward_table() {
+    local family table
+    family="$(fw_family)"
+    table="$(fw_forward_table)"
+    nft list table "$family" "$table" >/dev/null 2>&1 || return 0
+    pfwd_run nft delete table "$family" "$table"
+}
+
+fw_forward_table_exists() {
+    local family table
+    family="$(fw_family)"
+    table="$(fw_forward_table)"
+    nft list table "$family" "$table" >/dev/null 2>&1
+}
+
+fw_accounting_table_exists() {
+    local family table
+    family="$(fw_family)"
+    table="$(fw_table)"
+    nft list table "$family" "$table" >/dev/null 2>&1
+}
+
+fw_validate_render_file() {
+    local render_file="$1"
+    local validate_table validate_file table family
+    family="$(fw_family)"
+    table="$(fw_forward_table)"
+    validate_table="pfwd_validate_$$"
+    validate_file="$(mktemp "${render_file}.validate.XXXXXX")"
+    sed "s/^table $family $table /table $family $validate_table /" "$render_file" > "$validate_file"
+    nft -c -f "$validate_file" >/dev/null 2>&1
+    rm -f "$validate_file"
+}
+
+fw_render_runtime_to_stdout() {
+    local runtime_json="$1"
+    local table family
+    family="$(fw_family)"
+    table="$(fw_forward_table)"
+
+    if [ "$(jq '.rules | length' <<< "$runtime_json")" = "0" ]; then
+        return 0
+    fi
+
+    declare -A prerouting_ports=()
+    declare -A prerouting_seen=()
+    declare -A postrouting_keys=()
+    declare -A forward_keys=()
+    declare -A subchains=()
+    local line id user_id listen_ip listen_port proto remote_input resolved_target remote_port ipver comment snat_mode snat_source mss_mode mss_value key
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r id user_id listen_ip listen_port proto remote_input resolved_target remote_port ipver comment snat_mode snat_source mss_mode mss_value _traffic_mode _traffic_ratio _rule_limit _user_limit <<< "$line"
+        key="${proto}|${ipver}|${resolved_target}|${remote_port}|${snat_mode}|${snat_source}|${mss_mode}|${mss_value}"
+        if [ -z "${prerouting_seen["$key|$listen_port"]:-}" ]; then
+            if [ -n "${prerouting_ports[$key]:-}" ]; then
+                prerouting_ports["$key"]+=",${listen_port}"
+            else
+                prerouting_ports["$key"]="$listen_port"
+            fi
+            prerouting_seen["$key|$listen_port"]=1
+        fi
+        postrouting_keys["$key"]=1
+        subchains["prerouting|$ipver|$proto"]=1
+        subchains["postrouting|$ipver|$proto"]=1
+        if [ "$proto" = "tcp" ] && [ -n "$mss_mode" ]; then
+            forward_keys["$key"]=1
+            subchains["forward|$ipver|$proto"]=1
+        fi
+    done < <(fw_runtime_rule_rows "$runtime_json")
+
+    echo "table $family $table {"
+    echo "    chain prerouting {"
+    echo "        type nat hook prerouting priority dstnat; policy accept;"
+    for ipver in 4 6; do
+        for proto in tcp udp; do
+            [ -n "${subchains["prerouting|$ipver|$proto"]:-}" ] || continue
+            echo "        $(fw_dispatch_tokens "$proto" "$ipver") jump $(fw_subchain_name prerouting "$proto" "$ipver")"
+        done
+    done
+    echo "    }"
+    echo
+
+    echo "    chain postrouting {"
+    echo "        type nat hook postrouting priority srcnat; policy accept;"
+    for ipver in 4 6; do
+        for proto in tcp udp; do
+            [ -n "${subchains["postrouting|$ipver|$proto"]:-}" ] || continue
+            echo "        ct status dnat $(fw_dispatch_tokens "$proto" "$ipver") jump $(fw_subchain_name postrouting "$proto" "$ipver")"
+        done
+    done
+    echo "    }"
+    echo
+
+    echo "    chain forward {"
+    echo "        type filter hook forward priority 0; policy accept;"
+    echo "        ct state established,related accept"
+    for ipver in 4 6; do
+        for proto in tcp; do
+            [ -n "${subchains["forward|$ipver|$proto"]:-}" ] || continue
+            echo "        $(fw_dispatch_tokens "$proto" "$ipver") jump $(fw_subchain_name forward "$proto" "$ipver")"
+        done
+    done
+    echo "    }"
+    echo
+
+    echo "    chain input {"
+    echo "        type filter hook input priority filter - 10; policy accept;"
+    echo '        ip daddr 127.0.0.0/8 ct status dnat counter accept comment "Allow DNAT to localhost"'
+    echo '        ip6 daddr ::1 ct status dnat counter accept comment "Allow DNAT to localhost"'
+    echo "    }"
+    echo
+
+    for ipver in 4 6; do
+        for proto in tcp udp; do
+            echo "    chain $(fw_subchain_name prerouting "$proto" "$ipver") {"
+            while IFS= read -r key; do
+                [ -n "$key" ] || continue
+                IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+                [ "$key_proto" = "$proto" ] || continue
+                [ "$key_ipver" = "$ipver" ] || continue
+                if [ "$ipver" = "6" ]; then
+                    echo "        $proto dport $(fw_ports_to_expr "${prerouting_ports[$key]}") dnat ip6 to [$key_target]:$key_remote_port"
+                else
+                    echo "        $proto dport $(fw_ports_to_expr "${prerouting_ports[$key]}") dnat ip to $key_target:$key_remote_port"
+                fi
+            done < <(printf '%s\n' "${!prerouting_ports[@]}" | sort)
+            echo "    }"
+            echo
+
+            echo "    chain $(fw_subchain_name postrouting "$proto" "$ipver") {"
+            while IFS= read -r key; do
+                [ -n "$key" ] || continue
+                IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+                [ "$key_proto" = "$proto" ] || continue
+                [ "$key_ipver" = "$ipver" ] || continue
+                if [ "$key_snat_mode" = "snat" ] && [ -n "$key_snat_source" ]; then
+                    echo "        ct status dnat $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target $proto dport $key_remote_port snat to $key_snat_source"
+                else
+                    echo "        ct status dnat $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target $proto dport $key_remote_port masquerade"
+                fi
+            done < <(printf '%s\n' "${!postrouting_keys[@]}" | sort)
+            echo "    }"
+            echo
+        done
+
+        echo "    chain $(fw_subchain_name forward tcp "$ipver") {"
+        while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            IFS='|' read -r key_proto key_ipver key_target key_remote_port key_snat_mode key_snat_source key_mss_mode key_mss_value <<< "$key"
+            [ "$key_proto" = "tcp" ] || continue
+            [ "$key_ipver" = "$ipver" ] || continue
+            if [ "$key_mss_mode" = "clamp" ]; then
+                echo "        $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target tcp dport $key_remote_port tcp flags syn / syn,rst tcp option maxseg size set rt mtu"
+            elif [ "$key_mss_mode" = "set" ] && [ -n "$key_mss_value" ]; then
+                echo "        $([ "$ipver" = "6" ] && echo ip6 || echo ip) daddr $key_target tcp dport $key_remote_port tcp flags syn / syn,rst tcp option maxseg size set $key_mss_value"
+            fi
+        done < <(printf '%s\n' "${!forward_keys[@]}" | sort)
+        echo "    }"
+        echo
+    done
+    echo "}"
 }
 
 fw_render_nft_objects() {
-    local today
+    local runtime_json="$1"
+    local users_json stats_file today
     today="$(pfwd_today)"
-    stats_init >/dev/null
-    jq -r --arg today "$today" --slurpfile stats "$PFWD_STATS_FILE" '
-      .users[]?
-      | select((.limits.traffic_bytes // null) != null)
-      | [.id, (.limits.traffic_bytes // "null"), ($stats[0].users[.id].billing_used_bytes // 0)] | @tsv
-    ' "$PFWD_CONFIG_FILE" |
+    stats_file="$PFWD_STATS_FILE"
+    users_json="$(jq -c '.users // []' <<< "$runtime_json")"
+
+    jq -r --argjson users "$users_json" --slurpfile stats "$stats_file" '
+      $users[]
+      | select((.traffic_limit_bytes // 0) > 0)
+      | [.id, (.traffic_limit_bytes // 0), ($stats[0].users[.id].billing_used_bytes // 0)] | @tsv
+    ' <<< '{}' |
     while IFS=$'\t' read -r user_id limit used; do
+        [ -n "$user_id" ] || continue
         local quota_name
         quota_name="$(fw_safe_object_name user "$user_id")"
         echo "  quota $quota_name { over $limit bytes used ${used:-0} bytes }"
     done
 
-    jq -r --arg today "$today" --slurpfile stats "$PFWD_STATS_FILE" '
-      . as $cfg
-      | .forwards[]
-      | select(.enabled == true and (.stop_at == null or .stop_at > $today))
-      | . as $f
-      | ($cfg.users[]? | select(.id == $f.user_id) | (.limits.traffic_bytes // "null")) as $user_limit
+    jq -r --slurpfile stats "$stats_file" '
+      .rules[]?
       | [
-          $f.id,
-          $f.user_id,
-          ($f.listen_port | tostring),
-          ($f.limits.traffic_bytes // "null"),
-          ($stats[0].forwards[$f.id].billing_used_bytes // 0),
-          ($user_limit // "null")
-        ]
-      | @tsv
-    ' "$PFWD_CONFIG_FILE" |
-    while IFS=$'\t' read -r id user_id _ limit used user_limit; do
+          .id,
+          .user_id,
+          ((.traffic_limit_bytes // 0) | tostring),
+          ((.user_limit_bytes // 0) | tostring),
+          ($stats[0].forwards[.id].billing_used_bytes // 0)
+        ] | @tsv
+    ' <<< "$runtime_json" |
+    while IFS=$'\t' read -r id user_id rule_limit user_limit used; do
+        [ -n "$id" ] || continue
         local in_counter out_counter user_quota
         read -r in_counter out_counter < <(fw_counter_names "$id")
         user_quota="$(fw_safe_object_name user "$user_id")"
-        limit="${limit:-null}"
         echo "  counter $in_counter {}"
         echo "  counter $out_counter {}"
         echo "  chain fwd_${id//-/_}_limit {"
-        if [ "$user_limit" != "null" ] && [ -n "$user_limit" ]; then
+        if [ "${user_limit:-0}" -gt 0 ]; then
             echo "    quota name $user_quota drop"
         fi
-        if [ "$limit" != "null" ] && [ -n "$limit" ]; then
-            echo "    quota over $limit bytes used ${used:-0} bytes drop"
+        if [ "${rule_limit:-0}" -gt 0 ]; then
+            echo "    quota over $rule_limit bytes used ${used:-0} bytes drop"
         fi
         echo "    accept"
         echo "  }"
     done
 }
 
-fw_render_prerouting_chain() {
+fw_render_prerouting_count_chain() {
+    local runtime_json="$1"
     echo "  chain prerouting_count {"
     echo "    type filter hook prerouting priority -10; policy accept;"
-    fw_active_forwards_tsv '["id","listen_port","protocol"]' |
+    jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json" |
     while IFS=$'\t' read -r id port protocol; do
+        [ -n "$id" ] || continue
         local in_counter
         read -r in_counter _ < <(fw_counter_names "$id")
         case "${protocol:-tcp_udp}" in
@@ -134,11 +417,13 @@ fw_render_prerouting_chain() {
     echo "  }"
 }
 
-fw_render_postrouting_chain() {
+fw_render_postrouting_count_chain() {
+    local runtime_json="$1"
     echo "  chain postrouting_count {"
     echo "    type filter hook postrouting priority -10; policy accept;"
-    fw_active_forwards_tsv '["id","listen_port","protocol"]' |
+    jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json" |
     while IFS=$'\t' read -r id port protocol; do
+        [ -n "$id" ] || continue
         local out_counter
         read -r _ out_counter < <(fw_counter_names "$id")
         case "${protocol:-tcp_udp}" in
@@ -157,38 +442,92 @@ fw_render_postrouting_chain() {
     echo "  }"
 }
 
-fw_render_nft() {
-    config_init >/dev/null
+fw_render_accounting_to_stdout() {
+    local runtime_json="$1"
     local family table
     family="$(fw_family)"
     table="$(fw_table)"
-
     echo "table $family $table {"
-    fw_render_nft_objects
-    fw_render_prerouting_chain
-    fw_render_postrouting_chain
+    fw_render_nft_objects "$runtime_json"
+    fw_render_prerouting_count_chain "$runtime_json"
+    fw_render_postrouting_count_chain "$runtime_json"
     echo "}"
 }
 
-FW_NFT_RENDER_FILE="${PFWD_RUN_DIR}/firewall.nft"
-
-fw_apply_nft() {
+fw_apply_accounting_runtime() {
+    local runtime_json="$1"
     pfwd_require_cmd nft
-    local tmp
-    tmp="$(mktemp "$PFWD_RUN_DIR/nft.XXXXXX")"
-    fw_render_nft > "$tmp"
-    if [ -f "$FW_NFT_RENDER_FILE" ] && cmp -s "$tmp" "$FW_NFT_RENDER_FILE"; then
+
+    local tmp family table
+    family="$(fw_family)"
+    table="$(fw_table)"
+    tmp="$(mktemp "${FW_NFT_ACCOUNTING_RENDER_FILE}.tmp.XXXXXX")"
+    fw_render_accounting_to_stdout "$runtime_json" > "$tmp"
+    if [ -f "$FW_NFT_ACCOUNTING_RENDER_FILE" ] && cmp -s "$tmp" "$FW_NFT_ACCOUNTING_RENDER_FILE" && fw_accounting_table_exists; then
         rm -f "$tmp"
         return 0
     fi
-    local family table
-    family="$(fw_family)"
-    table="$(fw_table)"
     if nft list table "$family" "$table" >/dev/null 2>&1; then
         pfwd_run nft delete table "$family" "$table"
     fi
-    mv "$tmp" "$FW_NFT_RENDER_FILE"
-    pfwd_run nft -f "$FW_NFT_RENDER_FILE"
+    mv "$tmp" "$FW_NFT_ACCOUNTING_RENDER_FILE"
+    pfwd_run nft -f "$FW_NFT_ACCOUNTING_RENDER_FILE"
+}
+
+fw_apply_nft_runtime() {
+    local runtime_json="$1"
+    pfwd_require_cmd nft
+
+    if [ "$(jq '.rules | length' <<< "$runtime_json")" = "0" ]; then
+        fw_delete_forward_table || true
+        : > "$PFWD_FORWARDER_NFT_RENDER_FILE"
+        return 0
+    fi
+
+    local tmp_render
+    tmp_render="$(mktemp "${PFWD_FORWARDER_NFT_RENDER_FILE}.tmp.XXXXXX")"
+    fw_render_runtime_to_stdout "$runtime_json" > "$tmp_render"
+    if ! fw_validate_render_file "$tmp_render"; then
+        rm -f "$tmp_render"
+        pfwd_die "nft 转发配置校验失败"
+    fi
+    forwarder_ensure_ip_forwarding
+    if fw_route_localnet_needed "$runtime_json"; then
+        fw_ensure_route_localnet
+    fi
+    if [ -f "$PFWD_FORWARDER_NFT_RENDER_FILE" ] && fw_rule_matches_snapshot "$tmp_render" && fw_forward_table_exists; then
+        rm -f "$tmp_render"
+    else
+        mv "$tmp_render" "$PFWD_FORWARDER_NFT_RENDER_FILE"
+        fw_delete_forward_table || true
+        pfwd_run nft -f "$PFWD_FORWARDER_NFT_RENDER_FILE"
+    fi
+}
+
+fw_render_nft() {
+    local runtime_json
+    runtime_json="$(forwarder_runtime_json true)"
+    runtime_json="$(runtime_backend_json "$runtime_json" nft)"
+    fw_render_runtime_to_stdout "$runtime_json"
+}
+
+fw_apply_tc() {
+    local rate_count iface
+    rate_count="$(fw_effective_rate_count)"
+    iface="$(fw_tc_interface 2>/dev/null || true)"
+    if [ "$rate_count" -le 0 ]; then
+        command -v tc >/dev/null 2>&1 || return 0
+        [ -n "$iface" ] && fw_reset_tc_root "$iface"
+        return 0
+    fi
+    pfwd_require_cmd tc
+    [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
+    fw_reset_tc_root "$iface"
+    fw_render_tc | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # shellcheck disable=SC2086
+        pfwd_run $line
+    done
 }
 
 fw_effective_rate_count() {
@@ -239,19 +578,12 @@ fw_reset_tc_root() {
     pfwd_run tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
 }
 
-fw_apply_tc() {
-    pfwd_require_cmd tc
-    local rate_count iface
-    rate_count="$(fw_effective_rate_count)"
-    [ "$rate_count" -gt 0 ] || return 0
-    iface="$(fw_tc_interface)"
-    [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
-    fw_reset_tc_root "$iface"
-    fw_render_tc | while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        # shellcheck disable=SC2086
-        pfwd_run $line
-    done
+fw_read_nft_counters() {
+    local table family
+    family="$(fw_family)"
+    table="$(fw_table)"
+    command -v nft >/dev/null 2>&1 || return 1
+    nft -j list table "$family" "$table" 2>/dev/null
 }
 
 fw_read_counters() {

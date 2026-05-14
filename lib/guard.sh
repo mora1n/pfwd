@@ -49,11 +49,11 @@ guard_config_file() {
 }
 
 guard_bin_path() {
-    printf '%s\n' "${PFWD_GUARD_BIN_PATH:-$RFWD_GUARD_BIN_PATH}"
+    printf '%s\n' "$PFWD_XDP_BIN_PATH"
 }
 
 guard_status_file() {
-    printf '%s\n' "${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}"
+    printf '%s\n' "${PFWD_XDP_STATUS_FILE:-${PFWD_GUARD_STATUS_FILE:-$RFWD_GUARD_STATUS_FILE}}"
 }
 
 guard_xdp_pin_path() {
@@ -74,14 +74,14 @@ guard_asset_name() {
     case "$arch" in
         x86_64|amd64)
             if [ "$(guard_script_name)" = "pfwd" ]; then
-                echo "pfwd-guard-linux-amd64"
+                echo "pfwd-xdp-linux-amd64"
             else
                 echo "rfwd-guard-linux-amd64"
             fi
             ;;
         aarch64|arm64)
             if [ "$(guard_script_name)" = "pfwd" ]; then
-                echo "pfwd-guard-linux-arm64"
+                echo "pfwd-xdp-linux-arm64"
             else
                 echo "rfwd-guard-linux-arm64"
             fi
@@ -117,10 +117,6 @@ guard_enabled() {
     jq -r '.settings.guard.enabled // false' "$(guard_config_file)"
 }
 
-guard_xdp_mode() {
-    jq -r '.settings.guard.xdp_mode // "auto"' "$(guard_config_file)"
-}
-
 guard_block_http() {
     jq -r '.settings.guard.block_http // false' "$(guard_config_file)"
 }
@@ -152,7 +148,7 @@ guard_protocol_skip_ports_display() {
 }
 
 guard_read_settings() {
-    jq -r '{enabled: (.settings.guard.enabled // false), xdp_mode: (.settings.guard.xdp_mode // "auto"), block_http: (.settings.guard.block_http // false), block_tls: (.settings.guard.block_tls // false), block_socks: (.settings.guard.block_socks // false)}' "$(guard_config_file)"
+    jq -r '{enabled: (.settings.guard.enabled // false), block_http: (.settings.guard.block_http // false), block_tls: (.settings.guard.block_tls // false), block_socks: (.settings.guard.block_socks // false)}' "$(guard_config_file)"
 }
 
 guard_protocol_filters_enabled() {
@@ -170,15 +166,13 @@ guard_runtime_config_hash() {
     local ports_arg="$2"
     local settings
     settings="$(guard_read_settings)"
-    local http tls socks xdp_mode
-    xdp_mode="$(jq -r '.xdp_mode' <<< "$settings")"
+    local http tls socks
     http="$(jq -r '.block_http' <<< "$settings")"
     tls="$(jq -r '.block_tls' <<< "$settings")"
     socks="$(jq -r '.block_socks' <<< "$settings")"
     local payload
     payload="$(cat <<EOF
 iface=$iface
-xdp_mode=$xdp_mode
 http=$http
 tls=$tls
 socks=$socks
@@ -217,18 +211,6 @@ guard_config_set_tc_interface() {
     config_update --arg iface "$iface" '
       (.settings.guard //= {})
       | .settings.guard.tc_interface = $iface
-    '
-}
-
-guard_config_set_xdp_mode() {
-    local mode="$1"
-    case "$mode" in
-        off|auto|force) ;;
-        *) guard_die "无效 xdp 模式：$mode" ;;
-    esac
-    config_update --arg mode "$mode" '
-      (.settings.guard //= {})
-      | .settings.guard.xdp_mode = $mode
     '
 }
 
@@ -305,7 +287,7 @@ guard_apply_runtime() {
     local quiet="${1:-false}"
     config_init >/dev/null
     guard_mkdirs
-    guard_binary_exists || guard_die "缺少 guard 预编译二进制：$(guard_bin_path)"
+    guard_binary_exists || guard_die "缺少 XDP 预编译二进制：$(guard_bin_path)"
 
     if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
         whitelist_prepare_runtime
@@ -357,41 +339,33 @@ guard_apply_runtime() {
         fi
     fi
 
-    guard_run "$(guard_bin_path)" apply \
-      --iface "$iface" \
-      --xdp-mode "$(guard_xdp_mode)" \
-      --xdp-pin "$(guard_xdp_pin_path)" \
-      --ingress-pin "$(guard_ingress_pin_path)" \
-      --status-file "$(guard_status_file)" \
-      --config-hash "$config_hash" \
-      --xdp-whitelist "$whitelist_state" \
-      --whitelist-enabled "$whitelist_state" \
-      ${whitelist_files:+--whitelist-file "$whitelist_files"} \
-      --allow-any-ports "$allow_any_ports" \
-      --allow-ports "$ports_arg" \
-      --block-http "$(guard_block_http)" \
-      --block-tls "$(guard_block_tls)" \
-      --block-socks "$(guard_block_socks)"
+    if command -v forwarder_apply_runtime >/dev/null 2>&1; then
+        forwarder_apply_runtime
+    fi
 
     if [ "$quiet" != "true" ]; then
-        printf 'guard 已应用：iface=%s http=%s tls=%s socks=%s\n' \
+        printf 'guard 已应用到 XDP 数据面：iface=%s http=%s tls=%s socks=%s\n' \
           "$iface" "$(guard_block_http)" "$(guard_block_tls)" "$(guard_block_socks)"
     fi
 }
 
 guard_remove_runtime() {
     local quiet="${1:-false}"
-    local egress_pin=""
     if guard_binary_exists; then
         guard_run "$(guard_bin_path)" remove \
           --xdp-pin "$(guard_xdp_pin_path)" \
           --ingress-pin "$(guard_ingress_pin_path)" \
+          --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+          --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
           --status-file "$(guard_status_file)"
     else
-        rm -f "$(guard_status_file)" 2>/dev/null || true
+        runtime_remove_xdp_status_file
     fi
-    egress_pin="${PFWD_GUARD_LINK_EGRESS_PATH:-${RFWD_GUARD_LINK_EGRESS_PATH:-}}"
-    rm -f "$(guard_xdp_pin_path)" "$(guard_ingress_pin_path)" ${egress_pin:+"$egress_pin"}
+    runtime_remove_link_pins
+    runtime_remove_pinned_state
     if [ "$quiet" != "true" ]; then
         echo "guard 已移除"
     fi
@@ -399,11 +373,15 @@ guard_remove_runtime() {
 
 guard_status_json() {
     config_init >/dev/null
-    local runtime_status xdp_effective xdp_attach_kind xdp_reason
+    local runtime_status xdp_effective xdp_attach_kind xdp_reason ingress_kind protocol_guard forwarder_status backend
     runtime_status="$(guard_run "$(guard_bin_path)" status --status-file "$(guard_status_file)" 2>/dev/null || true)"
+    forwarder_status="$(forwarder_status_json 2>/dev/null || echo '{}')"
+    backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status" 2>/dev/null || echo none)"
     xdp_effective="$(jq -r '.xdp_effective // "off"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_attach_kind="$(jq -r '.xdp_attach_kind // "-"' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
     xdp_reason="$(jq -r '.xdp_reason // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    ingress_kind="$(jq -r '.ingress_kind // empty' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
+    protocol_guard="$(jq -r '.protocol_guard // false' <<< "${runtime_status:-{}}" 2>/dev/null || true)"
 
     local settings skip_ports skip_count
     settings="$(guard_read_settings)"
@@ -425,10 +403,12 @@ guard_status_json() {
       --arg status_file "$(guard_status_file)" \
       --arg xdp_pin "$(guard_xdp_pin_path)" \
       --arg ingress_pin "$(guard_ingress_pin_path)" \
-      --arg xdp_mode "$(jq -r '.xdp_mode' <<< "$settings")" \
+      --arg backend "$backend" \
       --arg xdp_effective "$xdp_effective" \
       --arg xdp_attach_kind "$xdp_attach_kind" \
       --arg xdp_reason "$xdp_reason" \
+      --arg ingress_kind "$ingress_kind" \
+      --argjson protocol_guard "$protocol_guard" \
       --argjson enabled "$(jq -r '.enabled' <<< "$settings")" \
       --argjson block_http "$(jq -r '.block_http' <<< "$settings")" \
       --argjson block_tls "$(jq -r '.block_tls' <<< "$settings")" \
@@ -443,10 +423,12 @@ guard_status_json() {
         script: $script,
         enabled: $enabled,
         iface: $iface,
-        xdp_mode: $xdp_mode,
+        backend: $backend,
         xdp_effective: $xdp_effective,
         xdp_attach_kind: $xdp_attach_kind,
         xdp_reason: $xdp_reason,
+        ingress_kind: $ingress_kind,
+        protocol_guard: $protocol_guard,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
@@ -470,9 +452,10 @@ guard_render_status() {
       [
         ["启用状态", (if .enabled then "已启用" else "已停用" end)],
         ["绑定网卡", (.iface // "-")],
-        ["XDP 模式", .xdp_mode],
+        ["转发后端", (.backend // "none")],
         ["XDP 实际状态", .xdp_effective],
         ["XDP 挂载", .xdp_attach_kind],
+        ["TC 协议封锁", (if .protocol_guard then (if (.ingress_kind // "") != "" then .ingress_kind else "开" end) else "关" end)],
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
@@ -482,7 +465,7 @@ guard_render_status() {
         ["自定义 CIDR", (.wl_custom_count | tostring)],
         ["白名单条目", (.wl_entries | tostring)],
         ["XDP Pin", .xdp_pin],
-        ["guard 二进制", .guard_binary],
+        ["XDP 二进制", .guard_binary],
         ["状态文件", .status_file]
       ]
       | map(@tsv)
