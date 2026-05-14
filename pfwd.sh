@@ -27,7 +27,7 @@ else
     PFWD_SCRIPT_DIR=""
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
-PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/xdp}"
+PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
 PFWD_LIB_FILES=(core config validate whitelist forwarder runtime firewall stats notify guard service commands ui)
 
 pfwd_bootstrap_xdp_asset_name() {
