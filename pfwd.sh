@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/xdp}"
-PFWD_LIB_FILES=(core config validate whitelist forwarder firewall stats notify guard service commands ui)
+PFWD_LIB_FILES=(core config validate whitelist forwarder runtime firewall stats notify guard service commands ui)
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -223,7 +223,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]
   pfwd import <file>
-  pfwd render [forwarder|nft|tc|guard|units]
+  pfwd render [forwarder|xdp|nft|tc|guard|units]
   pfwd refresh
   pfwd reconcile
   pfwd notify-test --user-id ID

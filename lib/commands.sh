@@ -90,8 +90,8 @@ cmd_update_check() {
     remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
     [ -n "$remote_version" ] || pfwd_die "无法解析远端版本号"
 
-    local_digest="$(service_update_bundle_digest "$PFWD_INSTALL_DIR")"
-    remote_digest="$(service_update_bundle_digest "$staged_dir")"
+    local_digest="$(service_update_bundle_digest "$PFWD_INSTALL_DIR" install)"
+    remote_digest="$(service_update_bundle_digest "$staged_dir" staged)"
     cmp="$(pfwd_version_compare "$remote_version" "$local_version")"
 
     echo "当前版本：$local_version"
@@ -847,7 +847,8 @@ cmd_doctor_benchmarks() {
 cmd_render() {
     local target="${1:-forwarder}"
     case "$target" in
-        xdp|forwarder) forwarder_render_config ;;
+        xdp) forwarder_render_xdp_config ;;
+        forwarder) forwarder_render_config ;;
         nft) fw_render_nft ;;
         tc) fw_render_tc ;;
         guard) guard_render_status ;;

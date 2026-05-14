@@ -75,6 +75,141 @@ guard_service_unit() {
     xdp_service_unit
 }
 
+service_unit_names() {
+    cat <<'EOF'
+pfwd-forward.service
+pfwd.service
+pfwd.timer
+pfwd-bbr.service
+pfwd-xdp.service
+EOF
+}
+
+service_shortcut_rows() {
+    printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH" "pfwd"
+    printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH" "bbr.sh"
+    printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH" "pfwd-bbr"
+}
+
+service_bundle_rows() {
+    local asset_rel="assets/$(guard_asset_name)"
+    local lib
+
+    printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
+    printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
+    printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
+    printf '0644\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\n'
+    printf '0644\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\n'
+    for lib in "${PFWD_LIB_FILES[@]}"; do
+        printf '0644\tlib/%s.sh\tlib/%s.sh\tlib/%s.sh\n' "$lib" "$lib" "$lib"
+    done
+}
+
+service_install_target_path() {
+    printf '%s/%s\n' "$PFWD_INSTALL_DIR" "$1"
+}
+
+service_prepare_install_dirs() {
+    mkdir -p "$PFWD_INSTALL_DIR/lib" \
+        "$PFWD_INSTALL_DIR/assets" \
+        "$(dirname "$PFWD_BIN_PATH")" \
+        "$(dirname "$PFWD_BBR_BIN_PATH")" \
+        "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" \
+        "$(dirname "$PFWD_XDP_BIN_PATH")" \
+        "$PFWD_SYSTEMD_DIR"
+}
+
+service_write_shortcuts() {
+    local target link_path _
+    while IFS=$'\t' read -r target link_path _; do
+        target="$(readlink -f "$target" 2>/dev/null || realpath "$target" 2>/dev/null || printf '%s' "$target")"
+        ln -sf "$target" "$link_path"
+    done < <(service_shortcut_rows)
+}
+
+service_remove_shortcuts() {
+    local _ link_path __
+    while IFS=$'\t' read -r _ link_path __; do
+        rm -f "$link_path"
+    done < <(service_shortcut_rows)
+}
+
+service_backup_shortcuts() {
+    local backup_dir="$1"
+    local _ link_path backup_name
+
+    mkdir -p "$backup_dir"
+    while IFS=$'\t' read -r _ link_path backup_name; do
+        if [ -L "$link_path" ] || [ -e "$link_path" ]; then
+            cp -a "$link_path" "$backup_dir/$backup_name"
+        fi
+    done < <(service_shortcut_rows)
+}
+
+service_restore_shortcuts() {
+    local backup_dir="$1"
+    local _ link_path backup_name
+
+    while IFS=$'\t' read -r _ link_path backup_name; do
+        mkdir -p "$(dirname "$link_path")"
+        rm -f "$link_path"
+        if [ -L "$backup_dir/$backup_name" ] || [ -e "$backup_dir/$backup_name" ]; then
+            cp -a "$backup_dir/$backup_name" "$link_path"
+        fi
+    done < <(service_shortcut_rows)
+}
+
+service_backup_unit_files() {
+    local backup_dir="$1"
+    local unit
+
+    mkdir -p "$backup_dir"
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if [ -e "$PFWD_SYSTEMD_DIR/$unit" ]; then
+            cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/$unit"
+        fi
+    done < <(service_unit_names)
+}
+
+service_restore_unit_files() {
+    local backup_dir="$1"
+    local unit
+
+    mkdir -p "$PFWD_SYSTEMD_DIR"
+    service_remove_unit_files
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if [ -e "$backup_dir/$unit" ]; then
+            cp -a "$backup_dir/$unit" "$PFWD_SYSTEMD_DIR/$unit"
+        fi
+    done < <(service_unit_names)
+}
+
+service_copy_bundle_from_dir() {
+    local source_root="$1"
+    local allow_existing_xdp="${2:-false}"
+    local mode source_rel install_rel _
+    local source_path target_path
+
+    while IFS=$'\t' read -r mode source_rel install_rel _; do
+        source_path="${source_root%/}/$source_rel"
+        target_path="$(service_install_target_path "$install_rel")"
+
+        if [ ! -f "$source_path" ]; then
+            if [ "$install_rel" = "bin/pfwd-xdp" ] && [ "$allow_existing_xdp" = "true" ] && [ -x "$target_path" ]; then
+                continue
+            fi
+            pfwd_die "安装包不完整：缺少 $source_path"
+        fi
+        if [ "$source_path" != "$target_path" ]; then
+            install -m "$mode" "$source_path" "$target_path"
+        else
+            chmod "$mode" "$target_path"
+        fi
+    done < <(service_bundle_rows)
+}
+
 service_write_unit_files() {
     mkdir -p "$PFWD_SYSTEMD_DIR"
     service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
@@ -85,39 +220,16 @@ service_write_unit_files() {
 
 service_install_files() {
     pfwd_mkdirs
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_XDP_BIN_PATH")" "$PFWD_SYSTEMD_DIR"
+    service_prepare_install_dirs
     [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
     [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv4 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated.zone $PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv6 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated-v6.zone $PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    if [ "$PFWD_SCRIPT_DIR/pfwd.sh" != "$PFWD_INSTALL_DIR/pfwd.sh" ]; then
-        cp "$PFWD_SCRIPT_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
-    fi
-    if [ "$PFWD_SCRIPT_DIR/bbr.sh" != "$PFWD_INSTALL_DIR/bbr.sh" ]; then
-        cp "$PFWD_SCRIPT_DIR/bbr.sh" "$PFWD_INSTALL_DIR/bbr.sh"
-    fi
-    if [ "$PFWD_SCRIPT_DIR/lib" != "$PFWD_INSTALL_DIR/lib" ]; then
-        cp "$PFWD_SCRIPT_DIR/lib/"*.sh "$PFWD_INSTALL_DIR/lib/"
-    fi
-    if [ "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" != "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" ]; then
-        cp "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
-    fi
-    if [ "$PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone" != "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" ]; then
-        cp "$PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    fi
-    if [ -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ]; then
-        if [ "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" != "$PFWD_XDP_BIN_PATH" ]; then
-            cp "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" "$PFWD_XDP_BIN_PATH"
-        fi
-    elif [ ! -x "$PFWD_XDP_BIN_PATH" ]; then
+    if [ ! -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ] && [ ! -x "$PFWD_XDP_BIN_PATH" ]; then
         pfwd_die "安装包不完整：缺少 XDP 预编译二进制 ($PFWD_SCRIPT_DIR/assets/$(guard_asset_name))"
     fi
-    chmod +x "$PFWD_INSTALL_DIR/pfwd.sh"
-    chmod +x "$PFWD_INSTALL_DIR/bbr.sh"
-    chmod +x "$PFWD_XDP_BIN_PATH"
-    ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
-    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
-    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
+    service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR" true
+    service_write_shortcuts
     service_write_unit_files
 }
 
@@ -172,8 +284,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-xdp.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-xdp.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -206,22 +318,43 @@ service_cleanup_pfwd_tc() {
     pfwd_run tc qdisc del dev "$iface" root 2>/dev/null || true
 }
 
+service_remove_unit_files() {
+    local unit
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        rm -f "$PFWD_SYSTEMD_DIR/$unit"
+    done < <(service_unit_names)
+}
+
+service_remove_binary_artifacts() {
+    local mode source_rel install_rel digest_label
+    service_remove_shortcuts
+    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
+        rm -f "$(service_install_target_path "$install_rel")"
+    done < <(service_bundle_rows)
+}
+
+service_remove_asset_artifacts() {
+    rm -rf "$PFWD_INSTALL_DIR/assets"
+}
+
+service_remove_installation_artifacts() {
+    service_remove_unit_files
+    service_remove_binary_artifacts
+    service_remove_asset_artifacts
+    rm -rf "$PFWD_INSTALL_DIR/lib"
+    rmdir "$PFWD_INSTALL_DIR/bin" 2>/dev/null || true
+}
+
 service_uninstall_files() {
     service_disable
     service_cleanup_pfwd_tc
     guard_remove_runtime true || true
-    rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.timer" \
-          "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
-    rm -f "$PFWD_BIN_PATH"
-    rm -f "$PFWD_INSTALL_DIR/pfwd.sh"
-    rm -f "$PFWD_XDP_BIN_PATH"
-    rm -rf "$PFWD_GUARD_STATE_DIR"
-    rm -rf "$PFWD_WHITELIST_STATE_DIR"
-    rm -f "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_STATUS_FILE"
-    rm -rf "$PFWD_INSTALL_DIR/lib"
-    rmdir "$PFWD_INSTALL_DIR/bin" 2>/dev/null || true
+    runtime_clear_accounting_runtime
+    runtime_remove_runtime_artifacts
+    runtime_remove_whitelist_runtime_files
+    runtime_remove_runtime_state_dirs
+    service_remove_installation_artifacts
 }
 
 service_purge_state() {
@@ -230,17 +363,33 @@ service_purge_state() {
 
 service_verify_removed() {
     local leftovers=()
-    for path in "$PFWD_BIN_PATH" "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_XDP_BIN_PATH" \
+    local path _ source_rel install_rel __
+    for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
         "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
-        "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+        "$PFWD_XDP_SK_LOOKUP_PIN_PATH" "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
+        "$PFWD_XDP_REVERSE_PIN_PATH" "$PFWD_XDP_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_V6_PIN_PATH" \
+        "$PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH" \
+        "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
         "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" \
-        "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" \
-        "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" \
-        "$PFWD_SYSTEMD_DIR/pfwd-forward.service" "$PFWD_SYSTEMD_DIR/pfwd.service" "$PFWD_SYSTEMD_DIR/pfwd.timer" "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"; do
+        "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
+        "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
+        "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"; do
         [ ! -e "$path" ] || leftovers+=("$path")
     done
+    while IFS=$'\t' read -r _ path __; do
+        [ ! -e "$path" ] || leftovers+=("$path")
+    done < <(service_shortcut_rows)
+    while IFS=$'\t' read -r _ source_rel install_rel __; do
+        path="$(service_install_target_path "$install_rel")"
+        [ ! -e "$path" ] || leftovers+=("$path")
+    done < <(service_bundle_rows)
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        path="$PFWD_SYSTEMD_DIR/$path"
+        [ ! -e "$path" ] || leftovers+=("$path")
+    done < <(service_unit_names)
     if [ "${#leftovers[@]}" -gt 0 ]; then
         printf 'leftover path: %s\n' "${leftovers[@]}" >&2
         return 1
@@ -266,75 +415,43 @@ service_update_create_workdir() {
 service_update_download_bundle() {
     local work_dir="$1"
     local staged_dir="$work_dir/staged"
-    local lib
 
     mkdir -p "$staged_dir/lib" "$staged_dir/assets"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$staged_dir/pfwd.sh" || return 1
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$staged_dir/bbr.sh" || return 1
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$(guard_asset_name)" "$staged_dir/assets/$(guard_asset_name)" || return 1
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$staged_dir/assets/cn-aggregated.zone" || return 1
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$staged_dir/assets/cn-aggregated-v6.zone" || return 1
-    for lib in "${PFWD_LIB_FILES[@]}"; do
-        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/lib/$lib.sh" "$staged_dir/lib/$lib.sh" || return 1
-    done
+    local _ source_rel __ ___
+    while IFS=$'\t' read -r _ source_rel __ ___; do
+        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
+    done < <(service_bundle_rows)
 }
 
 service_update_validate_bundle() {
     local dir="$1"
-    local lib
-
-    [ -f "$dir/pfwd.sh" ] || {
-        echo "更新包缺少 pfwd.sh" >&2
-        return 1
-    }
-    [ -f "$dir/bbr.sh" ] || {
-        echo "更新包缺少 bbr.sh" >&2
-        return 1
-    }
-    [ -f "$dir/assets/$(guard_asset_name)" ] || {
-        echo "更新包缺少 assets/$(guard_asset_name)" >&2
-        return 1
-    }
-    [ -f "$dir/assets/cn-aggregated.zone" ] || {
-        echo "更新包缺少 assets/cn-aggregated.zone" >&2
-        return 1
-    }
-    [ -f "$dir/assets/cn-aggregated-v6.zone" ] || {
-        echo "更新包缺少 assets/cn-aggregated-v6.zone" >&2
-        return 1
-    }
-    bash -n "$dir/pfwd.sh" || return 1
-    bash -n "$dir/bbr.sh" || return 1
-    for lib in "${PFWD_LIB_FILES[@]}"; do
-        [ -f "$dir/lib/$lib.sh" ] || {
-            echo "更新包缺少 lib/$lib.sh" >&2
+    local _ source_rel __ ___
+    while IFS=$'\t' read -r _ source_rel __ ___; do
+        [ -f "$dir/$source_rel" ] || {
+            echo "更新包缺少 $source_rel" >&2
             return 1
         }
-        bash -n "$dir/lib/$lib.sh" || return 1
-    done
+        case "$source_rel" in
+            *.sh) bash -n "$dir/$source_rel" || return 1 ;;
+        esac
+    done < <(service_bundle_rows)
 }
 
 service_update_bundle_digest() {
     local dir="$1"
-    local payload="" lib
-    local xdp_file=""
+    local layout="${2:-staged}"
+    local payload="" mode source_rel install_rel digest_label
+    local digest_path=""
 
-    if [ -f "$dir/assets/$(guard_asset_name)" ]; then
-        xdp_file="$dir/assets/$(guard_asset_name)"
-    elif [ -f "$dir/bin/pfwd-xdp" ]; then
-        xdp_file="$dir/bin/pfwd-xdp"
-    else
-        pfwd_die "缺少 XDP 二进制用于生成摘要：$dir"
-    fi
-
-    payload="pfwd.sh $(pfwd_file_checksum "$dir/pfwd.sh")"$'\n'
-    payload="${payload}bbr.sh $(pfwd_file_checksum "$dir/bbr.sh")"$'\n'
-    payload="${payload}xdp $(pfwd_file_checksum "$xdp_file")"$'\n'
-    payload="${payload}assets/cn-aggregated.zone $(pfwd_file_checksum "$dir/assets/cn-aggregated.zone")"$'\n'
-    payload="${payload}assets/cn-aggregated-v6.zone $(pfwd_file_checksum "$dir/assets/cn-aggregated-v6.zone")"$'\n'
-    for lib in "${PFWD_LIB_FILES[@]}"; do
-        payload="${payload}lib/$lib.sh $(pfwd_file_checksum "$dir/lib/$lib.sh")"$'\n'
-    done
+    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
+        case "$layout" in
+            install) digest_path="$dir/$install_rel" ;;
+            staged) digest_path="$dir/$source_rel" ;;
+            *) pfwd_die "未知更新包布局：$layout" ;;
+        esac
+        [ -f "$digest_path" ] || pfwd_die "缺少更新产物用于生成摘要：$digest_path"
+        payload="${payload}${digest_label} $(pfwd_file_checksum "$digest_path")"$'\n'
+    done < <(service_bundle_rows)
     printf '%s' "$payload" | pfwd_stdin_checksum
 }
 
@@ -384,52 +501,25 @@ service_update_restore_enabled_state() {
 service_update_backup_current() {
     local work_dir="$1"
     local backup_dir="$work_dir/backup"
-    local unit
 
     mkdir -p "$backup_dir/install" "$backup_dir/systemd" "$backup_dir/bin"
     cp -a "$PFWD_INSTALL_DIR/." "$backup_dir/install/"
-    if [ -e "$PFWD_BIN_PATH" ]; then
-        cp -a "$PFWD_BIN_PATH" "$backup_dir/bin/pfwd"
-    fi
-    if [ -e "$PFWD_BBR_BIN_PATH" ]; then
-        cp -a "$PFWD_BBR_BIN_PATH" "$backup_dir/bin/bbr.sh"
-    fi
-    if [ -e "$PFWD_BBR_ALIAS_BIN_PATH" ]; then
-        cp -a "$PFWD_BBR_ALIAS_BIN_PATH" "$backup_dir/bin/pfwd-bbr"
-    fi
-    if [ -e "$PFWD_XDP_BIN_PATH" ]; then
-        cp -a "$PFWD_XDP_BIN_PATH" "$backup_dir/bin/pfwd-xdp"
-    fi
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service; do
-        if [ -e "$PFWD_SYSTEMD_DIR/$unit" ]; then
-            cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/systemd/$unit"
-        fi
-    done
+    service_backup_shortcuts "$backup_dir/bin"
+    service_backup_unit_files "$backup_dir/systemd"
 }
 
 service_update_apply_staged() {
     local work_dir="$1"
     local staged_dir="$work_dir/staged"
-    local lib
 
-    mkdir -p "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/assets" "$(dirname "$PFWD_BIN_PATH")" "$(dirname "$PFWD_BBR_BIN_PATH")" "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" "$(dirname "$PFWD_XDP_BIN_PATH")"
-    install -m 0755 "$staged_dir/pfwd.sh" "$PFWD_INSTALL_DIR/pfwd.sh"
-    install -m 0755 "$staged_dir/bbr.sh" "$PFWD_INSTALL_DIR/bbr.sh"
-    install -m 0755 "$staged_dir/assets/$(guard_asset_name)" "$PFWD_XDP_BIN_PATH"
-    install -m 0644 "$staged_dir/assets/cn-aggregated.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
-    install -m 0644 "$staged_dir/assets/cn-aggregated-v6.zone" "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    for lib in "${PFWD_LIB_FILES[@]}"; do
-        install -m 0644 "$staged_dir/lib/$lib.sh" "$PFWD_INSTALL_DIR/lib/$lib.sh"
-    done
-    ln -sf "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH"
-    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH"
-    ln -sf "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH"
+    service_prepare_install_dirs
+    service_copy_bundle_from_dir "$staged_dir"
+    service_write_shortcuts
 }
 
 service_update_rollback() {
     local work_dir="$1"
     local backup_dir="$work_dir/backup"
-    local unit
 
     [ -d "$backup_dir/install" ] || return 1
 
@@ -437,38 +527,8 @@ service_update_rollback() {
     mkdir -p "$PFWD_INSTALL_DIR"
     cp -a "$backup_dir/install/." "$PFWD_INSTALL_DIR/"
 
-    if [ -e "$backup_dir/bin/pfwd" ]; then
-        mkdir -p "$(dirname "$PFWD_BIN_PATH")"
-        rm -f "$PFWD_BIN_PATH"
-        cp -a "$backup_dir/bin/pfwd" "$PFWD_BIN_PATH"
-    fi
-    if [ -e "$backup_dir/bin/bbr.sh" ]; then
-        mkdir -p "$(dirname "$PFWD_BBR_BIN_PATH")"
-        rm -f "$PFWD_BBR_BIN_PATH"
-        cp -a "$backup_dir/bin/bbr.sh" "$PFWD_BBR_BIN_PATH"
-    fi
-    if [ -e "$backup_dir/bin/pfwd-bbr" ]; then
-        mkdir -p "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")"
-        rm -f "$PFWD_BBR_ALIAS_BIN_PATH"
-        cp -a "$backup_dir/bin/pfwd-bbr" "$PFWD_BBR_ALIAS_BIN_PATH"
-    fi
-    if [ -e "$backup_dir/bin/pfwd-xdp" ]; then
-        mkdir -p "$(dirname "$PFWD_XDP_BIN_PATH")"
-        rm -f "$PFWD_XDP_BIN_PATH"
-        cp -a "$backup_dir/bin/pfwd-xdp" "$PFWD_XDP_BIN_PATH"
-    fi
-
-    mkdir -p "$PFWD_SYSTEMD_DIR"
-    rm -f "$PFWD_SYSTEMD_DIR/pfwd-forward.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd.timer" \
-          "$PFWD_SYSTEMD_DIR/pfwd-bbr.service" \
-          "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service; do
-        if [ -e "$backup_dir/systemd/$unit" ]; then
-            cp -a "$backup_dir/systemd/$unit" "$PFWD_SYSTEMD_DIR/$unit"
-        fi
-    done
+    service_restore_shortcuts "$backup_dir/bin"
+    service_restore_unit_files "$backup_dir/systemd"
 
     if command -v systemctl >/dev/null 2>&1; then
         pfwd_run systemctl daemon-reload || true

@@ -33,6 +33,7 @@ const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
 const ruleFlagXDPDisabled = uint16(1 << 0)
+const ruleCounterPinSuffix = "_rule_counters"
 
 type bpfObjects struct {
 	PFWDXDP              *ebpf.Program `ebpf:"pfwd_xdp"`
@@ -194,6 +195,23 @@ type statusPayload struct {
 	StatsPin       string `json:"stats_pin,omitempty"`
 }
 
+type runtimeMapPins struct {
+	Settings         string
+	Rules            string
+	Connections      string
+	Reverse          string
+	RuleCounter      string
+	UserCounter      string
+	Stats            string
+	WhitelistV4      string
+	WhitelistV6      string
+	WhitelistCacheV4 string
+	WhitelistCacheV6 string
+	AllowedFlows     string
+	GuardPrefixes    string
+	SkipPorts        string
+}
+
 type xdpSettings struct {
 	WhitelistEnabled uint8
 	BlockHTTP        uint8
@@ -241,6 +259,17 @@ type counterVal struct {
 	BillingBytes   uint64 `json:"billing_bytes"`
 }
 
+type connKey struct {
+	Family     uint8
+	Protocol   uint8
+	ClientPort uint16
+	ListenPort uint16
+	TargetPort uint16
+	ClientAddr [16]byte
+	ListenAddr [16]byte
+	TargetAddr [16]byte
+}
+
 type connVal struct {
 	RuleID             uint32
 	UserID             uint32
@@ -258,6 +287,17 @@ type connVal struct {
 	Bytes              uint64
 }
 
+type reverseKey struct {
+	Family     uint8
+	Protocol   uint8
+	SourcePort uint16
+	TargetPort uint16
+	ClientPort uint16
+	SourceAddr [16]byte
+	TargetAddr [16]byte
+	ClientAddr [16]byte
+}
+
 type whitelistKeyV4 struct {
 	PrefixLen uint32
 	Addr      uint32
@@ -268,9 +308,28 @@ type whitelistKeyV6 struct {
 	Addr      [16]byte
 }
 
+type whitelistCacheKeyV6 struct {
+	Addr [16]byte
+}
+
 type portKey struct {
 	Port uint16
 	Pad  [4]byte
+}
+
+type flowKey struct {
+	Family   uint8
+	Protocol uint8
+	Sport    uint16
+	Dport    uint16
+	Saddr    [16]byte
+	Daddr    [16]byte
+}
+
+type guardPrefixVal struct {
+	SeenLen uint8
+	Pad     [7]byte
+	Prefix  [8]byte
 }
 
 func main() {
@@ -459,6 +518,36 @@ func applyRuntime(opts applyOptions) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("移除 memlock 限制失败: %w", err)
 	}
+	if opts.GuardMode == "off" {
+		if err := removeRuntime(removeOptions{
+			StatusFile:     opts.StatusFile,
+			XDPPin:         opts.XDPPin,
+			IngressPin:     opts.IngressPin,
+			LoopbackPin:    opts.LoopbackPin,
+			SkLookupPin:    opts.SkLookupPin,
+			RuleCounterPin: opts.RuleCounterPin,
+			UserCounterPin: opts.UserCounterPin,
+			StatsPin:       opts.StatsPin,
+		}); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("清理旧运行态失败: %w", err)
+		}
+		payload := statusPayload{Applied: false, BinaryVersion: binaryVersion, GuardMode: opts.GuardMode, RuntimeFile: opts.RuntimeFile, StateFile: opts.StateFile}
+		return writeStatus(opts.StatusFile, payload)
+	}
+	iface, err := net.InterfaceByName(opts.Iface)
+	if err != nil {
+		return fmt.Errorf("查找网卡 %q 失败: %w", opts.Iface, err)
+	}
+	currentStatus, _ := readStatus(opts.StatusFile)
+	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
+	needIngress := opts.GuardMode == "ingress" || (protocolGuard && guardIngressEnabled(runtimeData.Settings))
+	if canIncrementalApply(currentStatus, runtimeData, opts, iface, needIngress) {
+		if err := applyIncrementalRuntime(currentStatus, runtimeData, opts, iface, protocolGuard); err == nil {
+			return nil
+		} else if !opts.Quiet {
+			fmt.Fprintf(os.Stderr, "pfwd-xdp: incremental apply 失败，回退到 full reattach: %v\n", err)
+		}
+	}
 	if err := removeRuntime(removeOptions{
 		StatusFile:     opts.StatusFile,
 		XDPPin:         opts.XDPPin,
@@ -471,14 +560,6 @@ func applyRuntime(opts applyOptions) error {
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧运行态失败: %w", err)
 	}
-	if opts.GuardMode == "off" {
-		payload := statusPayload{Applied: false, BinaryVersion: binaryVersion, GuardMode: opts.GuardMode, RuntimeFile: opts.RuntimeFile, StateFile: opts.StateFile}
-		return writeStatus(opts.StatusFile, payload)
-	}
-	iface, err := net.InterfaceByName(opts.Iface)
-	if err != nil {
-		return fmt.Errorf("查找网卡 %q 失败: %w", opts.Iface, err)
-	}
 	objs, err := loadObjects(opts.GuardMode)
 	if err != nil {
 		return err
@@ -490,8 +571,6 @@ func applyRuntime(opts applyOptions) error {
 	if err := pinRuntimeMaps(objs, opts); err != nil {
 		return err
 	}
-	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
-	needIngress := opts.GuardMode == "ingress" || (protocolGuard && guardIngressEnabled(runtimeData.Settings))
 	xdpEffective := "disabled"
 	xdpKind := ""
 	xdpReason := ""
@@ -625,6 +704,53 @@ func loadRuntime(path string) (*runtimeFile, error) {
 	return &runtimeData, nil
 }
 
+func runtimePinNamespace(ruleCounterPin string) string {
+	base := filepath.Base(strings.TrimSpace(ruleCounterPin))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "pfwd"
+	}
+	if strings.HasSuffix(base, ruleCounterPinSuffix) {
+		base = strings.TrimSuffix(base, ruleCounterPinSuffix)
+	}
+	base = strings.Trim(base, "_- ")
+	if base == "" {
+		return "pfwd"
+	}
+	return base
+}
+
+func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) runtimeMapPins {
+	dir := filepath.Dir(ruleCounterPin)
+	namespace := runtimePinNamespace(ruleCounterPin)
+	return runtimeMapPins{
+		Settings:         filepath.Join(dir, namespace+"_settings"),
+		Rules:            filepath.Join(dir, namespace+"_rules"),
+		Connections:      filepath.Join(dir, namespace+"_connections"),
+		Reverse:          filepath.Join(dir, namespace+"_reverse"),
+		RuleCounter:      ruleCounterPin,
+		UserCounter:      userCounterPin,
+		Stats:            statsPin,
+		WhitelistV4:      filepath.Join(dir, namespace+"_whitelist_v4"),
+		WhitelistV6:      filepath.Join(dir, namespace+"_whitelist_v6"),
+		WhitelistCacheV4: filepath.Join(dir, namespace+"_whitelist_cache_v4"),
+		WhitelistCacheV6: filepath.Join(dir, namespace+"_whitelist_cache_v6"),
+		AllowedFlows:     filepath.Join(dir, namespace+"_allowed_flows"),
+		GuardPrefixes:    filepath.Join(dir, namespace+"_guard_prefixes"),
+		SkipPorts:        filepath.Join(dir, namespace+"_protocol_skip_ports"),
+	}
+}
+
+func runtimeMapPinsFromApplyOptions(opts applyOptions) runtimeMapPins {
+	return runtimeMapPinsFromPaths(opts.RuleCounterPin, opts.UserCounterPin, opts.StatsPin)
+}
+
+func runtimeMapPinsFromRemoveOptions(opts removeOptions, payload statusPayload) runtimeMapPins {
+	ruleCounterPin := firstNonEmpty(opts.RuleCounterPin, payload.RuleCounterPin, "/sys/fs/bpf/pfwd_rule_counters")
+	userCounterPin := firstNonEmpty(opts.UserCounterPin, payload.UserCounterPin, "/sys/fs/bpf/pfwd_user_counters")
+	statsPin := firstNonEmpty(opts.StatsPin, payload.StatsPin, "/sys/fs/bpf/pfwd_stats")
+	return runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin)
+}
+
 func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) error {
 	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
 		return fmt.Errorf("关键 BPF map 未加载")
@@ -677,10 +803,22 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 }
 
 func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
+	pinLayout := runtimeMapPinsFromApplyOptions(opts)
 	pins := map[string]*ebpf.Map{
-		opts.RuleCounterPin: objs.PFWDRuleCounter,
-		opts.UserCounterPin: objs.PFWDUserCounter,
-		opts.StatsPin:       objs.PFWDStats,
+		pinLayout.Settings:         objs.PFWDSettings,
+		pinLayout.Rules:            objs.PFWDRules,
+		pinLayout.Connections:      objs.PFWDConnections,
+		pinLayout.Reverse:          objs.PFWDReverse,
+		pinLayout.RuleCounter:      objs.PFWDRuleCounter,
+		pinLayout.UserCounter:      objs.PFWDUserCounter,
+		pinLayout.Stats:            objs.PFWDStats,
+		pinLayout.WhitelistV4:      objs.PFWDWhitelistV4,
+		pinLayout.WhitelistV6:      objs.PFWDWhitelistV6,
+		pinLayout.WhitelistCacheV4: objs.PFWDWhitelistCacheV4,
+		pinLayout.WhitelistCacheV6: objs.PFWDWhitelistCacheV6,
+		pinLayout.AllowedFlows:     objs.PFWDFlows,
+		pinLayout.GuardPrefixes:    objs.PFWDGuardPrefixes,
+		pinLayout.SkipPorts:        objs.PFWDSkipPorts,
 	}
 	for path, m := range pins {
 		if m == nil {
@@ -695,6 +833,298 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		}
 	}
 	return nil
+}
+
+func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
+	load := func(path string) (*ebpf.Map, error) {
+		return ebpf.LoadPinnedMap(path, nil)
+	}
+	settings, err := load(pinLayout.Settings)
+	if err != nil {
+		return nil, fmt.Errorf("加载 pinned settings map 失败: %w", err)
+	}
+	rules, err := load(pinLayout.Rules)
+	if err != nil {
+		settings.Close()
+		return nil, fmt.Errorf("加载 pinned rules map 失败: %w", err)
+	}
+	connections, err := load(pinLayout.Connections)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		return nil, fmt.Errorf("加载 pinned connections map 失败: %w", err)
+	}
+	reverse, err := load(pinLayout.Reverse)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		return nil, fmt.Errorf("加载 pinned reverse map 失败: %w", err)
+	}
+	ruleCounter, err := load(pinLayout.RuleCounter)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		reverse.Close()
+		return nil, fmt.Errorf("加载 pinned rule counter map 失败: %w", err)
+	}
+	userCounter, err := load(pinLayout.UserCounter)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		reverse.Close()
+		ruleCounter.Close()
+		return nil, fmt.Errorf("加载 pinned user counter map 失败: %w", err)
+	}
+	stats, err := load(pinLayout.Stats)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		reverse.Close()
+		ruleCounter.Close()
+		userCounter.Close()
+		return nil, fmt.Errorf("加载 pinned stats map 失败: %w", err)
+	}
+	whitelistV4, err := load(pinLayout.WhitelistV4)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v4 map 失败: %w", err))
+	}
+	whitelistV6, err := load(pinLayout.WhitelistV6)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v6 map 失败: %w", err))
+	}
+	whitelistCacheV4, err := load(pinLayout.WhitelistCacheV4)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v4 map 失败: %w", err))
+	}
+	whitelistCacheV6, err := load(pinLayout.WhitelistCacheV6)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v6 map 失败: %w", err))
+	}
+	allowedFlows, err := load(pinLayout.AllowedFlows)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, nil, nil, nil, fmt.Errorf("加载 pinned allowed_flows map 失败: %w", err))
+	}
+	guardPrefixes, err := load(pinLayout.GuardPrefixes)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, nil, nil, fmt.Errorf("加载 pinned guard_prefixes map 失败: %w", err))
+	}
+	skipPorts, err := load(pinLayout.SkipPorts)
+	if err != nil {
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, nil, fmt.Errorf("加载 pinned skip_ports map 失败: %w", err))
+	}
+	return &bpfObjects{
+		PFWDSettings:         settings,
+		PFWDRules:            rules,
+		PFWDConnections:      connections,
+		PFWDReverse:          reverse,
+		PFWDRuleCounter:      ruleCounter,
+		PFWDUserCounter:      userCounter,
+		PFWDStats:            stats,
+		PFWDWhitelistV4:      whitelistV4,
+		PFWDWhitelistV6:      whitelistV6,
+		PFWDWhitelistCacheV4: whitelistCacheV4,
+		PFWDWhitelistCacheV6: whitelistCacheV6,
+		PFWDFlows:            allowedFlows,
+		PFWDGuardPrefixes:    guardPrefixes,
+		PFWDSkipPorts:        skipPorts,
+	}, nil
+}
+
+func closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts *ebpf.Map, err error) (*bpfObjects, error) {
+	for _, m := range []*ebpf.Map{settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts} {
+		if m != nil {
+			_ = m.Close()
+		}
+	}
+	return nil, err
+}
+
+func clearMap[K comparable, V any](m *ebpf.Map) error {
+	if m == nil {
+		return nil
+	}
+	it := m.Iterate()
+	var key K
+	var value V
+	for it.Next(&key, &value) {
+		keyCopy := key
+		if err := m.Delete(&keyCopy); err != nil {
+			return fmt.Errorf("删除 map entry 失败: %w", err)
+		}
+	}
+	return it.Err()
+}
+
+func clearCounterArrayMap(m *ebpf.Map, maxEntries uint32) error {
+	if m == nil {
+		return nil
+	}
+	zero := counterVal{}
+	for i := uint32(0); i < maxEntries; i++ {
+		key := i
+		if err := m.Update(&key, &zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 counter array 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
+func clearPerCPUStatsMap(m *ebpf.Map) error {
+	if m == nil {
+		return nil
+	}
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	zero := make([]uint64, cpus)
+	for i := uint32(0); i < 7; i++ {
+		key := i
+		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 percpu stats 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
+func clearRuntimeMaps(objs *bpfObjects) error {
+	if err := clearMap[ruleKey, ruleVal](objs.PFWDRules); err != nil {
+		return err
+	}
+	if err := clearMap[connKey, connVal](objs.PFWDConnections); err != nil {
+		return err
+	}
+	if err := clearMap[reverseKey, connVal](objs.PFWDReverse); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
+		return err
+	}
+	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+		return err
+	}
+	if err := clearCounterArrayMap(objs.PFWDRuleCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearCounterArrayMap(objs.PFWDUserCounter, maxUsers); err != nil {
+		return err
+	}
+	if err := clearPerCPUStatsMap(objs.PFWDStats); err != nil {
+		return err
+	}
+	return nil
+}
+
+func pinnedPathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, needIngress bool) bool {
+	if !payload.Applied {
+		return false
+	}
+	if payload.BinaryVersion != "" && payload.BinaryVersion != binaryVersion {
+		return false
+	}
+	if payload.Interface != "" && iface != nil && payload.Interface != iface.Name {
+		return false
+	}
+	if payload.GuardMode != opts.GuardMode {
+		return false
+	}
+	if (payload.IngressKind != "") != needIngress {
+		return false
+	}
+	if opts.GuardMode == "full" && payload.XDPEffective != "enabled" {
+		return false
+	}
+	if opts.GuardMode == "full" && !pinnedPathExists(firstNonEmpty(opts.XDPPin, payload.XDPPin)) {
+		return false
+	}
+	if needIngress && !pinnedPathExists(firstNonEmpty(opts.IngressPin, payload.IngressPin)) {
+		return false
+	}
+	pinLayout := runtimeMapPinsFromApplyOptions(opts)
+	requiredMapPins := []string{
+		pinLayout.Settings,
+		pinLayout.Rules,
+		pinLayout.Connections,
+		pinLayout.Reverse,
+		pinLayout.RuleCounter,
+		pinLayout.UserCounter,
+		pinLayout.Stats,
+		pinLayout.WhitelistV4,
+		pinLayout.WhitelistV6,
+		pinLayout.WhitelistCacheV4,
+		pinLayout.WhitelistCacheV6,
+		pinLayout.AllowedFlows,
+		pinLayout.GuardPrefixes,
+		pinLayout.SkipPorts,
+	}
+	for _, path := range requiredMapPins {
+		if !pinnedPathExists(path) {
+			return false
+		}
+	}
+	return runtimeData != nil
+}
+
+func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {
+	objs, err := loadPinnedRuntimeMaps(runtimeMapPinsFromApplyOptions(opts))
+	if err != nil {
+		return err
+	}
+	defer objs.Close()
+	if err := clearRuntimeMaps(objs); err != nil {
+		return fmt.Errorf("清理 pinned maps 失败: %w", err)
+	}
+	if err := loadMaps(objs, runtimeData, opts); err != nil {
+		return fmt.Errorf("重载 pinned maps 失败: %w", err)
+	}
+	updated := payload
+	updated.Applied = true
+	updated.BinaryVersion = binaryVersion
+	updated.AppliedAt = time.Now().UTC().Format(time.RFC3339)
+	updated.Interface = iface.Name
+	updated.InterfaceIndex = iface.Index
+	updated.GuardMode = opts.GuardMode
+	updated.ProtocolGuard = protocolGuard
+	updated.RuntimeFile = opts.RuntimeFile
+	updated.StateFile = opts.StateFile
+	updated.ConfigHash = runtimeData.ConfigHash
+	updated.Rules = len(runtimeData.Rules)
+	updated.Users = len(runtimeData.Users)
+	updated.XDPPin = opts.XDPPin
+	updated.IngressPin = opts.IngressPin
+	updated.LoopbackPin = opts.LoopbackPin
+	updated.SkLookupPin = opts.SkLookupPin
+	updated.RuleCounterPin = opts.RuleCounterPin
+	updated.UserCounterPin = opts.UserCounterPin
+	updated.StatsPin = opts.StatsPin
+	return writeStatus(opts.StatusFile, updated)
 }
 
 func protocolGuardEnabled(settings runtimeSettings) bool {
@@ -981,9 +1411,7 @@ func removeRuntime(opts removeOptions) error {
 	ingressPin := firstNonEmpty(opts.IngressPin, payload.IngressPin)
 	loopbackPin := firstNonEmpty(opts.LoopbackPin, payload.LoopbackPin)
 	skLookupPin := firstNonEmpty(opts.SkLookupPin, payload.SkLookupPin)
-	ruleCounterPin := firstNonEmpty(opts.RuleCounterPin, payload.RuleCounterPin)
-	userCounterPin := firstNonEmpty(opts.UserCounterPin, payload.UserCounterPin)
-	statsPin := firstNonEmpty(opts.StatsPin, payload.StatsPin)
+	pinLayout := runtimeMapPinsFromRemoveOptions(opts, payload)
 	if xdpPin != "" {
 		_ = removePinnedLink(xdpPin)
 	}
@@ -1003,14 +1431,25 @@ func removeRuntime(opts removeOptions) error {
 			return err
 		}
 	}
-	if ruleCounterPin != "" {
-		_ = os.Remove(ruleCounterPin)
-	}
-	if userCounterPin != "" {
-		_ = os.Remove(userCounterPin)
-	}
-	if statsPin != "" {
-		_ = os.Remove(statsPin)
+	for _, path := range []string{
+		pinLayout.Settings,
+		pinLayout.Rules,
+		pinLayout.Connections,
+		pinLayout.Reverse,
+		pinLayout.RuleCounter,
+		pinLayout.UserCounter,
+		pinLayout.Stats,
+		pinLayout.WhitelistV4,
+		pinLayout.WhitelistV6,
+		pinLayout.WhitelistCacheV4,
+		pinLayout.WhitelistCacheV6,
+		pinLayout.AllowedFlows,
+		pinLayout.GuardPrefixes,
+		pinLayout.SkipPorts,
+	} {
+		if path != "" {
+			_ = os.Remove(path)
+		}
 	}
 	return nil
 }

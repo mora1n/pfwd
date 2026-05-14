@@ -504,12 +504,23 @@ fw_apply_nft_runtime() {
     fi
 }
 
+fw_render_nft() {
+    local runtime_json
+    runtime_json="$(forwarder_runtime_json true)"
+    runtime_json="$(runtime_backend_json "$runtime_json" nft)"
+    fw_render_runtime_to_stdout "$runtime_json"
+}
+
 fw_apply_tc() {
-    pfwd_require_cmd tc
     local rate_count iface
     rate_count="$(fw_effective_rate_count)"
-    [ "$rate_count" -gt 0 ] || return 0
-    iface="$(fw_tc_interface)"
+    iface="$(fw_tc_interface 2>/dev/null || true)"
+    if [ "$rate_count" -le 0 ]; then
+        command -v tc >/dev/null 2>&1 || return 0
+        [ -n "$iface" ] && fw_reset_tc_root "$iface"
+        return 0
+    fi
+    pfwd_require_cmd tc
     [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
     fw_reset_tc_root "$iface"
     fw_render_tc | while IFS= read -r line; do

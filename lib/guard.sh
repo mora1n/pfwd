@@ -362,9 +362,10 @@ guard_remove_runtime() {
           --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
           --status-file "$(guard_status_file)"
     else
-        rm -f "$(guard_status_file)" 2>/dev/null || true
+        runtime_remove_xdp_status_file
     fi
-    rm -f "$(guard_xdp_pin_path)" "$(guard_ingress_pin_path)" "$PFWD_XDP_LOOPBACK_PIN_PATH" "$PFWD_XDP_SK_LOOKUP_PIN_PATH"
+    runtime_remove_link_pins
+    runtime_remove_pinned_state
     if [ "$quiet" != "true" ]; then
         echo "guard 已移除"
     fi

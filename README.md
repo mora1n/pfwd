@@ -1,17 +1,18 @@
 # pfwd
 
-`pfwd` 是一个基于 XDP/eBPF 的轻量端口转发管理脚本。
-它负责用户、转发规则、到期停转、流量统计、限速限量、Telegram 通知、白名单和协议封锁；实际数据面由内置 `pfwd-xdp` 二进制负责。
+`pfwd` 是一个轻量端口转发管理脚本。
+它负责用户、转发规则、到期停转、流量统计、限速限量、Telegram 通知、白名单和协议封锁；数据面优先使用内置 `pfwd-xdp`，必要时自动回退到 `nftables`，速率限制仍由 `tc` 执行。
 
 ## 功能
 
 | 功能 | 说明 |
 | --- | --- |
-| XDP 转发 | TCP / UDP / TCP+UDP 端口转发，支持 IPv4 / IPv6 和域名运行时解析 |
-| XDP Options | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
+| 转发 | TCP / UDP / TCP+UDP 端口转发，支持 IPv4 / IPv6 和域名运行时解析 |
+| 数据面选路 | 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 走 `nftables`；XDP 不可用时自动 fallback |
+| XDP 选项 | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
 | Rate | 使用 `tc` 做端口级或用户级速率限制 |
-| Guard | 在 XDP/TC 数据面执行来源白名单和 TCP 首包协议封锁 |
+| Guard | 入口侧白名单和 TCP 首包协议封锁，运行在 XDP / ingress 分层数据面 |
 | Notify | Telegram 定时通知和手动通知 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
@@ -45,11 +46,24 @@ pfwd guard whitelist status
 
 构建 `pfwd-xdp` 还需要 Go、clang 和可用的 eBPF 工具链；普通安装使用预编译 assets。
 
+## 源码构建
+
+`xdp` 分支合并到 `main` 后，`main` 就是唯一的源码入口。需要重新生成可分发的 `pfwd-xdp` 预编译资产时，直接在仓库根目录执行：
+
+```bash
+./xdp/build.sh
+```
+
+构建脚本会重建 `xdp/xdp_bpfel.o`，并把目标架构二进制输出到：
+
+- `assets/pfwd-xdp-linux-amd64`
+- `assets/pfwd-xdp-linux-arm64`
+
 ## 安装
 
 > 以下操作默认root权限下进行
 
-在线安装：
+在线安装（`xdp` 合并后统一从 `main` 拉取）：
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
@@ -189,19 +203,21 @@ pfwd add \
 | 设置端口限制 | `pfwd limit set --forward-id <forward_id> --traffic 100GB --rate 50Mbps` | 端口级总量和速率 |
 | 设置用户总量 | `pfwd limit set --user-id alice --traffic 1TB` | 用户级总量限制 |
 | 批量限制 | `pfwd user-forwards-limit --user-id alice --rate 50Mbps --traffic-mode one-way` | 批量设置用户下全部端口 |
-| 刷新运行态 | `pfwd refresh` | 重新解析配置并应用 XDP 数据面 |
-| 渲染数据面 | `pfwd render xdp` | 查看即将写入 `pfwd-xdp` 的 runtime JSON |
+| 刷新运行态 | `pfwd refresh` | 重新解析配置并应用当前数据面 |
+| 渲染数据面 | `pfwd render xdp` | 查看 XDP 候选 runtime JSON |
 | 渲染速率 | `pfwd render tc` | 查看速率限制命令 |
 | 诊断 | `pfwd doctor` | 查看配置、二进制、systemd 和 benchmark |
 
 ## 配置语义
 
-- 监听 IP 默认 `::`，当前 XDP 后端只支持通配监听地址 `::` / `0.0.0.0`。
+- 监听 IP 默认 `::`；当前 XDP 正向转发只支持通配监听地址 `::` / `0.0.0.0`。
 - 远端地址支持域名、IPv4 和 `[IPv6]:PORT`。
 - 同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
+- 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 固定走 `nftables`。
+- 当 XDP 不可用时，符合条件的规则会自动回退到 `nftables`。
 - MSS 和固定 SNAT 持久化在 `.forwards[].xdp`。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
-- 速率限制由 `tc` 执行，数据面转发和计数由 `pfwd-xdp` 执行。
+- 速率限制由 `tc` 执行；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 
 ## BBR / 系统调优
 
