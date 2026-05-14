@@ -26,6 +26,10 @@ enum pfwd_mss_mode {
     PFWD_MSS_SET = 2,
 };
 
+enum pfwd_rule_flags {
+    PFWD_RULE_F_XDP_DISABLED = 1U << 0,
+};
+
 enum pfwd_inspect_result {
     PFWD_INSPECT_ALLOW = 0,
     PFWD_INSPECT_DROP = 1,
@@ -39,6 +43,8 @@ struct pfwd_settings {
     __u8 block_socks;
     __u8 guard_enabled;
     __u8 pad[3];
+    __u32 external_ifindex;
+    __u32 loopback_ifindex;
 };
 
 struct pfwd_port_key {
@@ -140,6 +146,16 @@ struct pfwd_flow_key {
     __u8 daddr[16];
 };
 
+struct pfwd_guard_prefix_val {
+    __u8 seen_len;
+    __u8 pad[7];
+    __u8 prefix[8];
+};
+
+struct pfwd_whitelist_cache_key_v6 {
+    __u8 addr[16];
+};
+
 struct pfwd_scratch {
     struct pfwd_conn_key conn_key;
     struct pfwd_conn_val conn;
@@ -217,9 +233,30 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
+    __type(key, __be32);
+    __type(value, __u8);
+} pfwd_whitelist_cache_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_whitelist_cache_key_v6);
+    __type(value, __u8);
+} pfwd_whitelist_cache_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
     __type(key, struct pfwd_flow_key);
     __type(value, __u8);
 } pfwd_allowed_flows SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_flow_key);
+    __type(value, struct pfwd_guard_prefix_val);
+} pfwd_guard_prefixes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -278,6 +315,31 @@ static __always_inline void zero_addr16(__u8 addr[16]) {
     }
 }
 
+static __always_inline int ipv4_is_loopback(__be32 addr) {
+    return (bpf_ntohl(addr) & 0xff000000U) == 0x7f000000U;
+}
+
+static __always_inline int ipv6_is_loopback(const __u8 addr[16]) {
+    int i;
+#pragma unroll
+    for (i = 0; i < 15; i++) {
+        if (addr[i] != 0) {
+            return 0;
+        }
+    }
+    return addr[15] == 1;
+}
+
+static __always_inline int rule_target_is_loopback(__u8 family, const struct pfwd_rule_val *rule) {
+    if (family == 4) {
+        return ipv4_is_loopback(ipv4_from16(rule->target_addr));
+    }
+    if (family == 6) {
+        return ipv6_is_loopback(rule->target_addr);
+    }
+    return 0;
+}
+
 static __always_inline int whitelist_match_v4(__be32 addr) {
     struct pfwd_whitelist_key_v4 key = {
         .prefixlen = 32,
@@ -285,6 +347,16 @@ static __always_inline int whitelist_match_v4(__be32 addr) {
     };
     __u8 *value = bpf_map_lookup_elem(&pfwd_whitelist_v4, &key);
     return value != 0;
+}
+
+static __always_inline int whitelist_cache_hit_v4(__be32 addr) {
+    __u8 *value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v4, &addr);
+    return value != 0;
+}
+
+static __always_inline void whitelist_cache_store_v4(__be32 addr) {
+    __u8 value = 1;
+    bpf_map_update_elem(&pfwd_whitelist_cache_v4, &addr, &value, BPF_ANY);
 }
 
 static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
@@ -295,6 +367,43 @@ static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
     pfwd_memcpy16(key.addr, addr);
     value = bpf_map_lookup_elem(&pfwd_whitelist_v6, &key);
     return value != 0;
+}
+
+static __always_inline int whitelist_cache_hit_v6(const __u8 addr[16]) {
+    struct pfwd_whitelist_cache_key_v6 key = {};
+    __u8 *value;
+    pfwd_memcpy16(key.addr, addr);
+    value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v6, &key);
+    return value != 0;
+}
+
+static __always_inline void whitelist_cache_store_v6(const __u8 addr[16]) {
+    struct pfwd_whitelist_cache_key_v6 key = {};
+    __u8 value = 1;
+    pfwd_memcpy16(key.addr, addr);
+    bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
+}
+
+static __always_inline int whitelist_allowed_v4(__be32 addr) {
+    if (whitelist_cache_hit_v4(addr)) {
+        return 1;
+    }
+    if (!whitelist_match_v4(addr)) {
+        return 0;
+    }
+    whitelist_cache_store_v4(addr);
+    return 1;
+}
+
+static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
+    if (whitelist_cache_hit_v6(addr)) {
+        return 1;
+    }
+    if (!whitelist_match_v6(addr)) {
+        return 0;
+    }
+    whitelist_cache_store_v6(addr);
+    return 1;
 }
 
 static __always_inline int traffic_over_limit(const struct pfwd_rule_val *rule, __u64 input_delta, __u64 output_delta) {
@@ -557,18 +666,13 @@ static __always_inline int inspect_payload_bytes_xdp(const __u8 *payload, __u32 
     return PFWD_INSPECT_ALLOW;
 }
 
-static __always_inline int inspect_payload_bytes_ingress(const __u8 *payload, __u32 len, const struct pfwd_settings *settings) {
-    if (settings->block_http && match_http(payload, len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return PFWD_INSPECT_DROP;
+static __always_inline int inspect_guard_prefix(const struct pfwd_guard_prefix_val *prefix, const struct pfwd_settings *settings) {
+    int verdict = inspect_payload_bytes_xdp(prefix->prefix, prefix->seen_len, settings);
+    if (verdict == PFWD_INSPECT_DROP) {
+        return verdict;
     }
-    if (settings->block_tls && match_tls_client_hello(payload, len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return PFWD_INSPECT_DROP;
-    }
-    if (settings->block_socks && match_socks(payload, len)) {
-        stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
-        return PFWD_INSPECT_DROP;
+    if (prefix->seen_len < 8) {
+        return PFWD_INSPECT_NEED_MORE;
     }
     return PFWD_INSPECT_ALLOW;
 }
@@ -591,63 +695,55 @@ static __always_inline int inspect_payload_xdp(void *payload_start, void *data_e
     if (read_len < 3) {
         return PFWD_INSPECT_NEED_MORE;
     }
-    if (read_len >= 1) {
-        if ((void *)(p + 1) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[0] = p[0];
+    if ((void *)(p + read_len) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return PFWD_INSPECT_NEED_MORE;
     }
-    if (read_len >= 2) {
-        if ((void *)(p + 2) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if ((__u32)i >= read_len) {
+            break;
         }
-        payload[1] = p[1];
-    }
-    if (read_len >= 3) {
-        if ((void *)(p + 3) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[2] = p[2];
-    }
-    if (read_len >= 4) {
-        if ((void *)(p + 4) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[3] = p[3];
-    }
-    if (read_len >= 5) {
-        if ((void *)(p + 5) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[4] = p[4];
-    }
-    if (read_len >= 6) {
-        if ((void *)(p + 6) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[5] = p[5];
-    }
-    if (read_len >= 7) {
-        if ((void *)(p + 7) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[6] = p[6];
-    }
-    if (read_len >= 8) {
-        if ((void *)(p + 8) > data_end) {
-            stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return PFWD_INSPECT_NEED_MORE;
-        }
-        payload[7] = p[7];
+        payload[i] = p[i];
     }
     return inspect_payload_bytes_xdp(payload, read_len, settings);
+}
+
+static __always_inline __u32 tcp_payload_prefix_len(const __u8 *payload, void *data_end) {
+    __u32 len = 0;
+
+    if ((void *)(payload + 1) > data_end) {
+        return 0;
+    }
+    len = 1;
+    if ((void *)(payload + 2) > data_end) {
+        return len;
+    }
+    len = 2;
+    if ((void *)(payload + 3) > data_end) {
+        return len;
+    }
+    len = 3;
+    if ((void *)(payload + 4) > data_end) {
+        return len;
+    }
+    len = 4;
+    if ((void *)(payload + 5) > data_end) {
+        return len;
+    }
+    len = 5;
+    if ((void *)(payload + 6) > data_end) {
+        return len;
+    }
+    len = 6;
+    if ((void *)(payload + 7) > data_end) {
+        return len;
+    }
+    len = 7;
+    if ((void *)(payload + 8) > data_end) {
+        return len;
+    }
+    return 8;
 }
 
 static __always_inline int port_skipped(__be16 port) {
@@ -658,45 +754,90 @@ static __always_inline int port_skipped(__be16 port) {
     return value != 0;
 }
 
-static __always_inline int tcp_forward_rule_exists(__u8 family, __be16 listen_port, const __u8 listen_addr[16]) {
-    struct pfwd_rule_key key = {
+static __always_inline struct pfwd_rule_val *lookup_forward_rule(
+    __u8 family,
+    __u8 protocol,
+    __be16 listen_port,
+    const __u8 listen_addr[16]
+) {
+    struct pfwd_rule_key exact_key = {
         .family = family,
-        .protocol = IPPROTO_TCP,
+        .protocol = protocol,
+        .listen_port = listen_port,
+    };
+    struct pfwd_rule_key wildcard_key = {
+        .family = family,
+        .protocol = protocol,
         .listen_port = listen_port,
     };
     struct pfwd_rule_val *rule;
 
-    pfwd_memcpy16(key.listen_addr, listen_addr);
-    rule = bpf_map_lookup_elem(&pfwd_rules, &key);
+    pfwd_memcpy16(exact_key.listen_addr, listen_addr);
+    rule = bpf_map_lookup_elem(&pfwd_rules, &exact_key);
     if (rule) {
-        return 1;
+        return rule;
     }
-    zero_addr16(key.listen_addr);
-    rule = bpf_map_lookup_elem(&pfwd_rules, &key);
-    return rule != 0;
-}
-
-static __always_inline int inspect_payload(struct __sk_buff *skb, __u32 offset, __u32 len, const struct pfwd_settings *settings) {
-    __u8 payload[8];
-    __u32 read_len = len >= 8 ? 8 : len;
-    if (read_len < 3) {
-        return PFWD_INSPECT_NEED_MORE;
-    }
-    if (bpf_skb_load_bytes(skb, offset, payload, read_len) < 0) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return PFWD_INSPECT_NEED_MORE;
-    }
-    return inspect_payload_bytes_ingress(payload, read_len, settings);
+    return bpf_map_lookup_elem(&pfwd_rules, &wildcard_key);
 }
 
 static __always_inline int protocol_guard_active(const struct pfwd_settings *settings) {
     return settings && settings->guard_enabled && (settings->block_http || settings->block_tls || settings->block_socks);
 }
 
+static __always_inline int rule_xdp_disabled(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_XDP_DISABLED);
+}
+
+static __always_inline int append_guard_prefix(
+    const __u8 *payload,
+    void *data_end,
+    __u32 payload_len,
+    struct pfwd_guard_prefix_val *state
+) {
+    __u32 offset = state->seen_len;
+    __u32 copy_len = payload_len;
+
+    if (offset >= 8 || copy_len == 0) {
+        return 0;
+    }
+    if (copy_len > 8 - offset) {
+        copy_len = 8 - offset;
+    }
+    if ((void *)(payload + copy_len) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return -1;
+    }
+    if (copy_len > 0) {
+        state->prefix[offset] = payload[0];
+    }
+    if (copy_len > 1) {
+        state->prefix[offset + 1] = payload[1];
+    }
+    if (copy_len > 2) {
+        state->prefix[offset + 2] = payload[2];
+    }
+    if (copy_len > 3) {
+        state->prefix[offset + 3] = payload[3];
+    }
+    if (copy_len > 4) {
+        state->prefix[offset + 4] = payload[4];
+    }
+    if (copy_len > 5) {
+        state->prefix[offset + 5] = payload[5];
+    }
+    if (copy_len > 6) {
+        state->prefix[offset + 6] = payload[6];
+    }
+    if (copy_len > 7) {
+        state->prefix[offset + 7] = payload[7];
+    }
+    state->seen_len = offset + copy_len;
+    return 0;
+}
+
 static __always_inline int inspect_xdp_tcp_flow(
     void *payload_start,
     void *data_end,
-    __u32 payload_len,
     const struct pfwd_settings *settings,
     struct pfwd_rule_val *rule,
     __u64 packet_len,
@@ -707,9 +848,12 @@ static __always_inline int inspect_xdp_tcp_flow(
     __be16 dport
 ) {
     struct pfwd_flow_key flow = {};
+    struct pfwd_guard_prefix_val next_prefix = {};
+    struct pfwd_guard_prefix_val *stored_prefix;
+    __u32 payload_len = tcp_payload_prefix_len((const __u8 *)payload_start, data_end);
     int verdict;
 
-    if (!protocol_guard_active(settings) || port_skipped(dport)) {
+    if (!protocol_guard_active(settings) || port_skipped(dport) || payload_len == 0) {
         return XDP_PASS;
     }
     flow.family = family;
@@ -719,16 +863,37 @@ static __always_inline int inspect_xdp_tcp_flow(
     pfwd_memcpy16(flow.saddr, saddr);
     pfwd_memcpy16(flow.daddr, daddr);
     if (flow_allowed(&flow)) {
+        bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
         return XDP_PASS;
     }
-    verdict = inspect_payload_xdp(payload_start, data_end, payload_len, settings);
+    stored_prefix = bpf_map_lookup_elem(&pfwd_guard_prefixes, &flow);
+    if (!stored_prefix && payload_len >= 8) {
+        verdict = inspect_payload_xdp(payload_start, data_end, payload_len, settings);
+        if (verdict == PFWD_INSPECT_DROP) {
+            count_drop(rule, packet_len);
+            return XDP_DROP;
+        }
+        flow_store_allow(&flow);
+        return XDP_PASS;
+    }
+    if (stored_prefix) {
+        next_prefix = *stored_prefix;
+    }
+    if (append_guard_prefix(payload_start, data_end, payload_len, &next_prefix) < 0) {
+        return XDP_PASS;
+    }
+    verdict = inspect_guard_prefix(&next_prefix, settings);
     if (verdict == PFWD_INSPECT_DROP) {
+        bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
         count_drop(rule, packet_len);
         return XDP_DROP;
     }
-    if (verdict == PFWD_INSPECT_ALLOW) {
-        flow_store_allow(&flow);
+    if (verdict == PFWD_INSPECT_NEED_MORE) {
+        bpf_map_update_elem(&pfwd_guard_prefixes, &flow, &next_prefix, BPF_ANY);
+        return XDP_PASS;
     }
+    flow_store_allow(&flow);
+    bpf_map_delete_elem(&pfwd_guard_prefixes, &flow);
     return XDP_PASS;
 }
 
@@ -779,6 +944,292 @@ static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_en
     }
 }
 
+static __always_inline int tc_redirect_external(const struct pfwd_settings *settings) {
+    if (!settings || settings->external_ifindex == 0) {
+        return TC_ACT_SHOT;
+    }
+    return bpf_redirect_neigh(settings->external_ifindex, 0, 0, 0);
+}
+
+static __always_inline struct bpf_sock *lookup_local_socket_v4(
+    void *ctx,
+    __u8 protocol,
+    __be32 client_addr,
+    __be32 target_addr,
+    __be16 client_port,
+    __be16 target_port
+) {
+    struct bpf_sock_tuple tuple = {};
+    tuple.ipv4.saddr = client_addr;
+    tuple.ipv4.daddr = target_addr;
+    tuple.ipv4.sport = client_port;
+    tuple.ipv4.dport = target_port;
+    if (protocol == IPPROTO_TCP) {
+        return bpf_sk_lookup_tcp(ctx, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+    }
+    return bpf_sk_lookup_udp(ctx, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
+}
+
+static __always_inline struct bpf_sock *lookup_local_socket_v6(
+    void *ctx,
+    __u8 protocol,
+    const __u8 client_addr[16],
+    const __u8 target_addr[16],
+    __be16 client_port,
+    __be16 target_port
+) {
+    struct bpf_sock_tuple tuple = {};
+    __builtin_memcpy(tuple.ipv6.saddr, client_addr, sizeof(tuple.ipv6.saddr));
+    __builtin_memcpy(tuple.ipv6.daddr, target_addr, sizeof(tuple.ipv6.daddr));
+    tuple.ipv6.sport = client_port;
+    tuple.ipv6.dport = target_port;
+    if (protocol == IPPROTO_TCP) {
+        return bpf_sk_lookup_tcp(ctx, &tuple, sizeof(tuple.ipv6), BPF_F_CURRENT_NETNS, 0);
+    }
+    return bpf_sk_lookup_udp(ctx, &tuple, sizeof(tuple.ipv6), BPF_F_CURRENT_NETNS, 0);
+}
+
+static __always_inline int prepare_local_conn_v4(
+    __be32 client_addr,
+    __be32 listen_addr,
+    __be16 client_port,
+    __be16 listen_port,
+    __u8 protocol,
+    const struct pfwd_rule_val *rule,
+    struct pfwd_scratch *scratch,
+    __u64 packet_len
+) {
+    struct pfwd_conn_val *existing_conn;
+    __be32 source_addr = rule->snat_mode == PFWD_SNAT_FIXED ? ipv4_from16(rule->snat_addr) : listen_addr;
+    __be16 source_port;
+
+    if (!scratch) {
+        stat_inc(PFWD_STAT_DROPPED);
+        return -1;
+    }
+    __builtin_memset(scratch, 0, sizeof(*scratch));
+    scratch->conn_key.family = 4;
+    scratch->conn_key.protocol = protocol;
+    scratch->conn_key.client_port = client_port;
+    scratch->conn_key.listen_port = listen_port;
+    scratch->conn_key.target_port = rule->target_port;
+    copy_ipv4_to16(scratch->conn_key.client_addr, client_addr);
+    copy_ipv4_to16(scratch->conn_key.listen_addr, listen_addr);
+    pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+    existing_conn = bpf_map_lookup_elem(&pfwd_connections, &scratch->conn_key);
+    if (existing_conn) {
+        return 0;
+    }
+
+    scratch->reverse_key.family = 4;
+    scratch->reverse_key.protocol = protocol;
+    scratch->reverse_key.target_port = rule->target_port;
+    pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
+    source_port = allocate_source_port_v4(&scratch->reverse_key, client_port, client_addr, listen_addr, rule->target_port);
+    if (source_port == 0) {
+        stat_inc(PFWD_STAT_DROPPED);
+        count_drop(rule, packet_len);
+        return -1;
+    }
+
+    scratch->conn.rule_id = rule->rule_id;
+    scratch->conn.user_id = rule->user_id;
+    copy_ipv4_to16(scratch->conn.client_addr, client_addr);
+    copy_ipv4_to16(scratch->conn.listen_addr, listen_addr);
+    copy_ipv4_to16(scratch->conn.source_addr, source_addr);
+    scratch->conn.client_port = client_port;
+    scratch->conn.source_port = source_port;
+    scratch->conn.listen_port = listen_port;
+    scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
+    scratch->conn.traffic_mode = rule->traffic_mode;
+    scratch->conn.packets = 1;
+    scratch->conn.bytes = packet_len;
+    bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
+
+    scratch->reverse_key.source_port = source_port;
+    copy_ipv4_to16(scratch->reverse_key.source_addr, source_addr);
+    bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int prepare_local_conn_v6(
+    const __u8 client_addr[16],
+    const __u8 listen_addr[16],
+    __be16 client_port,
+    __be16 listen_port,
+    __u8 protocol,
+    const struct pfwd_rule_val *rule,
+    struct pfwd_scratch *scratch,
+    __u64 packet_len
+) {
+    struct pfwd_conn_val *existing_conn;
+    __be16 source_port;
+
+    if (!scratch) {
+        stat_inc(PFWD_STAT_DROPPED);
+        return -1;
+    }
+    __builtin_memset(scratch, 0, sizeof(*scratch));
+    scratch->conn_key.family = 6;
+    scratch->conn_key.protocol = protocol;
+    scratch->conn_key.client_port = client_port;
+    scratch->conn_key.listen_port = listen_port;
+    scratch->conn_key.target_port = rule->target_port;
+    pfwd_memcpy16(scratch->conn_key.client_addr, client_addr);
+    pfwd_memcpy16(scratch->conn_key.listen_addr, listen_addr);
+    pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+    existing_conn = bpf_map_lookup_elem(&pfwd_connections, &scratch->conn_key);
+    if (existing_conn) {
+        return 0;
+    }
+
+    scratch->reverse_key.family = 6;
+    scratch->reverse_key.protocol = protocol;
+    scratch->reverse_key.target_port = rule->target_port;
+    pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
+    pfwd_memcpy16(scratch->addr_a, client_addr);
+    pfwd_memcpy16(scratch->addr_b, listen_addr);
+    if (rule->snat_mode == PFWD_SNAT_FIXED) {
+        pfwd_memcpy16(scratch->addr_c, rule->snat_addr);
+    } else {
+        pfwd_memcpy16(scratch->addr_c, listen_addr);
+    }
+    source_port = allocate_source_port_v6(&scratch->reverse_key, client_port, scratch->addr_a, scratch->addr_b, rule->target_port);
+    if (source_port == 0) {
+        stat_inc(PFWD_STAT_DROPPED);
+        count_drop(rule, packet_len);
+        return -1;
+    }
+
+    scratch->conn.rule_id = rule->rule_id;
+    scratch->conn.user_id = rule->user_id;
+    pfwd_memcpy16(scratch->conn.client_addr, client_addr);
+    pfwd_memcpy16(scratch->conn.listen_addr, listen_addr);
+    pfwd_memcpy16(scratch->conn.source_addr, scratch->addr_c);
+    scratch->conn.client_port = client_port;
+    scratch->conn.source_port = source_port;
+    scratch->conn.listen_port = listen_port;
+    scratch->conn.traffic_ratio_scaled = rule->traffic_ratio_scaled;
+    scratch->conn.traffic_mode = rule->traffic_mode;
+    scratch->conn.packets = 1;
+    scratch->conn.bytes = packet_len;
+    bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
+
+    scratch->reverse_key.source_port = source_port;
+    pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
+    bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int tc_local_forward_v4(
+    void *ctx,
+    void *data_end,
+    struct ipv4hdr_min *ip4,
+    __u32 ihl,
+    __u8 protocol,
+    __be16 sport,
+    __be16 dport,
+    const struct pfwd_settings *settings,
+    struct pfwd_rule_val *rule,
+    __u64 packet_len
+) {
+    __u32 scratch_key = 0;
+    struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
+    struct bpf_sock *sk;
+
+    if (settings && settings->whitelist_enabled && !whitelist_allowed_v4(ip4->saddr)) {
+        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    if (protocol == IPPROTO_TCP) {
+        struct tcphdr_min *tcp = (void *)ip4 + ihl;
+        __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+        void *payload_start = (void *)tcp + tcp_len;
+        __u8 src16[16];
+        __u8 dst16[16];
+        if (tcp_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        copy_ipv4_to16(src16, ip4->saddr);
+        copy_ipv4_to16(dst16, ip4->daddr);
+        if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
+            return TC_ACT_SHOT;
+        }
+    }
+    if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
+        stat_inc(PFWD_STAT_QUOTA_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    sk = lookup_local_socket_v4(ctx, protocol, ip4->saddr, ipv4_from16(rule->target_addr), sport, rule->target_port);
+    if (!sk) {
+        stat_inc(PFWD_STAT_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    bpf_sk_release(sk);
+    if (prepare_local_conn_v4(ip4->saddr, ip4->daddr, sport, dport, protocol, rule, scratch, packet_len) < 0) {
+        return TC_ACT_SHOT;
+    }
+    count_input(rule, packet_len, 1);
+    stat_inc(PFWD_STAT_FORWARDED);
+    return TC_ACT_OK;
+}
+
+static __always_inline int tc_local_forward_v6(
+    void *ctx,
+    void *data_end,
+    struct ipv6hdr_min *ip6,
+    __u8 protocol,
+    __be16 sport,
+    __be16 dport,
+    const struct pfwd_settings *settings,
+    struct pfwd_rule_val *rule,
+    __u64 packet_len
+) {
+    __u32 scratch_key = 0;
+    struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
+    struct bpf_sock *sk;
+
+    if (settings && settings->whitelist_enabled && !whitelist_allowed_v6(ip6->saddr)) {
+        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    if (protocol == IPPROTO_TCP) {
+        struct tcphdr_min *tcp = (void *)(ip6 + 1);
+        __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+        void *payload_start = (void *)tcp + tcp_len;
+        if (tcp_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+            return TC_ACT_SHOT;
+        }
+    }
+    if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
+        stat_inc(PFWD_STAT_QUOTA_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    sk = lookup_local_socket_v6(ctx, protocol, ip6->saddr, rule->target_addr, sport, rule->target_port);
+    if (!sk) {
+        stat_inc(PFWD_STAT_DROPPED);
+        count_drop(rule, packet_len);
+        return TC_ACT_SHOT;
+    }
+    bpf_sk_release(sk);
+    if (prepare_local_conn_v6(ip6->saddr, ip6->daddr, sport, dport, protocol, rule, scratch, packet_len) < 0) {
+        return TC_ACT_SHOT;
+    }
+    count_input(rule, packet_len, 1);
+    stat_inc(PFWD_STAT_FORWARDED);
+    return TC_ACT_OK;
+}
+
 SEC("xdp")
 int pfwd_xdp(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -800,7 +1251,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
         __u8 protocol;
         __be16 sport = 0;
         __be16 dport = 0;
-        struct pfwd_rule_key rule_key = {};
+        __u8 listen_addr[16];
         struct pfwd_rule_val *rule;
         if ((void *)(ip4 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -834,16 +1285,16 @@ int pfwd_xdp(struct xdp_md *ctx) {
             dport = udp->dest;
         }
 
-        rule_key.family = 4;
-        rule_key.protocol = protocol;
-        rule_key.listen_port = dport;
-        copy_ipv4_to16(rule_key.listen_addr, ip4->daddr);
-        rule = bpf_map_lookup_elem(&pfwd_rules, &rule_key);
-        if (!rule) {
-            zero_addr16(rule_key.listen_addr);
-            rule = bpf_map_lookup_elem(&pfwd_rules, &rule_key);
-        }
+        copy_ipv4_to16(listen_addr, ip4->daddr);
+        rule = lookup_forward_rule(4, protocol, dport, listen_addr);
         if (rule) {
+            if (rule_xdp_disabled(rule)) {
+                stat_inc(PFWD_STAT_PASSED);
+                return XDP_PASS;
+            }
+            if (rule_target_is_loopback(4, rule)) {
+                return XDP_PASS;
+            }
             __u32 scratch_key = 0;
             struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
             struct pfwd_conn_val *existing_conn = 0;
@@ -855,7 +1306,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             __be32 new_daddr = ipv4_from16(rule->target_addr);
             __be16 new_sport = sport;
             __be16 new_dport = rule->target_port;
-            if (settings && settings->whitelist_enabled && !whitelist_match_v4(ip4->saddr)) {
+            if (settings && settings->whitelist_enabled && !whitelist_allowed_v4(ip4->saddr)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -864,17 +1315,15 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 struct tcphdr_min *tcp = (void *)ip4 + ihl;
                 __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
                 void *payload_start = (void *)tcp + tcp_len;
-                __u32 payload_len = 0;
                 __u8 src16[16];
                 __u8 dst16[16];
-                if (tcp_len < sizeof(*tcp) || payload_start > data_end) {
+                if (tcp_len < sizeof(*tcp)) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                payload_len = (__u32)(data_end - payload_start);
                 copy_ipv4_to16(src16, ip4->saddr);
                 copy_ipv4_to16(dst16, ip4->daddr);
-                if (inspect_xdp_tcp_flow(payload_start, data_end, payload_len, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
+                if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
                     return XDP_DROP;
                 }
             }
@@ -957,9 +1406,16 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     udp->check = csum_replace16(udp->check, old_dport, new_dport);
                 }
             }
-            count_input(rule, packet_len, 1);
-            stat_inc(PFWD_STAT_FORWARDED);
-            return fib_redirect_v4(ctx, eth, ip4, protocol, new_sport, new_dport);
+            {
+                int action = fib_redirect_v4(ctx, eth, ip4, protocol, new_sport, new_dport);
+                if (action == XDP_DROP) {
+                    count_drop(rule, packet_len);
+                    return action;
+                }
+                count_input(rule, packet_len, 1);
+                stat_inc(PFWD_STAT_FORWARDED);
+                return action;
+            }
         }
 
         {
@@ -1008,9 +1464,15 @@ int pfwd_xdp(struct xdp_md *ctx) {
                         udp->check = csum_replace16(udp->check, old_dst_port, new_dport);
                     }
                 }
-                count_output(conn, packet_len, 1);
-                stat_inc(PFWD_STAT_FORWARDED);
-                return fib_redirect_v4(ctx, eth, ip4, protocol, new_sport, new_dport);
+                {
+                    int action = fib_redirect_v4(ctx, eth, ip4, protocol, new_sport, new_dport);
+                    if (action == XDP_DROP) {
+                        return action;
+                    }
+                    count_output(conn, packet_len, 1);
+                    stat_inc(PFWD_STAT_FORWARDED);
+                    return action;
+                }
             }
         }
         stat_inc(PFWD_STAT_PASSED);
@@ -1022,7 +1484,6 @@ int pfwd_xdp(struct xdp_md *ctx) {
         __u8 protocol;
         __be16 sport = 0;
         __be16 dport = 0;
-        struct pfwd_rule_key rule_key = {};
         struct pfwd_rule_val *rule;
         if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -1050,21 +1511,20 @@ int pfwd_xdp(struct xdp_md *ctx) {
             sport = udp->source;
             dport = udp->dest;
         }
-        rule_key.family = 6;
-        rule_key.protocol = protocol;
-        rule_key.listen_port = dport;
-        pfwd_memcpy16(rule_key.listen_addr, ip6->daddr);
-        rule = bpf_map_lookup_elem(&pfwd_rules, &rule_key);
-        if (!rule) {
-            zero_addr16(rule_key.listen_addr);
-            rule = bpf_map_lookup_elem(&pfwd_rules, &rule_key);
-        }
+        rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
         if (rule) {
+            if (rule_xdp_disabled(rule)) {
+                stat_inc(PFWD_STAT_PASSED);
+                return XDP_PASS;
+            }
+            if (rule_target_is_loopback(6, rule)) {
+                return XDP_PASS;
+            }
             __u32 scratch_key = 0;
             struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
             struct pfwd_conn_val *existing_conn = 0;
             __be16 new_sport = sport;
-            if (settings && settings->whitelist_enabled && !whitelist_match_v6(ip6->saddr)) {
+            if (settings && settings->whitelist_enabled && !whitelist_allowed_v6(ip6->saddr)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -1073,13 +1533,11 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 struct tcphdr_min *tcp = (void *)(ip6 + 1);
                 __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
                 void *payload_start = (void *)tcp + tcp_len;
-                __u32 payload_len = 0;
-                if (tcp_len < sizeof(*tcp) || payload_start > data_end) {
+                if (tcp_len < sizeof(*tcp)) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                payload_len = (__u32)(data_end - payload_start);
-                if (inspect_xdp_tcp_flow(payload_start, data_end, payload_len, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
                     return XDP_DROP;
                 }
             }
@@ -1169,9 +1627,16 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     udp->check = csum_replace16(udp->check, old_dport, rule->target_port);
                 }
             }
-            count_input(rule, packet_len, 1);
-            stat_inc(PFWD_STAT_FORWARDED);
-            return fib_redirect_v6(ctx, eth, ip6, protocol, new_sport, rule->target_port);
+            {
+                int action = fib_redirect_v6(ctx, eth, ip6, protocol, new_sport, rule->target_port);
+                if (action == XDP_DROP) {
+                    count_drop(rule, packet_len);
+                    return action;
+                }
+                count_input(rule, packet_len, 1);
+                stat_inc(PFWD_STAT_FORWARDED);
+                return action;
+            }
         }
         {
             struct pfwd_reverse_key reverse_key = {};
@@ -1217,9 +1682,15 @@ int pfwd_xdp(struct xdp_md *ctx) {
                         udp->check = csum_replace16(udp->check, old_dport, new_dport);
                     }
                 }
-                count_output(conn, packet_len, 1);
-                stat_inc(PFWD_STAT_FORWARDED);
-                return fib_redirect_v6(ctx, eth, ip6, protocol, new_sport, new_dport);
+                {
+                    int action = fib_redirect_v6(ctx, eth, ip6, protocol, new_sport, new_dport);
+                    if (action == XDP_DROP) {
+                        return action;
+                    }
+                    count_output(conn, packet_len, 1);
+                    stat_inc(PFWD_STAT_FORWARDED);
+                    return action;
+                }
             }
         }
         stat_inc(PFWD_STAT_PASSED);
@@ -1232,88 +1703,397 @@ int pfwd_xdp(struct xdp_md *ctx) {
 
 SEC("tc")
 int pfwd_ingress(struct __sk_buff *skb) {
-    struct ethhdr eth;
+    void *data;
+    void *data_end;
+    struct ethhdr *eth;
     __u32 settings_key = 0;
     struct pfwd_settings *settings = bpf_map_lookup_elem(&pfwd_settings, &settings_key);
-    struct pfwd_flow_key flow = {};
-    __u8 listen_addr[16] = {};
-    __u32 l4_offset = 0;
-    __u32 payload_offset = 0;
-    __u32 payload_len = 0;
-    struct tcphdr_min tcp;
+    __u64 packet_len = skb->len;
 
-    if (!settings || !settings->guard_enabled || (!settings->block_http && !settings->block_tls && !settings->block_socks)) {
-        return TC_ACT_OK;
-    }
-    if (bpf_skb_load_bytes(skb, 0, &eth, sizeof(eth)) < 0) {
+    if (bpf_skb_pull_data(skb, skb->len) < 0) {
         stat_inc(PFWD_STAT_PARSE_SKIPPED);
         return TC_ACT_OK;
     }
-    if (bpf_ntohs(eth.h_proto) == ETH_P_IP) {
-        struct ipv4hdr_min ip4;
+    data = (void *)(long)skb->data;
+    data_end = (void *)(long)skb->data_end;
+    eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IP) {
+        struct ipv4hdr_min *ip4 = (void *)(eth + 1);
         __u32 ihl;
-        if (bpf_skb_load_bytes(skb, ETH_HLEN, &ip4, sizeof(ip4)) < 0) {
+        __u8 protocol;
+        __be16 sport = 0;
+        __be16 dport = 0;
+        __u8 listen_addr[16];
+        struct pfwd_rule_val *rule;
+
+        if ((void *)(ip4 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (ip4.protocol != IPPROTO_TCP) {
+        protocol = ip4->protocol;
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
             return TC_ACT_OK;
         }
-        ihl = (__u32)(ip4.version_ihl & 0x0f) * 4;
-        if (ihl < sizeof(ip4)) {
+        ihl = (__u32)(ip4->version_ihl & 0x0f) * 4;
+        if (ihl < sizeof(*ip4)) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        flow.family = 4;
-        flow.protocol = IPPROTO_TCP;
-        copy_ipv4_to16(flow.saddr, ip4.saddr);
-        copy_ipv4_to16(flow.daddr, ip4.daddr);
-        copy_ipv4_to16(listen_addr, ip4.daddr);
-        l4_offset = ETH_HLEN + ihl;
-    } else if (bpf_ntohs(eth.h_proto) == ETH_P_IPV6) {
-        struct ipv6hdr_min ip6;
-        if (bpf_skb_load_bytes(skb, ETH_HLEN, &ip6, sizeof(ip6)) < 0) {
+        if (protocol == IPPROTO_TCP) {
+            struct tcphdr_min *tcp = (void *)ip4 + ihl;
+            __u32 tcp_len;
+            void *payload_start;
+            __u8 src16[16];
+            __u8 dst16[16];
+            if ((void *)(tcp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp->source;
+            dport = tcp->dest;
+            copy_ipv4_to16(listen_addr, ip4->daddr);
+            rule = lookup_forward_rule(4, protocol, dport, listen_addr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
+                return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
+            }
+            if (!rule || !protocol_guard_active(settings) || port_skipped(dport)) {
+                return TC_ACT_OK;
+            }
+            tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+            payload_start = (void *)tcp + tcp_len;
+            if (tcp_len < sizeof(*tcp)) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            copy_ipv4_to16(src16, ip4->saddr);
+            copy_ipv4_to16(dst16, ip4->daddr);
+            if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
+            }
+            return TC_ACT_OK;
+        }
+        {
+            struct udphdr_min *udp = (void *)ip4 + ihl;
+            if ((void *)(udp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = udp->source;
+            dport = udp->dest;
+            copy_ipv4_to16(listen_addr, ip4->daddr);
+            rule = lookup_forward_rule(4, protocol, dport, listen_addr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
+                return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
+            }
+            return TC_ACT_OK;
+        }
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
+        struct ipv6hdr_min *ip6 = (void *)(eth + 1);
+        __u8 protocol;
+        __be16 sport = 0;
+        __be16 dport = 0;
+        struct pfwd_rule_val *rule;
+
+        if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (ip6.nexthdr != IPPROTO_TCP) {
+        protocol = ip6->nexthdr;
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
             return TC_ACT_OK;
         }
-        flow.family = 6;
-        flow.protocol = IPPROTO_TCP;
-        pfwd_memcpy16(flow.saddr, ip6.saddr);
-        pfwd_memcpy16(flow.daddr, ip6.daddr);
-        pfwd_memcpy16(listen_addr, ip6.daddr);
-        l4_offset = ETH_HLEN + sizeof(ip6);
-    } else {
-        return TC_ACT_OK;
-    }
-    if (bpf_skb_load_bytes(skb, l4_offset, &tcp, sizeof(tcp)) < 0) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
-    }
-    flow.sport = tcp.source;
-    flow.dport = tcp.dest;
-    if (port_skipped(tcp.dest)) {
-        return TC_ACT_OK;
-    }
-    if (!tcp_forward_rule_exists(flow.family, tcp.dest, listen_addr)) {
-        return TC_ACT_OK;
-    }
-    if (flow_allowed(&flow)) {
-        return TC_ACT_OK;
-    }
-    payload_offset = l4_offset + ((__u32)(tcp.doff_res >> 4) * 4);
-    if (payload_offset <= l4_offset || payload_offset >= skb->len) {
-        return TC_ACT_OK;
-    }
-    payload_len = skb->len - payload_offset;
-    int verdict = inspect_payload(skb, payload_offset, payload_len, settings);
-    if (verdict == PFWD_INSPECT_DROP) {
-        return TC_ACT_SHOT;
-    }
-    if (verdict == PFWD_INSPECT_ALLOW) {
-        flow_store_allow(&flow);
+        if (protocol == IPPROTO_TCP) {
+            struct tcphdr_min *tcp = (void *)(ip6 + 1);
+            __u32 tcp_len;
+            void *payload_start;
+            if ((void *)(tcp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp->source;
+            dport = tcp->dest;
+            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
+                return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
+            }
+            if (!rule || !protocol_guard_active(settings) || port_skipped(dport)) {
+                return TC_ACT_OK;
+            }
+            tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
+            payload_start = (void *)tcp + tcp_len;
+            if (tcp_len < sizeof(*tcp)) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
+            }
+            return TC_ACT_OK;
+        }
+        {
+            struct udphdr_min *udp = (void *)(ip6 + 1);
+            if ((void *)(udp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = udp->source;
+            dport = udp->dest;
+            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
+                return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
+            }
+            return TC_ACT_OK;
+        }
     }
     return TC_ACT_OK;
+}
+
+SEC("tc")
+int pfwd_loopback_egress(struct __sk_buff *skb) {
+    void *data;
+    void *data_end;
+    struct ethhdr *eth;
+    __u32 settings_key = 0;
+    struct pfwd_settings *settings = bpf_map_lookup_elem(&pfwd_settings, &settings_key);
+    __u64 packet_len = skb->len;
+
+    if (!settings) {
+        return TC_ACT_OK;
+    }
+    if (bpf_skb_pull_data(skb, skb->len) < 0) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    data = (void *)(long)skb->data;
+    data_end = (void *)(long)skb->data_end;
+    eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IP) {
+        struct ipv4hdr_min *ip4 = (void *)(eth + 1);
+        __u32 ihl;
+        __u8 protocol;
+        __be16 sport = 0;
+        __be16 dport = 0;
+        struct pfwd_reverse_key reverse_key = {};
+        struct pfwd_conn_val *conn;
+        __be32 old_saddr;
+        __be32 old_daddr;
+
+        if ((void *)(ip4 + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        protocol = ip4->protocol;
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
+            return TC_ACT_OK;
+        }
+        ihl = (__u32)(ip4->version_ihl & 0x0f) * 4;
+        if (ihl < sizeof(*ip4)) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        if (protocol == IPPROTO_TCP) {
+            struct tcphdr_min *tcp = (void *)ip4 + ihl;
+            if ((void *)(tcp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp->source;
+            dport = tcp->dest;
+        } else {
+            struct udphdr_min *udp = (void *)ip4 + ihl;
+            if ((void *)(udp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = udp->source;
+            dport = udp->dest;
+        }
+        old_saddr = ip4->saddr;
+        old_daddr = ip4->daddr;
+        reverse_key.family = 4;
+        reverse_key.protocol = protocol;
+        reverse_key.source_port = dport;
+        reverse_key.target_port = sport;
+        reverse_key.client_port = 0;
+        copy_ipv4_to16(reverse_key.source_addr, ip4->daddr);
+        copy_ipv4_to16(reverse_key.target_addr, ip4->saddr);
+        zero_addr16(reverse_key.client_addr);
+        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
+        if (!conn) {
+            return TC_ACT_OK;
+        }
+        {
+            __be16 new_sport = conn->listen_port;
+            __be16 new_dport = conn->source_port;
+            __be32 new_saddr = ipv4_from16(conn->listen_addr);
+            __be32 new_daddr = ipv4_from16(conn->client_addr);
+            ip4->saddr = new_saddr;
+            ip4->daddr = new_daddr;
+            ip4->check = csum_replace32(ip4->check, old_saddr, new_saddr);
+            ip4->check = csum_replace32(ip4->check, old_daddr, new_daddr);
+            if (protocol == IPPROTO_TCP) {
+                struct tcphdr_min *tcp = (void *)ip4 + ihl;
+                tcp->source = new_sport;
+                tcp->dest = new_dport;
+                tcp->check = csum_replace32(tcp->check, old_saddr, new_saddr);
+                tcp->check = csum_replace32(tcp->check, old_daddr, new_daddr);
+                tcp->check = csum_replace16(tcp->check, sport, new_sport);
+                tcp->check = csum_replace16(tcp->check, dport, new_dport);
+            } else {
+                struct udphdr_min *udp = (void *)ip4 + ihl;
+                udp->source = new_sport;
+                udp->dest = new_dport;
+                if (udp->check) {
+                    udp->check = csum_replace32(udp->check, old_saddr, new_saddr);
+                    udp->check = csum_replace32(udp->check, old_daddr, new_daddr);
+                    udp->check = csum_replace16(udp->check, sport, new_sport);
+                    udp->check = csum_replace16(udp->check, dport, new_dport);
+                }
+            }
+            {
+                int action = tc_redirect_external(settings);
+                if (action != TC_ACT_REDIRECT) {
+                    return TC_ACT_SHOT;
+                }
+                count_output(conn, packet_len, 1);
+                stat_inc(PFWD_STAT_FORWARDED);
+                return action;
+            }
+        }
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
+        struct ipv6hdr_min *ip6 = (void *)(eth + 1);
+        __u8 protocol;
+        __be16 sport = 0;
+        __be16 dport = 0;
+        struct pfwd_reverse_key reverse_key = {};
+        struct pfwd_conn_val *conn;
+        __u8 old_saddr[16];
+        __u8 old_daddr[16];
+
+        if ((void *)(ip6 + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        protocol = ip6->nexthdr;
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
+            return TC_ACT_OK;
+        }
+        if (protocol == IPPROTO_TCP) {
+            struct tcphdr_min *tcp = (void *)(ip6 + 1);
+            if ((void *)(tcp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp->source;
+            dport = tcp->dest;
+        } else {
+            struct udphdr_min *udp = (void *)(ip6 + 1);
+            if ((void *)(udp + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = udp->source;
+            dport = udp->dest;
+        }
+        reverse_key.family = 6;
+        reverse_key.protocol = protocol;
+        reverse_key.source_port = dport;
+        reverse_key.target_port = sport;
+        reverse_key.client_port = 0;
+        pfwd_memcpy16(reverse_key.source_addr, ip6->daddr);
+        pfwd_memcpy16(reverse_key.target_addr, ip6->saddr);
+        zero_addr16(reverse_key.client_addr);
+        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
+        if (!conn) {
+            return TC_ACT_OK;
+        }
+        pfwd_memcpy16(old_saddr, ip6->saddr);
+        pfwd_memcpy16(old_daddr, ip6->daddr);
+        pfwd_memcpy16(ip6->saddr, conn->listen_addr);
+        pfwd_memcpy16(ip6->daddr, conn->client_addr);
+        {
+            __be16 new_sport = conn->listen_port;
+            __be16 new_dport = conn->source_port;
+            if (protocol == IPPROTO_TCP) {
+                struct tcphdr_min *tcp = (void *)(ip6 + 1);
+                tcp->source = new_sport;
+                tcp->dest = new_dport;
+                tcp->check = csum_replace_addr16(tcp->check, old_saddr, ip6->saddr);
+                tcp->check = csum_replace_addr16(tcp->check, old_daddr, ip6->daddr);
+                tcp->check = csum_replace16(tcp->check, sport, new_sport);
+                tcp->check = csum_replace16(tcp->check, dport, new_dport);
+            } else {
+                struct udphdr_min *udp = (void *)(ip6 + 1);
+                udp->source = new_sport;
+                udp->dest = new_dport;
+                if (udp->check) {
+                    udp->check = csum_replace_addr16(udp->check, old_saddr, ip6->saddr);
+                    udp->check = csum_replace_addr16(udp->check, old_daddr, ip6->daddr);
+                    udp->check = csum_replace16(udp->check, sport, new_sport);
+                    udp->check = csum_replace16(udp->check, dport, new_dport);
+                }
+            }
+            {
+                int action = tc_redirect_external(settings);
+                if (action != TC_ACT_REDIRECT) {
+                    return TC_ACT_SHOT;
+                }
+                count_output(conn, packet_len, 1);
+                stat_inc(PFWD_STAT_FORWARDED);
+                return action;
+            }
+        }
+    }
+    return TC_ACT_OK;
+}
+
+SEC("sk_lookup")
+int pfwd_sk_lookup(struct bpf_sk_lookup *ctx) {
+    struct pfwd_rule_val *rule;
+    struct bpf_sock *sk;
+    __u8 listen_addr[16];
+    int err;
+
+    if (ctx->protocol != IPPROTO_TCP && ctx->protocol != IPPROTO_UDP) {
+        return SK_PASS;
+    }
+    if (ctx->family == AF_INET) {
+        copy_ipv4_to16(listen_addr, ctx->local_ip4);
+        rule = lookup_forward_rule(4, (__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port), listen_addr);
+        if (!rule || !rule_target_is_loopback(4, rule)) {
+            return SK_PASS;
+        }
+        sk = lookup_local_socket_v4(ctx, (__u8)ctx->protocol, ctx->remote_ip4, ipv4_from16(rule->target_addr), ctx->remote_port, rule->target_port);
+    } else if (ctx->family == AF_INET6) {
+        pfwd_memcpy16(listen_addr, (const __u8 *)ctx->local_ip6);
+        rule = lookup_forward_rule(6, (__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port), listen_addr);
+        if (!rule || !rule_target_is_loopback(6, rule)) {
+            return SK_PASS;
+        }
+        sk = lookup_local_socket_v6(ctx, (__u8)ctx->protocol, (const __u8 *)ctx->remote_ip6, rule->target_addr, ctx->remote_port, rule->target_port);
+    } else {
+        return SK_PASS;
+    }
+
+    if (!sk) {
+        stat_inc(PFWD_STAT_DROPPED);
+        return SK_DROP;
+    }
+    err = bpf_sk_assign(ctx, sk, BPF_SK_LOOKUP_F_REPLACE);
+    bpf_sk_release(sk);
+    if (err) {
+        stat_inc(PFWD_STAT_DROPPED);
+        return SK_DROP;
+    }
+    return SK_PASS;
 }

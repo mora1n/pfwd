@@ -223,7 +223,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]
   pfwd import <file>
-  pfwd render [xdp|tc|guard|units]
+  pfwd render [forwarder|nft|tc|guard|units]
   pfwd refresh
   pfwd reconcile
   pfwd notify-test --user-id ID
@@ -247,7 +247,7 @@ pfwd - XDP 端口转发管理脚本
 
 无参数运行时默认进入交互菜单；使用 pfwd help 查看命令列表。
 端口支持单个端口、逗号列表和范围，例如 443、443,553、1000-1005。
-监听 IP 默认使用 :: 双栈监听；当前 XDP 后端仅支持 :: / 0.0.0.0 这类通配监听地址。
+监听 IP 默认使用 :: 双栈监听；非 localhost 规则优先走 XDP，localhost/::1 自动走 nftables，XDP 不可用时会自动回退到 nftables。
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
   MSS 和固定 SNAT 通过 `.forwards[].xdp` 字段持久化。

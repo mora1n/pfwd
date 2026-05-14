@@ -4,18 +4,19 @@ config_default_json() {
     cat <<EOF
 {
   "settings": {
+    "nft_family": "inet",
+    "nft_table": "pfwd",
+    "forward_table": "port_forward",
     "domain_refresh_interval": "60s",
     "tc_interface": "",
     "default_listen_ip": "::",
     "default_random_port_range": "20000-30000",
     "xdp": {
-      "interface": "",
-      "mode": "auto"
+      "interface": ""
     },
     "guard": {
       "enabled": false,
       "tc_interface": "",
-      "xdp_mode": "auto",
       "block_http": false,
       "block_tls": false,
       "block_socks": false,

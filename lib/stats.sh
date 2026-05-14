@@ -96,6 +96,82 @@ stats_zero_snapshot_json() {
     ' "$cfg_file"
 }
 
+stats_merge_snapshots_json() {
+    local xdp_snapshot="$1"
+    local nft_snapshot="$2"
+    jq -n \
+      --argjson xdp "$xdp_snapshot" \
+      --argjson nft "$nft_snapshot" '
+      (($xdp + $nft) | group_by(.id) | map(
+        reduce .[] as $row (
+          {
+            id: .[0].id,
+            user_id: .[0].user_id,
+            traffic_mode: .[0].traffic_mode,
+            traffic_ratio: (. [0].traffic_ratio // 1),
+            input_bytes: 0,
+            output_bytes: 0,
+            input_packets: 0,
+            output_packets: 0,
+            dropped_bytes: 0,
+            dropped_packets: 0
+          };
+          .input_bytes += ($row.input_bytes // 0)
+          | .output_bytes += ($row.output_bytes // 0)
+          | .input_packets += ($row.input_packets // 0)
+          | .output_packets += ($row.output_packets // 0)
+          | .dropped_bytes += ($row.dropped_bytes // 0)
+          | .dropped_packets += ($row.dropped_packets // 0)
+        )
+      ))'
+}
+
+stats_snapshot_from_nft_runtime() {
+    local runtime_json="$1"
+    local nft_json
+    nft_json="$(fw_read_nft_counters 2>/dev/null || true)"
+    if [ -z "$nft_json" ]; then
+        jq -n --argjson runtime "$runtime_json" '
+          [
+            $runtime.rules[]? |
+            {
+              id: .id,
+              user_id: .user_id,
+              traffic_mode: (.traffic_mode // "two-way"),
+              traffic_ratio: (.traffic_ratio // 1),
+              input_bytes: 0,
+              output_bytes: 0,
+              input_packets: 0,
+              output_packets: 0,
+              dropped_bytes: 0,
+              dropped_packets: 0
+            }
+          ]'
+        return 0
+    fi
+
+    jq -n \
+      --argjson runtime "$runtime_json" \
+      --argjson nft "$nft_json" '
+      ($nft.nftables | map(select(.counter?)) | map({key: .counter.name, value: (.counter.bytes // 0)}) | from_entries) as $counters
+      | [
+          $runtime.rules[]? |
+          (.id | gsub("-"; "_")) as $safe |
+          {
+            id: .id,
+            user_id: .user_id,
+            traffic_mode: (.traffic_mode // "two-way"),
+            traffic_ratio: (.traffic_ratio // 1),
+            input_bytes: ($counters["fwd_" + $safe + "_in"] // 0),
+            output_bytes: ($counters["fwd_" + $safe + "_out"] // 0),
+            input_packets: 0,
+            output_packets: 0,
+            dropped_bytes: 0,
+            dropped_packets: 0
+          }
+        ]'
+}
+
 stats_usage_from_snapshot() {
     local snapshot="$1"
     local cfg_file="${2:-$PFWD_CONFIG_FILE}"
@@ -247,30 +323,58 @@ $jq_filter"
 stats_current_snapshot() {
     config_init >/dev/null
     stats_init >/dev/null
-    local cfg_file snapshot
+    local cfg_file snapshot xdp_snapshot nft_snapshot forwarder_status xdp_runtime nft_runtime xdp_status_json
     cfg_file="$PFWD_CONFIG_FILE"
     if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
         cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
     PFWD_STATS_LAST_SNAPSHOT_ERROR=""
-    if [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_FORWARDER_RUNTIME_FILE" ]; then
+    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
+        forwarder_status="$(forwarder_status_json)"
+    else
+        forwarder_status='{}'
+    fi
+    if [ -f "$PFWD_FORWARDER_XDP_RUNTIME_FILE" ]; then
+        xdp_runtime="$(cat "$PFWD_FORWARDER_XDP_RUNTIME_FILE")"
+    else
+        xdp_runtime='{"rules":[]}'
+    fi
+    if [ -f "$PFWD_FORWARDER_NFT_RUNTIME_FILE" ]; then
+        nft_runtime="$(cat "$PFWD_FORWARDER_NFT_RUNTIME_FILE")"
+    else
+        nft_runtime='{"rules":[]}'
+    fi
+
+    xdp_snapshot='[]'
+    nft_snapshot='[]'
+
+    if [ "$(jq -r '.xdp_applied // false' <<< "$forwarder_status")" = "true" ] && [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_FORWARDER_XDP_RUNTIME_FILE" ]; then
         local snapshot_error snapshot_status=0
         snapshot_error="$(mktemp "${PFWD_RUN_DIR}/snapshot.err.XXXXXX")"
-        snapshot="$("$(forwarder_bin_path)" snapshot \
-          --runtime-file "$PFWD_FORWARDER_RUNTIME_FILE" \
+        xdp_snapshot="$("$(forwarder_bin_path)" snapshot \
+          --runtime-file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" \
           --state-file "$PFWD_STATS_FILE" \
           --status-file "$PFWD_XDP_STATUS_FILE" \
           --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" 2>"$snapshot_error")" || snapshot_status=$?
-        if [ -n "$snapshot" ] && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$snapshot"; then
-            rm -f "$snapshot_error"
-            printf '%s\n' "$snapshot"
-            return 0
+        if [ -n "$xdp_snapshot" ] && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$xdp_snapshot"; then
+            :
+        else
+            xdp_snapshot='[]'
         fi
         PFWD_STATS_LAST_SNAPSHOT_ERROR="$(tr '\n' ' ' < "$snapshot_error" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
         rm -f "$snapshot_error"
         if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
             pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
         fi
+    fi
+
+    if [ "$(jq -r '.nft_applied // false' <<< "$forwarder_status")" = "true" ] && [ -f "$PFWD_FORWARDER_NFT_RUNTIME_FILE" ]; then
+        nft_snapshot="$(stats_snapshot_from_nft_runtime "$nft_runtime")"
+    fi
+
+    if jq -e 'length > 0' >/dev/null 2>&1 <<< "$xdp_snapshot" || jq -e 'length > 0' >/dev/null 2>&1 <<< "$nft_snapshot"; then
+        stats_merge_snapshots_json "$xdp_snapshot" "$nft_snapshot"
+        return 0
     fi
     stats_zero_snapshot_json "$cfg_file"
 }

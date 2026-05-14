@@ -1051,7 +1051,7 @@ ui_title() {
     local guard_status=""
     if command -v guard_enabled >/dev/null 2>&1; then
         if [ "$(guard_enabled)" = "true" ]; then
-            guard_status="guard: $(guard_xdp_mode)"
+            guard_status="guard: $(jq -r '.forwarding_backend // "none"' <<< "$(forwarder_status_json 2>/dev/null || echo '{}')")"
         else
             guard_status="guard: off"
         fi
@@ -3875,20 +3875,6 @@ ui_menu_guard() {
                 ui_maybe_pause success
                 ;;
             3)
-                ui_form_set "XDP 模式" "off 为关闭 XDP；auto 自动尝试 driver/generic 挂载，失败会报错；force 只允许 driver 挂载成功。"
-                ui_form_select_read "XDP 模式" "2" "0) 返回" "1) off" "2) auto" "3) force" || { ui_form_reset; continue; }
-                case "$UI_REPLY" in
-                    0) ui_form_reset; continue ;;
-                    1) ui_run cmd_guard xdp --mode off ;;
-                    2) ui_run cmd_guard xdp --mode auto ;;
-                    3) ui_run cmd_guard xdp --mode force ;;
-                    *) ui_form_reset; ui_warn "无效选择"; ui_pause; continue ;;
-                esac
-                ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard XDP 模式已更新" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
-                ;;
-            4)
                 ui_form_set "协议封锁" "HTTPS 会同时开启 HTTP 和 TLS 封锁；仅覆盖 TCP 首包。"
                 ui_form_select_read "HTTP" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
                 local block_http="false" block_tls="false" block_socks="false"
@@ -3908,20 +3894,20 @@ ui_menu_guard() {
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "guard 协议封锁已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
-            5)
+            4)
                 ui_menu_guard_skip_ports
                 ;;
-            6)
+            5)
                 ui_run cmd_guard_whitelist --enabled true
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已启用" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
-            7)
+            6)
                 ui_run cmd_guard_whitelist --enabled false
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单已停用" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
-            8)
+            7)
                 include_cn="$(whitelist_include_cn)"
                 if [ "$include_cn" = "true" ]; then
                     ui_run cmd_guard_whitelist --include-cn false
@@ -3932,10 +3918,10 @@ ui_menu_guard() {
                 fi
                 ui_maybe_pause success
                 ;;
-            9)
+            8)
                 ui_menu_whitelist_cidrs
                 ;;
-            10)
+            9)
                 ui_run cmd_guard_whitelist refresh
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "白名单数据已刷新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
@@ -4061,14 +4047,13 @@ ui_render_guard_menu_page() {
     echo
     ui_menu_item 1 "启用 guard"
     ui_menu_item 2 "停用 guard"
-    ui_menu_item 3 "XDP 模式"
-    ui_menu_item 4 "设置封锁协议"
-    ui_menu_item 5 "跳过端口"
-    ui_menu_item 6 "启用白名单"
-    ui_menu_item 7 "关闭白名单"
-    ui_menu_item 8 "允许国内 IP"
-    ui_menu_item 9 "自定义 CIDR"
-    ui_menu_item 10 "刷新白名单数据"
+    ui_menu_item 3 "设置封锁协议"
+    ui_menu_item 4 "跳过端口"
+    ui_menu_item 5 "启用白名单"
+    ui_menu_item 6 "关闭白名单"
+    ui_menu_item 7 "允许国内 IP"
+    ui_menu_item 8 "自定义 CIDR"
+    ui_menu_item 9 "刷新白名单数据"
     ui_menu_item 0 "返回"
 }
 

@@ -27,13 +27,29 @@ enum {
     BPF_ANY = 0,
 };
 
+#define BPF_F_CURRENT_NETNS ((__u64)-1)
+
 enum {
     BPF_F_NO_PREALLOC = 1,
 };
 
 enum {
+    BPF_SK_LOOKUP_F_REPLACE = 1U << 0,
+};
+
+enum {
+    BPF_F_INGRESS = 1U << 0,
+};
+
+enum {
     TC_ACT_OK = 0,
     TC_ACT_SHOT = 2,
+    TC_ACT_REDIRECT = 7,
+};
+
+enum {
+    SK_DROP = 0,
+    SK_PASS = 1,
 };
 
 enum {
@@ -86,6 +102,22 @@ struct xdp_md {
     __u32 ingress_ifindex;
     __u32 rx_queue_index;
     __u32 egress_ifindex;
+};
+
+struct bpf_sock;
+
+struct bpf_sk_lookup {
+    struct bpf_sock *sk;
+    __u32 family;
+    __u32 protocol;
+    __u32 remote_ip4;
+    __u32 remote_ip6[4];
+    __be16 remote_port;
+    __u16 pad0;
+    __u32 local_ip4;
+    __u32 local_ip6[4];
+    __u32 local_port;
+    __u32 ingress_ifindex;
 };
 
 struct ethhdr {
@@ -164,13 +196,36 @@ struct bpf_fib_lookup {
     __u8 dmac[ETH_ALEN];
 };
 
+struct bpf_sock_tuple {
+    union {
+        struct {
+            __be32 saddr;
+            __be32 daddr;
+            __be16 sport;
+            __be16 dport;
+        } ipv4;
+        struct {
+            __be32 saddr[4];
+            __be32 daddr[4];
+            __be16 sport;
+            __be16 dport;
+        } ipv6;
+    };
+};
+
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *unsafe_ptr) = (void *)113;
 static long (*bpf_skb_load_bytes)(const void *skb, __u32 offset, void *to, __u32 len) = (void *)26;
+static long (*bpf_skb_pull_data)(struct __sk_buff *skb, __u32 len) = (void *)39;
 static long (*bpf_fib_lookup)(void *ctx, struct bpf_fib_lookup *params, int plen, __u32 flags) = (void *)69;
 static long (*bpf_redirect)(__u32 ifindex, __u64 flags) = (void *)23;
+static long (*bpf_redirect_neigh)(__u32 ifindex, void *params, int plen, __u64 flags) = (void *)152;
+static struct bpf_sock *(*bpf_sk_lookup_tcp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *)84;
+static struct bpf_sock *(*bpf_sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *)85;
+static long (*bpf_sk_release)(void *sock) = (void *)86;
+static long (*bpf_sk_assign)(void *ctx, void *sk, __u64 flags) = (void *)124;
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 static __always_inline __u16 bpf_ntohs(__u16 value) { return __builtin_bswap16(value); }

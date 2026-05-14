@@ -32,22 +32,28 @@ const binaryVersion = "0.2.0"
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
+const ruleFlagXDPDisabled = uint16(1 << 0)
 
 type bpfObjects struct {
-	PFWDXDP         *ebpf.Program `ebpf:"pfwd_xdp"`
-	PFWDIngress     *ebpf.Program `ebpf:"pfwd_ingress"`
-	PFWDSettings    *ebpf.Map     `ebpf:"pfwd_settings"`
-	PFWDRules       *ebpf.Map     `ebpf:"pfwd_rules"`
-	PFWDConnections *ebpf.Map     `ebpf:"pfwd_connections"`
-	PFWDReverse     *ebpf.Map     `ebpf:"pfwd_reverse"`
-	PFWDRuleCounter *ebpf.Map     `ebpf:"pfwd_rule_counters"`
-	PFWDUserCounter *ebpf.Map     `ebpf:"pfwd_user_counters"`
-	PFWDStats       *ebpf.Map     `ebpf:"pfwd_stats"`
-	PFWDWhitelistV4 *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
-	PFWDWhitelistV6 *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
-	PFWDFlows       *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
-	PFWDSkipPorts   *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
-	PFWDScratch     *ebpf.Map     `ebpf:"pfwd_scratch"`
+	PFWDXDP              *ebpf.Program `ebpf:"pfwd_xdp"`
+	PFWDIngress          *ebpf.Program `ebpf:"pfwd_ingress"`
+	PFWDLoopbackEgress   *ebpf.Program `ebpf:"pfwd_loopback_egress"`
+	PFWDSkLookup         *ebpf.Program `ebpf:"pfwd_sk_lookup"`
+	PFWDSettings         *ebpf.Map     `ebpf:"pfwd_settings"`
+	PFWDRules            *ebpf.Map     `ebpf:"pfwd_rules"`
+	PFWDConnections      *ebpf.Map     `ebpf:"pfwd_connections"`
+	PFWDReverse          *ebpf.Map     `ebpf:"pfwd_reverse"`
+	PFWDRuleCounter      *ebpf.Map     `ebpf:"pfwd_rule_counters"`
+	PFWDUserCounter      *ebpf.Map     `ebpf:"pfwd_user_counters"`
+	PFWDStats            *ebpf.Map     `ebpf:"pfwd_stats"`
+	PFWDWhitelistV4      *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
+	PFWDWhitelistV6      *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
+	PFWDWhitelistCacheV4 *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v4"`
+	PFWDWhitelistCacheV6 *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v6"`
+	PFWDFlows            *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
+	PFWDGuardPrefixes    *ebpf.Map     `ebpf:"pfwd_guard_prefixes"`
+	PFWDSkipPorts        *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
+	PFWDScratch          *ebpf.Map     `ebpf:"pfwd_scratch"`
 }
 
 func (o *bpfObjects) Close() {
@@ -55,8 +61,9 @@ func (o *bpfObjects) Close() {
 		return
 	}
 	for _, closer := range []interface{ Close() error }{
-		o.PFWDXDP, o.PFWDIngress, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
-		o.PFWDRuleCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6, o.PFWDFlows, o.PFWDSkipPorts, o.PFWDScratch,
+		o.PFWDXDP, o.PFWDIngress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
+		o.PFWDRuleCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
+		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDFlows, o.PFWDGuardPrefixes, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
 			_ = closer.Close()
@@ -66,12 +73,14 @@ func (o *bpfObjects) Close() {
 
 type applyOptions struct {
 	Iface          string
-	Mode           string
+	GuardMode      string
 	RuntimeFile    string
 	StateFile      string
 	StatusFile     string
 	XDPPin         string
 	IngressPin     string
+	LoopbackPin    string
+	SkLookupPin    string
 	RuleCounterPin string
 	UserCounterPin string
 	StatsPin       string
@@ -83,6 +92,8 @@ type removeOptions struct {
 	StatusFile     string
 	XDPPin         string
 	IngressPin     string
+	LoopbackPin    string
+	SkLookupPin    string
 	RuleCounterPin string
 	UserCounterPin string
 	StatsPin       string
@@ -111,7 +122,6 @@ type runtimeFile struct {
 }
 
 type runtimeSettings struct {
-	XDPMode           string   `json:"xdp_mode"`
 	Interface         string   `json:"interface"`
 	GuardEnabled      bool     `json:"guard_enabled"`
 	WhitelistEnabled  bool     `json:"whitelist_enabled"`
@@ -151,6 +161,7 @@ type runtimeRule struct {
 	UserLimit           uint64  `json:"user_limit_bytes"`
 	BillingUsedBase     uint64  `json:"billing_used_base_bytes"`
 	UserBillingUsedBase uint64  `json:"user_billing_used_base_bytes"`
+	XDPDisabled         bool    `json:"xdp_disabled,omitempty"`
 	RemoteInput         string  `json:"remote_input,omitempty"`
 	Comment             string  `json:"comment,omitempty"`
 }
@@ -161,11 +172,13 @@ type statusPayload struct {
 	AppliedAt      string `json:"applied_at,omitempty"`
 	Interface      string `json:"interface,omitempty"`
 	InterfaceIndex int    `json:"interface_index,omitempty"`
-	XDPMode        string `json:"xdp_mode,omitempty"`
+	GuardMode      string `json:"guard_mode,omitempty"`
 	XDPEffective   string `json:"xdp_effective,omitempty"`
 	XDPAttachKind  string `json:"xdp_attach_kind,omitempty"`
 	XDPReason      string `json:"xdp_reason,omitempty"`
 	IngressKind    string `json:"ingress_kind,omitempty"`
+	LoopbackKind   string `json:"loopback_kind,omitempty"`
+	SkLookupKind   string `json:"sk_lookup_kind,omitempty"`
 	ProtocolGuard  bool   `json:"protocol_guard,omitempty"`
 	RuntimeFile    string `json:"runtime_file,omitempty"`
 	StateFile      string `json:"state_file,omitempty"`
@@ -174,6 +187,8 @@ type statusPayload struct {
 	Users          int    `json:"users,omitempty"`
 	XDPPin         string `json:"xdp_pin,omitempty"`
 	IngressPin     string `json:"ingress_pin,omitempty"`
+	LoopbackPin    string `json:"loopback_pin,omitempty"`
+	SkLookupPin    string `json:"sk_lookup_pin,omitempty"`
 	RuleCounterPin string `json:"rule_counter_pin,omitempty"`
 	UserCounterPin string `json:"user_counter_pin,omitempty"`
 	StatsPin       string `json:"stats_pin,omitempty"`
@@ -186,6 +201,8 @@ type xdpSettings struct {
 	BlockSOCKS       uint8
 	GuardEnabled     uint8
 	Pad              [3]uint8
+	ExternalIfindex  uint32
+	LoopbackIfindex  uint32
 }
 
 type ruleKey struct {
@@ -294,12 +311,14 @@ func runApply(args []string) error {
 	fs.SetOutput(os.Stderr)
 	var opts applyOptions
 	fs.StringVar(&opts.Iface, "iface", "", "network interface")
-	fs.StringVar(&opts.Mode, "xdp-mode", "auto", "off|auto|force")
+	fs.StringVar(&opts.GuardMode, "guard-mode", "full", "off|ingress|full")
 	fs.StringVar(&opts.RuntimeFile, "runtime-file", "", "runtime json")
 	fs.StringVar(&opts.StateFile, "state-file", "", "state json")
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
 	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs xdp link pin")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs ingress link pin")
+	fs.StringVar(&opts.LoopbackPin, "loopback-pin", "", "bpffs loopback egress link pin")
+	fs.StringVar(&opts.SkLookupPin, "sk-lookup-pin", "", "bpffs sk_lookup link pin")
 	fs.StringVar(&opts.RuleCounterPin, "rule-counter-pin", "/sys/fs/bpf/pfwd_rule_counters", "bpffs rule counter map pin")
 	fs.StringVar(&opts.UserCounterPin, "user-counter-pin", "/sys/fs/bpf/pfwd_user_counters", "bpffs user counter map pin")
 	fs.StringVar(&opts.StatsPin, "stats-pin", "/sys/fs/bpf/pfwd_stats", "bpffs stats map pin")
@@ -321,6 +340,8 @@ func runRemove(args []string) error {
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
 	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs xdp link pin")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs ingress link pin")
+	fs.StringVar(&opts.LoopbackPin, "loopback-pin", "", "bpffs loopback egress link pin")
+	fs.StringVar(&opts.SkLookupPin, "sk-lookup-pin", "", "bpffs sk_lookup link pin")
 	fs.StringVar(&opts.RuleCounterPin, "rule-counter-pin", "", "bpffs rule counter map pin")
 	fs.StringVar(&opts.UserCounterPin, "user-counter-pin", "", "bpffs user counter map pin")
 	fs.StringVar(&opts.StatsPin, "stats-pin", "", "bpffs stats map pin")
@@ -409,21 +430,18 @@ func applyRuntime(opts applyOptions) error {
 	if opts.Iface == "" {
 		opts.Iface = runtimeData.Settings.Interface
 	}
-	if opts.Mode == "" {
-		opts.Mode = runtimeData.Settings.XDPMode
+	if opts.GuardMode == "" {
+		opts.GuardMode = "full"
 	}
-	if opts.Mode == "" {
-		opts.Mode = "auto"
-	}
-	if opts.Iface == "" && opts.Mode != "off" {
+	if opts.Iface == "" && opts.GuardMode != "off" {
 		return fmt.Errorf("缺少 --iface")
 	}
-	switch opts.Mode {
-	case "off", "auto", "force":
+	switch opts.GuardMode {
+	case "off", "ingress", "full":
 	default:
-		return fmt.Errorf("无效 xdp-mode：%s", opts.Mode)
+		return fmt.Errorf("无效 guard-mode：%s", opts.GuardMode)
 	}
-	if opts.Mode != "off" && opts.XDPPin == "" {
+	if opts.GuardMode == "full" && opts.XDPPin == "" {
 		return fmt.Errorf("缺少 --xdp-pin")
 	}
 	if opts.IngressPin == "" {
@@ -445,21 +463,23 @@ func applyRuntime(opts applyOptions) error {
 		StatusFile:     opts.StatusFile,
 		XDPPin:         opts.XDPPin,
 		IngressPin:     opts.IngressPin,
+		LoopbackPin:    opts.LoopbackPin,
+		SkLookupPin:    opts.SkLookupPin,
 		RuleCounterPin: opts.RuleCounterPin,
 		UserCounterPin: opts.UserCounterPin,
 		StatsPin:       opts.StatsPin,
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧运行态失败: %w", err)
 	}
-	if opts.Mode == "off" {
-		payload := statusPayload{Applied: false, BinaryVersion: binaryVersion, XDPMode: opts.Mode, RuntimeFile: opts.RuntimeFile, StateFile: opts.StateFile}
+	if opts.GuardMode == "off" {
+		payload := statusPayload{Applied: false, BinaryVersion: binaryVersion, GuardMode: opts.GuardMode, RuntimeFile: opts.RuntimeFile, StateFile: opts.StateFile}
 		return writeStatus(opts.StatusFile, payload)
 	}
 	iface, err := net.InterfaceByName(opts.Iface)
 	if err != nil {
 		return fmt.Errorf("查找网卡 %q 失败: %w", opts.Iface, err)
 	}
-	objs, err := loadObjects()
+	objs, err := loadObjects(opts.GuardMode)
 	if err != nil {
 		return err
 	}
@@ -471,12 +491,20 @@ func applyRuntime(opts applyOptions) error {
 		return err
 	}
 	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
-	xdpEffective, xdpKind, xdpReason, err := attachXDP(iface, objs.PFWDXDP, opts)
-	if err != nil {
+	needIngress := opts.GuardMode == "ingress" || (protocolGuard && guardIngressEnabled(runtimeData.Settings))
+	xdpEffective := "disabled"
+	xdpKind := ""
+	xdpReason := ""
+	if opts.GuardMode == "full" {
+		xdpEffective, xdpKind, xdpReason, err = attachXDP(iface, objs.PFWDXDP, opts)
+		if err != nil {
+			return err
+		}
+	} else if err := removeXDPLink(opts.XDPPin); err != nil {
 		return err
 	}
 	ingressKind := ""
-	if protocolGuard && guardIngressEnabled(runtimeData.Settings) {
+	if needIngress {
 		ingressKind, err = attachIngress(iface, objs.PFWDIngress, opts.IngressPin)
 		if err != nil {
 			return err
@@ -484,8 +512,22 @@ func applyRuntime(opts applyOptions) error {
 	} else if err := removeIngressRuntime(opts.IngressPin, iface.Name); err != nil {
 		return err
 	}
+	loopbackKind := ""
+	skLookupKind := ""
+	if err := removeSkLookupRuntime(opts.SkLookupPin); err != nil {
+		return err
+	}
+	if err := removeLoopbackRuntime(opts.LoopbackPin, "lo"); err != nil {
+		return err
+	}
 	if ingressKind != "" && !opts.Quiet {
 		fmt.Fprintf(os.Stderr, "pfwd-xdp: tc ingress attached via %s\n", ingressKind)
+	}
+	if loopbackKind != "" && !opts.Quiet {
+		fmt.Fprintf(os.Stderr, "pfwd-xdp: loopback egress attached via %s\n", loopbackKind)
+	}
+	if skLookupKind != "" && !opts.Quiet {
+		fmt.Fprintf(os.Stderr, "pfwd-xdp: sk_lookup attached via %s\n", skLookupKind)
 	}
 	payload := statusPayload{
 		Applied:        true,
@@ -493,11 +535,13 @@ func applyRuntime(opts applyOptions) error {
 		AppliedAt:      time.Now().UTC().Format(time.RFC3339),
 		Interface:      iface.Name,
 		InterfaceIndex: iface.Index,
-		XDPMode:        opts.Mode,
+		GuardMode:      opts.GuardMode,
 		XDPEffective:   xdpEffective,
 		XDPAttachKind:  xdpKind,
 		XDPReason:      xdpReason,
 		IngressKind:    ingressKind,
+		LoopbackKind:   loopbackKind,
+		SkLookupKind:   skLookupKind,
 		ProtocolGuard:  protocolGuard,
 		RuntimeFile:    opts.RuntimeFile,
 		StateFile:      opts.StateFile,
@@ -506,6 +550,8 @@ func applyRuntime(opts applyOptions) error {
 		Users:          len(runtimeData.Users),
 		XDPPin:         opts.XDPPin,
 		IngressPin:     opts.IngressPin,
+		LoopbackPin:    opts.LoopbackPin,
+		SkLookupPin:    opts.SkLookupPin,
 		RuleCounterPin: opts.RuleCounterPin,
 		UserCounterPin: opts.UserCounterPin,
 		StatsPin:       opts.StatsPin,
@@ -513,22 +559,48 @@ func applyRuntime(opts applyOptions) error {
 	return writeStatus(opts.StatusFile, payload)
 }
 
-func loadObjects() (*bpfObjects, error) {
+func loadObjects(guardMode string) (*bpfObjects, error) {
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpBPFEL))
 	if err != nil {
 		return nil, fmt.Errorf("加载 eBPF spec 失败: %w", err)
 	}
-	var objs bpfObjects
-	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
+	delete(spec.Programs, "pfwd_loopback_egress")
+	delete(spec.Programs, "pfwd_sk_lookup")
+	if guardMode != "full" {
+		delete(spec.Programs, "pfwd_xdp")
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelBranch},
-	}); err != nil {
+	})
+	if err != nil {
 		var verifierErr *ebpf.VerifierError
 		if errors.As(err, &verifierErr) {
 			return nil, fmt.Errorf("加载 eBPF 对象失败: %+v", verifierErr)
 		}
 		return nil, fmt.Errorf("加载 eBPF 对象失败: %+v", err)
 	}
-	return &objs, nil
+	objs := &bpfObjects{
+		PFWDXDP:              coll.Programs["pfwd_xdp"],
+		PFWDIngress:          coll.Programs["pfwd_ingress"],
+		PFWDLoopbackEgress:   coll.Programs["pfwd_loopback_egress"],
+		PFWDSkLookup:         coll.Programs["pfwd_sk_lookup"],
+		PFWDSettings:         coll.Maps["pfwd_settings"],
+		PFWDRules:            coll.Maps["pfwd_rules"],
+		PFWDConnections:      coll.Maps["pfwd_connections"],
+		PFWDReverse:          coll.Maps["pfwd_reverse"],
+		PFWDRuleCounter:      coll.Maps["pfwd_rule_counters"],
+		PFWDUserCounter:      coll.Maps["pfwd_user_counters"],
+		PFWDStats:            coll.Maps["pfwd_stats"],
+		PFWDWhitelistV4:      coll.Maps["pfwd_whitelist_v4"],
+		PFWDWhitelistV6:      coll.Maps["pfwd_whitelist_v6"],
+		PFWDWhitelistCacheV4: coll.Maps["pfwd_whitelist_cache_v4"],
+		PFWDWhitelistCacheV6: coll.Maps["pfwd_whitelist_cache_v6"],
+		PFWDFlows:            coll.Maps["pfwd_allowed_flows"],
+		PFWDGuardPrefixes:    coll.Maps["pfwd_guard_prefixes"],
+		PFWDSkipPorts:        coll.Maps["pfwd_protocol_skip_ports"],
+		PFWDScratch:          coll.Maps["pfwd_scratch"],
+	}
+	return objs, nil
 }
 
 func loadRuntime(path string) (*runtimeFile, error) {
@@ -557,12 +629,22 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
 		return fmt.Errorf("关键 BPF map 未加载")
 	}
+	var externalIfindex uint32
+	if opts.Iface != "" {
+		iface, err := net.InterfaceByName(opts.Iface)
+		if err != nil {
+			return fmt.Errorf("查找外部网卡失败: %w", err)
+		}
+		externalIfindex = uint32(iface.Index)
+	}
 	settings := xdpSettings{
 		WhitelistEnabled: boolToUint8(runtimeData.Settings.WhitelistEnabled),
 		BlockHTTP:        boolToUint8(runtimeData.Settings.BlockHTTP),
 		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
 		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
 		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
+		ExternalIfindex:  externalIfindex,
+		LoopbackIfindex:  0,
 	}
 	key := uint32(0)
 	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
@@ -621,6 +703,37 @@ func protocolGuardEnabled(settings runtimeSettings) bool {
 
 func guardIngressEnabled(settings runtimeSettings) bool {
 	return strings.EqualFold(strings.TrimSpace(settings.GuardIngressMode), "tc")
+}
+
+func runtimeHasLoopbackBackend(runtimeData *runtimeFile) bool {
+	if runtimeData == nil {
+		return false
+	}
+	for _, rule := range runtimeData.Rules {
+		if !isLoopbackResolvedTarget(rule.ResolvedTarget) {
+			continue
+		}
+		switch rule.IPVersion {
+		case 4, 6:
+			return true
+		}
+	}
+	return false
+}
+
+func removeXDPLink(pin string) error {
+	if pin == "" {
+		return nil
+	}
+	return removePinnedLink(pin)
+}
+
+func isLoopbackResolvedTarget(raw string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback()
 }
 
 func loadProtocolSkipPorts(skipMap *ebpf.Map, ports []uint16) error {
@@ -724,6 +837,9 @@ func makeRuleVal(rule runtimeRule) (ruleVal, error) {
 	if rule.TrafficMode == "one-way" {
 		value.TrafficMode = 1
 	}
+	if rule.XDPDisabled {
+		value.Flags |= ruleFlagXDPDisabled
+	}
 	return value, nil
 }
 
@@ -752,61 +868,110 @@ func attachXDP(iface *net.Interface, prog *ebpf.Program, opts applyOptions) (str
 		}
 		return "enabled", kind, "", nil
 	}
-	if opts.Mode != "force" {
-		if effective, kind, reason, err := tryAttach(link.XDPDriverMode, "driver"); err == nil {
-			return effective, kind, reason, nil
-		} else {
-			driverErr := err
-			if effective, kind, reason, err := tryAttach(link.XDPGenericMode, "generic"); err == nil {
-				return effective, kind, reason, nil
-			} else {
-				return "", "", "", fmt.Errorf("XDP auto attach 失败：driver=%v; generic=%w", driverErr, err)
-			}
-		}
+	if opts.GuardMode != "full" {
+		return "disabled", "", "guard-only", nil
 	}
 	if effective, kind, reason, err := tryAttach(link.XDPDriverMode, "driver"); err == nil {
 		return effective, kind, reason, nil
 	} else {
-		return "", "", "", fmt.Errorf("XDP force attach 失败: %w", err)
+		driverErr := err
+		if effective, kind, reason, err := tryAttach(link.XDPGenericMode, "generic"); err == nil {
+			return effective, kind, reason, nil
+		} else {
+			return "", "", "", fmt.Errorf("XDP auto attach 失败：driver=%v; generic=%w", driverErr, err)
+		}
 	}
 }
 
-func attachIngress(iface *net.Interface, prog *ebpf.Program, pin string) (string, error) {
+func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attach ebpf.AttachType, direction string) (string, error) {
 	if prog == nil {
-		return "", fmt.Errorf("pfwd_ingress program 未加载")
+		return "", fmt.Errorf("tc program 未加载")
 	}
 	if err := os.MkdirAll(filepath.Dir(pin), 0o755); err != nil {
-		return "", fmt.Errorf("创建 ingress pin 目录失败: %w", err)
+		return "", fmt.Errorf("创建 tc pin 目录失败: %w", err)
 	}
 	_ = removePinnedLink(pin)
-	if attached, err := link.AttachTCX(link.TCXOptions{Program: prog, Interface: iface.Index, Attach: ebpf.AttachTCXIngress}); err == nil {
-		defer attached.Close()
-		if err := attached.Pin(pin); err != nil {
-			return "", fmt.Errorf("pin tcx link 失败: %w", err)
-		}
-		return "tcx", attached.Close()
-	}
 	if err := runTC("qdisc", "replace", "dev", iface.Name, "clsact"); err != nil {
 		return "", err
 	}
 	if err := prog.Pin(pin); err != nil {
-		return "", fmt.Errorf("pin ingress program 失败: %w", err)
+		return "", fmt.Errorf("pin tc program 失败: %w", err)
 	}
-	if err := runTC("filter", "replace", "dev", iface.Name, "ingress", "bpf", "direct-action", "object-pinned", pin); err != nil {
+	if err := runTC("filter", "replace", "dev", iface.Name, direction, "bpf", "direct-action", "object-pinned", pin); err != nil {
 		return "", err
 	}
 	return "tc", nil
 }
 
-func removeIngressRuntime(pin string, ifaceName string) error {
+func attachIngress(iface *net.Interface, prog *ebpf.Program, pin string) (string, error) {
+	return attachTCProgram(iface, prog, pin, ebpf.AttachTCXIngress, "ingress")
+}
+
+func attachLoopbackEgress(iface *net.Interface, prog *ebpf.Program, pin string) (string, error) {
+	return attachTCProgram(iface, prog, pin, ebpf.AttachTCXEgress, "egress")
+}
+
+func attachSkLookup(prog *ebpf.Program, pin string) (string, error) {
+	if prog == nil {
+		return "", fmt.Errorf("sk_lookup program 未加载")
+	}
+	if err := features.HaveProgramType(ebpf.SkLookup); err != nil {
+		return "", fmt.Errorf("检测到 localhost 后端，但当前内核不支持 sk_lookup: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pin), 0o755); err != nil {
+		return "", fmt.Errorf("创建 sk_lookup pin 目录失败: %w", err)
+	}
+	_ = removePinnedLink(pin)
+	netns, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		return "", fmt.Errorf("打开当前 netns 失败: %w", err)
+	}
+	defer netns.Close()
+	attached, err := link.AttachNetNs(int(netns.Fd()), prog)
+	if err != nil {
+		return "", fmt.Errorf("附加 sk_lookup 失败: %w", err)
+	}
+	defer attached.Close()
+	if err := attached.Pin(pin); err != nil {
+		return "", fmt.Errorf("pin sk_lookup link 失败: %w", err)
+	}
+	if err := attached.Close(); err != nil {
+		return "", fmt.Errorf("关闭 sk_lookup link fd 失败: %w", err)
+	}
+	return "netns", nil
+}
+
+func removeTCRuntime(pin string, ifaceName string, direction string) error {
 	if pin != "" {
 		_ = removePinnedLink(pin)
 		_ = removePinnedProgram(pin)
 	}
 	if ifaceName != "" {
-		_ = runTC("filter", "delete", "dev", ifaceName, "ingress")
+		_ = runTC("filter", "delete", "dev", ifaceName, direction)
 		_ = runTC("qdisc", "delete", "dev", ifaceName, "clsact")
 	}
+	return nil
+}
+
+func removeIngressRuntime(pin string, ifaceName string) error {
+	if err := removeTCRuntime(pin, ifaceName, "ingress"); err != nil {
+		return err
+	}
+	if pin != "/sys/fs/bpf/pfwd_ingress_link" {
+		_ = removeTCRuntime("/sys/fs/bpf/pfwd_ingress_link", "", "ingress")
+	}
+	return nil
+}
+
+func removeLoopbackRuntime(pin string, ifaceName string) error {
+	return removeTCRuntime(pin, ifaceName, "egress")
+}
+
+func removeSkLookupRuntime(pin string) error {
+	if pin == "" {
+		return nil
+	}
+	_ = removePinnedLink(pin)
 	return nil
 }
 
@@ -814,6 +979,8 @@ func removeRuntime(opts removeOptions) error {
 	payload, _ := readStatus(opts.StatusFile)
 	xdpPin := firstNonEmpty(opts.XDPPin, payload.XDPPin)
 	ingressPin := firstNonEmpty(opts.IngressPin, payload.IngressPin)
+	loopbackPin := firstNonEmpty(opts.LoopbackPin, payload.LoopbackPin)
+	skLookupPin := firstNonEmpty(opts.SkLookupPin, payload.SkLookupPin)
 	ruleCounterPin := firstNonEmpty(opts.RuleCounterPin, payload.RuleCounterPin)
 	userCounterPin := firstNonEmpty(opts.UserCounterPin, payload.UserCounterPin)
 	statsPin := firstNonEmpty(opts.StatsPin, payload.StatsPin)
@@ -824,6 +991,12 @@ func removeRuntime(opts removeOptions) error {
 		_ = removeIngressRuntime(ingressPin, payload.Interface)
 	} else if payload.Interface != "" {
 		_ = removeIngressRuntime("", payload.Interface)
+	}
+	if loopbackPin != "" {
+		_ = removeLoopbackRuntime(loopbackPin, "lo")
+	}
+	if skLookupPin != "" {
+		_ = removeSkLookupRuntime(skLookupPin)
 	}
 	if opts.StatusFile != "" {
 		if err := os.Remove(opts.StatusFile); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1128,7 +1301,7 @@ func removePinnedLink(pin string) error {
 	pinned, err := link.LoadPinnedLink(pin, nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return err
+			return nil
 		}
 		_ = os.Remove(pin)
 		return nil
@@ -1145,7 +1318,7 @@ func removePinnedProgram(pin string) error {
 	prog, err := ebpf.LoadPinnedProgram(pin, nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return err
+			return nil
 		}
 		_ = os.Remove(pin)
 		return nil
@@ -1171,8 +1344,8 @@ func usageError() error {
 
 func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "用法：")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --xdp-mode off|auto|force --xdp-pin PATH --ingress-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH --ingress-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --guard-mode off|ingress|full --xdp-pin PATH --ingress-pin PATH [--loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH --ingress-pin PATH [--loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")

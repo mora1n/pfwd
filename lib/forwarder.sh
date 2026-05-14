@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+forwarder_table() {
+    fw_forward_table
+}
+
 forwarder_target_kind() {
     local target="$1"
     if [[ "$target" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
@@ -125,10 +129,6 @@ forwarder_iface() {
     ip route show default 2>/dev/null | awk '{print $5; exit}'
 }
 
-forwarder_xdp_mode() {
-    jq -r '.settings.xdp.mode // "auto"' "$PFWD_CONFIG_FILE"
-}
-
 forwarder_protocol_filters_enabled() {
     if [ "$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")" != "true" ]; then
         echo false
@@ -142,7 +142,7 @@ forwarder_protocol_filters_enabled() {
 }
 
 forwarder_guard_ingress_mode() {
-    echo off
+    echo tc
 }
 
 forwarder_whitelist_files_json() {
@@ -166,6 +166,10 @@ forwarder_whitelist_files_json() {
 
 forwarder_protocol_skip_ports_json() {
     jq -c '.settings.guard.protocol_skip_ports // []' "$PFWD_CONFIG_FILE"
+}
+
+forwarder_runtime_has_loopback_backend() {
+    jq -e '.rules[]? | select(.resolved_target == "127.0.0.1" or .resolved_target == "::1")' >/dev/null
 }
 
 forwarder_runtime_json() {
@@ -194,8 +198,7 @@ forwarder_runtime_json() {
           (.traffic_mode // "two-way"),
           ((.traffic_ratio // 1) | tostring),
           (.limits.traffic_bytes // 0 | tostring)
-        ]
-      | @tsv
+        ] | @tsv
     ' "$PFWD_CONFIG_FILE")"
 
     user_index_json="$(jq -r '
@@ -325,27 +328,25 @@ forwarder_runtime_json() {
         done <<< "$rows"
     fi
 
-    local guard_enabled whitelist_enabled protocol_filters_enabled
+    local guard_enabled whitelist_state protocol_filters_enabled
     guard_enabled="$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")"
-    whitelist_enabled="false"
+    whitelist_state="false"
     if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
-        whitelist_enabled="true"
+        whitelist_state="true"
     fi
     protocol_filters_enabled="$(forwarder_protocol_filters_enabled)"
 
     settings_json="$(jq -n \
-      --arg mode "$(forwarder_xdp_mode)" \
       --arg iface "$(forwarder_iface)" \
       --arg guard_ingress_mode "$(forwarder_guard_ingress_mode)" \
       --argjson guard_enabled "$guard_enabled" \
-      --argjson whitelist_enabled "$whitelist_enabled" \
+      --argjson whitelist_enabled "$whitelist_state" \
       --argjson block_http "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
       --argjson block_tls "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
       --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE"; else echo false; fi)" \
       --argjson skip_ports "$(forwarder_protocol_skip_ports_json)" \
       --argjson files "$(forwarder_whitelist_files_json)" '
       {
-        xdp_mode: $mode,
         interface: $iface,
         guard_ingress_mode: $guard_ingress_mode,
         guard_enabled: $guard_enabled,
@@ -376,9 +377,23 @@ forwarder_runtime_json() {
     '
 }
 
+forwarder_runtime_config_hash() {
+    jq -S '.' | sha256sum | awk '{print $1}'
+}
+
 forwarder_write_runtime_file() {
     local runtime_json="$1"
     printf '%s\n' "$runtime_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_RUNTIME_FILE"
+}
+
+forwarder_write_xdp_runtime_file() {
+    local runtime_json="$1"
+    printf '%s\n' "$runtime_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_XDP_RUNTIME_FILE"
+}
+
+forwarder_write_nft_runtime_file() {
+    local runtime_json="$1"
+    printf '%s\n' "$runtime_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_NFT_RUNTIME_FILE"
 }
 
 forwarder_render_config() {
@@ -397,37 +412,303 @@ forwarder_ensure_ip_forwarding() {
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
 }
 
+forwarder_split_runtime_json() {
+    local runtime_json="$1"
+    local xdp_rules nft_rules xdp_payload nft_payload
+
+    xdp_rules="$(jq '
+      [
+        .rules[]?
+        | if (.resolved_target == "127.0.0.1") or (.resolved_target == "::1") then
+            . + {xdp_disabled: true}
+          else
+            .
+          end
+      ]
+    ' <<< "$runtime_json")"
+    nft_rules="$(jq '
+      [.rules[]? | select((.resolved_target == "127.0.0.1") or (.resolved_target == "::1"))]
+    ' <<< "$runtime_json")"
+
+    xdp_payload="$(jq \
+      --argjson rules "$xdp_rules" '
+      .rules = $rules
+      | .rule_index = (reduce ($rules[]? | .id) as $id ({}; .[$id] = (keys | length)))
+    ' <<< "$runtime_json")"
+    nft_payload="$(jq \
+      --argjson rules "$nft_rules" '
+      .rules = $rules
+      | .rule_index = (reduce ($rules[]? | .id) as $id ({}; .[$id] = (keys | length)))
+    ' <<< "$runtime_json")"
+
+    FORWARDER_SPLIT_XDP_RUNTIME_JSON="$xdp_payload"
+    FORWARDER_SPLIT_NFT_RUNTIME_JSON="$nft_payload"
+}
+
+forwarder_xdp_guard_required() {
+    local runtime_json="$1"
+    jq -e '
+      (.settings.guard_enabled == true)
+      and ((.settings.whitelist_enabled == true) or (.settings.block_http == true) or (.settings.block_tls == true) or (.settings.block_socks == true))
+    ' >/dev/null <<< "$runtime_json"
+}
+
+forwarder_xdp_forward_rule_count() {
+    local runtime_json="$1"
+    jq '[.rules[]? | select((.xdp_disabled // false) | not)] | length' <<< "$runtime_json"
+}
+
+forwarder_runtime_status_json() {
+    local backend="$1"
+    local runtime_json="$2"
+    local xdp_runtime_json="$3"
+    local nft_runtime_json="$4"
+    local fallback_reason="${5:-}"
+    local xdp_error="${6:-}"
+    local xdp_applied="${7:-false}"
+    local nft_applied="${8:-false}"
+    local xdp_status_json="${9:-{}}"
+    local xdp_forward_applied="${10:-false}"
+    [ -n "$runtime_json" ] || runtime_json='{"rules":[],"settings":{}}'
+    [ -n "$xdp_runtime_json" ] || xdp_runtime_json='{"rules":[]}'
+    [ -n "$nft_runtime_json" ] || nft_runtime_json='{"rules":[]}'
+    if ! jq -e . >/dev/null 2>&1 <<< "$xdp_status_json"; then
+        xdp_status_json='{}'
+    fi
+
+    jq -n \
+      --arg backend "$backend" \
+      --arg fallback_reason "$fallback_reason" \
+      --arg xdp_error "$xdp_error" \
+      --argjson xdp_applied "$xdp_applied" \
+      --argjson nft_applied "$nft_applied" \
+      --argjson xdp_forward_applied "$xdp_forward_applied" \
+      --argjson runtime "$runtime_json" \
+      --argjson xdp_runtime "$xdp_runtime_json" \
+      --argjson nft_runtime "$nft_runtime_json" \
+      --argjson xdp_status "$xdp_status_json" \
+      --arg generated_at "$(pfwd_now_iso)" '
+      {
+        applied: ((($runtime.rules | length) > 0) and ($xdp_applied or $nft_applied)),
+        generated_at: $generated_at,
+        forwarding_backend: $backend,
+        xdp_applied: $xdp_applied,
+        xdp_forward_applied: $xdp_forward_applied,
+        nft_applied: $nft_applied,
+        loopback_via_nft: (($nft_runtime.rules | any(.resolved_target == "127.0.0.1" or .resolved_target == "::1")) // false),
+        fallback_reason: (if $fallback_reason == "" then null else $fallback_reason end),
+        xdp_error: (if $xdp_error == "" then null else $xdp_error end),
+        rules: ($runtime.rules | length),
+        xdp_rules_count: ([$xdp_runtime.rules[]? | select((.xdp_disabled // false) | not)] | length),
+        xdp_guard_rules_count: ([$xdp_runtime.rules[]? | select((.xdp_disabled // false) == true)] | length),
+        nft_rules_count: ($nft_runtime.rules | length),
+        interface: ($runtime.settings.interface // ""),
+        protocol_guard: ($runtime.settings.guard_enabled // false),
+        whitelist_enabled: ($runtime.settings.whitelist_enabled // false),
+        xdp_status: $xdp_status
+      }'
+}
+
+forwarder_write_status_file() {
+    local status_json="$1"
+    printf '%s\n' "$status_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_STATUS_FILE"
+}
+
+forwarder_status_json() {
+    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
+        jq '.' "$PFWD_FORWARDER_STATUS_FILE"
+    else
+    jq -n '
+          {
+            applied: false,
+            forwarding_backend: "none",
+            xdp_applied: false,
+            xdp_forward_applied: false,
+            nft_applied: false,
+            loopback_via_nft: false,
+            rules: 0,
+            xdp_rules_count: 0,
+            xdp_guard_rules_count: 0,
+            nft_rules_count: 0,
+            interface: "",
+            protocol_guard: false,
+            whitelist_enabled: false
+          }'
+    fi
+}
+
+forwarder_render_status() {
+    local json
+    json="$(forwarder_status_json)"
+    jq -r '
+      [
+        ["后端", (.forwarding_backend // "none")],
+        ["XDP 转发", (if .xdp_applied then "开" else "关" end)],
+        ["XDP 正向转发", (if (.xdp_forward_applied // false) then "开" else "关" end)],
+        ["nft 转发", (if .nft_applied then "开" else "关" end)],
+        ["localhost 走 nft", (if .loopback_via_nft then "是" else "否" end)],
+        ["生效规则", (.rules | tostring)],
+        ["XDP 规则", (.xdp_rules_count | tostring)],
+        ["XDP Guard 规则", ((.xdp_guard_rules_count // 0) | tostring)],
+        ["nft 规则", (.nft_rules_count | tostring)],
+        ["绑定网卡", (.interface // "-")],
+        ["回退原因", (.fallback_reason // "-")]
+      ]
+      | map(@tsv)
+      | .[]
+    ' <<< "$json"
+}
+
+forwarder_apply_xdp_runtime() {
+    local runtime_json="$1"
+    local xdp_status xdp_error="" iface total_rules
+    total_rules="$(jq '.rules | length' <<< "$runtime_json")"
+    if [ "$total_rules" = "0" ]; then
+        if [ -x "$(forwarder_bin_path)" ]; then
+            pfwd_run "$(forwarder_bin_path)" remove \
+              --status-file "$PFWD_XDP_STATUS_FILE" \
+              --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+              --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+              --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+              --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+              --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+              --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+              --stats-pin "$PFWD_XDP_STATS_PIN_PATH" || true
+        fi
+        jq -n '{applied:false}' 
+        return 0
+    fi
+
+    iface="$(jq -r '.settings.interface // empty' <<< "$runtime_json")"
+    [ -n "$iface" ] || iface="$(forwarder_iface)"
+    [ -n "$iface" ] || pfwd_die "无法确定 XDP 网卡，请设置 settings.xdp.interface 或 settings.tc_interface"
+
+    if [ ! -x "$(forwarder_bin_path)" ]; then
+        return 1
+    fi
+
+    xdp_status="$(
+      "$(forwarder_bin_path)" apply \
+        --runtime-file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" \
+        --state-file "$PFWD_STATS_FILE" \
+        --status-file "$PFWD_XDP_STATUS_FILE" \
+        --iface "$iface" \
+        --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+        --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+        --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+        --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+        --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+        --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+        --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
+        --guard-mode ingress \
+        --quiet 2>&1
+    )" || {
+        xdp_error="$xdp_status"
+        pfwd_run "$(forwarder_bin_path)" remove \
+          --status-file "$PFWD_XDP_STATUS_FILE" \
+          --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+          --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+          --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+          --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" || true
+        printf '%s' "$xdp_error" >&2
+        return 1
+    }
+
+    if [ -f "$PFWD_XDP_STATUS_FILE" ]; then
+        jq '.' "$PFWD_XDP_STATUS_FILE"
+    else
+        jq -n '{applied:true}'
+    fi
+}
+
 forwarder_apply_runtime() {
-    local runtime_json
+    local runtime_json xdp_runtime_json nft_runtime_json
+    local xdp_status_json="" xdp_error="" backend="none"
+    local xdp_applied="false" xdp_forward_applied="false" nft_applied="false"
+    local xdp_forward_rules=0 xdp_guard_required="false"
     pfwd_debug "forwarder_apply_runtime start"
     config_init >/dev/null
     forwarder_validate_config
     if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
         whitelist_prepare_runtime
     fi
+
     runtime_json="$(forwarder_runtime_json true)"
     forwarder_write_runtime_file "$runtime_json"
-    if [ "$(printf '%s\n' "$runtime_json" | jq '.rules | length')" = "0" ]; then
+    forwarder_split_runtime_json "$runtime_json"
+    xdp_runtime_json="$FORWARDER_SPLIT_XDP_RUNTIME_JSON"
+    nft_runtime_json="$FORWARDER_SPLIT_NFT_RUNTIME_JSON"
+    forwarder_write_xdp_runtime_file "$xdp_runtime_json"
+    forwarder_write_nft_runtime_file "$nft_runtime_json"
+    xdp_forward_rules="$(forwarder_xdp_forward_rule_count "$xdp_runtime_json")"
+    if forwarder_xdp_guard_required "$runtime_json"; then
+        xdp_guard_required="true"
+    fi
+
+    if [ "$(jq '.rules | length' <<< "$runtime_json")" = "0" ]; then
         forwarder_stop_runtime
         return 0
     fi
-    pfwd_require_cmd "$(forwarder_bin_path)"
-    local iface
-    iface="$(forwarder_iface)"
-    [ -n "$iface" ] || pfwd_die "无法确定 XDP 网卡，请设置 settings.xdp.interface 或 settings.tc_interface"
+
     forwarder_ensure_ip_forwarding
-    pfwd_run "$(forwarder_bin_path)" apply \
-      --runtime-file "$PFWD_FORWARDER_RUNTIME_FILE" \
-      --state-file "$PFWD_STATS_FILE" \
-      --status-file "$PFWD_XDP_STATUS_FILE" \
-      --iface "$iface" \
-      --xdp-mode "$(forwarder_xdp_mode)" \
-      --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
-      --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
-      --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
-      --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
-      --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
-      --quiet
+
+    if [ "$xdp_forward_rules" -gt 0 ] || [ "$xdp_guard_required" = "true" ]; then
+        if xdp_status_json="$(forwarder_apply_xdp_runtime "$xdp_runtime_json" 2>&1)"; then
+            xdp_applied="true"
+            if [ "$xdp_forward_rules" -gt 0 ]; then
+                xdp_forward_applied="true"
+            fi
+        else
+            xdp_error="$xdp_status_json"
+            xdp_status_json='{}'
+            nft_runtime_json="$(jq \
+              --argjson extra "$(jq '[.rules[]? | select((.xdp_disabled // false) | not)]' <<< "$xdp_runtime_json")" \
+              '.rules += $extra | .rule_index = (reduce (.rules[]? | .id) as $id ({}; .[$id] = (keys | length)))' <<< "$nft_runtime_json")"
+            forwarder_write_nft_runtime_file "$nft_runtime_json"
+        fi
+    else
+        pfwd_run "$(forwarder_bin_path)" remove \
+          --status-file "$PFWD_XDP_STATUS_FILE" \
+          --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
+          --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+          --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+          --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" || true
+        xdp_status_json='{}'
+    fi
+
+    if [ "$(jq '.rules | length' <<< "$nft_runtime_json")" -gt 0 ]; then
+        fw_apply_nft_runtime "$nft_runtime_json"
+        nft_applied="true"
+    else
+        fw_delete_forward_table || true
+        : > "$PFWD_FORWARDER_NFT_RENDER_FILE"
+    fi
+
+    fw_apply_accounting_runtime "$runtime_json"
+    fw_apply_tc
+
+    if [ "$xdp_forward_applied" = "true" ] && [ "$nft_applied" = "true" ]; then
+        backend="hybrid"
+    elif [ "$xdp_forward_applied" = "true" ]; then
+        backend="xdp-only"
+    elif [ "$nft_applied" = "true" ]; then
+        if [ -n "$xdp_error" ]; then
+            backend="nft-fallback"
+        else
+            backend="nft-only"
+        fi
+    elif [ "$xdp_applied" = "true" ]; then
+        backend="guard-only"
+    fi
+
+    forwarder_write_status_file "$(forwarder_runtime_status_json "$backend" "$runtime_json" "$xdp_runtime_json" "$nft_runtime_json" "${xdp_error:+XDP 不可用，已自动切换到 nftables}" "$xdp_error" "$xdp_applied" "$nft_applied" "${xdp_status_json:-{}}" "$xdp_forward_applied")"
+    fw_cleanup_legacy_nft
 }
 
 forwarder_run_maintenance() {
@@ -440,11 +721,19 @@ forwarder_stop_runtime() {
           --status-file "$PFWD_XDP_STATUS_FILE" \
           --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
           --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+          --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+          --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
           --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
           --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
           --stats-pin "$PFWD_XDP_STATS_PIN_PATH" || true
     fi
+    fw_delete_forward_table || true
+    fw_cleanup_legacy_nft || true
     printf '[]\n' | pfwd_write_atomic "$PFWD_FORWARDER_RUNTIME_FILE"
+    printf '[]\n' | pfwd_write_atomic "$PFWD_FORWARDER_XDP_RUNTIME_FILE"
+    printf '[]\n' | pfwd_write_atomic "$PFWD_FORWARDER_NFT_RUNTIME_FILE"
+    : > "$PFWD_FORWARDER_NFT_RENDER_FILE"
+    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,rules:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false}')"
 }
 
 forwarder_validate_config() {
@@ -459,8 +748,8 @@ forwarder_validate_config() {
 forwarder_service_unit() {
     cat <<EOF
 [Unit]
-Description=pfwd XDP boot restore
-After=network-online.target systemd-sysctl.service
+Description=pfwd XDP/nft runtime restore
+After=network-online.target nftables.service systemd-sysctl.service ufw.service
 Wants=network-online.target
 
 [Service]

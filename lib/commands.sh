@@ -845,9 +845,10 @@ cmd_doctor_benchmarks() {
 }
 
 cmd_render() {
-    local target="${1:-xdp}"
+    local target="${1:-forwarder}"
     case "$target" in
         xdp|forwarder) forwarder_render_config ;;
+        nft) fw_render_nft ;;
         tc) fw_render_tc ;;
         guard) guard_render_status ;;
         units)
@@ -860,7 +861,7 @@ cmd_render() {
             echo "# pfwd-xdp.service"
             guard_service_unit
             ;;
-        *) pfwd_die "用法：pfwd render [xdp|tc|guard|units]" ;;
+        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|guard|units]" ;;
     esac
 }
 
@@ -913,9 +914,14 @@ cmd_notify_test() {
 
 cmd_doctor() {
     config_init >/dev/null
+    local forwarder_status backend fallback_reason
+    forwarder_status="$(forwarder_status_json)"
+    backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
+    fallback_reason="$(jq -r '.fallback_reason // empty' <<< "$forwarder_status")"
     echo "配置文件：$PFWD_CONFIG_FILE"
     jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
-    echo "数据面：XDP"
+    echo "数据面：$backend"
+    if [ -n "$fallback_reason" ]; then echo "回退原因：$fallback_reason"; fi
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
@@ -989,19 +995,6 @@ cmd_guard() {
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard status"
             guard_render_status
             ;;
-        xdp)
-            local mode=""
-            while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    --mode) mode="${2:-}"; shift 2 ;;
-                    *) pfwd_die "未知选项：$1" ;;
-                esac
-            done
-            [ -n "$mode" ] || pfwd_die "用法：pfwd guard xdp --mode off|auto|force"
-            guard_config_set_xdp_mode "$mode"
-            cmd_apply_guard_runtime
-            echo "guard XDP 模式已更新：$mode"
-            ;;
         protocols)
             local http="__KEEP__" https="__KEEP__" tls="__KEEP__" socks="__KEEP__"
             local skip_port="" replace_skip_ports="false" clear_skip_ports="false" tmp_ports skip_ports_input=""
@@ -1067,7 +1060,7 @@ cmd_guard() {
             cmd_guard_whitelist_custom "$@"
             ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|xdp|protocols|whitelist|whitelist-custom"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-custom"
             ;;
     esac
 }
