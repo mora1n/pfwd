@@ -34,6 +34,8 @@ const maxRules = 4096
 const maxUsers = 4096
 const ruleFlagXDPDisabled = uint16(1 << 0)
 const ruleCounterPinSuffix = "_rule_counters"
+const tcPrefBPFIngress = "10"
+const tcPrefBPFEgress = "10"
 
 type bpfObjects struct {
 	PFWDXDP              *ebpf.Program `ebpf:"pfwd_xdp"`
@@ -1454,7 +1456,11 @@ func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attac
 	if err := prog.Pin(pin); err != nil {
 		return "", fmt.Errorf("pin tc program 失败: %w", err)
 	}
-	if err := runTC("filter", "replace", "dev", iface.Name, direction, "bpf", "direct-action", "object-pinned", pin); err != nil {
+	pref := tcPrefBPFIngress
+	if direction == "egress" {
+		pref = tcPrefBPFEgress
+	}
+	if err := runTC("filter", "replace", "dev", iface.Name, direction, "pref", pref, "bpf", "direct-action", "object-pinned", pin); err != nil {
 		return "", err
 	}
 	return "tc", nil
@@ -1504,8 +1510,11 @@ func removeTCRuntime(pin string, ifaceName string, direction string) error {
 		_ = removePinnedProgram(pin)
 	}
 	if ifaceName != "" {
-		_ = runTC("filter", "delete", "dev", ifaceName, direction)
-		_ = runTC("qdisc", "delete", "dev", ifaceName, "clsact")
+		pref := tcPrefBPFIngress
+		if direction == "egress" {
+			pref = tcPrefBPFEgress
+		}
+		_ = runTC("filter", "delete", "dev", ifaceName, direction, "pref", pref)
 	}
 	return nil
 }

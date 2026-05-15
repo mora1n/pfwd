@@ -517,17 +517,19 @@ fw_apply_tc() {
     iface="$(fw_tc_interface 2>/dev/null || true)"
     if [ "$rate_count" -le 0 ]; then
         command -v tc >/dev/null 2>&1 || return 0
-        [ -n "$iface" ] && fw_reset_tc_root "$iface"
+        [ -n "$iface" ] && fw_reset_tc_runtime "$iface"
         return 0
     fi
     pfwd_require_cmd tc
     [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
-    fw_reset_tc_root "$iface"
+    fw_reset_tc_runtime "$iface"
+    fw_ensure_ifb
     fw_render_tc | while IFS= read -r line; do
         [ -n "$line" ] || continue
         # shellcheck disable=SC2086
         pfwd_run $line
     done
+    fw_write_tc_state "$iface"
 }
 
 fw_effective_rate_count() {
@@ -550,13 +552,27 @@ fw_render_tc() {
     rate_count="$(fw_effective_rate_count)"
     [ "$rate_count" -gt 0 ] || return 0
 
-    local iface
+    local iface ifb_dev
     iface="$(fw_tc_interface)"
     [ -n "$iface" ] || pfwd_die "未配置 tc 网卡，且未找到默认路由网卡"
+    ifb_dev="$(fw_tc_ifb_name)"
+
     echo "tc qdisc add dev $iface root handle 1: htb default 999 r2q 100"
-    echo "tc class add dev $iface parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit quantum 1514"
+    echo "tc class replace dev $iface parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit quantum 1514"
+    echo "tc qdisc replace dev $iface clsact"
+    echo "tc qdisc add dev $ifb_dev root handle 1: htb default 999 r2q 100"
+    echo "tc class replace dev $ifb_dev parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit quantum 1514"
+    echo "tc filter add dev $iface ingress pref $PFWD_TC_INGRESS_PREF matchall action mirred egress redirect dev $ifb_dev"
 
     local class_index=10
+    fw_effective_rate_rows | while IFS=$'\t' read -r id user_id rate port protocol; do
+        [ -n "$id" ] || continue
+        fw_render_tc_rule_pair "$iface" "$ifb_dev" "$rate" "$port" "$protocol" "$class_index"
+        class_index=$((class_index + 1))
+    done
+}
+
+fw_effective_rate_rows() {
     jq -r '
       . as $cfg
       | .forwards[]
@@ -564,18 +580,165 @@ fw_render_tc() {
       | ($cfg.users[]? | select(.id == $f.user_id) | .limits.rate // null) as $user_rate
       | (($f.limits.rate // $user_rate) // null) as $rate
       | select($rate != null)
-      | [$f.id, $rate, ($f.listen_port | tostring)] | @tsv
-    ' "$PFWD_CONFIG_FILE" | while IFS=$'\t' read -r id rate port; do
-        echo "tc class add dev $iface parent 1: classid 1:$class_index htb rate $rate ceil $rate quantum 1514"
-        echo "tc filter add dev $iface protocol ip parent 1: prio $class_index u32 match ip sport $port 0xffff flowid 1:$class_index"
-        class_index=$((class_index + 1))
-    done
+      | [$f.id, $f.user_id, $rate, ($f.listen_port | tostring), ($f.protocol // "tcp_udp")] | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
+fw_tc_ifb_name() {
+    printf '%s\n' "$PFWD_TC_IFB_DEV"
+}
+
+fw_tc_supports_flower() {
+    tc qdisc replace dev lo clsact >/dev/null 2>&1 || return 1
+    tc filter add dev lo ingress pref 65534 protocol ip flower ip_proto tcp dst_port 1 action drop >/dev/null 2>&1
+    local rc=$?
+    tc filter del dev lo ingress pref 65534 >/dev/null 2>&1 || true
+    tc qdisc del dev lo clsact >/dev/null 2>&1 || true
+    [ "$rc" -eq 0 ]
+}
+
+fw_tc_state_read_iface() {
+    [ -f "$PFWD_TC_STATE_FILE" ] || return 0
+    awk -F= '$1=="TC_IFACE"{print $2}' "$PFWD_TC_STATE_FILE" 2>/dev/null || true
+}
+
+fw_write_tc_state() {
+    local iface="$1"
+    mkdir -p "$(dirname "$PFWD_TC_STATE_FILE")"
+    cat > "$PFWD_TC_STATE_FILE" <<EOF
+TC_IFACE=$iface
+TC_IFB=$(fw_tc_ifb_name)
+EOF
+}
+
+fw_clear_tc_state() {
+    rm -f "$PFWD_TC_STATE_FILE"
+}
+
+fw_ensure_ifb() {
+    local ifb_dev
+    ifb_dev="$(fw_tc_ifb_name)"
+    if command -v modprobe >/dev/null 2>&1; then
+        pfwd_run modprobe ifb >/dev/null 2>&1 || true
+    fi
+    ip link show dev "$ifb_dev" >/dev/null 2>&1 || pfwd_run ip link add "$ifb_dev" type ifb
+    pfwd_run ip link set dev "$ifb_dev" up
+}
+
+fw_remove_ifb() {
+    local ifb_dev
+    ifb_dev="$(fw_tc_ifb_name)"
+    pfwd_run ip link set dev "$ifb_dev" down >/dev/null 2>&1 || true
+    pfwd_run ip link del "$ifb_dev" type ifb >/dev/null 2>&1 || true
+}
+
+fw_render_tc_rule_pair() {
+    local iface="$1"
+    local ifb_dev="$2"
+    local rate="$3"
+    local port="$4"
+    local protocol="$5"
+    local class_index="$6"
+    local classid="1:$class_index"
+
+    echo "tc class replace dev $iface parent 1: classid $classid htb rate $rate ceil $rate quantum 1514"
+    echo "tc class replace dev $ifb_dev parent 1: classid $classid htb rate $rate ceil $rate quantum 1514"
+
+    case "$protocol" in
+        tcp)
+            fw_render_tc_filters "$iface" "$ifb_dev" "$port" tcp "$classid" "$class_index"
+            ;;
+        udp)
+            fw_render_tc_filters "$iface" "$ifb_dev" "$port" udp "$classid" "$class_index"
+            ;;
+        *)
+            fw_render_tc_filters "$iface" "$ifb_dev" "$port" tcp "$classid" "$class_index"
+            fw_render_tc_filters "$iface" "$ifb_dev" "$port" udp "$classid" "$class_index"
+            ;;
+    esac
+}
+
+fw_tc_filter_pref() {
+    local class_index="$1"
+    local l4="$2"
+    local family="$3"
+    local base=$((1000 + class_index * 10))
+    local offset=0
+    [ "$l4" = "udp" ] && offset=$((offset + 2))
+    [ "$family" = "ipv6" ] && offset=$((offset + 1))
+    printf '%s\n' "$((base + offset))"
+}
+
+fw_render_tc_filters() {
+    if fw_tc_supports_flower; then
+        fw_render_tc_flower_filters "$@"
+    else
+        fw_render_tc_u32_filters "$@"
+    fi
+}
+
+fw_render_tc_flower_filters() {
+    local iface="$1"
+    local ifb_dev="$2"
+    local port="$3"
+    local l4="$4"
+    local classid="$5"
+    local class_index="$6"
+    local pref_ipv4 pref_ipv6
+    pref_ipv4="$(fw_tc_filter_pref "$class_index" "$l4" ipv4)"
+    pref_ipv6="$(fw_tc_filter_pref "$class_index" "$l4" ipv6)"
+
+    echo "tc filter add dev $iface protocol ip parent 1: pref $pref_ipv4 flower ip_proto $l4 src_port $port flowid $classid"
+    echo "tc filter add dev $iface protocol ipv6 parent 1: pref $pref_ipv6 flower ip_proto $l4 src_port $port flowid $classid"
+    echo "tc filter add dev $ifb_dev protocol ip parent 1: pref $pref_ipv4 flower ip_proto $l4 dst_port $port flowid $classid"
+    echo "tc filter add dev $ifb_dev protocol ipv6 parent 1: pref $pref_ipv6 flower ip_proto $l4 dst_port $port flowid $classid"
+}
+
+fw_render_tc_u32_filters() {
+    local iface="$1"
+    local ifb_dev="$2"
+    local port="$3"
+    local l4="$4"
+    local classid="$5"
+    local class_index="$6"
+    local ip_proto="6"
+    local pref
+    [ "$l4" = "udp" ] && ip_proto="17"
+    pref="$(fw_tc_filter_pref "$class_index" "$l4" ipv4)"
+
+    echo "tc filter add dev $iface protocol ip parent 1: pref $pref u32 match ip protocol $ip_proto 0xff match ip sport $port 0xffff flowid $classid"
+    echo "tc filter add dev $ifb_dev protocol ip parent 1: pref $pref u32 match ip protocol $ip_proto 0xff match ip dport $port 0xffff flowid $classid"
 }
 
 fw_reset_tc_root() {
     local iface="$1"
     [ -n "$iface" ] || return 0
     pfwd_run tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+}
+
+fw_reset_tc_ingress() {
+    local iface="$1"
+    [ -n "$iface" ] || return 0
+    pfwd_run tc filter del dev "$iface" ingress pref "$PFWD_TC_INGRESS_PREF" >/dev/null 2>&1 || true
+}
+
+fw_reset_tc_ifb() {
+    local ifb_dev
+    ifb_dev="$(fw_tc_ifb_name)"
+    pfwd_run tc qdisc del dev "$ifb_dev" root >/dev/null 2>&1 || true
+}
+
+fw_reset_tc_runtime() {
+    local iface="${1:-}"
+    if [ -z "$iface" ]; then
+        iface="$(fw_tc_state_read_iface)"
+    fi
+    [ -n "$iface" ] || iface="$(fw_tc_interface 2>/dev/null || true)"
+    [ -n "$iface" ] && fw_reset_tc_root "$iface"
+    [ -n "$iface" ] && fw_reset_tc_ingress "$iface"
+    fw_reset_tc_ifb
+    fw_remove_ifb
+    fw_clear_tc_state
 }
 
 fw_read_nft_counters() {

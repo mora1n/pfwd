@@ -11,7 +11,7 @@
 | 数据面选路 | 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 走 `nftables`；XDP 不可用时自动 fallback |
 | XDP 选项 | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
-| Rate | 使用 `tc` 做端口级或用户级速率限制 |
+| Rate | 使用 `tc` 做端口级或用户级双向速率限制 |
 | Guard | 入口侧白名单和 TCP 首包协议封锁，运行在 XDP / ingress 分层数据面 |
 | Notify | Telegram 定时通知和手动通知 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
@@ -217,7 +217,7 @@ pfwd add \
 - 当 XDP 不可用时，符合条件的规则会自动回退到 `nftables`。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
-- 速率限制由 `tc` 执行；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
+- 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 
 ## BBR / 系统调优
 

@@ -924,10 +924,19 @@ cmd_notify_test() {
 
 cmd_doctor() {
     config_init >/dev/null
-    local forwarder_status backend fallback_reason
+    local forwarder_status backend fallback_reason tc_iface tc_ifb tc_mode
     forwarder_status="$(forwarder_status_json)"
     backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
     fallback_reason="$(jq -r '.fallback_reason // empty' <<< "$forwarder_status")"
+    tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
+    tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
+    if [ -n "$tc_iface" ]; then
+        tc_mode="bidirectional-ifb"
+    elif [ "$(fw_effective_rate_count 2>/dev/null || echo 0)" -gt 0 ]; then
+        tc_mode="configured-no-runtime"
+    else
+        tc_mode="disabled"
+    fi
     echo "配置文件：$PFWD_CONFIG_FILE"
     jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
     echo "数据面：$backend"
@@ -935,6 +944,9 @@ cmd_doctor() {
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
+    echo "tc.mode：$tc_mode"
+    if [ -n "$tc_iface" ]; then echo "tc.iface：$tc_iface"; fi
+    if [ -n "$tc_ifb" ] && [ "$tc_mode" = "bidirectional-ifb" ]; then echo "tc.ifb：$tc_ifb"; fi
     if command -v systemctl >/dev/null 2>&1; then echo "systemctl：正常"; else echo "systemctl：缺失"; fi
     if guard_binary_exists; then echo "guard：$(guard_bin_path)"; else echo "guard：缺失"; fi
     echo "运行态安装：$(service_runtime_status_label)"

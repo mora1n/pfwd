@@ -313,10 +313,10 @@ service_config_value_or_default() {
 
 service_cleanup_pfwd_tc() {
     local iface
-    iface="$(fw_tc_interface 2>/dev/null || true)"
+    iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
+    [ -n "$iface" ] || iface="$(fw_tc_interface 2>/dev/null || true)"
     command -v tc >/dev/null 2>&1 || return 0
-    [ -n "$iface" ] || return 0
-    pfwd_run tc qdisc del dev "$iface" root 2>/dev/null || true
+    fw_reset_tc_runtime "$iface"
 }
 
 service_remove_unit_files() {
