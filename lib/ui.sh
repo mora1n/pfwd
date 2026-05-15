@@ -1930,21 +1930,25 @@ ui_main_user_rows() {
 ui_main_forward_rows() {
     local data="$1"
     jq -r '
-      .forwards
+      . as $data
+      | .forwards
       | sort_by(.user_id, .listen_port, .id)
       | .[]?
+      | . as $forward
+      | (($data.users | map(select(.id == $forward.user_id)) | .[0].limits.rate) // null) as $user_rate
       | [
-          (if .enabled then "true" else "false" end),
-          .user_id,
-          (.listen_ip // "::"),
-          (.listen_port | tostring),
-          .remote_host,
-          (.remote_port | tostring),
-          (.input_bytes // "0"),
-          (.output_bytes // "0"),
-          (.stop_at // "-"),
-          ((.traffic_ratio // 1) | tostring),
-          (if (.comment // "") == "" then "-" else .comment end)
+          (if $forward.enabled then "true" else "false" end),
+          $forward.user_id,
+          ($forward.listen_ip // "::"),
+          ($forward.listen_port | tostring),
+          $forward.remote_host,
+          ($forward.remote_port | tostring),
+          ($forward.input_bytes // "0"),
+          ($forward.output_bytes // "0"),
+          ($forward.stop_at // "-"),
+          (($forward.traffic_ratio // 1) | tostring),
+          (($forward.limits.rate // $user_rate) // "null"),
+          (if ($forward.comment // "") == "" then "-" else $forward.comment end)
         ]
       | @tsv
     ' <<< "$data"
@@ -2163,6 +2167,9 @@ ui_render_forward_groups() {
                 $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
                     render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(format_ratio "$block_col8")"$'\t'"$(ui_display_or_dash "$block_col9")"$'\n'
                     ;;
+                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
+                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(format_ratio "$block_col8")"$'\t'"$(ui_format_rate "$block_col9")"$'\t'"$(ui_display_or_dash "$block_col10")"$'\n'
+                    ;;
                 $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
                     render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\t'"$block_col8"$'\t'"$(format_ratio "$block_col9")"$'\t'"$block_col10"$'\t'"$block_col11"$'\t'"$(ui_display_or_dash "$block_col12")"$'\n'
                     ;;
@@ -2188,6 +2195,10 @@ ui_render_forward_groups() {
                     $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
                         group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
                         group_shrink="2,3,4,5,6,7,8"
+                        ;;
+                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
+                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注'
+                        group_shrink="2,3,4,5,6,7,8,9"
                         ;;
                     $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
                         group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
@@ -2218,6 +2229,10 @@ ui_render_forward_groups() {
             group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
             group_shrink="2,3,4,5,6,7,8"
             ;;
+        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
+            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注'
+            group_shrink="2,3,4,5,6,7,8,9"
+            ;;
         $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
             group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
             group_shrink="3,4,6,7,8,9,10,11"
@@ -2244,14 +2259,14 @@ ui_print_main_forward_summary() {
         return
     fi
 
-    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at ratio comment; do
+    while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at ratio rate comment; do
         local remote_text listen_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
-        rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(format_ratio "$ratio")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
+        rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(format_ratio "$ratio")"$'\t'"$(ui_format_rate "$rate")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
     done < <(ui_main_forward_rows "$data")
     rows="${rows%$'\n'}"
-    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注' "4,9,2,7,3" "$(ui_empty_forwards_text)"
+    ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注' "4,10,2,7,3" "$(ui_empty_forwards_text)"
 }
 
 ui_print_main_forwards() {
