@@ -2755,7 +2755,10 @@ ui_menu_guard_skip_ports_delete() {
         fi
         if [ "$delete_all" -eq 1 ]; then
             ui_run cmd_guard protocols --clear-skip-ports
-            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已清空" "$UI_C_MENU_NUM"
+            if [ "$UI_STATUS" -eq 0 ]; then
+                ui_notice_set "协议封锁跳过端口已清空" "$UI_C_MENU_NUM"
+                ui_pause
+            fi
             return 0
         fi
         delete_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
@@ -2770,7 +2773,10 @@ ui_menu_guard_skip_ports_delete() {
             idx=$((idx + 1))
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$remaining_ports"
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已删除" "$UI_C_MENU_NUM"
+        if [ "$UI_STATUS" -eq 0 ]; then
+            ui_notice_set "协议封锁跳过端口已删除" "$UI_C_MENU_NUM"
+            ui_pause
+        fi
         return 0
     done
 }
@@ -2817,7 +2823,10 @@ ui_menu_guard_skip_ports_update() {
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$updated_ports"
         ui_form_reset
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
+        if [ "$UI_STATUS" -eq 0 ]; then
+            ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
+            ui_pause
+        fi
         return 0
     done
 }
@@ -3985,13 +3994,19 @@ ui_menu_whitelist_cidrs_delete() {
     indexes="$UI_REPLY"
     if printf '%s\n' "$indexes" | grep -qx '1'; then
         ui_run cmd_guard_whitelist_custom clear
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已清空" "$UI_C_MENU_NUM"
+        if [ "$UI_STATUS" -eq 0 ]; then
+            ui_notice_set "自定义 CIDR 已清空" "$UI_C_MENU_NUM"
+            ui_pause
+        fi
         return 0
     fi
     resolved_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
     [ -n "$resolved_indexes" ] || { ui_warn "请选择要删除的自定义 CIDR"; return 1; }
     ui_run cmd_guard_whitelist_custom delete $resolved_indexes
-    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义 CIDR 已删除" "$UI_C_MENU_NUM"
+    if [ "$UI_STATUS" -eq 0 ]; then
+        ui_notice_set "自定义 CIDR 已删除" "$UI_C_MENU_NUM"
+        ui_pause
+    fi
 }
 
 ui_render_whitelist_cidrs_menu_page() {
