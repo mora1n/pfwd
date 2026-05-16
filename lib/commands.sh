@@ -438,6 +438,7 @@ cmd_notify_delete() {
 cmd_add() {
     local user_id="" remote="" listen_ip="" listen_port="" random_range="" stop_at="" protocol="tcp_udp" traffic_mode="two-way"
     local traffic_ratio="1.0" comment="" mss_mode="" mss_value="" snat_mode="masquerade" snat_source=""
+    local stop_at_explicit="false" traffic_mode_explicit="false"
     config_init >/dev/null
     listen_ip="$(jq -r '.settings.default_listen_ip // "::"' "$PFWD_CONFIG_FILE")"
 
@@ -448,9 +449,9 @@ cmd_add() {
             --listen-ip) listen_ip="${2:-}"; shift 2 ;;
             --listen-port) listen_port="${2:-}"; shift 2 ;;
             --random-port) random_range="${2:-}"; shift 2 ;;
-            --stop-at) stop_at="${2:-}"; shift 2 ;;
+            --stop-at) stop_at="${2:-}"; stop_at_explicit="true"; shift 2 ;;
             --protocol) protocol="${2:-}"; shift 2 ;;
-            --traffic-mode) traffic_mode="${2:-}"; shift 2 ;;
+            --traffic-mode) traffic_mode="${2:-}"; traffic_mode_explicit="true"; shift 2 ;;
             --traffic-ratio) traffic_ratio="${2:-}"; shift 2 ;;
             --comment) comment="${2:-}"; shift 2 ;;
             --mss-clamp) mss_mode="clamp"; mss_value=""; shift ;;
@@ -463,6 +464,21 @@ cmd_add() {
 
     [ -n "$user_id" ] || pfwd_die "必须提供 --user-id"
     [ -n "$remote" ] || pfwd_die "必须提供 --remote"
+
+    local user_defaults default_rate="" default_stop_at="" default_traffic_mode=""
+    user_defaults="$(config_user_forward_defaults_json "$user_id")"
+    default_rate="$(jq -r '.rate // ""' <<< "$user_defaults")"
+    default_stop_at="$(jq -r '.stop_at // ""' <<< "$user_defaults")"
+    default_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$user_defaults")"
+
+    if [ "$traffic_mode_explicit" != "true" ] && [ -n "$default_traffic_mode" ]; then
+        traffic_mode="$default_traffic_mode"
+    fi
+    if [ "$stop_at_explicit" = "true" ] && [ "$stop_at" = "-" ]; then
+        stop_at=""
+    elif [ "$stop_at_explicit" != "true" ] && [ -n "$default_stop_at" ]; then
+        stop_at="$default_stop_at"
+    fi
 
     local parsed remote_host remote_ports listen_ports reserved="" port forward_ids count
     parsed="$(parse_host_port_spec "$remote")"
@@ -485,7 +501,7 @@ cmd_add() {
         listen_ports="$(expand_port_spec "$listen_port")"
     fi
 
-    forward_ids="$(config_add_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source")"
+    forward_ids="$(config_add_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$comment" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source" "$default_rate")"
     count="$(printf '%s\n' "$forward_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
     echo "转发已添加：$count 条"
     printf '%s\n' "$forward_ids" | sed '/^$/d' | sed 's/^/  /'

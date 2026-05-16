@@ -199,6 +199,9 @@ config_add_user() {
       .users += [{
         "id": $id,
         "created_at": $now,
+        "forward_defaults": {
+          "stop_at": null
+        },
         "telegram": {
           "enabled": false,
           "bot_token": "",
@@ -587,9 +590,11 @@ config_add_forward() {
     local mss_value="${11:-}"
     local snat_mode="${12:-masquerade}"
     local snat_source="${13:-}"
+    local default_rate="${14:-}"
 
     [ -z "$stop_at" ] || stop_at="$(normalize_date_input "$stop_at")"
     traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio")"
+    [ -z "$default_rate" ] || default_rate="$(normalize_rate "$default_rate")"
     config_validate_new_forward "$user_id" "$listen_ip" "$listen_port" "$remote" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
 
     local id now remote_host remote_port parsed
@@ -615,6 +620,7 @@ config_add_forward() {
       --arg mss_value "$mss_value" \
       --arg snat_mode "$snat_mode" \
       --arg snat_source "$snat_source" \
+      --arg default_rate "$default_rate" \
       --arg now "$now" '
       .forwards += [{
         "id": $id,
@@ -637,7 +643,7 @@ config_add_forward() {
         },
         "limits": {
           "traffic_bytes": null,
-          "rate": null
+          "rate": (if $default_rate == "" then null else $default_rate end)
         },
         "created_at": $now
       }]
@@ -661,9 +667,11 @@ config_add_forward_batch() {
     local mss_value="${12:-}"
     local snat_mode="${13:-masquerade}"
     local snat_source="${14:-}"
+    local default_rate="${15:-}"
 
     [ -z "$stop_at" ] || stop_at="$(normalize_date_input "$stop_at")"
     traffic_ratio="$(normalize_traffic_ratio_input "$traffic_ratio")"
+    [ -z "$default_rate" ] || default_rate="$(normalize_rate "$default_rate")"
     config_validate_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
 
     local count id now jq_forwards="[]" listen_port remote_port
@@ -690,6 +698,7 @@ config_add_forward_batch() {
           --arg mss_value "$mss_value" \
           --arg snat_mode "$snat_mode" \
           --arg snat_source "$snat_source" \
+          --arg default_rate "$default_rate" \
           --arg now "$now" '
           $forwards + [{
             "id": $id,
@@ -712,7 +721,7 @@ config_add_forward_batch() {
             },
             "limits": {
               "traffic_bytes": null,
-              "rate": null
+              "rate": (if $default_rate == "" then null else $default_rate end)
             },
             "created_at": $now
           }]
@@ -780,6 +789,7 @@ config_set_user_forwards_expire() {
           .
         end
       )
+      | (.users[] | select(.id == $id) | .forward_defaults.stop_at) = $stop_at
     '
 }
 
@@ -792,7 +802,31 @@ config_clear_user_forwards_expire() {
       .forwards |= map(
         if .user_id == $id then .stop_at = null else . end
       )
+      | (.users[] | select(.id == $id) | .forward_defaults.stop_at) = null
     '
+}
+
+config_user_forward_defaults_json() {
+    local user_id
+    user_id="$(normalize_user_id "$1")"
+    local now_minute
+    now_minute="$(pfwd_now_minute)"
+    validate_user_id "$user_id"
+    config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    jq -c --arg id "$user_id" --arg now "$now_minute" '
+      (.users[] | select(.id == $id)) as $user
+      | (($user.forward_defaults.stop_at // null)) as $default_stop_at
+      | {
+          "rate": ($user.limits.rate // null),
+          "traffic_mode": ($user.limits.traffic_mode // "two-way"),
+          "stop_at": (
+            if ($default_stop_at != null and $default_stop_at > $now)
+            then $default_stop_at
+            else null
+            end
+          )
+        }
+    ' "$PFWD_CONFIG_FILE"
 }
 
 config_set_forward_limit() {
@@ -876,6 +910,12 @@ config_set_user_forward_limits() {
              end)
         end
       )
+      | (if $rate == "__KEEP__" then . else
+            (.users[] | select(.id == $id) | .limits.rate) = (if $rate == "" then null else $rate end)
+         end)
+      | (if $traffic_mode == "" or $traffic_mode == "__KEEP__" then . else
+            (.users[] | select(.id == $id) | .limits.traffic_mode) = $traffic_mode
+         end)
     '
 }
 

@@ -3221,11 +3221,17 @@ ui_menu_users() {
 
 ui_menu_add_forward() {
     local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode traffic_ratio comment args=()
+    local user_defaults="" default_rate="" default_stop_at="" default_traffic_mode="" stop_prompt=""
     ui_form_set "添加转发" "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
     ui_select_user true || return 0
     [ "$UI_EDIT_ABORTED" = "1" ] && return 0
     user_id="$UI_REPLY"
+    user_defaults="$(config_user_forward_defaults_json "$user_id")"
+    default_rate="$(jq -r '.rate // ""' <<< "$user_defaults")"
+    default_stop_at="$(jq -r '.stop_at // ""' <<< "$user_defaults")"
+    default_traffic_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$user_defaults")"
     ui_form_add_kv "用户" "$user_id"
+    [ -z "$default_rate" ] || ui_form_add_kv "默认端口速率" "$default_rate"
     ui_form_read "目标 IP/域名" || return 0
     remote_host="$UI_REPLY"
     ui_form_add_kv "目标 IP/域名" "$remote_host"
@@ -3247,13 +3253,18 @@ ui_menu_add_forward() {
         ui_form_add_kv "监听端口" "$listen_port"
     fi
     [ -z "$random_range" ] || ui_form_add_kv "随机端口范围" "$random_range"
-    ui_form_read "到期日期 YYYYMMDD，支持 +7/7d，留空不限期" || return 0
+    if [ -n "$default_stop_at" ]; then
+        stop_prompt="到期日期 YYYYMMDD，支持 +7/7d；回车继承默认值，输入 - 不限期"
+    else
+        stop_prompt="到期日期 YYYYMMDD，支持 +7/7d，留空不限期"
+    fi
+    ui_form_read "$stop_prompt" "$default_stop_at" || return 0
     stop_at="$UI_REPLY"
     ui_form_add_kv "到期日期" "$stop_at"
     ui_select_protocol "转发协议" || return 0
     protocol="$UI_REPLY"
     ui_form_add_kv "转发协议" "$(ui_protocol_label "$protocol")"
-    ui_select_traffic_mode "计费模式" || return 0
+    ui_select_traffic_mode "计费模式" false "$default_traffic_mode" || return 0
     traffic_mode="$UI_TRAFFIC_MODE"
     ui_form_add_kv "计费模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
     ui_read_traffic_ratio "流量倍率，默认 1.0" "1.0" || return 0
