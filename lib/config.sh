@@ -700,9 +700,14 @@ config_set_forward_expire() {
     local forward_id="$1"
     local stop_at
     stop_at="$(normalize_date_input "$2")"
+    local now_minute
+    now_minute="$(pfwd_now_minute)"
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
-    config_update --arg id "$forward_id" --arg stop_at "$stop_at" '
-      (.forwards[] | select(.id == $id) | .stop_at) = $stop_at
+    config_update --arg id "$forward_id" --arg stop_at "$stop_at" --arg now "$now_minute" '
+      (.forwards[] | select(.id == $id)) |= (
+        .stop_at = $stop_at
+        | if $stop_at > $now then .enabled = true else . end
+      )
     '
 }
 
@@ -711,11 +716,18 @@ config_set_user_forwards_expire() {
     user_id="$(normalize_user_id "$1")"
     local stop_at
     stop_at="$(normalize_date_input "$2")"
+    local now_minute
+    now_minute="$(pfwd_now_minute)"
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
-    config_update --arg id "$user_id" --arg stop_at "$stop_at" '
+    config_update --arg id "$user_id" --arg stop_at "$stop_at" --arg now "$now_minute" '
       .forwards |= map(
-        if .user_id == $id then .stop_at = $stop_at else . end
+        if .user_id == $id then
+          .stop_at = $stop_at
+          | if $stop_at > $now then .enabled = true else . end
+        else
+          .
+        end
       )
     '
 }
@@ -917,11 +929,13 @@ config_update_forward() {
     local new_listen_ip new_listen_port new_remote_host new_remote_port new_stop_at new_protocol new_traffic_mode new_traffic_ratio remote_spec
     local current_comment current_mss_mode current_mss_value current_snat_mode current_snat_source
     local new_comment new_mss_mode new_mss_value new_snat_mode new_snat_source
+    local now_minute
     current_comment="$(jq -r '.comment // ""' <<< "$current")"
     current_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$current")"
     current_mss_value="$(jq -r '.net.mss_value // ""' <<< "$current")"
     current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$current")"
     current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$current")"
+    now_minute="$(pfwd_now_minute)"
 
     new_listen_ip="$(config_keep_or_apply "$listen_ip_raw" "$current_listen_ip")"
     if [ "$listen_ip_raw" != "__KEEP__" ]; then
@@ -1006,7 +1020,8 @@ config_update_forward() {
       --arg mss_mode "$new_mss_mode" \
       --arg mss_value "$new_mss_value" \
       --arg snat_mode "$new_snat_mode" \
-      --arg snat_source "$new_snat_source" '
+      --arg snat_source "$new_snat_source" \
+      --arg now "$now_minute" '
       .forwards |= map(
         if .id == $id then
           .listen_ip = $listen_ip
@@ -1014,6 +1029,7 @@ config_update_forward() {
           | .remote_host = $remote_host
           | .remote_port = $remote_port
           | .stop_at = (if $stop_at == "" then null else $stop_at end)
+          | if $stop_at != "" and $stop_at > $now then .enabled = true else . end
           | .protocol = $protocol
           | .traffic_mode = $traffic_mode
           | .traffic_ratio = ($traffic_ratio | tonumber)

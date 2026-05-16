@@ -2079,19 +2079,23 @@ ui_forward_select_rows() {
 ui_user_forward_select_rows() {
     local user_id="$1"
     local allow_zero="${2:-false}"
+    local include_all="${3:-false}"
     local rows=""
     if [ "$allow_zero" = "true" ]; then
         rows+=$'0\t返回\t-\t-\t-\t-\n'
+    fi
+    if [ "$include_all" = "true" ]; then
+        rows+=$'1\t全部端口\t-\t-\t-\t-\n'
     fi
     while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
         local remote_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         rows+="$index"$'\t'"$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
-    done < <(jq -r --arg id "$user_id" '
+    done < <(jq -r --arg id "$user_id" --argjson start_index "$( [ "$include_all" = "true" ] && echo 2 || echo 1 )" '
       ([.forwards[] | select(.user_id == $id)] | sort_by(.listen_port, .id))
       | to_entries[]
       | [
-          ((.key + 1) | tostring),
+          ((.key + $start_index) | tostring),
           (.value.listen_port | tostring),
           .value.remote_host,
           (.value.remote_port | tostring),
@@ -2625,6 +2629,85 @@ ui_select_forwards_multi() {
     UI_REPLY="$forward_ids"
 }
 
+ui_render_forward_scope_page() {
+    local title="${1:-选择转发范围}"
+    ui_header "$title"
+    ui_notice_render
+    ui_menu_item 0 "返回"
+    ui_menu_item 1 "全部转发"
+    ui_menu_item 2 "按用户选择"
+}
+
+ui_select_forward_scoped() {
+    local allow_zero="${1:-false}"
+    local scope_title="${2:-选择转发范围}"
+    UI_EDIT_ABORTED=0
+
+    while true; do
+        ui_render_page ui_render_forward_scope_page "$scope_title" || return 1
+        ui_read "选择范围" || return 1
+        case "$UI_REPLY" in
+            0)
+                if [ "$allow_zero" = "true" ]; then
+                    UI_EDIT_ABORTED=1
+                    return 0
+                fi
+                ui_warn "无效选择"
+                ;;
+            1)
+                ui_select_forward "$allow_zero" || return 1
+                return 0
+                ;;
+            2)
+                ui_select_user true || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                local user_id="$UI_REPLY"
+                ui_select_user_forward "$user_id" true || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                return 0
+                ;;
+            *)
+                ui_warn "无效选择"
+                ;;
+        esac
+    done
+}
+
+ui_select_forwards_multi_scoped() {
+    local allow_zero="${1:-false}"
+    local scope_title="${2:-选择转发范围}"
+    UI_EDIT_ABORTED=0
+
+    while true; do
+        ui_render_page ui_render_forward_scope_page "$scope_title" || return 1
+        ui_read "选择范围" || return 1
+        case "$UI_REPLY" in
+            0)
+                if [ "$allow_zero" = "true" ]; then
+                    UI_EDIT_ABORTED=1
+                    return 0
+                fi
+                ui_warn "无效选择"
+                ;;
+            1)
+                ui_select_forwards_multi "$allow_zero" || return 1
+                return 0
+                ;;
+            2)
+                ui_select_user true || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                local user_id="$UI_REPLY"
+                ui_select_user_forwards_multi "$user_id" true || return 1
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                return 0
+                ;;
+            *)
+                ui_warn "无效选择"
+                ;;
+        esac
+    done
+}
+
 ui_batch_print_result() {
     local ok="$1"
     local fail="$2"
@@ -2640,15 +2723,28 @@ ui_select_user_forwards_multi() {
         ui_warn "该用户暂无转发"
         return 1
     fi
-    local count raw indexes forward_ids
+    local count raw indexes forward_ids index_count
     count="$(jq -r --arg id "$user_id" '[.forwards[] | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE")"
-    ui_render_page ui_render_user_forward_select_page "$user_id" "$allow_zero"
+    ui_render_page ui_render_user_forward_select_page "$user_id" "$allow_zero" "true"
     ui_read "选择转发序号，可多选：1,3,5 或 1-3" || return 1
     raw="$UI_REPLY"
-    ui_multiselect_parse_indexes "$raw" "$count" "$allow_zero" || return 1
+    ui_multiselect_parse_indexes "$raw" "$((count + 1))" "$allow_zero" || return 1
     [ "$UI_EDIT_ABORTED" = "1" ] && return 0
     indexes="$UI_REPLY"
-    forward_ids="$(ui_resolve_user_forward_ids_by_indexes "$user_id" "$indexes")"
+    if printf '%s\n' "$indexes" | grep -qx '1'; then
+        index_count="$(printf '%s\n' "$indexes" | sed '/^$/d' | wc -l | tr -d ' ')"
+        if [ "$index_count" != "1" ]; then
+            ui_warn "选择全部端口时不能和其他序号混合选择"
+            return 1
+        fi
+        forward_ids="$(jq -r --arg id "$user_id" '
+          [.forwards[] | select(.user_id == $id) | { id, listen_port, sort_id: .id }]
+          | sort_by(.listen_port, .sort_id)
+          | .[].id
+        ' "$PFWD_CONFIG_FILE")"
+    else
+        forward_ids="$(ui_resolve_user_forward_ids_by_indexes "$user_id" "$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')")"
+    fi
     [ -n "$forward_ids" ] || { ui_warn "转发序号不存在"; return 1; }
     UI_REPLY="$forward_ids"
 }
@@ -2843,7 +2939,7 @@ ui_menu_guard_skip_ports() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_select_forwards_multi true || { ui_pause; continue; }
+                ui_select_forwards_multi_scoped true "选择需要跳过协议封锁的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 forward_ids="$UI_REPLY"
                 ports="$(ui_resolve_listen_ports_by_forward_ids "$forward_ids")"
@@ -2957,13 +3053,14 @@ ui_select_user_forward_table() {
 ui_render_user_forward_select_page() {
     local user_id="$1"
     local allow_zero="${2:-false}"
+    local include_all="${3:-false}"
     ui_header "选择转发"
     ui_notice_render
     if [ "$allow_zero" = "true" ]; then
         ui_print_line "0) 返回" "$UI_C_ACCENT"
     fi
     ui_print_line "用户：$user_id" "$UI_C_HEADER"
-    ui_select_user_forward_table "$user_id" false
+    ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$(ui_user_forward_select_rows "$user_id" false "$include_all")" "3,6,2"
 }
 
 ui_select_user_forward() {
@@ -3150,7 +3247,7 @@ ui_menu_forwards() {
                 ;;
             2)
                 ui_require_users || { ui_pause; continue; }
-                ui_select_forward true || { ui_pause; continue; }
+                ui_select_forward_scoped true "选择要修改的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_ratio="" current_comment=""
                 local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
@@ -3301,7 +3398,7 @@ ui_menu_forwards() {
                 ;;
             3)
                 ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi || { ui_pause; continue; }
+                ui_select_forwards_multi_scoped true "选择要暂停的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local stop_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r forward_id; do
@@ -3318,7 +3415,7 @@ ui_menu_forwards() {
                 ;;
             4)
                 ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi || { ui_pause; continue; }
+                ui_select_forwards_multi_scoped true "选择要恢复的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local start_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r forward_id; do
@@ -3335,7 +3432,7 @@ ui_menu_forwards() {
                 ;;
             5)
                 ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi || { ui_pause; continue; }
+                ui_select_forwards_multi_scoped true "选择要删除的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local delete_ids="$UI_REPLY" summary=""
                 while IFS= read -r forward_id; do
