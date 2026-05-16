@@ -346,8 +346,7 @@ fw_render_runtime_to_stdout() {
 
 fw_render_nft_objects() {
     local runtime_json="$1"
-    local users_json stats_file today
-    today="$(pfwd_today)"
+    local users_json stats_file
     stats_file="$PFWD_STATS_FILE"
     users_json="$(jq -c '.users // []' <<< "$runtime_json")"
 

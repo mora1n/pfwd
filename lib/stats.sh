@@ -553,38 +553,48 @@ stats_set_user_reset_day() {
     user_id="$(normalize_user_id "$1")"
     day="$2"
     validate_user_id "$user_id"
-    validate_reset_day "$day"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    day="$(normalize_reset_day_input "$day")"
     if [ "$day" = "0" ]; then
         stats_update --arg id "$user_id" '(.users[$id] //= {}) | (.users[$id].reset_day) = null'
     else
-        stats_update --arg id "$user_id" --argjson day "$day" '(.users[$id] //= {}) | (.users[$id].reset_day) = $day'
+        stats_update --arg id "$user_id" --arg day "$day" '(.users[$id] //= {}) | (.users[$id].reset_day) = $day'
     fi
 }
 
 stats_set_forward_reset_day() {
     local forward_id="$1"
     local day="$2"
-    validate_reset_day "$day"
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
+    day="$(normalize_reset_day_input "$day")"
     if [ "$day" = "0" ]; then
         stats_update --arg id "$forward_id" '(.forwards[$id] //= {}) | (.forwards[$id].reset_day) = null'
     else
-        stats_update --arg id "$forward_id" --argjson day "$day" '(.forwards[$id] //= {}) | (.forwards[$id].reset_day) = $day'
+        stats_update --arg id "$forward_id" --arg day "$day" '(.forwards[$id] //= {}) | (.forwards[$id].reset_day) = $day'
     fi
 }
 
 stats_apply_due_resets() {
     stats_rollup_current
-    local today day month changed="false"
-    today="$(pfwd_today)"
-    day="$(date -d "$today" '+%-d')"
-    month="$(date -d "$today" '+%Y-%m')"
+    local now_minute month days_in_month changed="false"
+    now_minute="$(pfwd_now_minute)"
+    month="$(date -d "$now_minute" '+%Y-%m')"
+    days_in_month="$(date -d "$(date -d "$now_minute" '+%Y-%m-01') +1 month -1 day" '+%d')"
 
     local state line kind id reset_day last_month
-    state="$(jq -r --argjson day "$day" --arg month "$month" '
-      (.users // {} | to_entries[] | select((.value.reset_day // null) != null and (.value.reset_day <= $day) and (.value.last_reset_month // "") != $month) | ["user", .key, (.value.reset_day | tostring), (.value.last_reset_month // "")] | @tsv),
-      (.forwards // {} | to_entries[] | select((.value.reset_day // null) != null and (.value.reset_day <= $day) and (.value.last_reset_month // "") != $month) | ["forward", .key, (.value.reset_day | tostring), (.value.last_reset_month // "")] | @tsv)
+    state="$(jq -r --arg now "$now_minute" --arg month "$month" --argjson dim "$days_in_month" '
+      def schedule_due($reset_day; $now; $month; $dim):
+        (if ($reset_day | type) == "number" then
+          (($reset_day | tostring) + " 00:00")
+        else
+          $reset_day
+        end) as $normalized
+        | ($normalized | capture("^(?<day>[0-9]{2}) (?<time>[0-9]{2}:[0-9]{2})$")) as $parts
+        | (($parts.day | tonumber) as $configured_day
+        | (($configured_day | if . > $dim then $dim else . end) | tostring | if length == 1 then "0" + . else . end) as $effective_day
+        | ($month + "-" + $effective_day + " " + $parts.time)) <= $now;
+      (.users // {} | to_entries[] | select((.value.reset_day // null) != null and schedule_due(.value.reset_day; $now; $month; $dim) and (.value.last_reset_month // "") != $month) | ["user", .key, (.value.reset_day | tostring), (.value.last_reset_month // "")] | @tsv),
+      (.forwards // {} | to_entries[] | select((.value.reset_day // null) != null and schedule_due(.value.reset_day; $now; $month; $dim) and (.value.last_reset_month // "") != $month) | ["forward", .key, (.value.reset_day | tostring), (.value.last_reset_month // "")] | @tsv)
     ' "$PFWD_STATS_FILE")"
 
     while IFS=$'\t' read -r kind id reset_day last_month; do

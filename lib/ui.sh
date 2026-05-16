@@ -956,7 +956,7 @@ ui_forward_state_color() {
 ui_forward_display_state() {
     local enabled="$1"
     local stop_at="${2:-}"
-    local today
+    local now_minute
     if [ "$enabled" = "true" ] || [ "$enabled" = "启用" ] || [ "$enabled" = "已启用" ] || [ "$enabled" = "active" ]; then
         printf 'active'
         return 0
@@ -965,8 +965,8 @@ ui_forward_display_state() {
         printf 'paused'
         return 0
     fi
-    today="$(date '+%Y-%m-%d')"
-    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$today" -o "$stop_at" = "$today" ]; then
+    now_minute="$(pfwd_now_minute)"
+    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$now_minute" -o "$stop_at" = "$now_minute" ]; then
         printf 'stopped'
         return 0
     fi
@@ -1891,6 +1891,11 @@ ui_format_rate() {
     fi
 }
 
+ui_format_reset_day() {
+    local value="$1"
+    reset_day_display "$value"
+}
+
 ui_main_usage_json() {
     ui_cached_data "main_usage_json" fw_read_counters
 }
@@ -2114,7 +2119,7 @@ ui_print_user_traffic_summary() {
     forward_count="$(ui_user_forward_count "$user_id")"
     rows+="用户名"$'\t'"$user_id"$'\n'
     rows+="转发数"$'\t'"${forward_count} 个"$'\n'
-    rows+="重置日"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
+    rows+="重置日"$'\t'"$(ui_format_reset_day "$reset_day")"$'\n'
     rows+="总限额"$'\t'"$(ui_format_limit "$total_limit")"$'\n'
     rows+="每端口速率"$'\t'"$(ui_format_rate "$rate")"$'\n'
     rows+="计费用量"$'\t'"$(format_bytes "$used")"$'\n'
@@ -2134,7 +2139,7 @@ ui_print_main_user_summary() {
     fi
 
     while IFS=$'\t' read -r user count used two_way one_way limit reset_day; do
-        rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(ui_progress_bar "$used" "$limit")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_display_or_dash "$reset_day")"$'\n'
+        rows+="$user"$'\t'"$count"$'\t'"$(format_bytes "$used")"$'\t'"$(ui_progress_bar "$used" "$limit")"$'\t'"$(format_bytes "$two_way")"$'\t'"$(format_bytes "$one_way")"$'\t'"$(ui_format_limit "$limit")"$'\t'"$(ui_format_reset_day "$reset_day")"$'\n'
     done < <(ui_main_user_rows "$data")
     rows="${rows%$'\n'}"
     ui_table_render $'用户名\t转发数\t计费用量\t用量进度\t双向计费\t单向计费\t总限额\t重置日' "$rows" "1,6,7"
@@ -3399,11 +3404,11 @@ ui_menu_expire_limit() {
                     ui_select_traffic_scope "$user_id" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && continue
                     scope="$UI_REPLY"
-                    ui_form_set "流量管理" "修改转发到期日。输入 - 清空，0 返回上级。"
+                    ui_form_set "流量管理" "修改转发到期日。支持 YYYYMMDD 或 YYYY-MM-DD HH:MM；仅日期默认 00:00。输入 - 清空，0 返回上级。"
                     ui_form_add_kv "用户" "$user_id"
                     ui_form_add_kv "作用范围" "$scope"
                     if [[ "$scope" == user:* ]]; then
-                        ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
+                        ui_form_edit_read "转发到期日，支持 YYYYMMDD[ HH:MM]、+7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
                         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                         if [ -z "$UI_REPLY" ]; then
                             ui_warn "未修改"
@@ -3413,7 +3418,7 @@ ui_menu_expire_limit() {
                             ui_run cmd_expire user-set --user-id "${scope#user:}" --stop-at "$UI_REPLY"
                         fi
                     else
-                        ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
+                        ui_form_edit_read "转发到期日，支持 YYYYMMDD[ HH:MM]、+7/7d，输入 - 清空" || { ui_form_reset; ui_pause; continue; }
                         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
                         local stop_value="$UI_REPLY" ok=0 fail=0
                         if [ -z "$stop_value" ]; then
@@ -3536,7 +3541,7 @@ ui_menu_expire_limit() {
                     ui_maybe_pause success
                     ;;
                 3)
-                    ui_form_set "流量管理" "重置统计或设置重置日。"
+                    ui_form_set "流量管理" "重置统计或设置重置日。重置日支持 15 或 15 09:30；仅日期默认 00:00，0 关闭。"
                     ui_form_add_kv "用户" "$user_id"
                     ui_form_select_read "选择" "" "1) 立即重置" "2) 设置每月重置日" "0) 返回" || { ui_form_reset; continue; }
                     local reset_action="$UI_REPLY" scope="" args=()
@@ -3570,7 +3575,7 @@ ui_menu_expire_limit() {
                             [ "$UI_EDIT_ABORTED" = "1" ] && continue
                             scope="$UI_REPLY"
                             ui_form_add_kv "作用范围" "$scope"
-                            ui_form_read "每月重置日 1-31；0 关闭自动重置" || { ui_form_reset; continue; }
+                            ui_form_read "每月重置日，支持 15 或 15 09:30；0 关闭自动重置" || { ui_form_reset; continue; }
                             local day="$UI_REPLY"
                             if [ -z "$day" ]; then
                                 ui_warn "未修改"
@@ -3729,7 +3734,7 @@ ui_menu_telegram() {
                 ui_select_user true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 local schedule_user="$UI_REPLY" interval_choice="" interval_value="" daily_time=""
-                ui_form_set "Telegram 通知" "留空表示不修改；输入 0 可清除对应定时。"
+                ui_form_set "Telegram 通知" "留空表示不修改；输入 - 清空对应定时。"
                 ui_form_add_kv "目标用户" "$schedule_user"
                 ui_form_read "间隔发送，单位分钟；例如 60" || { ui_form_reset; continue; }
                 interval_choice="$UI_REPLY"
@@ -3737,12 +3742,12 @@ ui_menu_telegram() {
                 ui_form_read "每日发送时间 HH:MM；例如 09:30" || { ui_form_reset; continue; }
                 daily_time="$UI_REPLY"
                 ui_form_add_kv "每日发送时间" "$daily_time"
-                if [ "$interval_choice" = "0" ]; then
+                if [ "$interval_choice" = "-" ]; then
                     interval_value=""
                 else
                     interval_value="${interval_choice:-__KEEP__}"
                 fi
-                if [ "$daily_time" = "0" ]; then
+                if [ "$daily_time" = "-" ]; then
                     daily_time=""
                 elif [ -z "$daily_time" ]; then
                     daily_time="__KEEP__"

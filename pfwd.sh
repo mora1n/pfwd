@@ -210,16 +210,16 @@ pfwd - XDP 端口转发管理脚本
   pfwd start <forward_id>
   pfwd stop <forward_id>
   pfwd delete <forward_id>
-  pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]
-  pfwd expire set <forward_id> --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d
+  pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD[ HH:MM]|YYYY-MM-DD[ HH:MM]|YYYY/MM/DD[ HH:MM]|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]
+  pfwd expire set <forward_id> --stop-at YYYYMMDD[ HH:MM]|YYYY-MM-DD[ HH:MM]|YYYY/MM/DD[ HH:MM]|+7|7d
   pfwd expire clear <forward_id>
-  pfwd expire user-set --user-id ID --stop-at YYYYMMDD|YYYY-MM-DD|YYYY/MM/DD|+7|7d
+  pfwd expire user-set --user-id ID --stop-at YYYYMMDD[ HH:MM]|YYYY-MM-DD[ HH:MM]|YYYY/MM/DD[ HH:MM]|+7|7d
   pfwd expire user-clear --user-id ID
   pfwd limit set --forward-id ID [--traffic 100GB] [--rate 50Mbps] [--traffic-mode one-way|two-way]
   pfwd limit set --user-id ID [--traffic 1TB] [--rate 200Mbps]
   pfwd user-forwards-limit --user-id ID [--traffic 100GB] [--rate 50Mbps] [--traffic-mode one-way|two-way]
   pfwd traffic used set --user-id ID|--forward-id ID --used 100GB
-  pfwd traffic reset-day set --user-id ID|--forward-id ID --day 0-31
+  pfwd traffic reset-day set --user-id ID|--forward-id ID --day 0|15|15T09:30|'15 09:30'
   pfwd traffic reset-now --user-id ID|--forward-id ID
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]

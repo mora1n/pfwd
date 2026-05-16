@@ -251,11 +251,11 @@ guard_config_set_protocol_skip_ports() {
 }
 
 guard_active_port_specs() {
-    local today
-    today="$(pfwd_today)"
-    jq -r --arg today "$today" '
+    local now_minute
+    now_minute="$(pfwd_now_minute)"
+    jq -r --arg now "$now_minute" '
       .forwards[]
-      | select(.enabled == true and (.stop_at == null or .stop_at > $today))
+      | select(.enabled == true and (.stop_at == null or .stop_at > $now))
       | [.listen_port, (.protocol // "tcp_udp")] | @tsv
     ' "$(guard_config_file)"
 }

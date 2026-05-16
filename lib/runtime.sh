@@ -70,15 +70,15 @@ runtime_compiled_json() {
         config_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
 
-    local today rows rules_json="[]" users_json settings_json rule_index_json user_index_json
+    local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json
     local rules_tmp=""
     local -A user_limit_by_id=() user_index_by_id=() rule_index_by_id=() rule_billing_by_id=() user_billing_by_id=()
     local -A resolve_rows_cache=() resolve_error_cache=()
-    today="$(pfwd_today)"
+    now_minute="$(pfwd_now_minute)"
 
-    rows="$(jq -r --arg today "$today" '
+    rows="$(jq -r --arg now "$now_minute" '
       .forwards[]
-      | select(.enabled == true and (.stop_at == null or .stop_at > $today))
+      | select(.enabled == true and (.stop_at == null or .stop_at > $now))
       | [
           .id,
           .user_id,

@@ -96,6 +96,10 @@ pfwd_today() {
     date '+%Y-%m-%d'
 }
 
+pfwd_now_minute() {
+    date '+%Y-%m-%d %H:%M'
+}
+
 pfwd_mkdirs() {
     mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR"
 }

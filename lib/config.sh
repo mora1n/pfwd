@@ -700,7 +700,6 @@ config_set_forward_expire() {
     local forward_id="$1"
     local stop_at
     stop_at="$(normalize_date_input "$2")"
-    validate_date "$stop_at"
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
     config_update --arg id "$forward_id" --arg stop_at "$stop_at" '
       (.forwards[] | select(.id == $id) | .stop_at) = $stop_at
@@ -713,7 +712,6 @@ config_set_user_forwards_expire() {
     local stop_at
     stop_at="$(normalize_date_input "$2")"
     validate_user_id "$user_id"
-    validate_date "$stop_at"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     config_update --arg id "$user_id" --arg stop_at "$stop_at" '
       .forwards |= map(
@@ -1034,10 +1032,10 @@ config_update_forward() {
 }
 
 config_disable_expired() {
-    local today="$1"
-    config_update --arg today "$today" '
+    local now_minute="$1"
+    config_update --arg now "$now_minute" '
       .forwards |= map(
-        if .enabled == true and .stop_at != null and .stop_at <= $today
+        if .enabled == true and .stop_at != null and .stop_at <= $now
         then .enabled = false
         else .
         end
@@ -1047,8 +1045,8 @@ config_disable_expired() {
 
 config_disable_telegram_for_expired_users() {
     config_init >/dev/null
-    local today="$1"
-    config_update --arg today "$today" '
+    local now_minute="$1"
+    config_update --arg now "$now_minute" '
       . as $cfg
       | .users |= map(
           . as $user
@@ -1056,8 +1054,8 @@ config_disable_telegram_for_expired_users() {
             .
           else
             ([ $cfg.forwards[]? | select(.user_id == $user.id) ]) as $forwards
-            | ([ $forwards[] | select(.enabled == true and (.stop_at == null or .stop_at > $today)) ] | length) as $active_count
-            | ([ $forwards[] | select(.stop_at != null and .stop_at <= $today) ] | length) as $expired_count
+            | ([ $forwards[] | select(.enabled == true and (.stop_at == null or .stop_at > $now)) ] | length) as $active_count
+            | ([ $forwards[] | select(.stop_at != null and .stop_at <= $now) ] | length) as $expired_count
             | if (($forwards | length) > 0 and $active_count == 0 and $expired_count > 0) then
                 .telegram.enabled = false
               else

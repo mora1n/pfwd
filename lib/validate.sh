@@ -61,28 +61,80 @@ validate_date() {
 
 normalize_date_input() {
     local value="$1"
-    local normalized=""
-    value="$(printf '%s' "$value" | tr -d '[:space:]')"
+    local normalized="" date_part="" time_part="" checked=""
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [ -n "$value" ] || pfwd_die "日期不能为空"
 
-    if [[ "$value" =~ ^[0-9]{8}$ ]]; then
-        normalized="${value:0:4}-${value:4:2}-${value:6:2}"
-    elif [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        normalized="$value"
-    elif [[ "$value" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]]; then
-        normalized="${value//\//-}"
+    if [[ "$value" =~ ^([0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}/[0-9]{2}/[0-9]{2})([[:space:]]+([0-9]{2}:[0-9]{2}))?$ ]]; then
+        date_part="${BASH_REMATCH[1]}"
+        time_part="${BASH_REMATCH[3]:-00:00}"
+        if [[ "$date_part" =~ ^[0-9]{8}$ ]]; then
+            normalized="${date_part:0:4}-${date_part:4:2}-${date_part:6:2} ${time_part}"
+        elif [[ "$date_part" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]]; then
+            normalized="${date_part//\//-} ${time_part}"
+        else
+            normalized="${date_part} ${time_part}"
+        fi
     elif [[ "$value" =~ ^\+([0-9]+)$ ]]; then
-        normalized="$(date -d "+${BASH_REMATCH[1]} days" '+%Y-%m-%d' 2>/dev/null)" || pfwd_die "无效日期：$value"
+        normalized="$(date -d "+${BASH_REMATCH[1]} days" '+%Y-%m-%d 00:00' 2>/dev/null)" || pfwd_die "无效日期：$value"
     elif [[ "$value" =~ ^([0-9]+)[dD]$ ]]; then
-        normalized="$(date -d "+${BASH_REMATCH[1]} days" '+%Y-%m-%d' 2>/dev/null)" || pfwd_die "无效日期：$value"
+        normalized="$(date -d "+${BASH_REMATCH[1]} days" '+%Y-%m-%d 00:00' 2>/dev/null)" || pfwd_die "无效日期：$value"
     else
-        pfwd_die "无效日期：$value，支持 YYYYMMDD、YYYY-MM-DD、YYYY/MM/DD、+7、7d"
+        pfwd_die "无效日期：$value，支持 YYYYMMDD、YYYY-MM-DD、YYYY/MM/DD、可选 HH:MM、+7、7d"
     fi
 
-    local checked
-    checked="$(date -d "$normalized" '+%Y-%m-%d' 2>/dev/null)" || pfwd_die "无效日期：$value"
+    checked="$(date -d "$normalized" '+%Y-%m-%d %H:%M' 2>/dev/null)" || pfwd_die "无效日期：$value"
     [ "$checked" = "$normalized" ] || pfwd_die "无效日期：$value"
     echo "$normalized"
+}
+
+validate_reset_day() {
+    local value="$1"
+    normalize_reset_day_input "$value" >/dev/null
+}
+
+normalize_reset_day_input() {
+    local value="$1"
+    local day="" time_part="00:00"
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$value" ] || pfwd_die "重置日不能为空"
+
+    if [ "$value" = "0" ]; then
+        printf '0\n'
+        return 0
+    fi
+
+    if [[ "$value" =~ ^([0-9]{1,2})([[:space:]]+|T)?([0-9]{2}:[0-9]{2})?$ ]]; then
+        day="${BASH_REMATCH[1]}"
+        [ -n "${BASH_REMATCH[3]:-}" ] && time_part="${BASH_REMATCH[3]}"
+    else
+        pfwd_die "无效重置日：$value，支持 0、1-31、或 15 09:30"
+    fi
+
+    [[ "$day" =~ ^[0-9]+$ ]] || pfwd_die "无效重置日：$value"
+    [ "$day" -ge 1 ] && [ "$day" -le 31 ] || pfwd_die "重置日必须是 1-31，或 0 表示关闭：$value"
+    validate_hhmm_time "$time_part"
+    printf '%02d %s\n' "$day" "$time_part"
+}
+
+reset_day_to_json() {
+    local value="$1"
+    local normalized
+    normalized="$(normalize_reset_day_input "$value")"
+    if [ "$normalized" = "0" ]; then
+        printf 'null\n'
+    else
+        jq -Rn --arg value "$normalized" '$value'
+    fi
+}
+
+reset_day_display() {
+    local value="$1"
+    if [ -z "$value" ] || [ "$value" = "null" ] || [ "$value" = "-" ]; then
+        printf '%s\n' "-"
+    else
+        printf '%s\n' "$value"
+    fi
 }
 
 validate_traffic_mode() {

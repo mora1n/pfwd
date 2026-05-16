@@ -576,7 +576,7 @@ cmd_forward() {
     shift || true
     case "$sub" in
         update) cmd_forward_update "$@" ;;
-        *) pfwd_die "用法：pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]" ;;
+        *) pfwd_die "用法：pfwd forward update --forward-id ID [--listen-ip IP] [--listen-port PORT] [--remote-host HOST] [--remote-port PORT] [--stop-at YYYYMMDD[ HH:MM]|YYYY-MM-DD[ HH:MM]|YYYY/MM/DD[ HH:MM]|+7|7d|--clear-stop-at] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT|--clear-comment] [--mss-clamp|--mss VALUE|--clear-mss] [--masquerade|--snat-source IP]" ;;
     esac
 }
 
@@ -741,7 +741,7 @@ cmd_traffic() {
         reset-day)
             local scope="${1:-}"
             shift || true
-            [ "$scope" = "set" ] || pfwd_die "用法：pfwd traffic reset-day set --user-id ID|--forward-id ID --day 1"
+            [ "$scope" = "set" ] || pfwd_die "用法：pfwd traffic reset-day set --user-id ID|--forward-id ID --day 0|15|15T09:30|'15 09:30'"
             local user_id="" forward_id="" day=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
@@ -889,14 +889,14 @@ cmd_refresh() {
 
 cmd_reconcile() {
     config_init >/dev/null
-    local before after today need_refresh=false sent
+    local before after now_minute need_refresh=false sent
     if stats_apply_due_resets; then
         need_refresh=true
     fi
-    today="$(pfwd_today)"
+    now_minute="$(pfwd_now_minute)"
     before="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
-    config_disable_expired "$today"
-    config_disable_telegram_for_expired_users "$today"
+    config_disable_expired "$now_minute"
+    config_disable_telegram_for_expired_users "$now_minute"
     after="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
     if [ "$before" != "$after" ]; then
         need_refresh=true
