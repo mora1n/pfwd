@@ -242,17 +242,93 @@ cmd_user() {
             jq -r '.users[]?.id' "$PFWD_CONFIG_FILE"
             ;;
         delete)
-            [ "$#" -eq 1 ] || pfwd_die "用法：pfwd user delete <username>"
-            local user_id
-            user_id="$(normalize_user_id "$1")"
-            config_delete_user "$user_id"
-            echo "用户已删除：$user_id"
+            cmd_user_delete "$@"
             ;;
         telegram)
             cmd_user_telegram "$@"
             ;;
         *) pfwd_die "用法：pfwd user add|list|delete|telegram" ;;
     esac
+}
+
+cmd_format_remote() {
+    local host="$1"
+    local port="$2"
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+cmd_protocol_label() {
+    case "${1:-tcp_udp}" in
+        tcp) printf 'TCP' ;;
+        udp) printf 'UDP' ;;
+        *) printf 'TCP+UDP' ;;
+    esac
+}
+
+cmd_forward_state_label() {
+    local enabled="$1"
+    local stop_at="${2:-}"
+    local now_minute
+    if [ "$enabled" = "true" ]; then
+        printf '启用'
+        return 0
+    fi
+    now_minute="$(pfwd_now_minute)"
+    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$now_minute" -o "$stop_at" = "$now_minute" ]; then
+        printf '停止'
+        return 0
+    fi
+    printf '停用'
+}
+
+cmd_print_user_forward_summary() {
+    local user_id
+    user_id="$(normalize_user_id "$1")"
+    local listen_port remote_host remote_port protocol enabled stop_at remote_text state_text
+    while IFS=$'\t' read -r listen_port remote_host remote_port protocol enabled stop_at; do
+        [ -n "$listen_port" ] || continue
+        remote_text="$(cmd_format_remote "$remote_host" "$remote_port")"
+        state_text="$(cmd_forward_state_label "$enabled" "$stop_at")"
+        printf '  %s -> %s  %s  %s\n' "$listen_port" "$remote_text" "$(cmd_protocol_label "$protocol")" "$state_text"
+    done < <(config_user_forward_summary_tsv "$user_id")
+}
+
+cmd_user_delete() {
+    [ "$#" -ge 1 ] || pfwd_die "用法：pfwd user delete <username> [--cascade]"
+    local user_id cascade="false"
+    user_id="$(normalize_user_id "$1")"
+    shift || true
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --cascade) cascade="true"; shift ;;
+            *) pfwd_die "用法：pfwd user delete <username> [--cascade]" ;;
+        esac
+    done
+    [ -n "$user_id" ] || pfwd_die "用法：pfwd user delete <username> [--cascade]"
+
+    local forward_count deleted_ports
+    forward_count="$(config_user_forward_count "$user_id")"
+    if [ "$forward_count" -gt 0 ] && [ "$cascade" != "true" ]; then
+        echo "用户 $user_id 仍有关联转发："
+        cmd_print_user_forward_summary "$user_id"
+        pfwd_die "如需连带删除上述端口，请使用：pfwd user delete $user_id --cascade"
+    fi
+
+    if [ "$forward_count" -gt 0 ]; then
+        deleted_ports="$(config_user_forward_summary_tsv "$user_id" | awk -F $'\t' 'NF {print $1}' | paste -sd, -)"
+        config_delete_user_cascade "$user_id"
+        echo "用户已删除：$user_id（同时删除 $forward_count 条转发：$deleted_ports）"
+        stats_rollup_current
+        cmd_apply_forwarding_bundle
+        return 0
+    fi
+
+    config_delete_user "$user_id"
+    echo "用户已删除：$user_id"
 }
 
 cmd_user_telegram() {

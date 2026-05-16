@@ -230,6 +230,57 @@ config_delete_user() {
     config_update --arg id "$user_id" '.users = [.users[] | select(.id != $id)]'
 }
 
+config_user_forward_count() {
+    local user_id
+    user_id="$(normalize_user_id "$1")"
+    validate_user_id "$user_id"
+    config_init >/dev/null
+    config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    jq -r --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length' "$PFWD_CONFIG_FILE"
+}
+
+config_user_forward_summary_tsv() {
+    local user_id
+    user_id="$(normalize_user_id "$1")"
+    validate_user_id "$user_id"
+    config_init >/dev/null
+    config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    jq -r --arg id "$user_id" '
+      [.forwards[]? | select(.user_id == $id) | {
+        listen_port,
+        remote_host,
+        remote_port,
+        protocol: (.protocol // "tcp_udp"),
+        enabled: (if .enabled then "true" else "false" end),
+        stop_at: (.stop_at // "-"),
+        sort_id: .id
+      }]
+      | sort_by(.listen_port, .sort_id)
+      | .[]
+      | [
+          (.listen_port | tostring),
+          .remote_host,
+          (.remote_port | tostring),
+          .protocol,
+          .enabled,
+          .stop_at
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
+config_delete_user_cascade() {
+    local user_id
+    user_id="$(normalize_user_id "$1")"
+    validate_user_id "$user_id"
+    config_init >/dev/null
+    config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
+    config_update --arg id "$user_id" '
+      .forwards = [.forwards[] | select(.user_id != $id)]
+      | .users = [.users[] | select(.id != $id)]
+    '
+}
+
 config_set_user_telegram() {
     local user_id
     user_id="$(normalize_user_id "$1")"

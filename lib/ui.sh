@@ -1304,6 +1304,22 @@ ui_run() {
     return 0
 }
 
+ui_run_capture() {
+    local output="" status=0
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        ui_dry_run_reset
+    fi
+    UI_REPLY=""
+    output="$("$@" 2>&1)" || status=$?
+    UI_REPLY="$output"
+    if [ "$status" -eq 0 ]; then
+        UI_STATUS=0
+    else
+        UI_STATUS=1
+    fi
+    return 0
+}
+
 ui_confirm_text() {
     local expected="$1"
     local prompt="$2"
@@ -2106,6 +2122,48 @@ ui_user_forward_select_rows() {
       | @tsv
     ' "$PFWD_CONFIG_FILE")
     printf '%s' "${rows%$'\n'}"
+}
+
+ui_user_delete_forward_rows() {
+    local user_id="$1"
+    local rows=""
+    local listen_port remote_host remote_port protocol enabled stop_at remote_text state_text
+    while IFS=$'\t' read -r listen_port remote_host remote_port protocol enabled stop_at; do
+        [ -n "$listen_port" ] || continue
+        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
+        state_text="$(ui_forward_state_text "$(ui_forward_display_state "$enabled" "$stop_at")")"
+        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state_text"$'\n'
+    done < <(config_user_forward_summary_tsv "$user_id")
+    printf '%s' "${rows%$'\n'}"
+}
+
+ui_print_user_delete_preview() {
+    local user_ids="$1"
+    local has_forwards="false"
+    local user_id count
+
+    ui_print_line "将删除以下用户：" "$UI_C_WARN"
+    while IFS= read -r user_id; do
+        [ -n "$user_id" ] || continue
+        printf '%s\n' "$user_id"
+    done <<< "$user_ids"
+
+    while IFS= read -r user_id; do
+        [ -n "$user_id" ] || continue
+        count="$(config_user_forward_count "$user_id")"
+        [ "$count" -gt 0 ] || continue
+        has_forwards="true"
+        printf '\n'
+        ui_print_line "用户：$user_id（以下转发将一并删除）" "$UI_C_WARN"
+        ui_table_render $'监听\t目标\t协议\t状态' "$(ui_user_delete_forward_rows "$user_id")" "2,4"
+    done <<< "$user_ids"
+
+    if [ "$has_forwards" = "true" ]; then
+        printf '\n'
+        ui_print_line "以上关联转发会随用户一起删除。" "$UI_C_WARN"
+    fi
+
+    UI_REPLY="$has_forwards"
 }
 
 ui_print_user_traffic_summary() {
@@ -3124,23 +3182,28 @@ ui_menu_users() {
             2)
                 ui_select_users_multi true || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local user_ids="$UI_REPLY" user_list=""
-                while IFS= read -r user_id; do
-                    [ -n "$user_id" ] || continue
-                    user_list+="${user_id}"$'\n'
-                done <<< "$user_ids"
-                user_list="${user_list%$'\n'}"
-                ui_print_line "将删除以下用户：" "$UI_C_WARN"
-                printf '%s\n' "$user_list"
-                if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
+                local user_ids="$UI_REPLY" has_forwards="" confirm_prompt=""
+                ui_print_user_delete_preview "$user_ids"
+                has_forwards="$UI_REPLY"
+                if [ "$has_forwards" = "true" ]; then
+                    confirm_prompt="输入 delete 确认删除用户及其关联转发"
+                else
+                    confirm_prompt="输入 delete 确认批量删除"
+                fi
+                if ui_confirm_text "delete" "$confirm_prompt"; then
                     local ok=0 fail=0
                     while IFS= read -r user_id; do
                         [ -n "$user_id" ] || continue
-                        if cmd_user delete "$user_id"; then
+                        ui_run_capture cmd_user delete "$user_id" --cascade
+                        if [ "$UI_STATUS" -eq 0 ]; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "删除失败：$user_id"
+                            if [ -n "$UI_REPLY" ]; then
+                                ui_error "$UI_REPLY"
+                            else
+                                ui_error "删除失败：$user_id"
+                            fi
                         fi
                     done <<< "$user_ids"
                     ui_batch_print_result "$ok" "$fail"

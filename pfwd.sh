@@ -202,7 +202,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd init
   pfwd user add <username>
   pfwd user list
-  pfwd user delete <username>
+  pfwd user delete <username> [--cascade]
   pfwd user telegram <username>|--all --bot-token TOKEN --chat-id CHAT_ID [--server-name NAME] [--enabled true|false]
   pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --listen-port PORT[,PORT]|START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
   pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --random-port START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
