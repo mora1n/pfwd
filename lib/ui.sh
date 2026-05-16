@@ -374,6 +374,11 @@ ui_page_draw() {
         ui_print_line "$status_text" "$UI_C_DIM"
     fi
 
+    # The prompt line may shrink when we switch from showing [default] to
+    # showing typed input. Clear from the prompt row to the end of screen so
+    # wrapped default text from the previous draw cannot remain on screen.
+    printf '\033[J'
+
     if [ -n "$prompt" ]; then
         if [ -n "$default" ] && [ -z "$buffer" ]; then
             printf '%s [%s]: %s' "$prompt" "$default" "$buffer"
