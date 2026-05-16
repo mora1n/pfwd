@@ -3374,27 +3374,30 @@ ui_menu_forwards() {
 }
 
 ui_menu_expire_limit() {
+    local user_id=""
     while true; do
-        ui_render_page ui_render_traffic_select_user_page
-        ui_read "选择用户序号" || return 0
-        if ! ui_has_users; then
+        if [ -z "$user_id" ]; then
+            ui_render_page ui_render_traffic_select_user_page
+            ui_read "选择用户序号" || return 0
+            if ! ui_has_users; then
+                case "$UI_REPLY" in
+                    0) return 0 ;;
+                    *) ui_require_users; ui_pause; continue ;;
+                esac
+            fi
             case "$UI_REPLY" in
                 0) return 0 ;;
-                *) ui_require_users; ui_pause; continue ;;
+                '')
+                    ui_warn "无效序号"
+                    ui_pause
+                    continue
+                    ;;
             esac
+            [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
+            user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
+            [ -n "$user_id" ] || { ui_warn "用户序号不存在"; ui_pause; user_id=""; continue; }
         fi
-        case "$UI_REPLY" in
-            0) return 0 ;;
-            '')
-                ui_warn "无效序号"
-                ui_pause
-                continue
-                ;;
-        esac
-        [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
-        local user_id
-        user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
-        [ -n "$user_id" ] || { ui_warn "用户序号不存在"; ui_pause; continue; }
+
         while true; do
             ui_render_page ui_render_traffic_user_menu_page "$user_id"
             ui_read "选择" || return 0
@@ -3652,7 +3655,10 @@ ui_menu_expire_limit() {
                     ui_form_reset
                     ui_maybe_pause success
                     ;;
-                0) return 0 ;;
+                0)
+                    user_id=""
+                    break
+                    ;;
                 *) ui_warn "无效选择"; ui_pause ;;
             esac
         done
