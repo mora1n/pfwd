@@ -2142,12 +2142,11 @@ ui_user_forward_select_rows() {
 ui_user_forward_summary_rows() {
     local user_id="$1"
     local rows=""
-    local listen_port remote_host remote_port protocol enabled stop_at remote_text state_text
+    local listen_port remote_host remote_port protocol enabled stop_at remote_text
     while IFS=$'\t' read -r listen_port remote_host remote_port protocol enabled stop_at; do
         [ -n "$listen_port" ] || continue
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        state_text="$(ui_forward_state_text "$(ui_forward_display_state "$enabled" "$stop_at")")"
-        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state_text"$'\t'"$stop_at"$'\n'
+        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\t'"$stop_at"$'\n'
     done < <(config_user_forward_summary_tsv "$user_id")
     printf '%s' "${rows%$'\n'}"
 }
@@ -2155,12 +2154,11 @@ ui_user_forward_summary_rows() {
 ui_user_delete_forward_rows() {
     local user_id="$1"
     local rows=""
-    local listen_port remote_host remote_port protocol enabled stop_at remote_text state_text
+    local listen_port remote_host remote_port protocol enabled stop_at remote_text
     while IFS=$'\t' read -r listen_port remote_host remote_port protocol enabled stop_at; do
         [ -n "$listen_port" ] || continue
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
-        state_text="$(ui_forward_state_text "$(ui_forward_display_state "$enabled" "$stop_at")")"
-        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state_text"$'\n'
+        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$enabled"$'\n'
     done < <(config_user_forward_summary_tsv "$user_id")
     printf '%s' "${rows%$'\n'}"
 }
