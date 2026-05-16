@@ -2124,6 +2124,19 @@ ui_user_forward_select_rows() {
     printf '%s' "${rows%$'\n'}"
 }
 
+ui_user_forward_summary_rows() {
+    local user_id="$1"
+    local rows=""
+    local listen_port remote_host remote_port protocol enabled stop_at remote_text state_text
+    while IFS=$'\t' read -r listen_port remote_host remote_port protocol enabled stop_at; do
+        [ -n "$listen_port" ] || continue
+        remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
+        state_text="$(ui_forward_state_text "$(ui_forward_display_state "$enabled" "$stop_at")")"
+        rows+="$listen_port"$'\t'"$remote_text"$'\t'"$(ui_protocol_label "$protocol")"$'\t'"$state_text"$'\t'"$stop_at"$'\n'
+    done < <(config_user_forward_summary_tsv "$user_id")
+    printf '%s' "${rows%$'\n'}"
+}
+
 ui_user_delete_forward_rows() {
     local user_id="$1"
     local rows=""
@@ -2359,6 +2372,16 @@ ui_print_forward_list() {
         return
     fi
     ui_render_forward_groups "$(ui_forward_list_rows)" $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注' "4,12,2,7,8,10,3" "$(ui_empty_forwards_text)"
+}
+
+ui_print_user_forward_summary() {
+    local user_id="$1"
+    config_init >/dev/null
+    if ! jq -e --arg id "$user_id" '[.forwards[]? | select(.user_id == $id)] | length > 0' "$PFWD_CONFIG_FILE" >/dev/null; then
+        ui_print_line "$(ui_empty_forwards_text)"
+        return
+    fi
+    ui_table_render $'监听\t目标\t协议\t状态\t到期' "$(ui_user_forward_summary_rows "$user_id")" "2,5"
 }
 
 ui_print_user_list() {
@@ -2691,7 +2714,7 @@ ui_render_forward_scope_page() {
     local title="${1:-选择转发范围}"
     ui_header "$title"
     ui_notice_render
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
     ui_menu_item 1 "全部转发"
     ui_menu_item 2 "按用户选择"
 }
@@ -3072,7 +3095,7 @@ ui_render_forward_select_page() {
     ui_header "选择转发"
     ui_notice_render
     if [ "$allow_zero" = "true" ]; then
-        ui_print_line "0) 返回" "$UI_C_ACCENT"
+        ui_print_line "0) 返回上级菜单" "$UI_C_ACCENT"
     fi
     ui_select_forward_table false
 }
@@ -3115,7 +3138,7 @@ ui_render_user_forward_select_page() {
     ui_header "选择转发"
     ui_notice_render
     if [ "$allow_zero" = "true" ]; then
-        ui_print_line "0) 返回" "$UI_C_ACCENT"
+        ui_print_line "0) 返回上级菜单" "$UI_C_ACCENT"
     fi
     ui_print_line "用户：$user_id" "$UI_C_HEADER"
     ui_table_render $'序号\t监听\t目标\t协议\t状态\t到期' "$(ui_user_forward_select_rows "$user_id" false "$include_all")" "3,6,2"
@@ -3145,7 +3168,7 @@ ui_select_user_forward() {
 ui_select_traffic_scope() {
     local user_id="$1"
     UI_EDIT_ABORTED=0
-    echo "0) 返回"
+    echo "0) 返回上级菜单"
     echo "1) 用户所有端口"
     echo "2) 选择端口，可多选"
     ui_read "作用范围" "1" || return 1
@@ -3220,12 +3243,17 @@ ui_menu_users() {
 }
 
 ui_menu_add_forward() {
+    local preset_user_id="${1:-}"
     local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode traffic_ratio comment args=()
     local user_defaults="" default_rate="" default_stop_at="" default_traffic_mode="" stop_prompt=""
     ui_form_set "添加转发" "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。"
-    ui_select_user true || return 0
-    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
-    user_id="$UI_REPLY"
+    if [ -n "$preset_user_id" ]; then
+        user_id="$preset_user_id"
+    else
+        ui_select_user true || return 0
+        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+        user_id="$UI_REPLY"
+    fi
     user_defaults="$(config_user_forward_defaults_json "$user_id")"
     default_rate="$(jq -r '.rate // ""' <<< "$user_defaults")"
     default_stop_at="$(jq -r '.stop_at // ""' <<< "$user_defaults")"
@@ -3309,238 +3337,261 @@ ui_menu_add_forward() {
 }
 
 ui_menu_forwards() {
+    local user_id=""
     while true; do
-        ui_render_page ui_render_forwards_menu_page
-        ui_read "选择" || return 0
-        case "$UI_REPLY" in
-            1)
-                ui_require_users || { ui_pause; continue; }
-                ui_menu_add_forward
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
-                ;;
-            2)
-                ui_require_users || { ui_pause; continue; }
-                ui_select_forward_scoped true "选择要修改的转发范围" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_ratio="" current_comment=""
-                local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
-                local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" traffic_ratio="" comment="" args=()
-                current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
-                current_listen_ip="$(jq -r '.listen_ip // "::"' <<< "$current")"
-                current_listen_port="$(jq -r '.listen_port' <<< "$current")"
-                current_remote_host="$(jq -r '.remote_host' <<< "$current")"
-                current_remote_port="$(jq -r '.remote_port' <<< "$current")"
-                current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
-                current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
-                current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
-                current_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
-                current_comment="$(jq -r '.comment // ""' <<< "$current")"
-                current_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$current")"
-                current_mss_value="$(jq -r '.net.mss_value // ""' <<< "$current")"
-                current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$current")"
-                current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$current")"
-
-                ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
-                ui_form_add_kv "转发 ID" "$forward_id"
-                ui_form_add_kv "当前监听 IP" "$current_listen_ip"
-                ui_form_add_kv "当前监听端口" "$current_listen_port"
-                ui_form_add_kv "当前目标 IP/域名" "$current_remote_host"
-                ui_form_add_kv "当前目标端口" "$current_remote_port"
-                ui_form_add_kv "当前协议" "$(ui_protocol_label "$current_protocol")"
-                ui_form_add_kv "当前计费模式" "$( [ "$current_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
-                ui_form_add_kv "当前倍率" "$(format_ratio "$current_ratio")"
-                ui_form_add_kv "当前到期日" "${current_stop_at:-}"
-                ui_form_add_kv "当前备注" "$current_comment"
-
-                ui_form_edit_read "监听 IP" "$current_listen_ip" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                listen_ip="$UI_REPLY"
-                ui_form_add_kv "新监听 IP" "$listen_ip"
-
-                ui_form_edit_read "监听端口" "$current_listen_port" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                listen_port="$UI_REPLY"
-                ui_form_add_kv "新监听端口" "$listen_port"
-
-                ui_form_edit_read "目标 IP/域名" "$current_remote_host" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                remote_host="$UI_REPLY"
-                ui_form_add_kv "新目标 IP/域名" "$remote_host"
-
-                ui_form_edit_read "目标端口" "$current_remote_port" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                remote_port="$UI_REPLY"
-                ui_form_add_kv "新目标端口" "$remote_port"
-
-                ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d" "${current_stop_at:-}" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                stop_at="$UI_REPLY"
-                ui_form_add_kv "新到期日" "$stop_at"
-
-                ui_select_protocol_edit "转发协议" "$current_protocol" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                protocol="$UI_REPLY"
-                [ -z "$protocol" ] || ui_form_add_kv "新协议" "$(ui_protocol_label "$protocol")"
-
-                ui_select_traffic_mode_edit "计费模式" "$current_mode" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                traffic_mode="$UI_TRAFFIC_MODE"
-                [ -z "$traffic_mode" ] || ui_form_add_kv "新计费模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
-
-                ui_read_traffic_ratio_edit "流量倍率" "$current_ratio" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                traffic_ratio="$UI_TRAFFIC_RATIO"
-                ui_form_add_kv "新倍率" "$(format_ratio "$traffic_ratio")"
-
-                ui_form_edit_read "备注" "$current_comment" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                comment="$UI_REPLY"
-                ui_form_add_kv "新备注" "$comment"
-
-                ui_select_mss_mode_edit "MSS 处理方式" "$current_mss_mode" "$current_mss_value" "$remote_host" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                case "$UI_MSS_MODE" in
-                    clamp) ui_form_add_kv "新 MSS" "Clamp" ;;
-                    set) ui_form_add_kv "新 MSS" "$UI_MSS_VALUE" ;;
-                    __CLEAR__) ui_form_add_kv "新 MSS" "清空" ;;
+        if [ -z "$user_id" ]; then
+            ui_render_page ui_render_forwards_select_user_page
+            ui_read "选择用户序号" || return 0
+            if ! ui_has_users; then
+                case "$UI_REPLY" in
+                    0) return 0 ;;
+                    *) ui_require_users; ui_pause; continue ;;
                 esac
-                ui_select_snat_mode_edit "SNAT 处理方式" "$current_snat_mode" "$current_snat_source" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
-                case "$UI_SNAT_MODE" in
-                    snat) ui_form_add_kv "新 SNAT" "$UI_SNAT_SOURCE" ;;
-                    masquerade) ui_form_add_kv "新 SNAT" "masquerade" ;;
-                esac
+            fi
+            case "$UI_REPLY" in
+                0) return 0 ;;
+                '') ui_warn "无效序号"; ui_pause; continue ;;
+            esac
+            [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
+            user_id="$(jq -r --argjson idx "$UI_REPLY" '.users[$idx - 1].id // ""' "$PFWD_CONFIG_FILE")"
+            [ -n "$user_id" ] || { ui_warn "用户序号不存在"; ui_pause; user_id=""; continue; }
+        fi
 
-                args=(--forward-id "$forward_id")
-                [ "$listen_ip" = "$current_listen_ip" ] || args+=(--listen-ip "$listen_ip")
-                [ "$listen_port" = "$current_listen_port" ] || args+=(--listen-port "$listen_port")
-                [ "$remote_host" = "$current_remote_host" ] || args+=(--remote-host "$remote_host")
-                [ "$remote_port" = "$current_remote_port" ] || args+=(--remote-port "$remote_port")
-                if [ "$stop_at" = "-" ]; then
-                    [ -n "$current_stop_at" ] && args+=(--clear-stop-at)
-                elif [ "$stop_at" != "$current_stop_at" ]; then
-                    [ -n "$stop_at" ] && args+=(--stop-at "$stop_at")
-                fi
-                [ -z "$protocol" ] || [ "$protocol" = "$current_protocol" ] || args+=(--protocol "$protocol")
-                [ -z "$traffic_mode" ] || [ "$traffic_mode" = "$current_mode" ] || args+=(--traffic-mode "$traffic_mode")
-                [ -z "$traffic_ratio" ] || [ "$traffic_ratio" = "$current_ratio" ] || args+=(--traffic-ratio "$traffic_ratio")
-                if [ "$comment" = "-" ]; then
-                    [ -n "$current_comment" ] && args+=(--clear-comment)
-                elif [ "$comment" != "$current_comment" ]; then
-                    args+=(--comment "$comment")
-                fi
-                case "$UI_MSS_MODE" in
-                    clamp)
-                        if [ "$current_mss_mode" != "clamp" ]; then
-                            args+=(--mss-clamp)
-                        fi
-                        ;;
-                    set)
-                        if [ "$current_mss_mode" != "set" ] || [ "$UI_MSS_VALUE" != "$current_mss_value" ]; then
-                            args+=(--mss "$UI_MSS_VALUE")
-                        fi
-                        ;;
-                    __CLEAR__)
-                        if [ -n "$current_mss_mode" ] || [ -n "$current_mss_value" ]; then
-                            args+=(--clear-mss)
-                        fi
-                        ;;
-                esac
-                case "$UI_SNAT_MODE" in
-                    snat)
-                        if [ "$current_snat_mode" != "snat" ] || [ "$UI_SNAT_SOURCE" != "$current_snat_source" ]; then
-                            args+=(--snat-source "$UI_SNAT_SOURCE")
-                        fi
-                        ;;
-                    masquerade)
-                        if [ "$current_snat_mode" != "masquerade" ] || [ -n "$current_snat_source" ]; then
-                            args+=(--masquerade)
-                        fi
-                        ;;
-                esac
+        while true; do
+            ui_render_page ui_render_forwards_menu_page "$user_id"
+            ui_read "选择" || return 0
+            case "$UI_REPLY" in
+                1)
+                    ui_menu_add_forward "$user_id"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已添加" "$UI_C_MENU_NUM"
+                    ui_maybe_pause success
+                    ;;
+                2)
+                    ui_select_user_forward "$user_id" true || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                    local forward_id="$UI_REPLY" current="" current_listen_ip="" current_listen_port="" current_remote_host="" current_remote_port="" current_stop_at="" current_protocol="" current_mode="" current_ratio="" current_comment=""
+                    local current_mss_mode="" current_mss_value="" current_snat_mode="" current_snat_source=""
+                    local listen_ip="" listen_port="" remote_host="" remote_port="" stop_at="" protocol="" traffic_mode="" traffic_ratio="" comment="" args=()
+                    current="$(jq -c --arg id "$forward_id" '.forwards[] | select(.id == $id)' "$PFWD_CONFIG_FILE")"
+                    current_listen_ip="$(jq -r '.listen_ip // "::"' <<< "$current")"
+                    current_listen_port="$(jq -r '.listen_port' <<< "$current")"
+                    current_remote_host="$(jq -r '.remote_host' <<< "$current")"
+                    current_remote_port="$(jq -r '.remote_port' <<< "$current")"
+                    current_stop_at="$(jq -r '.stop_at // ""' <<< "$current")"
+                    current_protocol="$(jq -r '.protocol // "tcp_udp"' <<< "$current")"
+                    current_mode="$(jq -r '.traffic_mode // "two-way"' <<< "$current")"
+                    current_ratio="$(jq -r '(.traffic_ratio // 1) | tostring' <<< "$current")"
+                    current_comment="$(jq -r '.comment // ""' <<< "$current")"
+                    current_mss_mode="$(jq -r '.net.mss_mode // ""' <<< "$current")"
+                    current_mss_value="$(jq -r '.net.mss_value // ""' <<< "$current")"
+                    current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$current")"
+                    current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$current")"
 
-                if [ "${#args[@]}" -eq 2 ]; then
-                    ui_warn "未修改"
-                else
+                    ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
+                    ui_form_add_kv "用户" "$user_id"
+                    ui_form_add_kv "转发 ID" "$forward_id"
+                    ui_form_add_kv "当前监听 IP" "$current_listen_ip"
+                    ui_form_add_kv "当前监听端口" "$current_listen_port"
+                    ui_form_add_kv "当前目标 IP/域名" "$current_remote_host"
+                    ui_form_add_kv "当前目标端口" "$current_remote_port"
+                    ui_form_add_kv "当前协议" "$(ui_protocol_label "$current_protocol")"
+                    ui_form_add_kv "当前计费模式" "$( [ "$current_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
+                    ui_form_add_kv "当前倍率" "$(format_ratio "$current_ratio")"
+                    ui_form_add_kv "当前到期日" "${current_stop_at:-}"
+                    ui_form_add_kv "当前备注" "$current_comment"
+
+                    ui_form_edit_read "监听 IP" "$current_listen_ip" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    listen_ip="$UI_REPLY"
+                    ui_form_add_kv "新监听 IP" "$listen_ip"
+
+                    ui_form_edit_read "监听端口" "$current_listen_port" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    listen_port="$UI_REPLY"
+                    ui_form_add_kv "新监听端口" "$listen_port"
+
+                    ui_form_edit_read "目标 IP/域名" "$current_remote_host" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    remote_host="$UI_REPLY"
+                    ui_form_add_kv "新目标 IP/域名" "$remote_host"
+
+                    ui_form_edit_read "目标端口" "$current_remote_port" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    remote_port="$UI_REPLY"
+                    ui_form_add_kv "新目标端口" "$remote_port"
+
+                    ui_form_edit_read "转发到期日 YYYYMMDD，支持 +7/7d" "${current_stop_at:-}" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    stop_at="$UI_REPLY"
+                    ui_form_add_kv "新到期日" "$stop_at"
+
+                    ui_select_protocol_edit "转发协议" "$current_protocol" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    protocol="$UI_REPLY"
+                    [ -z "$protocol" ] || ui_form_add_kv "新协议" "$(ui_protocol_label "$protocol")"
+
+                    ui_select_traffic_mode_edit "计费模式" "$current_mode" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    traffic_mode="$UI_TRAFFIC_MODE"
+                    [ -z "$traffic_mode" ] || ui_form_add_kv "新计费模式" "$( [ "$traffic_mode" = "one-way" ] && echo "单向计费" || echo "双向计费" )"
+
+                    ui_read_traffic_ratio_edit "流量倍率" "$current_ratio" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    traffic_ratio="$UI_TRAFFIC_RATIO"
+                    ui_form_add_kv "新倍率" "$(format_ratio "$traffic_ratio")"
+
+                    ui_form_edit_read "备注" "$current_comment" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    comment="$UI_REPLY"
+                    ui_form_add_kv "新备注" "$comment"
+
+                    ui_select_mss_mode_edit "MSS 处理方式" "$current_mss_mode" "$current_mss_value" "$remote_host" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    case "$UI_MSS_MODE" in
+                        clamp) ui_form_add_kv "新 MSS" "Clamp" ;;
+                        set) ui_form_add_kv "新 MSS" "$UI_MSS_VALUE" ;;
+                        __CLEAR__) ui_form_add_kv "新 MSS" "清空" ;;
+                    esac
+                    ui_select_snat_mode_edit "SNAT 处理方式" "$current_snat_mode" "$current_snat_source" || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_warn "已取消"; ui_pause; continue; }
+                    case "$UI_SNAT_MODE" in
+                        snat) ui_form_add_kv "新 SNAT" "$UI_SNAT_SOURCE" ;;
+                        masquerade) ui_form_add_kv "新 SNAT" "masquerade" ;;
+                    esac
+
+                    args=(--forward-id "$forward_id")
+                    [ "$listen_ip" = "$current_listen_ip" ] || args+=(--listen-ip "$listen_ip")
+                    [ "$listen_port" = "$current_listen_port" ] || args+=(--listen-port "$listen_port")
+                    [ "$remote_host" = "$current_remote_host" ] || args+=(--remote-host "$remote_host")
+                    [ "$remote_port" = "$current_remote_port" ] || args+=(--remote-port "$remote_port")
+                    if [ "$stop_at" = "-" ]; then
+                        [ -n "$current_stop_at" ] && args+=(--clear-stop-at)
+                    elif [ "$stop_at" != "$current_stop_at" ]; then
+                        [ -n "$stop_at" ] && args+=(--stop-at "$stop_at")
+                    fi
+                    [ -z "$protocol" ] || [ "$protocol" = "$current_protocol" ] || args+=(--protocol "$protocol")
+                    [ -z "$traffic_mode" ] || [ "$traffic_mode" = "$current_mode" ] || args+=(--traffic-mode "$traffic_mode")
+                    [ -z "$traffic_ratio" ] || [ "$traffic_ratio" = "$current_ratio" ] || args+=(--traffic-ratio "$traffic_ratio")
+                    if [ "$comment" = "-" ]; then
+                        [ -n "$current_comment" ] && args+=(--clear-comment)
+                    elif [ "$comment" != "$current_comment" ]; then
+                        args+=(--comment "$comment")
+                    fi
+                    case "$UI_MSS_MODE" in
+                        clamp)
+                            if [ "$current_mss_mode" != "clamp" ]; then
+                                args+=(--mss-clamp)
+                            fi
+                            ;;
+                        set)
+                            if [ "$current_mss_mode" != "set" ] || [ "$UI_MSS_VALUE" != "$current_mss_value" ]; then
+                                args+=(--mss "$UI_MSS_VALUE")
+                            fi
+                            ;;
+                        __CLEAR__)
+                            if [ -n "$current_mss_mode" ] || [ -n "$current_mss_value" ]; then
+                                args+=(--clear-mss)
+                            fi
+                            ;;
+                    esac
+                    case "$UI_SNAT_MODE" in
+                        snat)
+                            if [ "$current_snat_mode" != "snat" ] || [ "$UI_SNAT_SOURCE" != "$current_snat_source" ]; then
+                                args+=(--snat-source "$UI_SNAT_SOURCE")
+                            fi
+                            ;;
+                        masquerade)
+                            if [ "$current_snat_mode" != "masquerade" ] || [ -n "$current_snat_source" ]; then
+                                args+=(--masquerade)
+                            fi
+                            ;;
+                    esac
+
+                    if [ "${#args[@]}" -eq 2 ]; then
+                        ui_warn "未修改"
+                    else
+                        ui_form_reset
+                        ui_run cmd_forward_update "${args[@]}"
+                        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "$UI_C_MENU_NUM"
+                    fi
                     ui_form_reset
-                    ui_run cmd_forward_update "${args[@]}"
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "转发已更新：$forward_id" "$UI_C_MENU_NUM"
-                fi
-                ui_form_reset
-                ui_maybe_pause success
-                ;;
-            3)
-                ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi_scoped true "选择要暂停的转发范围" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local stop_ids="$UI_REPLY" ok=0 fail=0
-                while IFS= read -r forward_id; do
-                    [ -n "$forward_id" ] || continue
-                    if cmd_toggle_forward false "$forward_id"; then
-                        ok=$((ok + 1))
-                    else
-                        fail=$((fail + 1))
-                        ui_error "暂停失败：$forward_id"
-                    fi
-                done <<< "$stop_ids"
-                ui_batch_print_result "$ok" "$fail"
-                ui_notice_set "批量暂停完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
-                ;;
-            4)
-                ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi_scoped true "选择要恢复的转发范围" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local start_ids="$UI_REPLY" ok=0 fail=0
-                while IFS= read -r forward_id; do
-                    [ -n "$forward_id" ] || continue
-                    if cmd_toggle_forward true "$forward_id"; then
-                        ok=$((ok + 1))
-                    else
-                        fail=$((fail + 1))
-                        ui_error "恢复失败：$forward_id"
-                    fi
-                done <<< "$start_ids"
-                ui_batch_print_result "$ok" "$fail"
-                ui_notice_set "批量恢复完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
-                ;;
-            5)
-                ui_require_users || { ui_pause; continue; }
-                ui_select_forwards_multi_scoped true "选择要删除的转发范围" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                local delete_ids="$UI_REPLY" summary=""
-                while IFS= read -r forward_id; do
-                    [ -n "$forward_id" ] || continue
-                    summary+="$(
-                        jq -r --arg id "$forward_id" '
-                          .forwards[] | select(.id == $id) |
-                          "\(.id)  用户:\(.user_id)  监听:\(.listen_port)"
-                        ' "$PFWD_CONFIG_FILE"
-                    )"$'\n'
-                done <<< "$delete_ids"
-                summary="${summary%$'\n'}"
-                ui_print_line "将删除以下转发：" "$UI_C_WARN"
-                printf '%s\n' "$summary"
-                if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
-                    local ok=0 fail=0
+                    ui_maybe_pause success
+                    ;;
+                3)
+                    ui_select_user_forwards_multi "$user_id" true || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                    local stop_ids="$UI_REPLY" ok=0 fail=0
                     while IFS= read -r forward_id; do
                         [ -n "$forward_id" ] || continue
-                        if cmd_delete "$forward_id"; then
+                        if cmd_toggle_forward false "$forward_id"; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "删除失败：$forward_id"
+                            ui_error "暂停失败：$forward_id"
                         fi
-                    done <<< "$delete_ids"
+                    done <<< "$stop_ids"
                     ui_batch_print_result "$ok" "$fail"
-                    ui_notice_set "批量删除转发完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
-                else
-                    ui_warn "已取消"
-                fi
-                ;;
-            0) return 0 ;;
-            *) ui_warn "无效选择"; ui_pause ;;
-        esac
+                    ui_notice_set "批量暂停完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                    ;;
+                4)
+                    ui_select_user_forwards_multi "$user_id" true || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                    local start_ids="$UI_REPLY" ok=0 fail=0
+                    while IFS= read -r forward_id; do
+                        [ -n "$forward_id" ] || continue
+                        if cmd_toggle_forward true "$forward_id"; then
+                            ok=$((ok + 1))
+                        else
+                            fail=$((fail + 1))
+                            ui_error "恢复失败：$forward_id"
+                        fi
+                    done <<< "$start_ids"
+                    ui_batch_print_result "$ok" "$fail"
+                    ui_notice_set "批量恢复完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                    ;;
+                5)
+                    ui_select_user_forwards_multi "$user_id" true || { ui_pause; continue; }
+                    [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                    local delete_ids="$UI_REPLY" summary=""
+                    while IFS= read -r forward_id; do
+                        [ -n "$forward_id" ] || continue
+                        summary+="$(
+                            jq -r --arg id "$forward_id" '
+                              .forwards[] | select(.id == $id) |
+                              "\(.id)  监听:\(.listen_port)"
+                            ' "$PFWD_CONFIG_FILE"
+                        )"$'\n'
+                    done <<< "$delete_ids"
+                    summary="${summary%$'\n'}"
+                    ui_print_line "将删除以下转发：" "$UI_C_WARN"
+                    printf '%s\n' "$summary"
+                    if ui_confirm_text "delete" "输入 delete 确认批量删除"; then
+                        local ok=0 fail=0
+                        while IFS= read -r forward_id; do
+                            [ -n "$forward_id" ] || continue
+                            if cmd_delete "$forward_id"; then
+                                ok=$((ok + 1))
+                            else
+                                fail=$((fail + 1))
+                                ui_error "删除失败：$forward_id"
+                            fi
+                        done <<< "$delete_ids"
+                        ui_batch_print_result "$ok" "$fail"
+                        ui_notice_set "批量删除转发完成：成功 $ok 项，失败 $fail 项" "$( [ "$fail" -gt 0 ] && echo 33 || echo 32 )"
+                    else
+                        ui_warn "已取消"
+                    fi
+                    ;;
+                0)
+                    user_id=""
+                    break
+                    ;;
+                *)
+                    ui_warn "无效选择"
+                    ui_pause
+                    ;;
+            esac
+        done
     done
 }
 
@@ -4297,20 +4348,34 @@ ui_render_users_menu_page() {
     echo
     ui_menu_item 1 "添加用户"
     ui_menu_item 2 "删除用户"
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
 }
 
 ui_render_forwards_menu_page() {
+    local user_id="$1"
     ui_header "转发管理"
     ui_notice_render
-    ui_print_forward_list
+    ui_print_user_traffic_summary "$user_id"
+    echo
+    ui_print_line "当前用户端口" "$UI_C_HEADER"
+    ui_print_user_forward_summary "$user_id"
     echo
     ui_menu_item 1 "添加转发"
     ui_menu_item 2 "修改转发"
     ui_menu_item 3 "暂停转发"
     ui_menu_item 4 "恢复转发"
     ui_menu_item 5 "删除转发"
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
+}
+
+ui_render_forwards_select_user_page() {
+    ui_header "转发管理"
+    ui_notice_render
+    ui_print_user_list true
+    if ! ui_has_users; then
+        echo
+        ui_menu_item 0 "返回上级菜单"
+    fi
 }
 
 ui_render_traffic_user_menu_page() {
@@ -4323,7 +4388,7 @@ ui_render_traffic_user_menu_page() {
     ui_menu_item 2 "端口设置"
     ui_menu_item 3 "流量重置日"
     ui_menu_item 4 "设置已用流量"
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
 }
 
 ui_render_traffic_select_user_page() {
@@ -4332,7 +4397,7 @@ ui_render_traffic_select_user_page() {
     ui_print_user_list true
     if ! ui_has_users; then
         echo
-        ui_menu_item 0 "返回"
+        ui_menu_item 0 "返回上级菜单"
     fi
 }
 
@@ -4347,7 +4412,7 @@ ui_render_telegram_menu_page() {
     ui_menu_item 4 "恢复通知"
     ui_menu_item 5 "暂停通知"
     ui_menu_item 6 "删除通知"
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
 }
 
 ui_render_export_import_menu_page() {
@@ -4357,7 +4422,7 @@ ui_render_export_import_menu_page() {
     echo
     ui_menu_item 1 "导出配置"
     ui_menu_item 2 "导入配置"
-    ui_menu_item 0 "返回"
+    ui_menu_item 0 "返回上级菜单"
 }
 
 ui_menu_uninstall() {
