@@ -4146,6 +4146,26 @@ ui_menu_update() {
     ui_maybe_pause success
 }
 
+ui_menu_restart_runtime() {
+    ui_clear_screen
+    ui_header "重启服务"
+    echo "将先停止当前 pfwd 的 XDP/nft/tc 运行态，再按当前配置重新应用。"
+    echo "这会短暂中断当前转发。"
+    echo
+    if ! service_runtime_installed; then
+        ui_warn "未检测到已安装的运行态，请先执行安装。"
+        ui_pause
+        return 0
+    fi
+    if ui_confirm_text "restart" "输入 restart 确认重启运行态"; then
+        ui_run cmd_restart
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "pfwd 运行态已重启" "$UI_C_MENU_NUM"
+    else
+        ui_warn "已取消"
+    fi
+    ui_maybe_pause success
+}
+
 ui_print_guard_summary() {
     ui_table_render $'项目\t值' "$(ui_guard_summary_rows)" "2"
 }
@@ -4369,7 +4389,8 @@ ui_render_main_menu_page() {
     ui_menu_item 5 "流量防护"
     ui_menu_item 6 "配置导入导出"
     ui_menu_item 7 "更新"
-    ui_menu_item 8 "卸载"
+    ui_menu_item 8 "重启服务"
+    ui_menu_item 9 "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -4501,7 +4522,8 @@ cmd_menu() {
             5) ui_menu_guard ;;
             6) ui_menu_export_import ;;
             7) ui_menu_update ;;
-            8) ui_menu_uninstall ;;
+            8) ui_menu_restart_runtime ;;
+            9) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

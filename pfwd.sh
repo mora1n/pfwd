@@ -173,6 +173,7 @@ pfwd_main() {
         import) cmd_import "$@" ;;
         render) cmd_render "$@" ;;
         refresh) cmd_refresh "$@" ;;
+        restart) cmd_restart "$@" ;;
         reconcile) cmd_reconcile "$@" ;;
         notify-test) cmd_notify_test "$@" ;;
         notify-enable) cmd_notify_enable "$@" ;;
@@ -226,6 +227,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd import <file>
   pfwd render [forwarder|xdp|nft|tc|guard|units]
   pfwd refresh
+  pfwd restart
   pfwd reconcile
   pfwd notify-test --user-id ID
   pfwd notify-schedule --user-id ID [--interval-minutes 60|--clear-interval] [--daily-time 09:30|--clear-daily]
@@ -251,6 +253,7 @@ pfwd - XDP 端口转发管理脚本
 监听 IP 默认使用 :: 双栈监听；非 localhost 规则优先走 XDP，localhost/::1 自动走 nftables，XDP 不可用时会自动回退到 nftables。
 转发协议支持 tcp、udp、tcp_udp；默认 tcp_udp。同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 远端地址支持域名、IPv4 和 [IPv6]:PORT；localhost 会渲染为本地 IPv4/IPv6 双栈目标。
+  `refresh` 会按当前配置重新应用运行态；`restart` 会先停止当前 XDP/nft/tc 运行态，再重新应用。
   MSS 和固定 SNAT 通过 `.forwards[].net` 字段持久化；转发网卡通过 `settings.forward.interface` 指定。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。

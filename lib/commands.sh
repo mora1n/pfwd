@@ -979,6 +979,16 @@ cmd_refresh() {
     echo "已刷新"
 }
 
+cmd_restart() {
+    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd restart"
+    config_init >/dev/null
+    stats_rollup_current
+    cmd_runtime_ready || return 0
+    forwarder_stop_runtime
+    cmd_apply_forwarding_bundle
+    echo "已重启运行态"
+}
+
 cmd_reconcile() {
     config_init >/dev/null
     local before after now_minute need_refresh=false sent
