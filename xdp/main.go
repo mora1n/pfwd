@@ -36,6 +36,9 @@ const ruleFlagXDPDisabled = uint16(1 << 0)
 const ruleCounterPinSuffix = "_rule_counters"
 const tcPrefBPFIngress = "10"
 const tcPrefBPFEgress = "10"
+const connStateTCPSynPending = uint8(1)
+const connStateTCPEstablished = uint8(2)
+const statsEntryCount = 9
 
 type bpfObjects struct {
 	PFWDXDP              *ebpf.Program `ebpf:"pfwd_xdp"`
@@ -112,6 +115,13 @@ type snapshotOptions struct {
 type statsOptions struct {
 	StatusFile string
 	StatsPin   string
+}
+
+type connSummary struct {
+	Total          uint64 `json:"total"`
+	TCPSynPending  uint64 `json:"tcp_syn_pending"`
+	TCPEstablished uint64 `json:"tcp_established"`
+	UDP            uint64 `json:"udp"`
 }
 
 type runtimeFile struct {
@@ -233,6 +243,7 @@ type statusPayload struct {
 	RuleCounterPin string `json:"rule_counter_pin,omitempty"`
 	UserCounterPin string `json:"user_counter_pin,omitempty"`
 	StatsPin       string `json:"stats_pin,omitempty"`
+	ActiveSummary  *connSummary `json:"active_summary,omitempty"`
 }
 
 type runtimeMapPins struct {
@@ -327,7 +338,8 @@ type connVal struct {
 	TrafficMode        uint8
 	UserLimitEnabled   uint8
 	BillingEnabled     uint8
-	Pad8               [5]uint8
+	State              uint8
+	Pad8               [4]uint8
 	Packets            uint64
 	Bytes              uint64
 }
@@ -478,6 +490,11 @@ func runStatus(args []string) error {
 			payload = statusPayload{Applied: false, BinaryVersion: binaryVersion}
 		} else {
 			return err
+		}
+	}
+	if payload.Applied {
+		if summary, err := loadConnectionSummaryFromStatus(payload); err == nil {
+			payload.ActiveSummary = summary
 		}
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -690,6 +707,9 @@ func applyRuntime(opts applyOptions) error {
 		RuleCounterPin: opts.RuleCounterPin,
 		UserCounterPin: opts.UserCounterPin,
 		StatsPin:       opts.StatsPin,
+	}
+	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
+		payload.ActiveSummary = summary
 	}
 	return writeStatus(opts.StatusFile, payload)
 }
@@ -1101,7 +1121,7 @@ func clearPerCPUStatsMap(m *ebpf.Map) error {
 		return fmt.Errorf("获取 PossibleCPU 失败: %w", err)
 	}
 	zero := make([]uint64, cpus)
-	for i := uint32(0); i < 7; i++ {
+	for i := uint32(0); i < statsEntryCount; i++ {
 		key := i
 		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("重置 percpu stats 失败 (key=%d): %w", i, err)
@@ -1247,6 +1267,9 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.RuleCounterPin = opts.RuleCounterPin
 	updated.UserCounterPin = opts.UserCounterPin
 	updated.StatsPin = opts.StatsPin
+	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
+		updated.ActiveSummary = summary
+	}
 	return writeStatus(opts.StatusFile, updated)
 }
 
@@ -1671,13 +1694,16 @@ func dumpStats(opts statsOptions) error {
 	defer statsMap.Close()
 
 	var payload struct {
-		Passed           uint64 `json:"passed"`
-		Dropped          uint64 `json:"dropped"`
-		Forwarded        uint64 `json:"forwarded"`
-		QuotaDropped     uint64 `json:"quota_dropped"`
-		WhitelistDropped uint64 `json:"whitelist_dropped"`
-		ProtocolDropped  uint64 `json:"protocol_dropped"`
-		ParseSkipped     uint64 `json:"parse_skipped"`
+		Passed           uint64       `json:"passed"`
+		Dropped          uint64       `json:"dropped"`
+		Forwarded        uint64       `json:"forwarded"`
+		QuotaDropped     uint64       `json:"quota_dropped"`
+		WhitelistDropped uint64       `json:"whitelist_dropped"`
+		ProtocolDropped  uint64       `json:"protocol_dropped"`
+		ParseSkipped     uint64       `json:"parse_skipped"`
+		TCPPrewarmed     uint64       `json:"tcp_prewarmed"`
+		TCPEstablished   uint64       `json:"tcp_established"`
+		ActiveSummary    *connSummary `json:"active_summary,omitempty"`
 	}
 	values := []*uint64{
 		&payload.Passed,
@@ -1687,6 +1713,8 @@ func dumpStats(opts statsOptions) error {
 		&payload.WhitelistDropped,
 		&payload.ProtocolDropped,
 		&payload.ParseSkipped,
+		&payload.TCPPrewarmed,
+		&payload.TCPEstablished,
 	}
 	for i, dst := range values {
 		key := uint32(i)
@@ -1696,9 +1724,70 @@ func dumpStats(opts statsOptions) error {
 		}
 		*dst = total
 	}
+	if opts.StatusFile != "" {
+		status, err := readStatus(opts.StatusFile)
+		if err == nil {
+			summary, summaryErr := loadConnectionSummaryFromStatus(status)
+			if summaryErr == nil {
+				payload.ActiveSummary = summary
+			} else {
+				payload.ActiveSummary = status.ActiveSummary
+			}
+		}
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(payload)
+}
+
+func summarizeConnections(m *ebpf.Map) (*connSummary, error) {
+	if m == nil {
+		return nil, nil
+	}
+	summary := &connSummary{}
+	it := m.Iterate()
+	var key connKey
+	var value connVal
+	for it.Next(&key, &value) {
+		summary.Total++
+		switch key.Protocol {
+		case 6:
+			switch value.State {
+			case connStateTCPSynPending:
+				summary.TCPSynPending++
+			case connStateTCPEstablished:
+				summary.TCPEstablished++
+			default:
+				summary.TCPEstablished++
+			}
+		case 17:
+			summary.UDP++
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 connection map 失败: %w", err)
+	}
+	if summary.Total == 0 {
+		return &connSummary{}, nil
+	}
+	return summary, nil
+}
+
+func loadConnectionSummaryFromStatus(payload statusPayload) (*connSummary, error) {
+	pinLayout := runtimeMapPinsFromPaths(
+		firstNonEmpty(payload.RuleCounterPin, "/sys/fs/bpf/pfwd_rule_counters"),
+		firstNonEmpty(payload.UserCounterPin, "/sys/fs/bpf/pfwd_user_counters"),
+		firstNonEmpty(payload.StatsPin, "/sys/fs/bpf/pfwd_stats"),
+	)
+	if !pinnedPathExists(pinLayout.Connections) {
+		return payload.ActiveSummary, nil
+	}
+	connMap, err := ebpf.LoadPinnedMap(pinLayout.Connections, nil)
+	if err != nil {
+		return payload.ActiveSummary, err
+	}
+	defer connMap.Close()
+	return summarizeConnections(connMap)
 }
 
 func lookupPerCPUUint64(m *ebpf.Map, key uint32) (uint64, error) {

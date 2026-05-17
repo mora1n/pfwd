@@ -241,11 +241,22 @@ forwarder_write_status_file() {
     printf '%s\n' "$status_json" | jq '.' | pfwd_write_atomic "$PFWD_FORWARDER_STATUS_FILE"
 }
 
+forwarder_xdp_status_json() {
+    if [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_XDP_STATUS_FILE" ]; then
+        "$(forwarder_bin_path)" status --status-file "$PFWD_XDP_STATUS_FILE" 2>/dev/null && return 0
+    fi
+    if [ -f "$PFWD_XDP_STATUS_FILE" ]; then
+        jq '.' "$PFWD_XDP_STATUS_FILE" 2>/dev/null && return 0
+    fi
+    printf '{}\n'
+}
+
 forwarder_status_json() {
+    local base_json xdp_status_json
     if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
-        jq '.' "$PFWD_FORWARDER_STATUS_FILE"
+        base_json="$(jq '.' "$PFWD_FORWARDER_STATUS_FILE")"
     else
-    jq -n '
+        base_json="$(jq -n '
           {
             applied: false,
             forwarding_backend: "none",
@@ -261,8 +272,10 @@ forwarder_status_json() {
             interface: "",
             protocol_guard: false,
             whitelist_enabled: false
-          }'
+          }')"
     fi
+    xdp_status_json="$(forwarder_xdp_status_json)"
+    jq --argjson xdp_status "$xdp_status_json" '.xdp_status = $xdp_status' <<< "$base_json"
 }
 
 forwarder_render_status() {
@@ -281,6 +294,10 @@ forwarder_render_status() {
         ["Guard 数据面", (if (.xdp_guard_rules_count // 0) > 0 then "开" else "关" end)],
         ["nft 规则", (.nft_rules_count | tostring)],
         ["绑定网卡", (.interface // "-")],
+        ["XDP 活动连接", ((.xdp_status.active_summary.total // 0) | tostring)],
+        ["XDP TCP 预热中", ((.xdp_status.active_summary.tcp_syn_pending // 0) | tostring)],
+        ["XDP TCP 已建链", ((.xdp_status.active_summary.tcp_established // 0) | tostring)],
+        ["XDP UDP 活动", ((.xdp_status.active_summary.udp // 0) | tostring)],
         ["回退原因", (.fallback_reason // "-")]
       ]
       | map(@tsv)

@@ -1016,10 +1016,15 @@ cmd_notify_test() {
 
 cmd_doctor() {
     config_init >/dev/null
-    local forwarder_status backend fallback_reason tc_iface tc_ifb tc_mode
+    local forwarder_status xdp_status backend fallback_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
     forwarder_status="$(forwarder_status_json)"
+    xdp_status="$(forwarder_xdp_status_json)"
     backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
     fallback_reason="$(jq -r '.fallback_reason // empty' <<< "$forwarder_status")"
+    xdp_active_total="$(jq -r '.active_summary.total // 0' <<< "$xdp_status")"
+    xdp_tcp_prewarmed="$(jq -r '.active_summary.tcp_syn_pending // 0' <<< "$xdp_status")"
+    xdp_tcp_established="$(jq -r '.active_summary.tcp_established // 0' <<< "$xdp_status")"
+    xdp_udp_active="$(jq -r '.active_summary.udp // 0' <<< "$xdp_status")"
     tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
     tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
     if [ -n "$tc_iface" ]; then
@@ -1036,6 +1041,10 @@ cmd_doctor() {
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi
+    echo "xdp.active_total：$xdp_active_total"
+    echo "xdp.tcp_syn_pending：$xdp_tcp_prewarmed"
+    echo "xdp.tcp_established：$xdp_tcp_established"
+    echo "xdp.udp_active：$xdp_udp_active"
     echo "tc.mode：$tc_mode"
     if [ -n "$tc_iface" ]; then echo "tc.iface：$tc_iface"; fi
     if [ -n "$tc_ifb" ] && [ "$tc_mode" = "bidirectional-ifb" ]; then echo "tc.ifb：$tc_ifb"; fi

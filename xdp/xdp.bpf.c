@@ -12,7 +12,9 @@ enum pfwd_stat_index {
     PFWD_STAT_WHITELIST_DROPPED = 4,
     PFWD_STAT_PROTOCOL_DROPPED = 5,
     PFWD_STAT_PARSE_SKIPPED = 6,
-    PFWD_STAT_MAX = 7,
+    PFWD_STAT_TCP_PREWARMED = 7,
+    PFWD_STAT_TCP_ESTABLISHED = 8,
+    PFWD_STAT_MAX = 9,
 };
 
 enum pfwd_snat_mode {
@@ -40,6 +42,12 @@ enum pfwd_cache_verdict {
     PFWD_CACHE_UNKNOWN = 0,
     PFWD_CACHE_ALLOW = 1,
     PFWD_CACHE_DROP = 2,
+};
+
+enum pfwd_conn_state {
+    PFWD_CONN_STATE_NONE = 0,
+    PFWD_CONN_STATE_TCP_SYN_PENDING = 1,
+    PFWD_CONN_STATE_TCP_ESTABLISHED = 2,
 };
 
 struct pfwd_settings {
@@ -112,7 +120,8 @@ struct pfwd_conn_val {
     __u8 traffic_mode;
     __u8 user_limit_enabled;
     __u8 billing_enabled;
-    __u8 pad8[5];
+    __u8 state;
+    __u8 pad8[4];
     __u64 packets;
     __u64 bytes;
 };
@@ -287,6 +296,38 @@ static __always_inline void stat_inc(__u32 index) {
     __u64 *value = bpf_map_lookup_elem(&pfwd_stats, &index);
     if (value) {
         *value += 1;
+    }
+}
+
+static __always_inline int tcp_syn_only(const struct tcphdr_min *tcp) {
+    __u8 flags;
+
+    if (!tcp) {
+        return 0;
+    }
+    flags = tcp->flags;
+    return (flags & 0x02) && !(flags & 0x15);
+}
+
+static __always_inline void record_new_tcp_state(struct pfwd_conn_val *conn, __u8 state) {
+    if (!conn) {
+        return;
+    }
+    conn->state = state;
+    if (state == PFWD_CONN_STATE_TCP_SYN_PENDING) {
+        stat_inc(PFWD_STAT_TCP_PREWARMED);
+    } else if (state == PFWD_CONN_STATE_TCP_ESTABLISHED) {
+        stat_inc(PFWD_STAT_TCP_ESTABLISHED);
+    }
+}
+
+static __always_inline void mark_tcp_established(struct pfwd_conn_val *conn) {
+    if (!conn) {
+        return;
+    }
+    if (conn->state != PFWD_CONN_STATE_TCP_ESTABLISHED) {
+        conn->state = PFWD_CONN_STATE_TCP_ESTABLISHED;
+        stat_inc(PFWD_STAT_TCP_ESTABLISHED);
     }
 }
 
@@ -1248,6 +1289,7 @@ static __always_inline int prepare_local_conn_v4(
     __be16 client_port,
     __be16 listen_port,
     __u8 protocol,
+    __u8 conn_state,
     const struct pfwd_rule_val *rule,
     struct pfwd_scratch *scratch,
     __u64 packet_len
@@ -1297,6 +1339,9 @@ static __always_inline int prepare_local_conn_v4(
     scratch->conn.traffic_mode = rule->traffic_mode;
     scratch->conn.user_limit_enabled = rule->user_limit_enabled;
     scratch->conn.billing_enabled = rule->billing_enabled;
+    if (protocol == IPPROTO_TCP) {
+        record_new_tcp_state(&scratch->conn, conn_state);
+    }
     scratch->conn.packets = 1;
     scratch->conn.bytes = packet_len;
     bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1313,6 +1358,7 @@ static __always_inline int prepare_local_conn_v6(
     __be16 client_port,
     __be16 listen_port,
     __u8 protocol,
+    __u8 conn_state,
     const struct pfwd_rule_val *rule,
     struct pfwd_scratch *scratch,
     __u64 packet_len
@@ -1368,6 +1414,9 @@ static __always_inline int prepare_local_conn_v6(
     scratch->conn.traffic_mode = rule->traffic_mode;
     scratch->conn.user_limit_enabled = rule->user_limit_enabled;
     scratch->conn.billing_enabled = rule->billing_enabled;
+    if (protocol == IPPROTO_TCP) {
+        record_new_tcp_state(&scratch->conn, conn_state);
+    }
     scratch->conn.packets = 1;
     scratch->conn.bytes = packet_len;
     bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1393,6 +1442,7 @@ static __always_inline int tc_local_forward_v4(
     __u32 scratch_key = 0;
     struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
     struct bpf_sock *sk;
+    __u8 conn_state = PFWD_CONN_STATE_NONE;
 
     if (settings && settings->whitelist_enabled && !whitelist_allowed_v4(ip4->saddr)) {
         stat_inc(PFWD_STAT_WHITELIST_DROPPED);
@@ -1414,6 +1464,7 @@ static __always_inline int tc_local_forward_v4(
         if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
             return TC_ACT_SHOT;
         }
+        conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
     if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
         stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -1427,7 +1478,7 @@ static __always_inline int tc_local_forward_v4(
         return TC_ACT_SHOT;
     }
     bpf_sk_release(sk);
-    if (prepare_local_conn_v4(ip4->saddr, ip4->daddr, sport, dport, protocol, rule, scratch, packet_len) < 0) {
+    if (prepare_local_conn_v4(ip4->saddr, ip4->daddr, sport, dport, protocol, conn_state, rule, scratch, packet_len) < 0) {
         return TC_ACT_SHOT;
     }
     count_input(rule, packet_len, 1);
@@ -1449,6 +1500,7 @@ static __always_inline int tc_local_forward_v6(
     __u32 scratch_key = 0;
     struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
     struct bpf_sock *sk;
+    __u8 conn_state = PFWD_CONN_STATE_NONE;
 
     if (settings && settings->whitelist_enabled && !whitelist_allowed_v6(ip6->saddr)) {
         stat_inc(PFWD_STAT_WHITELIST_DROPPED);
@@ -1466,6 +1518,7 @@ static __always_inline int tc_local_forward_v6(
         if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
             return TC_ACT_SHOT;
         }
+        conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
     if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
         stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -1479,7 +1532,7 @@ static __always_inline int tc_local_forward_v6(
         return TC_ACT_SHOT;
     }
     bpf_sk_release(sk);
-    if (prepare_local_conn_v6(ip6->saddr, ip6->daddr, sport, dport, protocol, rule, scratch, packet_len) < 0) {
+    if (prepare_local_conn_v6(ip6->saddr, ip6->daddr, sport, dport, protocol, conn_state, rule, scratch, packet_len) < 0) {
         return TC_ACT_SHOT;
     }
     count_input(rule, packet_len, 1);
@@ -1510,6 +1563,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
         __be16 dport = 0;
         __u8 listen_addr[16];
         struct pfwd_rule_val *rule;
+        __u8 tcp_conn_state = PFWD_CONN_STATE_NONE;
         if ((void *)(ip4 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return XDP_PASS;
@@ -1583,6 +1637,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 4, src16, dst16, sport, dport) == XDP_DROP) {
                     return XDP_DROP;
                 }
+                tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
             if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -1611,6 +1666,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
             if (existing_conn) {
                 new_sport = existing_conn->source_port;
                 new_saddr = ipv4_from16(existing_conn->source_addr);
+                if (protocol == IPPROTO_TCP && tcp_conn_state == PFWD_CONN_STATE_TCP_ESTABLISHED) {
+                    mark_tcp_established(existing_conn);
+                }
             } else {
                 new_sport = allocate_source_port_v4(&scratch->reverse_key, sport, old_saddr, old_daddr, new_dport);
                 if (new_sport == 0) {
@@ -1632,6 +1690,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 scratch->conn.traffic_mode = rule->traffic_mode;
                 scratch->conn.user_limit_enabled = rule->user_limit_enabled;
                 scratch->conn.billing_enabled = rule->billing_enabled;
+                if (protocol == IPPROTO_TCP) {
+                    record_new_tcp_state(&scratch->conn, tcp_conn_state);
+                }
                 scratch->conn.packets = 1;
                 scratch->conn.bytes = packet_len;
                 bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
@@ -1692,6 +1753,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
             copy_ipv4_to16(reverse_key.client_addr, 0);
             conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
             if (conn) {
+                if (protocol == IPPROTO_TCP) {
+                    mark_tcp_established(conn);
+                }
                 __be16 new_sport = conn->listen_port;
                 __be16 new_dport = conn->source_port;
                 __be32 new_saddr = ipv4_from16(conn->listen_addr);
@@ -1744,6 +1808,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
         __be16 sport = 0;
         __be16 dport = 0;
         struct pfwd_rule_val *rule;
+        __u8 tcp_conn_state = PFWD_CONN_STATE_NONE;
         if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return XDP_PASS;
@@ -1799,6 +1864,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
                     return XDP_DROP;
                 }
+                tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
             if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, packet_len, 0)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
@@ -1834,6 +1900,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
             if (existing_conn) {
                 new_sport = existing_conn->source_port;
                 pfwd_memcpy16(scratch->addr_c, existing_conn->source_addr);
+                if (protocol == IPPROTO_TCP && tcp_conn_state == PFWD_CONN_STATE_TCP_ESTABLISHED) {
+                    mark_tcp_established(existing_conn);
+                }
             } else {
                 new_sport = allocate_source_port_v6(&scratch->reverse_key, sport, scratch->addr_a, scratch->addr_b, rule->target_port);
                 if (new_sport == 0) {
@@ -1855,6 +1924,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 scratch->conn.traffic_mode = rule->traffic_mode;
                 scratch->conn.user_limit_enabled = rule->user_limit_enabled;
                 scratch->conn.billing_enabled = rule->billing_enabled;
+                if (protocol == IPPROTO_TCP) {
+                    record_new_tcp_state(&scratch->conn, tcp_conn_state);
+                }
                 bpf_map_update_elem(&pfwd_connections, &scratch->conn_key, &scratch->conn, BPF_ANY);
                 scratch->reverse_key.source_port = new_sport;
                 pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
@@ -1912,6 +1984,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
             zero_addr16(reverse_key.client_addr);
             conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
             if (conn) {
+                if (protocol == IPPROTO_TCP) {
+                    mark_tcp_established(conn);
+                }
                 __u8 old_saddr[16];
                 __u8 old_daddr[16];
                 __be16 new_sport = conn->listen_port;
@@ -2192,6 +2267,9 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         if (!conn) {
             return TC_ACT_OK;
         }
+        if (protocol == IPPROTO_TCP) {
+            mark_tcp_established(conn);
+        }
         {
             __be16 new_sport = conn->listen_port;
             __be16 new_dport = conn->source_port;
@@ -2277,6 +2355,9 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
         if (!conn) {
             return TC_ACT_OK;
+        }
+        if (protocol == IPPROTO_TCP) {
+            mark_tcp_established(conn);
         }
         pfwd_memcpy16(old_saddr, ip6->saddr);
         pfwd_memcpy16(old_daddr, ip6->daddr);
