@@ -47,6 +47,7 @@ UI_C_MENU_NUM="32"
 UI_C_MENU_LABEL="36"
 UI_C_SUCCESS="1;32"
 UI_C_ACTIVE="1;32"
+UI_C_MIXED="1;36"
 UI_C_PAUSED="1;33"
 UI_C_WARN="33"
 UI_C_ERROR="31"
@@ -938,6 +939,7 @@ ui_table_render() {
 ui_forward_state_text() {
     case "$1" in
         active|true|启用|已启用) printf '●' ;;
+        mixed|混合|部分启用) printf '◐' ;;
         paused|false|停用|暂停|已停用) printf '◉' ;;
         stopped|停止) printf '○' ;;
         *) printf '○' ;;
@@ -947,30 +949,79 @@ ui_forward_state_text() {
 ui_forward_state_color() {
     case "$1" in
         active|true|启用|已启用) echo "$UI_C_ACTIVE" ;;
+        mixed|混合|部分启用) echo "$UI_C_MIXED" ;;
         paused|false|停用|暂停|已停用) echo "$UI_C_PAUSED" ;;
         stopped|停止) echo "$UI_C_STOPPED" ;;
         *) echo "$UI_C_PAUSED" ;;
     esac
 }
 
+ui_forward_state_name() {
+    case "$1" in
+        active|true|启用|已启用|●) printf 'active' ;;
+        mixed|混合|部分启用|◐) printf 'mixed' ;;
+        paused|false|停用|暂停|已停用|◉|■) printf 'paused' ;;
+        stopped|停止|○) printf 'stopped' ;;
+        *) printf '' ;;
+    esac
+}
+
 ui_forward_display_state() {
     local enabled="$1"
     local stop_at="${2:-}"
-    local now_minute
-    if [ "$enabled" = "true" ] || [ "$enabled" = "启用" ] || [ "$enabled" = "已启用" ] || [ "$enabled" = "active" ]; then
-        printf 'active'
+    local normalized
+
+    normalized="$(ui_forward_state_name "$enabled")"
+    if [ "$normalized" = "active" ] || [ "$normalized" = "mixed" ] || [ "$normalized" = "stopped" ]; then
+        printf '%s' "$normalized"
         return 0
     fi
-    if [ "$enabled" = "false" ] || [ "$enabled" = "停用" ] || [ "$enabled" = "已停用" ] || [ "$enabled" = "暂停" ] || [ "$enabled" = "paused" ]; then
-        printf 'paused'
-        return 0
-    fi
-    now_minute="$(pfwd_now_minute)"
-    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$now_minute" -o "$stop_at" = "$now_minute" ]; then
+
+    if pfwd_stop_at_expired "$stop_at"; then
         printf 'stopped'
         return 0
     fi
+
+    if [ "$normalized" = "paused" ]; then
+        printf 'paused'
+        return 0
+    fi
+
     printf 'paused'
+}
+
+ui_forward_aggregate_state() {
+    local user_id="$1"
+    local state_count=0
+    local seen_active=0
+    local seen_mixed=0
+    local seen_paused=0
+    local seen_stopped=0
+    local _listen_port _remote_host _remote_port _protocol enabled stop_at display_state
+
+    while IFS=$'\t' read -r _listen_port _remote_host _remote_port _protocol enabled stop_at; do
+        [ -n "$enabled" ] || continue
+        display_state="$(ui_forward_display_state "$enabled" "$stop_at")"
+        case "$display_state" in
+            active) seen_active=1 ;;
+            mixed) seen_mixed=1 ;;
+            paused) seen_paused=1 ;;
+            stopped) seen_stopped=1 ;;
+        esac
+    done < <(config_user_forward_summary_tsv "$user_id")
+
+    state_count=$((seen_active + seen_mixed + seen_paused + seen_stopped))
+    if [ "$state_count" -eq 0 ]; then
+        printf 'paused'
+    elif [ "$seen_mixed" -eq 1 ] || [ "$state_count" -gt 1 ]; then
+        printf 'mixed'
+    elif [ "$seen_active" -eq 1 ]; then
+        printf 'active'
+    elif [ "$seen_stopped" -eq 1 ]; then
+        printf 'stopped'
+    else
+        printf 'paused'
+    fi
 }
 
 ui_forward_state_cell() {
@@ -2111,12 +2162,13 @@ ui_user_forward_select_rows() {
     local user_id="$1"
     local allow_zero="${2:-false}"
     local include_all="${3:-false}"
-    local rows=""
+    local rows="" aggregate_state
     if [ "$allow_zero" = "true" ]; then
         rows+=$'0\t返回\t-\t-\t-\t-\n'
     fi
     if [ "$include_all" = "true" ]; then
-        rows+=$'1\t全部端口\t-\t-\t-\t-\n'
+        aggregate_state="$(ui_forward_aggregate_state "$user_id")"
+        rows+="1"$'\t'"全部端口"$'\t'"-"$'\t'"-"$'\t'"$aggregate_state"$'\t'"-"$'\n'
     fi
     while IFS=$'\t' read -r index listen_port remote_host remote_port protocol enabled stop_at; do
         local remote_text

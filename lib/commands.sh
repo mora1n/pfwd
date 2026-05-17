@@ -272,13 +272,11 @@ cmd_protocol_label() {
 cmd_forward_state_label() {
     local enabled="$1"
     local stop_at="${2:-}"
-    local now_minute
     if [ "$enabled" = "true" ]; then
         printf '启用'
         return 0
     fi
-    now_minute="$(pfwd_now_minute)"
-    if [ -n "$stop_at" ] && [ "$stop_at" != "-" ] && [ "$stop_at" != "null" ] && [ "$stop_at" \< "$now_minute" -o "$stop_at" = "$now_minute" ]; then
+    if pfwd_stop_at_expired "$stop_at"; then
         printf '停止'
         return 0
     fi

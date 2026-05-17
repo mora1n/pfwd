@@ -100,6 +100,43 @@ pfwd_now_minute() {
     date '+%Y-%m-%d %H:%M'
 }
 
+pfwd_normalize_minute_value() {
+    local value="${1:-}"
+    case "$value" in
+        ""|"-"|"null") printf '' ;;
+        ????-??-??)
+            printf '%s 00:00' "$value"
+            ;;
+        ????/??/??)
+            printf '%s 00:00' "${value//\//-}"
+            ;;
+        ????-??-??\ ??:??)
+            printf '%s' "$value"
+            ;;
+        ????/??/??\ ??:??)
+            printf '%s' "${value//\//-}"
+            ;;
+        ????????????)
+            printf '%s-%s-%s %s:%s' "${value:0:4}" "${value:4:2}" "${value:6:2}" "${value:8:2}" "${value:10:2}"
+            ;;
+        ????????)
+            printf '%s-%s-%s 00:00' "${value:0:4}" "${value:4:2}" "${value:6:2}"
+            ;;
+        *)
+            printf '%s' "$value"
+            ;;
+    esac
+}
+
+pfwd_stop_at_expired() {
+    local stop_at normalized now_minute
+    stop_at="${1:-}"
+    normalized="$(pfwd_normalize_minute_value "$stop_at")"
+    [ -n "$normalized" ] || return 1
+    now_minute="$(pfwd_now_minute)"
+    [ "$normalized" \< "$now_minute" ] || [ "$normalized" = "$now_minute" ]
+}
+
 pfwd_mkdirs() {
     mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR"
 }
