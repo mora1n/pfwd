@@ -214,14 +214,14 @@ struct {
 } pfwd_reverse SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, PFWD_MAX_RULES);
     __type(key, __u32);
     __type(value, struct pfwd_counter);
 } pfwd_rule_counters SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, PFWD_MAX_USERS);
     __type(key, __u32);
     __type(value, struct pfwd_counter);
@@ -464,6 +464,13 @@ static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
     return verdict == PFWD_CACHE_ALLOW;
 }
 
+static __always_inline __u64 counter_billing_total(struct pfwd_counter *counter, __u64 base) {
+    if (!counter) {
+        return base;
+    }
+    return base + counter->billing_bytes;
+}
+
 static __always_inline __u64 scaled_bytes(__u64 bytes, __u64 ratio) {
     if (ratio == 0 || ratio == PFWD_RATIO_SCALE) {
         return bytes;
@@ -486,20 +493,14 @@ static __always_inline int traffic_over_limit(const struct pfwd_rule_val *rule, 
     }
     if (rule->rule_limit_bytes > 0) {
         rule_counter = bpf_map_lookup_elem(&pfwd_rule_counters, &rule_id);
-        current_rule = rule->rule_billing_used_base_bytes;
-        if (rule_counter) {
-            current_rule += rule_counter->billing_bytes;
-        }
+        current_rule = counter_billing_total(rule_counter, rule->rule_billing_used_base_bytes);
         if (current_rule + billed_delta > rule->rule_limit_bytes) {
             return 1;
         }
     }
     if (rule->user_limit_bytes > 0) {
         user_counter = bpf_map_lookup_elem(&pfwd_user_counters, &user_id);
-        current_user = rule->user_billing_used_base_bytes;
-        if (user_counter) {
-            current_user += user_counter->billing_bytes;
-        }
+        current_user = counter_billing_total(user_counter, rule->user_billing_used_base_bytes);
         if (current_user + billed_delta > rule->user_limit_bytes) {
             return 1;
         }
@@ -520,20 +521,20 @@ static __always_inline void count_input(const struct pfwd_rule_val *rule, __u64 
     }
     counter = bpf_map_lookup_elem(&pfwd_rule_counters, &key);
     if (counter) {
-        __sync_fetch_and_add(&counter->input_bytes, bytes);
-        __sync_fetch_and_add(&counter->input_packets, packets);
+        counter->input_bytes += bytes;
+        counter->input_packets += packets;
         if (rule->billing_enabled) {
-            __sync_fetch_and_add(&counter->billing_bytes, billed);
+            counter->billing_bytes += billed;
         }
     }
     key = rule->user_id;
     if (rule->user_limit_enabled) {
         counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
         if (counter) {
-            __sync_fetch_and_add(&counter->input_bytes, bytes);
-            __sync_fetch_and_add(&counter->input_packets, packets);
+            counter->input_bytes += bytes;
+            counter->input_packets += packets;
             if (rule->billing_enabled) {
-                __sync_fetch_and_add(&counter->billing_bytes, billed);
+                counter->billing_bytes += billed;
             }
         }
     }
@@ -552,20 +553,20 @@ static __always_inline void count_output(const struct pfwd_conn_val *conn, __u64
     }
     counter = bpf_map_lookup_elem(&pfwd_rule_counters, &key);
     if (counter) {
-        __sync_fetch_and_add(&counter->output_bytes, bytes);
-        __sync_fetch_and_add(&counter->output_packets, packets);
+        counter->output_bytes += bytes;
+        counter->output_packets += packets;
         if (conn->billing_enabled) {
-            __sync_fetch_and_add(&counter->billing_bytes, billed);
+            counter->billing_bytes += billed;
         }
     }
     key = conn->user_id;
     if (conn->user_limit_enabled) {
         counter = bpf_map_lookup_elem(&pfwd_user_counters, &key);
         if (counter) {
-            __sync_fetch_and_add(&counter->output_bytes, bytes);
-            __sync_fetch_and_add(&counter->output_packets, packets);
+            counter->output_bytes += bytes;
+            counter->output_packets += packets;
             if (conn->billing_enabled) {
-                __sync_fetch_and_add(&counter->billing_bytes, billed);
+                counter->billing_bytes += billed;
             }
         }
     }
@@ -576,8 +577,8 @@ static __always_inline void count_drop(const struct pfwd_rule_val *rule, __u64 b
     __u32 key = rule->rule_id;
     counter = bpf_map_lookup_elem(&pfwd_rule_counters, &key);
     if (counter) {
-        __sync_fetch_and_add(&counter->dropped_bytes, bytes);
-        __sync_fetch_and_add(&counter->dropped_packets, 1);
+        counter->dropped_bytes += bytes;
+        counter->dropped_packets += 1;
     }
 }
 
@@ -1139,6 +1140,13 @@ static __always_inline int inspect_xdp_tcp_flow(
     if (!protocol_guard_active(settings)) {
         return XDP_PASS;
     }
+    if (settings->has_skip_ports && port_skipped(dport)) {
+        return XDP_PASS;
+    }
+    payload_len = tcp_payload_prefix_len((const __u8 *)payload_start, data_end);
+    if (payload_len == 0) {
+        return XDP_PASS;
+    }
     flow.family = family;
     flow.protocol = IPPROTO_TCP;
     flow.sport = sport;
@@ -1152,13 +1160,6 @@ static __always_inline int inspect_xdp_tcp_flow(
     if (verdict == PFWD_CACHE_DROP) {
         count_drop(rule, packet_len);
         return XDP_DROP;
-    }
-    if (settings->has_skip_ports && port_skipped(dport)) {
-        return XDP_PASS;
-    }
-    payload_len = tcp_payload_prefix_len((const __u8 *)payload_start, data_end);
-    if (payload_len == 0) {
-        return XDP_PASS;
     }
     stored_prefix = bpf_map_lookup_elem(&pfwd_guard_prefixes, &flow);
     if (!stored_prefix && payload_len >= 8) {

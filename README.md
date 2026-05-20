@@ -8,7 +8,7 @@
 | 功能 | 说明 |
 | --- | --- |
 | 转发 | TCP / UDP / TCP+UDP 端口转发，支持 IPv4 / IPv6 和域名运行时解析 |
-| 数据面选路 | 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 走 `nftables`；XDP 不可用时自动 fallback |
+| 数据面选路 | 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 走 `nftables`；两类规则并存时显示为 `hybrid`，仅 XDP 真失败时才是 fallback |
 | XDP 选项 | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
 | Rate | 使用 `tc` 做端口级或用户级双向速率限制 |
@@ -214,7 +214,8 @@ pfwd add \
 - 远端地址支持域名、IPv4 和 `[IPv6]:PORT`。
 - 同一监听端口可拆分为一条 TCP 和一条 UDP 转发。
 - 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 固定走 `nftables`。
-- 当 XDP 不可用时，符合条件的规则会自动回退到 `nftables`。
+- localhost 规则与非 localhost 规则并存时，状态显示为 `hybrid`；这是正常规则级分流，不表示 XDP 故障。
+- 当 XDP 不可用时，原本应走 XDP 的规则才会自动回退到 `nftables`，此时状态才是 `nft-fallback`。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。

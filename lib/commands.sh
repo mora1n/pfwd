@@ -1024,11 +1024,12 @@ cmd_notify_test() {
 
 cmd_doctor() {
     config_init >/dev/null
-    local forwarder_status xdp_status backend fallback_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
+    local forwarder_status xdp_status backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
     forwarder_status="$(forwarder_status_json)"
     xdp_status="$(forwarder_xdp_status_json)"
     backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
     fallback_reason="$(jq -r '.fallback_reason // empty' <<< "$forwarder_status")"
+    hybrid_reason="$(jq -r '.hybrid_reason // empty' <<< "$forwarder_status")"
     xdp_active_total="$(jq -r '.active_summary.total // 0' <<< "$xdp_status")"
     xdp_tcp_prewarmed="$(jq -r '.active_summary.tcp_syn_pending // 0' <<< "$xdp_status")"
     xdp_tcp_established="$(jq -r '.active_summary.tcp_established // 0' <<< "$xdp_status")"
@@ -1045,7 +1046,11 @@ cmd_doctor() {
     echo "配置文件：$PFWD_CONFIG_FILE"
     jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
     echo "数据面：$backend"
-    if [ -n "$fallback_reason" ]; then echo "回退原因：$fallback_reason"; fi
+    if [ -n "$fallback_reason" ]; then
+        echo "回退原因：$fallback_reason"
+    elif [ "$hybrid_reason" = "loopback-split" ]; then
+        echo "混合原因：localhost 分流"
+    fi
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi

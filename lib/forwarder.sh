@@ -195,6 +195,8 @@ forwarder_runtime_status_json() {
     local nft_applied="${8:-false}"
     local xdp_status_json="${9:-{}}"
     local xdp_forward_applied="${10:-false}"
+    local loopback_split_active="${11:-false}"
+    local hybrid_reason="${12:-}"
     [ -n "$runtime_json" ] || runtime_json='{"rules":[],"settings":{}}'
     [ -n "$xdp_runtime_json" ] || xdp_runtime_json='{"rules":[]}'
     [ -n "$nft_runtime_json" ] || nft_runtime_json='{"rules":[]}'
@@ -209,6 +211,8 @@ forwarder_runtime_status_json() {
       --argjson xdp_applied "$xdp_applied" \
       --argjson nft_applied "$nft_applied" \
       --argjson xdp_forward_applied "$xdp_forward_applied" \
+      --argjson loopback_split_active "$loopback_split_active" \
+      --arg hybrid_reason "$hybrid_reason" \
       --argjson runtime "$runtime_json" \
       --argjson xdp_runtime "$xdp_runtime_json" \
       --argjson nft_runtime "$nft_runtime_json" \
@@ -222,6 +226,8 @@ forwarder_runtime_status_json() {
         xdp_forward_applied: $xdp_forward_applied,
         nft_applied: $nft_applied,
         loopback_via_nft: (($runtime.rules | any(.loopback_local == true)) // false),
+        loopback_split_active: $loopback_split_active,
+        hybrid_reason: (if $hybrid_reason == "" then null else $hybrid_reason end),
         fallback_reason: (if $fallback_reason == "" then null else $fallback_reason end),
         xdp_error: (if $xdp_error == "" then null else $xdp_error end),
         rules: ($runtime.rules | length),
@@ -264,6 +270,7 @@ forwarder_status_json() {
             xdp_forward_applied: false,
             nft_applied: false,
             loopback_via_nft: false,
+            loopback_split_active: false,
             rules: 0,
             xdp_candidate_rules_count: 0,
             xdp_rules_count: 0,
@@ -288,6 +295,7 @@ forwarder_render_status() {
         ["XDP 正向转发", (if (.xdp_forward_applied // false) then "开" else "关" end)],
         ["nft 转发", (if .nft_applied then "开" else "关" end)],
         ["localhost 走 nft", (if .loopback_via_nft then "是" else "否" end)],
+        ["混合原因", (if (.hybrid_reason // "") == "" then "-" elif .hybrid_reason == "loopback-split" then "localhost 分流" else .hybrid_reason end)],
         ["生效规则", (.rules | tostring)],
         ["XDP 候选规则", ((.xdp_candidate_rules_count // 0) | tostring)],
         ["XDP 规则", (.xdp_rules_count | tostring)],

@@ -313,6 +313,16 @@ type counterVal struct {
 	BillingBytes   uint64 `json:"billing_bytes"`
 }
 
+func (c *counterVal) add(other counterVal) {
+	c.InputBytes += other.InputBytes
+	c.OutputBytes += other.OutputBytes
+	c.InputPackets += other.InputPackets
+	c.OutputPackets += other.OutputPackets
+	c.DroppedBytes += other.DroppedBytes
+	c.DroppedPackets += other.DroppedPackets
+	c.BillingBytes += other.BillingBytes
+}
+
 type connKey struct {
 	Family     uint8
 	Protocol   uint8
@@ -889,6 +899,14 @@ func runtimeMapPinsFromRemoveOptions(opts removeOptions, payload statusPayload) 
 	return runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin)
 }
 
+func zeroPerCPUCounterValues() ([]counterVal, error) {
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return nil, fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	return make([]counterVal, cpus), nil
+}
+
 func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) error {
 	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
 		return fmt.Errorf("关键 BPF map 未加载")
@@ -927,9 +945,12 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 			return err
 		}
 	}
+	zeroCounter, err := zeroPerCPUCounterValues()
+	if err != nil {
+		return err
+	}
 	for _, user := range runtimeData.Users {
-		zero := counterVal{}
-		if err := objs.PFWDUserCounter.Update(&user.Index, &zero, ebpf.UpdateAny); err != nil {
+		if err := objs.PFWDUserCounter.Update(&user.Index, zeroCounter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("初始化用户计数失败 (%s): %w", user.ID, err)
 		}
 	}
@@ -1098,15 +1119,19 @@ func clearMap[K comparable, V any](m *ebpf.Map) error {
 	return it.Err()
 }
 
-func clearCounterArrayMap(m *ebpf.Map, maxEntries uint32) error {
+func clearPerCPUCounterMap(m *ebpf.Map, maxEntries uint32) error {
 	if m == nil {
 		return nil
 	}
-	zero := counterVal{}
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	zero := make([]counterVal, cpus)
 	for i := uint32(0); i < maxEntries; i++ {
 		key := i
-		if err := m.Update(&key, &zero, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("重置 counter array 失败 (key=%d): %w", i, err)
+		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 percpu counter 失败 (key=%d): %w", i, err)
 		}
 	}
 	return nil
@@ -1161,10 +1186,10 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
 		return err
 	}
-	if err := clearCounterArrayMap(objs.PFWDRuleCounter, maxRules); err != nil {
+	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
 		return err
 	}
-	if err := clearCounterArrayMap(objs.PFWDUserCounter, maxUsers); err != nil {
+	if err := clearPerCPUCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
 		return err
 	}
 	if err := clearPerCPUStatsMap(objs.PFWDStats); err != nil {
@@ -1341,8 +1366,11 @@ func putRule(objs *bpfObjects, rule runtimeRule) error {
 	if err := objs.PFWDRules.Update(&key, &value, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("写入规则失败 (%s): %w", rule.ID, err)
 	}
-	zero := counterVal{}
-	if err := objs.PFWDRuleCounter.Update(&rule.Index, &zero, ebpf.UpdateAny); err != nil {
+	zeroCounter, err := zeroPerCPUCounterValues()
+	if err != nil {
+		return err
+	}
+	if err := objs.PFWDRuleCounter.Update(&rule.Index, zeroCounter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("初始化规则计数失败 (%s): %w", rule.ID, err)
 	}
 	return nil
@@ -1661,8 +1689,10 @@ func snapshotCounters(opts snapshotOptions) error {
 	}
 	defer counterMap.Close()
 	for _, rule := range runtimeData.Rules {
-		var counter counterVal
-		_ = counterMap.Lookup(rule.Index, &counter)
+		counter, err := lookupPerCPUCounter(counterMap, rule.Index)
+		if err != nil {
+			return fmt.Errorf("读取规则计数失败 (%s): %w", rule.ID, err)
+		}
 		rows = append(rows, row{
 			ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio),
 			InputBytes: counter.InputBytes, OutputBytes: counter.OutputBytes,
@@ -1798,6 +1828,18 @@ func lookupPerCPUUint64(m *ebpf.Map, key uint32) (uint64, error) {
 	var total uint64
 	for _, value := range values {
 		total += value
+	}
+	return total, nil
+}
+
+func lookupPerCPUCounter(m *ebpf.Map, key uint32) (counterVal, error) {
+	var values []counterVal
+	if err := m.Lookup(&key, &values); err != nil {
+		return counterVal{}, err
+	}
+	var total counterVal
+	for _, value := range values {
+		total.add(value)
 	}
 	return total, nil
 }

@@ -527,7 +527,7 @@ runtime_reset_runtime_files() {
 }
 
 runtime_write_stopped_status() {
-    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false}')"
+    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false}')"
 }
 
 runtime_stop_compiled_runtime() {
@@ -631,6 +631,22 @@ runtime_backend_label() {
     fi
 }
 
+runtime_loopback_split_active() {
+    local runtime_json="$1"
+    local xdp_forward_applied="$2"
+    local nft_applied="$3"
+    local xdp_error="$4"
+
+    [ "$xdp_forward_applied" = "true" ] || return 1
+    [ "$nft_applied" = "true" ] || return 1
+    [ -z "$xdp_error" ] || return 1
+    jq -e '
+      ([.rules[]? | select(.loopback_local == true)] | length) > 0
+      and
+      ([.rules[]? | select(.execution_class == "xdp")] | length) > 0
+    ' >/dev/null <<< "$runtime_json"
+}
+
 runtime_apply_compiled_runtime() {
     local runtime_json="$1"
     local xdp_runtime_json nft_runtime_json nft_applied="false" backend fallback_reason=""
@@ -680,7 +696,13 @@ runtime_apply_compiled_runtime() {
     if [ -n "$RUNTIME_XDP_ERROR" ] && [ "$nft_applied" = "true" ]; then
         fallback_reason="XDP 不可用，已自动切换到 nftables"
     fi
-    forwarder_write_status_file "$(forwarder_runtime_status_json "$backend" "$runtime_json" "$xdp_runtime_json" "$nft_runtime_json" "$fallback_reason" "$RUNTIME_XDP_ERROR" "$RUNTIME_XDP_APPLIED" "$nft_applied" "${RUNTIME_XDP_STATUS_JSON:-{}}" "$RUNTIME_XDP_FORWARD_APPLIED")"
+    local loopback_split_active="false"
+    local hybrid_reason=""
+    if runtime_loopback_split_active "$runtime_json" "$RUNTIME_XDP_FORWARD_APPLIED" "$nft_applied" "$RUNTIME_XDP_ERROR"; then
+        loopback_split_active="true"
+        hybrid_reason="loopback-split"
+    fi
+    forwarder_write_status_file "$(forwarder_runtime_status_json "$backend" "$runtime_json" "$xdp_runtime_json" "$nft_runtime_json" "$fallback_reason" "$RUNTIME_XDP_ERROR" "$RUNTIME_XDP_APPLIED" "$nft_applied" "${RUNTIME_XDP_STATUS_JSON:-{}}" "$RUNTIME_XDP_FORWARD_APPLIED" "$loopback_split_active" "$hybrid_reason")"
     fw_cleanup_legacy_nft
 }
 
