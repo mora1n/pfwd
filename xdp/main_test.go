@@ -159,6 +159,43 @@ func TestConnectionAllowedByRuntimeInvalidatesBillingChange(t *testing.T) {
 	}
 }
 
+func TestRuleValEquivalentForRefreshIgnoresBillingBaseWhenBillingDisabled(t *testing.T) {
+	current := ruleVal{
+		RuleID:                   1,
+		UserID:                   2,
+		TargetPort:               htons(80),
+		TrafficRatioScaled:       ratioScale,
+		RuleBillingUsedBaseBytes: 100,
+		UserBillingUsedBaseBytes: 200,
+	}
+	expected := current
+	expected.RuleBillingUsedBaseBytes = 300
+	expected.UserBillingUsedBaseBytes = 400
+
+	if !ruleValEquivalentForRefresh(current, expected) {
+		t.Fatal("billing base changes should not refresh rules when billing is disabled")
+	}
+}
+
+func TestRuleValEquivalentForRefreshDetectsBillingBaseWhenBillingEnabled(t *testing.T) {
+	current := ruleVal{
+		RuleID:                   1,
+		UserID:                   2,
+		TargetPort:               htons(80),
+		TrafficRatioScaled:       ratioScale,
+		BillingEnabled:           1,
+		RuleBillingUsedBaseBytes: 100,
+		UserBillingUsedBaseBytes: 200,
+	}
+	expected := current
+	expected.RuleBillingUsedBaseBytes = 300
+	expected.UserBillingUsedBaseBytes = 400
+
+	if ruleValEquivalentForRefresh(current, expected) {
+		t.Fatal("billing base changes should refresh rules when billing is enabled")
+	}
+}
+
 func TestElapsedMillis(t *testing.T) {
 	start := time.Now().Add(-1500 * time.Millisecond)
 	elapsed := elapsedMillis(start)

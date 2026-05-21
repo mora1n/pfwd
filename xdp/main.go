@@ -1625,8 +1625,10 @@ func zeroRuleCounterOnce(objs *bpfObjects, key uint32, zeroCounter []counterVal,
 }
 
 func ruleValEquivalentForRefresh(current ruleVal, expected ruleVal) bool {
-	current.RuleBillingUsedBaseBytes = expected.RuleBillingUsedBaseBytes
-	current.UserBillingUsedBaseBytes = expected.UserBillingUsedBaseBytes
+	if current.BillingEnabled == 0 && expected.BillingEnabled == 0 {
+		current.RuleBillingUsedBaseBytes = expected.RuleBillingUsedBaseBytes
+		current.UserBillingUsedBaseBytes = expected.UserBillingUsedBaseBytes
+	}
 	return current == expected
 }
 
