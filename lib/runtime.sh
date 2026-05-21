@@ -442,7 +442,7 @@ runtime_attach_metadata() {
               [
                 (if (($rule.snat_mode // "masquerade") == "snat") then "fixed_snat" else empty end),
                 (if ((($rule.mss_mode // "") != "") and (($rule.mss_mode // "none") != "none")) then "mss" else empty end),
-                (if (($rule.traffic_limit_bytes // 0) > 0 or ($rule.user_limit_bytes // 0) > 0 or ($rule.billing_used_base_bytes // 0) > 0 or ($rule.user_billing_used_base_bytes // 0) > 0) then "metered" else empty end),
+                (if (($rule.traffic_limit_bytes // 0) > 0 or ($rule.user_limit_bytes // 0) > 0) then "metered" else empty end),
                 (if ((.settings.guard_enabled // false) == true and ($rule.protocol == "tcp")) then "guard" else empty end)
               ] | unique
             ) as $flags
