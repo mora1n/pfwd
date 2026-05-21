@@ -218,31 +218,31 @@ type runtimeRule struct {
 }
 
 type statusPayload struct {
-	Applied        bool   `json:"applied"`
-	BinaryVersion  string `json:"binary_version"`
-	AppliedAt      string `json:"applied_at,omitempty"`
-	Interface      string `json:"interface,omitempty"`
-	InterfaceIndex int    `json:"interface_index,omitempty"`
-	GuardMode      string `json:"guard_mode,omitempty"`
-	XDPEffective   string `json:"xdp_effective,omitempty"`
-	XDPAttachKind  string `json:"xdp_attach_kind,omitempty"`
-	XDPReason      string `json:"xdp_reason,omitempty"`
-	IngressKind    string `json:"ingress_kind,omitempty"`
-	LoopbackKind   string `json:"loopback_kind,omitempty"`
-	SkLookupKind   string `json:"sk_lookup_kind,omitempty"`
-	ProtocolGuard  bool   `json:"protocol_guard,omitempty"`
-	RuntimeFile    string `json:"runtime_file,omitempty"`
-	StateFile      string `json:"state_file,omitempty"`
-	ConfigHash     string `json:"config_hash,omitempty"`
-	Rules          int    `json:"rules,omitempty"`
-	Users          int    `json:"users,omitempty"`
-	XDPPin         string `json:"xdp_pin,omitempty"`
-	IngressPin     string `json:"ingress_pin,omitempty"`
-	LoopbackPin    string `json:"loopback_pin,omitempty"`
-	SkLookupPin    string `json:"sk_lookup_pin,omitempty"`
-	RuleCounterPin string `json:"rule_counter_pin,omitempty"`
-	UserCounterPin string `json:"user_counter_pin,omitempty"`
-	StatsPin       string `json:"stats_pin,omitempty"`
+	Applied        bool         `json:"applied"`
+	BinaryVersion  string       `json:"binary_version"`
+	AppliedAt      string       `json:"applied_at,omitempty"`
+	Interface      string       `json:"interface,omitempty"`
+	InterfaceIndex int          `json:"interface_index,omitempty"`
+	GuardMode      string       `json:"guard_mode,omitempty"`
+	XDPEffective   string       `json:"xdp_effective,omitempty"`
+	XDPAttachKind  string       `json:"xdp_attach_kind,omitempty"`
+	XDPReason      string       `json:"xdp_reason,omitempty"`
+	IngressKind    string       `json:"ingress_kind,omitempty"`
+	LoopbackKind   string       `json:"loopback_kind,omitempty"`
+	SkLookupKind   string       `json:"sk_lookup_kind,omitempty"`
+	ProtocolGuard  bool         `json:"protocol_guard,omitempty"`
+	RuntimeFile    string       `json:"runtime_file,omitempty"`
+	StateFile      string       `json:"state_file,omitempty"`
+	ConfigHash     string       `json:"config_hash,omitempty"`
+	Rules          int          `json:"rules,omitempty"`
+	Users          int          `json:"users,omitempty"`
+	XDPPin         string       `json:"xdp_pin,omitempty"`
+	IngressPin     string       `json:"ingress_pin,omitempty"`
+	LoopbackPin    string       `json:"loopback_pin,omitempty"`
+	SkLookupPin    string       `json:"sk_lookup_pin,omitempty"`
+	RuleCounterPin string       `json:"rule_counter_pin,omitempty"`
+	UserCounterPin string       `json:"user_counter_pin,omitempty"`
+	StatsPin       string       `json:"stats_pin,omitempty"`
 	ActiveSummary  *connSummary `json:"active_summary,omitempty"`
 }
 
@@ -634,7 +634,8 @@ func applyRuntime(opts applyOptions) error {
 		currentStatus.BinaryVersion == binaryVersion &&
 		currentStatus.ConfigHash == runtimeSemanticConfigHash &&
 		currentStatus.GuardMode == opts.GuardMode &&
-		currentStatus.Interface == iface.Name {
+		currentStatus.Interface == iface.Name &&
+		pinnedRuntimeMapsCompatible(opts) {
 		return nil
 	}
 	if canIncrementalApply(currentStatus, runtimeData, opts, iface, needIngress) {
@@ -851,7 +852,7 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 	payload := struct {
 		Settings        runtimeSemanticSettings `json:"settings"`
 		Rules           []runtimeSemanticRule   `json:"rules"`
-		WhitelistHashes []whitelistContentHash `json:"whitelist_hashes"`
+		WhitelistHashes []whitelistContentHash  `json:"whitelist_hashes"`
 	}{
 		Settings:        settings,
 		Rules:           rules,
@@ -1219,6 +1220,46 @@ func pinnedPathExists(path string) bool {
 	return err == nil
 }
 
+func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpBPFEL))
+	if err != nil {
+		return false
+	}
+	pinLayout := runtimeMapPinsFromApplyOptions(opts)
+	pins := map[string]string{
+		"pfwd_settings":            pinLayout.Settings,
+		"pfwd_rules":               pinLayout.Rules,
+		"pfwd_connections":         pinLayout.Connections,
+		"pfwd_reverse":             pinLayout.Reverse,
+		"pfwd_rule_counters":       pinLayout.RuleCounter,
+		"pfwd_user_counters":       pinLayout.UserCounter,
+		"pfwd_stats":               pinLayout.Stats,
+		"pfwd_whitelist_v4":        pinLayout.WhitelistV4,
+		"pfwd_whitelist_v6":        pinLayout.WhitelistV6,
+		"pfwd_whitelist_cache_v4":  pinLayout.WhitelistCacheV4,
+		"pfwd_whitelist_cache_v6":  pinLayout.WhitelistCacheV6,
+		"pfwd_allowed_flows":       pinLayout.AllowedFlows,
+		"pfwd_guard_prefixes":      pinLayout.GuardPrefixes,
+		"pfwd_protocol_skip_ports": pinLayout.SkipPorts,
+	}
+	for name, path := range pins {
+		mapSpec := spec.Maps[name]
+		if mapSpec == nil {
+			return false
+		}
+		pinnedMap, err := ebpf.LoadPinnedMap(path, nil)
+		if err != nil {
+			return false
+		}
+		err = mapSpec.Compatible(pinnedMap)
+		_ = pinnedMap.Close()
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, needIngress bool) bool {
 	if !payload.Applied {
 		return false
@@ -1266,7 +1307,7 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 			return false
 		}
 	}
-	return runtimeData != nil
+	return runtimeData != nil && pinnedRuntimeMapsCompatible(opts)
 }
 
 func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {

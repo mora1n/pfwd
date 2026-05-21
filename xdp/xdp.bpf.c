@@ -1076,6 +1076,9 @@ static __always_inline int append_guard_prefix(
 ) {
     __u32 offset;
     __u32 copy_len;
+    __u64 current;
+    __u64 incoming;
+    __u64 merged;
 
     if (!loaded_prefix || !state) {
         return -1;
@@ -1088,30 +1091,36 @@ static __always_inline int append_guard_prefix(
     if (copy_len > 8 - offset) {
         copy_len = 8 - offset;
     }
-    if (copy_len > 0) {
-        state->prefix[offset + 0] = loaded_prefix->prefix[0];
+
+    current = *(__u64 *)state->prefix;
+    incoming = *(__u64 *)loaded_prefix->prefix;
+    merged = current | (incoming << (offset * 8));
+    switch (offset + copy_len) {
+    case 1:
+        merged &= 0x00000000000000ffULL;
+        break;
+    case 2:
+        merged &= 0x000000000000ffffULL;
+        break;
+    case 3:
+        merged &= 0x0000000000ffffffULL;
+        break;
+    case 4:
+        merged &= 0x00000000ffffffffULL;
+        break;
+    case 5:
+        merged &= 0x000000ffffffffffULL;
+        break;
+    case 6:
+        merged &= 0x0000ffffffffffffULL;
+        break;
+    case 7:
+        merged &= 0x00ffffffffffffffULL;
+        break;
+    default:
+        break;
     }
-    if (copy_len > 1) {
-        state->prefix[offset + 1] = loaded_prefix->prefix[1];
-    }
-    if (copy_len > 2) {
-        state->prefix[offset + 2] = loaded_prefix->prefix[2];
-    }
-    if (copy_len > 3) {
-        state->prefix[offset + 3] = loaded_prefix->prefix[3];
-    }
-    if (copy_len > 4) {
-        state->prefix[offset + 4] = loaded_prefix->prefix[4];
-    }
-    if (copy_len > 5) {
-        state->prefix[offset + 5] = loaded_prefix->prefix[5];
-    }
-    if (copy_len > 6) {
-        state->prefix[offset + 6] = loaded_prefix->prefix[6];
-    }
-    if (copy_len > 7) {
-        state->prefix[offset + 7] = loaded_prefix->prefix[7];
-    }
+    *(__u64 *)state->prefix = merged;
     state->seen_len = offset + copy_len;
     return 0;
 }
