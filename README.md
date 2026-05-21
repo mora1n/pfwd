@@ -92,6 +92,7 @@ bash ./pfwd.sh install
 
 ```bash
 pfwd doctor
+pfwd doctor --bench
 pfwd render units
 /usr/local/lib/pfwd/bin/pfwd-xdp version
 ```
@@ -206,7 +207,7 @@ pfwd add \
 | 刷新运行态 | `pfwd refresh` | 重新解析配置并应用当前数据面 |
 | 渲染数据面 | `pfwd render xdp` | 查看 XDP 候选 runtime JSON |
 | 渲染速率 | `pfwd render tc` | 查看速率限制命令 |
-| 诊断 | `pfwd doctor` | 查看配置、二进制、systemd 和 benchmark |
+| 诊断 | `pfwd doctor` | 查看配置、二进制、systemd 和运行态摘要；`--bench` 显示 benchmark |
 
 ## 配置语义
 

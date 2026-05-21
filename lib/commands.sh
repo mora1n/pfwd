@@ -20,35 +20,45 @@ cmd_runtime_ready() {
 cmd_apply_forwarding_bundle() {
     config_init >/dev/null
     forwarder_validate_config
+    stats_runtime_cache_clear
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
     fw_apply_tc
+    stats_runtime_cache_clear
 }
 
 cmd_apply_forwarder_runtime() {
     config_init >/dev/null
     forwarder_validate_config
+    stats_runtime_cache_clear
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
+    stats_runtime_cache_clear
 }
 
 cmd_apply_firewall_runtime() {
     config_init >/dev/null
+    stats_runtime_cache_clear
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
+    stats_runtime_cache_clear
 }
 
 cmd_apply_firewall_tc_runtime() {
     config_init >/dev/null
+    stats_runtime_cache_clear
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
     fw_apply_tc
+    stats_runtime_cache_clear
 }
 
 cmd_apply_guard_runtime() {
     config_init >/dev/null
+    stats_runtime_cache_clear
     cmd_runtime_ready || return 0
     forwarder_apply_runtime
+    stats_runtime_cache_clear
 }
 
 cmd_refresh_after_change() {
@@ -943,6 +953,12 @@ cmd_doctor_benchmarks() {
     cmd_doctor_benchmark "benchmark.forward_list" "$(cmd_doctor_runner 'UI_COLOR_ENABLED=0; ui_print_forward_list >/dev/null')"
 }
 
+cmd_doctor_usage() {
+    cat <<'EOF'
+用法：pfwd doctor [--bench]
+EOF
+}
+
 cmd_render() {
     local target="${1:-forwarder}"
     case "$target" in
@@ -1023,8 +1039,23 @@ cmd_notify_test() {
 }
 
 cmd_doctor() {
+    local include_bench="false"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --bench) include_bench="true"; shift ;;
+            help|-h|--help)
+                cmd_doctor_usage
+                return 0
+                ;;
+            *)
+                cmd_doctor_usage >&2
+                pfwd_die "未知选项：$1"
+                ;;
+        esac
+    done
     config_init >/dev/null
     local forwarder_status xdp_status backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
+    stats_runtime_cache_clear
     forwarder_status="$(forwarder_status_json)"
     xdp_status="$(forwarder_xdp_status_json)"
     backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
@@ -1075,7 +1106,11 @@ cmd_doctor() {
     whitelist_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard_whitelist.%s：%s\n' "$key" "$value"
     done
-    cmd_doctor_benchmarks
+    if [ "$include_bench" = "true" ]; then
+        cmd_doctor_benchmarks
+    else
+        echo "benchmark：已省略（使用 pfwd doctor --bench 查看）"
+    fi
 }
 
 cmd_install() {

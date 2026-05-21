@@ -60,6 +60,80 @@ runtime_rule_counter_owner() {
     esac
 }
 
+runtime_rule_json_line() {
+    local id="$1"
+    local index="$2"
+    local user_id="$3"
+    local user_index="$4"
+    local listen_ip="$5"
+    local listen_port="$6"
+    local protocol="$7"
+    local remote_input="$8"
+    local resolved_target="$9"
+    shift 9
+    local remote_port="$1"
+    local ip_version="$2"
+    local comment="$3"
+    local snat_mode="$4"
+    local snat_source="$5"
+    local mss_mode="$6"
+    local mss_value="$7"
+    local traffic_mode="$8"
+    local traffic_ratio="$9"
+    shift 9
+    local execution_class="$1"
+    local backend_reason="$2"
+    local counter_owner="$3"
+    local rule_limit="$4"
+    local user_limit="$5"
+    local billing_used="$6"
+    local user_billing_used="$7"
+
+    local comment_json snat_source_json mss_mode_json mss_value_json fallback_reason_json loopback_local
+    comment_json="null"
+    snat_source_json="null"
+    mss_mode_json="null"
+    mss_value_json="null"
+    fallback_reason_json="null"
+    loopback_local="false"
+
+    [ -z "$comment" ] || comment_json="$(pfwd_json_escape "$comment")"
+    [ -z "$snat_source" ] || snat_source_json="$(pfwd_json_escape "$snat_source")"
+    [ -z "$mss_mode" ] || mss_mode_json="$(pfwd_json_escape "$mss_mode")"
+    [ -z "$mss_value" ] || mss_value_json="$mss_value"
+    [ -z "$backend_reason" ] || fallback_reason_json="$(pfwd_json_escape "$backend_reason")"
+    [ "$execution_class" = "nft" ] && loopback_local="true"
+
+    printf '{'
+    printf '"id":%s,' "$(pfwd_json_escape "$id")"
+    printf '"index":%s,' "$index"
+    printf '"user_id":%s,' "$(pfwd_json_escape "$user_id")"
+    printf '"user_index":%s,' "$user_index"
+    printf '"listen_ip":%s,' "$(pfwd_json_escape "$listen_ip")"
+    printf '"listen_port":%s,' "$listen_port"
+    printf '"protocol":%s,' "$(pfwd_json_escape "$protocol")"
+    printf '"remote_input":%s,' "$(pfwd_json_escape "$remote_input")"
+    printf '"resolved_target":%s,' "$(pfwd_json_escape "$resolved_target")"
+    printf '"remote_port":%s,' "$remote_port"
+    printf '"ip_version":%s,' "$ip_version"
+    printf '"comment":%s,' "$comment_json"
+    printf '"snat_mode":%s,' "$(pfwd_json_escape "$snat_mode")"
+    printf '"snat_source":%s,' "$snat_source_json"
+    printf '"mss_mode":%s,' "$mss_mode_json"
+    printf '"mss_value":%s,' "$mss_value_json"
+    printf '"traffic_mode":%s,' "$(pfwd_json_escape "$traffic_mode")"
+    printf '"traffic_ratio":%s,' "$traffic_ratio"
+    printf '"traffic_limit_bytes":%s,' "$rule_limit"
+    printf '"user_limit_bytes":%s,' "$user_limit"
+    printf '"billing_used_base_bytes":%s,' "$billing_used"
+    printf '"user_billing_used_base_bytes":%s,' "$user_billing_used"
+    printf '"execution_class":%s,' "$(pfwd_json_escape "$execution_class")"
+    printf '"fallback_reason":%s,' "$fallback_reason_json"
+    printf '"counter_owner":%s,' "$(pfwd_json_escape "$counter_owner")"
+    printf '"loopback_local":%s' "$loopback_local"
+    printf '}\n'
+}
+
 runtime_compiled_json() {
     local strict="${1:-true}"
     config_init >/dev/null
@@ -215,61 +289,13 @@ runtime_compiled_json() {
                         execution_class="$(runtime_rule_execution_class "$resolved_ip")"
                         backend_reason="$(runtime_rule_backend_reason "$resolved_ip")"
                         counter_owner="$(runtime_rule_counter_owner "$execution_class")"
-                        jq -cn \
-                          --arg id "$id" \
-                          --argjson index "$rule_index" \
-                          --arg user_id "$user_id" \
-                          --argjson user_index "$user_index" \
-                          --arg listen_ip "$listen_ip" \
-                          --argjson listen_port "$listen_port" \
-                          --arg protocol "$proto" \
-                          --arg remote_input "$remote_host" \
-                          --arg resolved_target "$resolved_ip" \
-                          --argjson remote_port "$remote_port" \
-                          --argjson ip_version "$family_ipver" \
-                          --arg comment "$comment" \
-                          --arg snat_mode "$snat_mode" \
-                          --arg snat_source "$snat_source" \
-                          --arg mss_mode "$mss_mode" \
-                          --arg mss_value "$mss_value" \
-                          --arg traffic_mode "$traffic_mode" \
-                          --arg traffic_ratio "$traffic_ratio" \
-                          --arg execution_class "$execution_class" \
-                          --arg backend_reason "$backend_reason" \
-                          --arg counter_owner "$counter_owner" \
-                          --argjson rule_limit "$rule_limit" \
-                          --argjson user_limit "${user_limit:-0}" \
-                          --argjson billing_used "$billing_used" \
-                          --argjson user_billing_used "$user_billing_used" '
-                          {
-                            id: $id,
-                            index: $index,
-                            user_id: $user_id,
-                            user_index: $user_index,
-                            listen_ip: $listen_ip,
-                            listen_port: $listen_port,
-                            protocol: $protocol,
-                            remote_input: $remote_input,
-                            resolved_target: $resolved_target,
-                            remote_port: $remote_port,
-                            ip_version: $ip_version,
-                            comment: (if $comment == "" then null else $comment end),
-                            snat_mode: $snat_mode,
-                            snat_source: (if $snat_source == "" then null else $snat_source end),
-                            mss_mode: (if $mss_mode == "" then null else $mss_mode end),
-                            mss_value: (if $mss_value == "" then null else ($mss_value | tonumber) end),
-                            traffic_mode: $traffic_mode,
-                            traffic_ratio: ($traffic_ratio | tonumber),
-                            traffic_limit_bytes: $rule_limit,
-                            user_limit_bytes: $user_limit,
-                            billing_used_base_bytes: $billing_used,
-                            user_billing_used_base_bytes: $user_billing_used,
-                            execution_class: $execution_class,
-                            fallback_reason: (if $backend_reason == "" then null else $backend_reason end),
-                            counter_owner: $counter_owner,
-                            loopback_local: ($execution_class == "nft")
-                          }
-                        ' >> "$rules_tmp"
+                        runtime_rule_json_line \
+                          "$id" "$rule_index" "$user_id" "$user_index" \
+                          "$listen_ip" "$listen_port" "$proto" "$remote_host" "$resolved_ip" \
+                          "$remote_port" "$family_ipver" "$comment" "$snat_mode" "$snat_source" \
+                          "$mss_mode" "$mss_value" "$traffic_mode" "$traffic_ratio" \
+                          "$execution_class" "$backend_reason" "$counter_owner" \
+                          "$rule_limit" "${user_limit:-0}" "$billing_used" "$user_billing_used" >> "$rules_tmp"
                     done <<< "$target_rows"
                 done < <(runtime_protocol_rows "$protocol")
             done <<< "$ip_versions"
@@ -333,15 +359,18 @@ runtime_attach_metadata() {
     local runtime_json
     runtime_json="$(cat)"
     local config_hash
-    config_hash="$(printf '%s' "$runtime_json" | jq -S 'del(.config_hash, .summary)' | pfwd_stdin_checksum)"
+    config_hash="$(printf '%s' "$runtime_json" | pfwd_stdin_checksum)"
     jq --arg config_hash "$config_hash" '
-      .config_hash = $config_hash
-      | .summary = {
-          rules: (.rules | length),
-          xdp_rules: ([.rules[]? | select(.execution_class == "xdp")] | length),
-          nft_rules: ([.rules[]? | select(.execution_class == "nft")] | length),
-          loopback_rules: ([.rules[]? | select(.loopback_local == true)] | length)
-        }
+      .summary = (
+        reduce (.rules[]?) as $rule (
+          {rules: 0, xdp_rules: 0, nft_rules: 0, loopback_rules: 0};
+          .rules += 1
+          | .xdp_rules += (if $rule.execution_class == "xdp" then 1 else 0 end)
+          | .nft_rules += (if $rule.execution_class == "nft" then 1 else 0 end)
+          | .loopback_rules += (if ($rule.loopback_local == true) then 1 else 0 end)
+        )
+      )
+      | .config_hash = $config_hash
     ' <<< "$runtime_json"
 }
 

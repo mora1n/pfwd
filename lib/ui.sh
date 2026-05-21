@@ -34,8 +34,7 @@ declare -ag UI_PAGE_LINES=()
 declare -ag UI_PAGE_PREV_LINES=()
 UI_PAGE_PREV_OFFSET=0
 declare -ag UI_DRY_RUN_LINES=()
-UI_DATA_CACHE=""
-UI_DATA_CACHE_KEY=""
+declare -Ag UI_DATA_CACHE_VALUES=()
 
 # Color theme
 UI_C_TITLE="1;96"
@@ -158,20 +157,18 @@ ui_notice_clear() {
 }
 
 ui_data_cache_clear() {
-    UI_DATA_CACHE=""
-    UI_DATA_CACHE_KEY=""
+    UI_DATA_CACHE_VALUES=()
 }
 
 ui_cached_data() {
     local cache_key="$1"
     shift
-    if [ "$UI_DATA_CACHE_KEY" = "$cache_key" ] && [ -n "$UI_DATA_CACHE" ]; then
-        printf '%s\n' "$UI_DATA_CACHE"
+    if [[ -v UI_DATA_CACHE_VALUES["$cache_key"] ]]; then
+        printf '%s\n' "${UI_DATA_CACHE_VALUES[$cache_key]}"
         return 0
     fi
-    UI_DATA_CACHE="$("$@")"
-    UI_DATA_CACHE_KEY="$cache_key"
-    printf '%s\n' "$UI_DATA_CACHE"
+    UI_DATA_CACHE_VALUES["$cache_key"]="$("$@")"
+    printf '%s\n' "${UI_DATA_CACHE_VALUES[$cache_key]}"
 }
 
 ui_dry_run_reset() {
@@ -1103,18 +1100,31 @@ ui_header() {
     printf '\n'
 }
 
+ui_main_title_meta_tsv() {
+    local backend="none"
+    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
+        backend="$(jq -r '.forwarding_backend // "none"' "$PFWD_FORWARDER_STATUS_FILE" 2>/dev/null || echo none)"
+    fi
+    jq -r --arg backend "$backend" '
+      [
+        (.users | length),
+        ([.forwards[]? | select(.enabled == true)] | length),
+        $backend
+      ] | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
 ui_title() {
-    local guard_status=""
+    local guard_status="" title_meta user_count forward_count backend
+    title_meta="$(ui_cached_data "main_title_meta_tsv" ui_main_title_meta_tsv)"
+    IFS=$'\t' read -r user_count forward_count backend <<< "$title_meta"
     if command -v guard_enabled >/dev/null 2>&1; then
         if [ "$(guard_enabled)" = "true" ]; then
-            guard_status="guard: $(jq -r '.forwarding_backend // "none"' <<< "$(forwarder_status_json 2>/dev/null || echo '{}')")"
+            guard_status="guard: ${backend:-none}"
         else
             guard_status="guard: off"
         fi
     fi
-    local user_count forward_count
-    user_count="$(jq '.users | length' "$PFWD_CONFIG_FILE" 2>/dev/null || echo "?")"
-    forward_count="$(jq '[.forwards[] | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE" 2>/dev/null || echo "?")"
     printf '\n'
     ui_color "$UI_C_TITLE" "pfwd v${PFWD_VERSION:-}"
     printf '  '

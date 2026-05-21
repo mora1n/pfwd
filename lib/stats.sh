@@ -10,6 +10,12 @@ EOF
 }
 
 PFWD_STATS_INITIALIZED=0
+PFWD_STATS_SNAPSHOT_CACHE=""
+PFWD_STATS_USAGE_CACHE=""
+PFWD_STATS_FORWARDER_STATUS_CACHE=""
+PFWD_STATS_XDP_STATUS_CACHE=""
+PFWD_STATS_RUNTIME_XDP_CACHE=""
+PFWD_STATS_RUNTIME_NFT_CACHE=""
 
 stats_init() {
     [ "$PFWD_STATS_INITIALIZED" = "1" ] && [ -f "$PFWD_STATS_FILE" ] && return 0
@@ -71,9 +77,71 @@ def seeded_two_way_display($old; $mode; $ratio):
 EOF
 }
 
-PFWD_STATS_SNAPSHOT_CACHE=""
-PFWD_STATS_SNAPSHOT_TIME=0
 PFWD_STATS_LAST_SNAPSHOT_ERROR=""
+
+stats_runtime_cache_clear() {
+    PFWD_STATS_SNAPSHOT_CACHE=""
+    PFWD_STATS_USAGE_CACHE=""
+    PFWD_STATS_FORWARDER_STATUS_CACHE=""
+    PFWD_STATS_XDP_STATUS_CACHE=""
+    PFWD_STATS_RUNTIME_XDP_CACHE=""
+    PFWD_STATS_RUNTIME_NFT_CACHE=""
+}
+
+stats_forwarder_status_cached() {
+    if [ -n "$PFWD_STATS_FORWARDER_STATUS_CACHE" ]; then
+        printf '%s\n' "$PFWD_STATS_FORWARDER_STATUS_CACHE"
+        return 0
+    fi
+    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
+        PFWD_STATS_FORWARDER_STATUS_CACHE="$(forwarder_status_json)"
+    else
+        PFWD_STATS_FORWARDER_STATUS_CACHE='{}'
+    fi
+    printf '%s\n' "$PFWD_STATS_FORWARDER_STATUS_CACHE"
+}
+
+stats_runtime_file_cached() {
+    local which="$1"
+    local file cache_var_name cache_var_value
+    case "$which" in
+        xdp)
+            file="$PFWD_FORWARDER_XDP_RUNTIME_FILE"
+            cache_var_name="PFWD_STATS_RUNTIME_XDP_CACHE"
+            ;;
+        nft)
+            file="$PFWD_FORWARDER_NFT_RUNTIME_FILE"
+            cache_var_name="PFWD_STATS_RUNTIME_NFT_CACHE"
+            ;;
+        *)
+            pfwd_die "未知 runtime cache 类型：$which"
+            ;;
+    esac
+    cache_var_value="${!cache_var_name:-}"
+    if [ -n "$cache_var_value" ]; then
+        printf '%s\n' "$cache_var_value"
+        return 0
+    fi
+    if [ -f "$file" ]; then
+        printf -v "$cache_var_name" '%s' "$(cat "$file")"
+    else
+        if [ "$which" = "xdp" ]; then
+            printf -v "$cache_var_name" '%s' '{"rules":[]}'
+        else
+            printf -v "$cache_var_name" '%s' '{"rules":[]}'
+        fi
+    fi
+    printf '%s\n' "${!cache_var_name}"
+}
+
+stats_xdp_status_cached() {
+    if [ -n "$PFWD_STATS_XDP_STATUS_CACHE" ]; then
+        printf '%s\n' "$PFWD_STATS_XDP_STATUS_CACHE"
+        return 0
+    fi
+    PFWD_STATS_XDP_STATUS_CACHE="$(forwarder_xdp_status_json)"
+    printf '%s\n' "$PFWD_STATS_XDP_STATUS_CACHE"
+}
 
 stats_zero_snapshot_json() {
     local cfg_file="${1:-$PFWD_CONFIG_FILE}"
@@ -323,27 +391,19 @@ $jq_filter"
 stats_current_snapshot() {
     config_init >/dev/null
     stats_init >/dev/null
-    local cfg_file snapshot xdp_snapshot nft_snapshot forwarder_status xdp_runtime nft_runtime xdp_status_json
+    local cfg_file xdp_snapshot nft_snapshot forwarder_status xdp_runtime nft_runtime
+    if [ -n "$PFWD_STATS_SNAPSHOT_CACHE" ]; then
+        printf '%s\n' "$PFWD_STATS_SNAPSHOT_CACHE"
+        return 0
+    fi
     cfg_file="$PFWD_CONFIG_FILE"
     if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
         cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
     PFWD_STATS_LAST_SNAPSHOT_ERROR=""
-    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
-        forwarder_status="$(forwarder_status_json)"
-    else
-        forwarder_status='{}'
-    fi
-    if [ -f "$PFWD_FORWARDER_XDP_RUNTIME_FILE" ]; then
-        xdp_runtime="$(cat "$PFWD_FORWARDER_XDP_RUNTIME_FILE")"
-    else
-        xdp_runtime='{"rules":[]}'
-    fi
-    if [ -f "$PFWD_FORWARDER_NFT_RUNTIME_FILE" ]; then
-        nft_runtime="$(cat "$PFWD_FORWARDER_NFT_RUNTIME_FILE")"
-    else
-        nft_runtime='{"rules":[]}'
-    fi
+    forwarder_status="$(stats_forwarder_status_cached)"
+    xdp_runtime="$(stats_runtime_file_cached xdp)"
+    nft_runtime="$(stats_runtime_file_cached nft)"
 
     xdp_snapshot='[]'
     nft_snapshot='[]'
@@ -373,21 +433,28 @@ stats_current_snapshot() {
     fi
 
     if jq -e 'length > 0' >/dev/null 2>&1 <<< "$xdp_snapshot" || jq -e 'length > 0' >/dev/null 2>&1 <<< "$nft_snapshot"; then
-        stats_merge_snapshots_json "$xdp_snapshot" "$nft_snapshot"
+        PFWD_STATS_SNAPSHOT_CACHE="$(stats_merge_snapshots_json "$xdp_snapshot" "$nft_snapshot")"
+        printf '%s\n' "$PFWD_STATS_SNAPSHOT_CACHE"
         return 0
     fi
-    stats_zero_snapshot_json "$cfg_file"
+    PFWD_STATS_SNAPSHOT_CACHE="$(stats_zero_snapshot_json "$cfg_file")"
+    printf '%s\n' "$PFWD_STATS_SNAPSHOT_CACHE"
 }
 
 stats_usage_json() {
     stats_init >/dev/null
     local cfg_file stats_file
+    if [ -n "$PFWD_STATS_USAGE_CACHE" ]; then
+        printf '%s\n' "$PFWD_STATS_USAGE_CACHE"
+        return 0
+    fi
     cfg_file="$PFWD_CONFIG_FILE"
     stats_file="$PFWD_STATS_FILE"
     if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
         cfg_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
-    stats_usage_from_snapshot "$(stats_current_snapshot)" "$cfg_file" "$stats_file"
+    PFWD_STATS_USAGE_CACHE="$(stats_usage_from_snapshot "$(stats_current_snapshot)" "$cfg_file" "$stats_file")"
+    printf '%s\n' "$PFWD_STATS_USAGE_CACHE"
 }
 
 stats_rollup_needed() {
@@ -410,6 +477,7 @@ stats_rollup_current() {
     snapshot="$(stats_current_snapshot)"
     stats_rollup_needed "$snapshot" || return 0
     stats_rollup_counters "$snapshot"
+    stats_runtime_cache_clear
 }
 
 stats_set_user_used() {

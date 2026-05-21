@@ -77,6 +77,15 @@ declare -ag BBR_UI_FORM_LINES=()
 declare -ag BBR_UI_FORM_OPTION_LINES=()
 declare -ag BBR_UI_PAGE_LINES=()
 declare -ag BBR_UI_DRY_RUN_LINES=()
+BBR_UI_C_TITLE="1;96"
+BBR_UI_C_HEADER="1;36"
+BBR_UI_C_DIM="2;37"
+BBR_UI_C_ACCENT="36"
+BBR_UI_C_SUCCESS="1;32"
+BBR_UI_C_WARN="33"
+BBR_UI_C_ERROR="31"
+BBR_UI_C_BRIGHT="1;37"
+BBR_UI_C_PANEL="36"
 
 bbr_die() {
     echo "错误：$*" >&2
@@ -85,6 +94,39 @@ bbr_die() {
 
 bbr_info() {
     echo "$*"
+}
+
+bbr_use_color() {
+    [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+}
+
+bbr_color() {
+    local code="$1"
+    shift
+    if bbr_use_color; then
+        printf '\033[%sm%s\033[0m' "$code" "$*"
+    else
+        printf '%s' "$*"
+    fi
+}
+
+bbr_print_line() {
+    local text="$1"
+    local code="${2:-}"
+    if [ -n "$code" ]; then
+        bbr_color "$code" "$text"
+    else
+        printf '%s' "$text"
+    fi
+    printf '\n'
+}
+
+bbr_rule() {
+    local char="${1:--}" width="${2:-72}" code="${3:-$BBR_UI_C_DIM}"
+    local line=""
+    printf -v line '%*s' "$width" ''
+    line="${line// /$char}"
+    bbr_print_line "$line" "$code"
 }
 
 bbr_ui_set_notice() {
@@ -633,8 +675,8 @@ bbr_render_form_page() {
     local hint="${2:-}"
     local line
     shift 2 || true
-    printf '== %s ==\n' "$title"
-    [ -n "$hint" ] && printf '%s\n' "$hint"
+    bbr_print_line "== $title ==" "$BBR_UI_C_HEADER"
+    [ -n "$hint" ] && bbr_print_line "$hint" "$BBR_UI_C_DIM"
     if [ -n "$hint" ] && { [ "${#BBR_UI_FORM_LINES[@]}" -gt 0 ] || [ "${#BBR_UI_FORM_OPTION_LINES[@]}" -gt 0 ]; }; then
         printf '\n'
     fi
@@ -879,12 +921,18 @@ bbr_ui_notice_prefix() {
 
 bbr_ui_print_notice() {
     [ -n "$BBR_UI_NOTICE" ] || return 0
-    printf '%s %s\n' "$(bbr_ui_notice_prefix "$BBR_UI_NOTICE_LEVEL")" "$BBR_UI_NOTICE"
+    local code="$BBR_UI_C_ACCENT"
+    case "$BBR_UI_NOTICE_LEVEL" in
+        success) code="$BBR_UI_C_SUCCESS" ;;
+        warn) code="$BBR_UI_C_WARN" ;;
+        error) code="$BBR_UI_C_ERROR" ;;
+    esac
+    bbr_print_line "$(bbr_ui_notice_prefix "$BBR_UI_NOTICE_LEVEL") $BBR_UI_NOTICE" "$code"
 }
 
 bbr_status_summary() {
     bbr_state_load
-    local cc qdisc release state_iface
+    local cc qdisc release state_iface restore_mode service_state tc_state bbr_state
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
     release="$(uname -r 2>/dev/null || echo unknown)"
@@ -892,41 +940,119 @@ bbr_status_summary() {
     if [ "$BBR_STATE_PRESENT" = "true" ]; then
         state_iface="$(bbr_resolve_iface "$BBR_STATE_TC_IFACE_MODE" "$BBR_STATE_TC_IFACE_VALUE" 2>/dev/null || true)"
     fi
+    if bbr_service_available; then
+        service_state="installed"
+    else
+        service_state="not-installed"
+    fi
+    if [ -n "${BBR_STATE_EGRESS_RATE:-}" ] || [ -n "${BBR_STATE_INGRESS_RATE:-}" ]; then
+        tc_state="on"
+    else
+        tc_state="off"
+    fi
+    if [ "$cc" = "bbr" ]; then
+        bbr_state="active"
+    elif bbr_sysctl_cc_available; then
+        bbr_state="available"
+    else
+        bbr_state="unavailable"
+    fi
+    if [ "$BBR_STATE_PRESENT" = "true" ]; then
+        restore_mode="armed"
+    else
+        restore_mode="none"
+    fi
     cat <<EOF
 kernel_release=$release
 congestion_control=$cc
 qdisc=$qdisc
-bbr_available=$(bbr_sysctl_cc_available && echo true || echo false)
-bbr_active=$([ "$cc" = "bbr" ] && echo true || echo false)
+bbr_state=$bbr_state
 applied_profile=${BBR_STATE_PROFILE:-none}
+restore_mode=$restore_mode
+service_state=$service_state
 nic_steering=${BBR_STATE_NIC_STEERING:-false}
+tc_state=$tc_state
 tc_iface_resolved=${state_iface:-}
 egress_rate=${BBR_STATE_EGRESS_RATE:-}
 ingress_rate=${BBR_STATE_INGRESS_RATE:-}
+bql_limit=${BBR_STATE_BQL_LIMIT:-65536}
 applied_at=${BBR_STATE_APPLIED_AT:-}
 skipped_runtime=${BBR_STATE_SKIPPED_RUNTIME:-}
 EOF
 }
 
+bbr_status_icon() {
+    case "$1" in
+        active|armed|installed|on|true) printf '●' ;;
+        available|none|off|false|not-installed) printf '○' ;;
+        *) printf '◉' ;;
+    esac
+}
+
+bbr_render_status_panel() {
+    local summary="$1"
+    local kernel release cc profile restore service steering tc_state tc_iface egress ingress bql skipped
+    release="$(awk -F= '$1 == "kernel_release" {print $2; exit}' <<< "$summary")"
+    cc="$(awk -F= '$1 == "congestion_control" {print $2; exit}' <<< "$summary")"
+    kernel="$(awk -F= '$1 == "qdisc" {print $2; exit}' <<< "$summary")"
+    profile="$(awk -F= '$1 == "applied_profile" {print $2; exit}' <<< "$summary")"
+    restore="$(awk -F= '$1 == "restore_mode" {print $2; exit}' <<< "$summary")"
+    service="$(awk -F= '$1 == "service_state" {print $2; exit}' <<< "$summary")"
+    steering="$(awk -F= '$1 == "nic_steering" {print $2; exit}' <<< "$summary")"
+    tc_state="$(awk -F= '$1 == "tc_state" {print $2; exit}' <<< "$summary")"
+    tc_iface="$(awk -F= '$1 == "tc_iface_resolved" {print $2; exit}' <<< "$summary")"
+    egress="$(awk -F= '$1 == "egress_rate" {print $2; exit}' <<< "$summary")"
+    ingress="$(awk -F= '$1 == "ingress_rate" {print $2; exit}' <<< "$summary")"
+    bql="$(awk -F= '$1 == "bql_limit" {print $2; exit}' <<< "$summary")"
+    skipped="$(awk -F= '$1 == "skipped_runtime" {print $2; exit}' <<< "$summary")"
+
+    bbr_print_line "运行概览" "$BBR_UI_C_HEADER"
+    bbr_print_line "  $(bbr_status_icon "$profile") profile      ${profile:-none}" "$BBR_UI_C_BRIGHT"
+    bbr_print_line "  $(bbr_status_icon "$restore") restore      ${restore:-none}"
+    bbr_print_line "  $(bbr_status_icon "$service") service      ${service:-not-installed}"
+    bbr_print_line "  $(bbr_status_icon "$tc_state") tc shaping  ${tc_state:-off}"
+    printf '\n'
+    bbr_print_line "内核与队列" "$BBR_UI_C_HEADER"
+    bbr_print_line "  kernel       ${release:-unknown}"
+    bbr_print_line "  congestion   ${cc:-unknown}"
+    bbr_print_line "  qdisc        ${kernel:-unknown}"
+    bbr_print_line "  bql_limit    ${bql:-65536}"
+    printf '\n'
+    bbr_print_line "运行态细节" "$BBR_UI_C_HEADER"
+    bbr_print_line "  steering     ${steering:-false}"
+    bbr_print_line "  tc_iface     ${tc_iface:--}"
+    bbr_print_line "  egress       ${egress:--}"
+    bbr_print_line "  ingress      ${ingress:--}"
+    [ -z "$skipped" ] || {
+        printf '\n'
+        bbr_print_line "跳过项" "$BBR_UI_C_HEADER"
+        bbr_print_line "  $skipped" "$BBR_UI_C_WARN"
+    }
+}
+
 bbr_menu_render() {
-    local line
-    printf '== pfwd-bbr ==\n'
-    printf '%s\n' "$(bbr_status_summary)"
-    echo
+    local line summary
+    summary="$(bbr_status_summary)"
+    bbr_print_line "pfwd-bbr" "$BBR_UI_C_TITLE"
+    bbr_print_line "BBR / sysctl / tc 一体化运行态管理" "$BBR_UI_C_ACCENT"
+    bbr_rule "-" 72 "$BBR_UI_C_DIM"
+    bbr_render_status_panel "$summary"
+    printf '\n'
     bbr_ui_print_notice
     if [ "${#BBR_UI_DRY_RUN_LINES[@]}" -gt 0 ]; then
-        echo "最近 dry-run："
+        bbr_print_line "最近 dry-run" "$BBR_UI_C_HEADER"
         for line in "${BBR_UI_DRY_RUN_LINES[@]}"; do
-            printf '%s\n' "$line"
+            bbr_print_line "  $line" "$BBR_UI_C_DIM"
         done
         echo
     fi
-    echo "1) 查看状态"
-    echo "2) 应用优化"
-    echo "3) 重置优化"
-    echo "4) 安装开机恢复服务"
-    echo "5) 卸载 pfwd-bbr"
-    echo "0) 退出"
+    bbr_print_line "操作" "$BBR_UI_C_HEADER"
+    bbr_print_line "1) 查看状态详情"
+    bbr_print_line "2) 应用优化"
+    bbr_print_line "3) 重置优化"
+    bbr_print_line "4) 安装开机恢复服务"
+    bbr_print_line "5) 卸载 pfwd-bbr"
+    bbr_print_line "0) 退出" "$BBR_UI_C_ACCENT"
 }
 
 bbr_menu() {

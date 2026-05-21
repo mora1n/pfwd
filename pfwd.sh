@@ -238,7 +238,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard whitelist [--enabled true|false] [--include-cn true|false] [--cidr IPv4/IPv6 CIDR] [--replace-custom] [--clear-custom] [--source-url URL]
   pfwd guard whitelist refresh|status
   pfwd guard whitelist-custom list|add|clear|delete|update ...
-  pfwd doctor
+  pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]
   pfwd uninstall

@@ -323,6 +323,19 @@ func (c *counterVal) add(other counterVal) {
 	c.BillingBytes += other.BillingBytes
 }
 
+type snapshotRow struct {
+	ID             string  `json:"id"`
+	UserID         string  `json:"user_id"`
+	TrafficMode    string  `json:"traffic_mode"`
+	TrafficRatio   float64 `json:"traffic_ratio"`
+	InputBytes     uint64  `json:"input_bytes"`
+	OutputBytes    uint64  `json:"output_bytes"`
+	InputPackets   uint64  `json:"input_packets"`
+	OutputPackets  uint64  `json:"output_packets"`
+	DroppedBytes   uint64  `json:"dropped_bytes"`
+	DroppedPackets uint64  `json:"dropped_packets"`
+}
+
 type connKey struct {
 	Family     uint8
 	Protocol   uint8
@@ -1649,19 +1662,7 @@ func snapshotCounters(opts snapshotOptions) error {
 	if err != nil {
 		return err
 	}
-	type row struct {
-		ID             string  `json:"id"`
-		UserID         string  `json:"user_id"`
-		TrafficMode    string  `json:"traffic_mode"`
-		TrafficRatio   float64 `json:"traffic_ratio"`
-		InputBytes     uint64  `json:"input_bytes"`
-		OutputBytes    uint64  `json:"output_bytes"`
-		InputPackets   uint64  `json:"input_packets"`
-		OutputPackets  uint64  `json:"output_packets"`
-		DroppedBytes   uint64  `json:"dropped_bytes"`
-		DroppedPackets uint64  `json:"dropped_packets"`
-	}
-	rows := make([]row, 0, len(runtimeData.Rules))
+	rows := make([]snapshotRow, 0, len(runtimeData.Rules))
 	applied := false
 	if opts.StatusFile != "" {
 		payload, err := readStatus(opts.StatusFile)
@@ -1683,25 +1684,24 @@ func snapshotCounters(opts snapshotOptions) error {
 			return fmt.Errorf("读取 XDP 计数 map 失败 (%s): %w", opts.RuleCounterPin, err)
 		}
 		for _, rule := range runtimeData.Rules {
-			rows = append(rows, row{ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio)})
+			rows = append(rows, snapshotRow{ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio)})
 		}
 		return json.NewEncoder(os.Stdout).Encode(rows)
 	}
 	defer counterMap.Close()
+	enc := json.NewEncoder(os.Stdout)
 	for _, rule := range runtimeData.Rules {
 		counter, err := lookupPerCPUCounter(counterMap, rule.Index)
 		if err != nil {
 			return fmt.Errorf("读取规则计数失败 (%s): %w", rule.ID, err)
 		}
-		rows = append(rows, row{
+		rows = append(rows, snapshotRow{
 			ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio),
 			InputBytes: counter.InputBytes, OutputBytes: counter.OutputBytes,
 			InputPackets: counter.InputPackets, OutputPackets: counter.OutputPackets,
 			DroppedBytes: counter.DroppedBytes, DroppedPackets: counter.DroppedPackets,
 		})
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
 	return enc.Encode(rows)
 }
 
