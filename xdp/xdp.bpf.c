@@ -38,6 +38,13 @@ enum pfwd_rule_flags {
     PFWD_RULE_F_MSS_ENABLED = 1U << 6,
 };
 
+enum pfwd_rule_flag_groups {
+    PFWD_RULE_F_NEEDS_POLICY = PFWD_RULE_F_NEEDS_COUNTER |
+                               PFWD_RULE_F_NEEDS_QUOTA |
+                               PFWD_RULE_F_NEEDS_GUARD |
+                               PFWD_RULE_F_NEEDS_ALLOW,
+};
+
 enum pfwd_inspect_result {
     PFWD_INSPECT_ALLOW = 0,
     PFWD_INSPECT_DROP = 1,
@@ -119,6 +126,10 @@ static __always_inline int rule_needs_guard(const struct pfwd_rule_val *rule) {
 
 static __always_inline int rule_needs_allow(const struct pfwd_rule_val *rule) {
     return rule && (rule->flags & PFWD_RULE_F_NEEDS_ALLOW);
+}
+
+static __always_inline int rule_needs_policy(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_POLICY);
 }
 
 static __always_inline int rule_snat_fixed(const struct pfwd_rule_val *rule) {
@@ -1599,10 +1610,12 @@ static __always_inline int tc_local_forward_v4(
     __u8 conn_state = PFWD_CONN_STATE_NONE;
     struct pfwd_counter_plan counters = {};
 
-    if (rule_needs_allow(rule) && settings && !whitelist_allowed_v4(ip4->saddr)) {
-        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-        count_drop(rule, packet_len);
-        return TC_ACT_SHOT;
+    if (rule_needs_policy(rule)) {
+        if (rule_needs_allow(rule) && settings && !whitelist_allowed_v4(ip4->saddr)) {
+            stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+            count_drop(rule, packet_len);
+            return TC_ACT_SHOT;
+        }
     }
     if (protocol == IPPROTO_TCP) {
         struct tcphdr_min *tcp = (void *)ip4 + ihl;
@@ -1612,16 +1625,20 @@ static __always_inline int tc_local_forward_v4(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (rule_needs_guard(rule) && inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-            return TC_ACT_SHOT;
+        if (rule_needs_policy(rule)) {
+            if (rule_needs_guard(rule) && inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
+            }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
-    prepare_input_counter_plan(rule, packet_len, &counters);
-    if (counter_plan_over_limit(rule, &counters)) {
-        stat_inc(PFWD_STAT_QUOTA_DROPPED);
-        count_drop_with_counter(rule, packet_len, counters.rule_counter);
-        return TC_ACT_SHOT;
+    if (rule_needs_policy(rule)) {
+        prepare_input_counter_plan(rule, packet_len, &counters);
+        if (counter_plan_over_limit(rule, &counters)) {
+            stat_inc(PFWD_STAT_QUOTA_DROPPED);
+            count_drop_with_counter(rule, packet_len, counters.rule_counter);
+            return TC_ACT_SHOT;
+        }
     }
     sk = lookup_local_socket_v4(ctx, protocol, ip4->saddr, ipv4_from16(rule->target_addr), sport, rule->target_port);
     if (!sk) {
@@ -1655,10 +1672,12 @@ static __always_inline int tc_local_forward_v6(
     __u8 conn_state = PFWD_CONN_STATE_NONE;
     struct pfwd_counter_plan counters = {};
 
-    if (rule_needs_allow(rule) && settings && !whitelist_allowed_v6(ip6->saddr)) {
-        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-        count_drop(rule, packet_len);
-        return TC_ACT_SHOT;
+    if (rule_needs_policy(rule)) {
+        if (rule_needs_allow(rule) && settings && !whitelist_allowed_v6(ip6->saddr)) {
+            stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+            count_drop(rule, packet_len);
+            return TC_ACT_SHOT;
+        }
     }
     if (protocol == IPPROTO_TCP) {
         struct tcphdr_min *tcp = (void *)(ip6 + 1);
@@ -1668,16 +1687,20 @@ static __always_inline int tc_local_forward_v6(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (rule_needs_guard(rule) && inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-            return TC_ACT_SHOT;
+        if (rule_needs_policy(rule)) {
+            if (rule_needs_guard(rule) && inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
+            }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
-    prepare_input_counter_plan(rule, packet_len, &counters);
-    if (counter_plan_over_limit(rule, &counters)) {
-        stat_inc(PFWD_STAT_QUOTA_DROPPED);
-        count_drop_with_counter(rule, packet_len, counters.rule_counter);
-        return TC_ACT_SHOT;
+    if (rule_needs_policy(rule)) {
+        prepare_input_counter_plan(rule, packet_len, &counters);
+        if (counter_plan_over_limit(rule, &counters)) {
+            stat_inc(PFWD_STAT_QUOTA_DROPPED);
+            count_drop_with_counter(rule, packet_len, counters.rule_counter);
+            return TC_ACT_SHOT;
+        }
     }
     sk = lookup_local_socket_v6(ctx, protocol, ip6->saddr, rule->target_addr, sport, rule->target_port);
     if (!sk) {
@@ -1766,10 +1789,12 @@ int pfwd_xdp(struct xdp_md *ctx) {
             __be32 new_daddr = ipv4_from16(rule->target_addr);
             __be16 new_sport = sport;
             __be16 new_dport = rule->target_port;
-            if (rule_needs_allow(rule) && !whitelist_allowed_v4(ip4->saddr)) {
-                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                count_drop(rule, packet_len);
-                return XDP_DROP;
+            if (rule_needs_policy(rule)) {
+                if (rule_needs_allow(rule) && !whitelist_allowed_v4(ip4->saddr)) {
+                    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                    count_drop(rule, packet_len);
+                    return XDP_DROP;
+                }
             }
             if (protocol == IPPROTO_TCP) {
                 struct tcphdr_min *tcp = (void *)ip4 + ihl;
@@ -1779,19 +1804,23 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (rule_needs_guard(rule)) {
-                    struct pfwd_settings *settings = lookup_settings();
-                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-                        return XDP_DROP;
+                if (rule_needs_policy(rule)) {
+                    if (rule_needs_guard(rule)) {
+                        struct pfwd_settings *settings = lookup_settings();
+                        if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                            return XDP_DROP;
+                        }
                     }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
-            prepare_input_counter_plan(rule, packet_len, &counters);
-            if (counter_plan_over_limit(rule, &counters)) {
-                stat_inc(PFWD_STAT_QUOTA_DROPPED);
-                count_drop_with_counter(rule, packet_len, counters.rule_counter);
-                return XDP_DROP;
+            if (rule_needs_policy(rule)) {
+                prepare_input_counter_plan(rule, packet_len, &counters);
+                if (counter_plan_over_limit(rule, &counters)) {
+                    stat_inc(PFWD_STAT_QUOTA_DROPPED);
+                    count_drop_with_counter(rule, packet_len, counters.rule_counter);
+                    return XDP_DROP;
+                }
             }
             {
                 struct pfwd_conn_key conn_key = {
@@ -1966,10 +1995,12 @@ int pfwd_xdp(struct xdp_md *ctx) {
             struct pfwd_conn_val *existing_conn = 0;
             struct pfwd_counter_plan counters = {};
             __be16 new_sport = sport;
-            if (rule_needs_allow(rule) && !whitelist_allowed_v6(ip6->saddr)) {
-                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                count_drop(rule, packet_len);
-                return XDP_DROP;
+            if (rule_needs_policy(rule)) {
+                if (rule_needs_allow(rule) && !whitelist_allowed_v6(ip6->saddr)) {
+                    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                    count_drop(rule, packet_len);
+                    return XDP_DROP;
+                }
             }
             if (protocol == IPPROTO_TCP) {
                 struct tcphdr_min *tcp = (void *)(ip6 + 1);
@@ -1979,19 +2010,23 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (rule_needs_guard(rule)) {
-                    struct pfwd_settings *settings = lookup_settings();
-                    if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-                        return XDP_DROP;
+                if (rule_needs_policy(rule)) {
+                    if (rule_needs_guard(rule)) {
+                        struct pfwd_settings *settings = lookup_settings();
+                        if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                            return XDP_DROP;
+                        }
                     }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
-            prepare_input_counter_plan(rule, packet_len, &counters);
-            if (counter_plan_over_limit(rule, &counters)) {
-                stat_inc(PFWD_STAT_QUOTA_DROPPED);
-                count_drop_with_counter(rule, packet_len, counters.rule_counter);
-                return XDP_DROP;
+            if (rule_needs_policy(rule)) {
+                prepare_input_counter_plan(rule, packet_len, &counters);
+                if (counter_plan_over_limit(rule, &counters)) {
+                    stat_inc(PFWD_STAT_QUOTA_DROPPED);
+                    count_drop_with_counter(rule, packet_len, counters.rule_counter);
+                    return XDP_DROP;
+                }
             }
             if (!scratch) {
                 stat_inc(PFWD_STAT_DROPPED);
