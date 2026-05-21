@@ -1792,8 +1792,6 @@ int pfwd_xdp(struct xdp_md *ctx) {
             if (rule_target_is_loopback(4, rule)) {
                 return XDP_PASS;
             }
-            __u32 scratch_key = 0;
-            struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
             struct pfwd_conn_val *existing_conn = 0;
             struct pfwd_counter_plan counters = {};
             __be32 old_saddr = ip4->saddr;
@@ -1858,6 +1856,8 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     mark_tcp_established(existing_conn);
                 }
             } else {
+                __u32 scratch_key = 0;
+                struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
                 if (!scratch) {
                     stat_inc(PFWD_STAT_DROPPED);
                     return XDP_DROP;
@@ -2006,11 +2006,12 @@ int pfwd_xdp(struct xdp_md *ctx) {
             if (rule_target_is_loopback(6, rule)) {
                 return XDP_PASS;
             }
-            __u32 scratch_key = 0;
-            struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
             struct pfwd_conn_val *existing_conn = 0;
             struct pfwd_counter_plan counters = {};
             __be16 new_sport = sport;
+            __u8 old_saddr[16];
+            __u8 old_daddr[16];
+            __u8 new_saddr[16];
             init_counter_plan(rule, &counters);
             if (counters.needs_policy) {
                 if (counters.needs_allow && !whitelist_allowed_v6(ip6->saddr)) {
@@ -2045,35 +2046,49 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_DROP;
                 }
             }
-            if (!scratch) {
-                stat_inc(PFWD_STAT_DROPPED);
-                return XDP_DROP;
+            pfwd_memcpy16(old_saddr, ip6->saddr);
+            pfwd_memcpy16(old_daddr, ip6->daddr);
+            {
+                struct pfwd_conn_key conn_key = {
+                    .family = 6,
+                    .protocol = protocol,
+                    .client_port = sport,
+                    .listen_port = dport,
+                    .target_port = rule->target_port,
+                };
+                pfwd_memcpy16(conn_key.client_addr, old_saddr);
+                pfwd_memcpy16(conn_key.listen_addr, old_daddr);
+                pfwd_memcpy16(conn_key.target_addr, rule->target_addr);
+                existing_conn = bpf_map_lookup_elem(&pfwd_connections, &conn_key);
             }
-            __builtin_memset(scratch, 0, sizeof(*scratch));
-            scratch->conn_key.family = 6;
-            scratch->conn_key.protocol = protocol;
-            scratch->conn_key.client_port = sport;
-            scratch->conn_key.listen_port = dport;
-            scratch->conn_key.target_port = rule->target_port;
-            pfwd_memcpy16(scratch->conn_key.client_addr, ip6->saddr);
-            pfwd_memcpy16(scratch->conn_key.listen_addr, ip6->daddr);
-            pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
-            existing_conn = bpf_map_lookup_elem(&pfwd_connections, &scratch->conn_key);
             if (existing_conn) {
                 new_sport = existing_conn->source_port;
-                pfwd_memcpy16(scratch->addr_a, ip6->saddr);
-                pfwd_memcpy16(scratch->addr_b, ip6->daddr);
-                pfwd_memcpy16(scratch->addr_c, existing_conn->source_addr);
+                pfwd_memcpy16(new_saddr, existing_conn->source_addr);
                 if (protocol == IPPROTO_TCP && tcp_conn_state == PFWD_CONN_STATE_TCP_ESTABLISHED) {
                     mark_tcp_established(existing_conn);
                 }
             } else {
-                pfwd_memcpy16(scratch->addr_a, ip6->saddr);
-                pfwd_memcpy16(scratch->addr_b, ip6->daddr);
+                __u32 scratch_key = 0;
+                struct pfwd_scratch *scratch = bpf_map_lookup_elem(&pfwd_scratch, &scratch_key);
+                if (!scratch) {
+                    stat_inc(PFWD_STAT_DROPPED);
+                    return XDP_DROP;
+                }
+                __builtin_memset(scratch, 0, sizeof(*scratch));
+                scratch->conn_key.family = 6;
+                scratch->conn_key.protocol = protocol;
+                scratch->conn_key.client_port = sport;
+                scratch->conn_key.listen_port = dport;
+                scratch->conn_key.target_port = rule->target_port;
+                pfwd_memcpy16(scratch->conn_key.client_addr, old_saddr);
+                pfwd_memcpy16(scratch->conn_key.listen_addr, old_daddr);
+                pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+                pfwd_memcpy16(scratch->addr_a, old_saddr);
+                pfwd_memcpy16(scratch->addr_b, old_daddr);
                 if (rule_snat_fixed(rule)) {
                     pfwd_memcpy16(scratch->addr_c, rule->snat_addr);
                 } else {
-                    pfwd_memcpy16(scratch->addr_c, ip6->daddr);
+                    pfwd_memcpy16(scratch->addr_c, old_daddr);
                 }
                 scratch->reverse_key.family = 6;
                 scratch->reverse_key.protocol = protocol;
@@ -2105,12 +2120,13 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 scratch->reverse_key.source_port = new_sport;
                 pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
                 bpf_map_update_elem(&pfwd_reverse, &scratch->reverse_key, &scratch->conn, BPF_ANY);
+                pfwd_memcpy16(new_saddr, scratch->addr_c);
             }
             rewrite_l4_forward_v6(
                 ip6, protocol,
-                scratch->addr_a, scratch->addr_b,
+                old_saddr, old_daddr,
                 sport, dport,
-                scratch->addr_c, rule->target_addr,
+                new_saddr, rule->target_addr,
                 new_sport, rule->target_port,
                 data_end, rule
             );
