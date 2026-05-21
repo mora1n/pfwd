@@ -3,6 +3,7 @@ package main
 import (
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func testAddr16(t *testing.T, raw string) [16]byte {
@@ -155,5 +156,13 @@ func TestConnectionAllowedByRuntimeInvalidatesBillingChange(t *testing.T) {
 
 	if connectionAllowedByRuntime(key, value, allowed) {
 		t.Fatal("billing mode change should invalidate connection")
+	}
+}
+
+func TestElapsedMillis(t *testing.T) {
+	start := time.Now().Add(-1500 * time.Millisecond)
+	elapsed := elapsedMillis(start)
+	if elapsed < 1000 {
+		t.Fatalf("elapsedMillis returned %d, want at least 1000", elapsed)
 	}
 }

@@ -243,6 +243,7 @@ forwarder_runtime_status_json() {
         incremental_apply: ($xdp_status.incremental_apply // false),
         preserved_connections: ($xdp_status.preserved_connections // 0),
         invalidated_connections: ($xdp_status.invalidated_connections // 0),
+        refresh_report: ($xdp_status.refresh_report // {}),
         profile_counts: ($runtime.summary.profile_counts // $xdp_status.profile_counts // {}),
         xdp_status: $xdp_status
       }'
@@ -290,6 +291,7 @@ forwarder_status_json() {
             incremental_apply: false,
             preserved_connections: 0,
             invalidated_connections: 0,
+            refresh_report: {},
             profile_counts: {}
           }')"
     fi
@@ -319,6 +321,13 @@ forwarder_render_status() {
         ["XDP 增量刷新", (if (.xdp_status.incremental_apply // .incremental_apply // false) then "是" else "否" end)],
         ["XDP 保留连接", ((.xdp_status.preserved_connections // .preserved_connections // 0) | tostring)],
         ["XDP 失效连接", ((.xdp_status.invalidated_connections // .invalidated_connections // 0) | tostring)],
+        ["XDP refresh", ((.xdp_status.refresh_report.mode // .refresh_report.mode // "-") | tostring)],
+        ["XDP refresh 耗时", (((.xdp_status.refresh_report.total_duration_ms // .refresh_report.total_duration_ms // null) | if . == null then "-" else tostring + " ms" end))],
+        ["XDP 规则变更", (((.xdp_status.refresh_report.rules_added // .refresh_report.rules_added // 0) | tostring) + "/" + ((.xdp_status.refresh_report.rules_updated // .refresh_report.rules_updated // 0) | tostring) + "/" + ((.xdp_status.refresh_report.rules_deleted // .refresh_report.rules_deleted // 0) | tostring) + " add/update/delete"],
+        ["XDP 用户变更", (((.xdp_status.refresh_report.users_added // .refresh_report.users_added // 0) | tostring) + "/" + ((.xdp_status.refresh_report.users_updated // .refresh_report.users_updated // 0) | tostring) + "/" + ((.xdp_status.refresh_report.users_deleted // .refresh_report.users_deleted // 0) | tostring) + " add/update/delete"],
+        ["XDP counter 保留", ((.xdp_status.refresh_report.counters_preserved // .refresh_report.counters_preserved // 0) | tostring)],
+        ["XDP counter 重置", ((.xdp_status.refresh_report.counters_reset // .refresh_report.counters_reset // 0) | tostring)],
+        ["XDP reconcile 耗时", (((.xdp_status.refresh_report.reconcile_duration_ms // .refresh_report.reconcile_duration_ms // null) | if . == null then "-" else tostring + " ms" end))],
         ["XDP profile", (((.profile_counts // .xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $profiles | if $profiles == "" then "-" else $profiles end)],
         ["XDP 活动连接", ((.xdp_status.active_summary.total // 0) | tostring)],
         ["XDP TCP 预热中", ((.xdp_status.active_summary.tcp_syn_pending // 0) | tostring)],

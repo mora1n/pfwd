@@ -1057,6 +1057,9 @@ cmd_doctor() {
     config_init >/dev/null
     local forwarder_status xdp_status backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
     local dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts
+    local refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms
+    local refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted
+    local refresh_counters_preserved refresh_counters_reset
     stats_runtime_cache_clear
     forwarder_status="$(forwarder_status_json)"
     xdp_status="$(forwarder_xdp_status_json)"
@@ -1073,6 +1076,18 @@ cmd_doctor() {
     preserved_connections="$(jq -r '.xdp_status.preserved_connections // .preserved_connections // 0' <<< "$forwarder_status")"
     invalidated_connections="$(jq -r '.xdp_status.invalidated_connections // .invalidated_connections // 0' <<< "$forwarder_status")"
     profile_counts="$(jq -r '((.profile_counts // .xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $profiles | if $profiles == "" then "-" else $profiles end' <<< "$forwarder_status")"
+    refresh_mode="$(jq -r '.xdp_status.refresh_report.mode // .refresh_report.mode // "-"' <<< "$forwarder_status")"
+    refresh_total_ms="$(jq -r '.xdp_status.refresh_report.total_duration_ms // .refresh_report.total_duration_ms // "-"' <<< "$forwarder_status")"
+    refresh_reconcile_ms="$(jq -r '.xdp_status.refresh_report.reconcile_duration_ms // .refresh_report.reconcile_duration_ms // "-"' <<< "$forwarder_status")"
+    refresh_map_load_ms="$(jq -r '.xdp_status.refresh_report.map_load_duration_ms // .refresh_report.map_load_duration_ms // "-"' <<< "$forwarder_status")"
+    refresh_rules_added="$(jq -r '.xdp_status.refresh_report.rules_added // .refresh_report.rules_added // 0' <<< "$forwarder_status")"
+    refresh_rules_updated="$(jq -r '.xdp_status.refresh_report.rules_updated // .refresh_report.rules_updated // 0' <<< "$forwarder_status")"
+    refresh_rules_deleted="$(jq -r '.xdp_status.refresh_report.rules_deleted // .refresh_report.rules_deleted // 0' <<< "$forwarder_status")"
+    refresh_users_added="$(jq -r '.xdp_status.refresh_report.users_added // .refresh_report.users_added // 0' <<< "$forwarder_status")"
+    refresh_users_updated="$(jq -r '.xdp_status.refresh_report.users_updated // .refresh_report.users_updated // 0' <<< "$forwarder_status")"
+    refresh_users_deleted="$(jq -r '.xdp_status.refresh_report.users_deleted // .refresh_report.users_deleted // 0' <<< "$forwarder_status")"
+    refresh_counters_preserved="$(jq -r '.xdp_status.refresh_report.counters_preserved // .refresh_report.counters_preserved // 0' <<< "$forwarder_status")"
+    refresh_counters_reset="$(jq -r '.xdp_status.refresh_report.counters_reset // .refresh_report.counters_reset // 0' <<< "$forwarder_status")"
     tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
     tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
     if [ -n "$tc_iface" ]; then
@@ -1095,6 +1110,18 @@ cmd_doctor() {
     echo "xdp.incremental_apply：$incremental_apply"
     echo "xdp.preserved_connections：$preserved_connections"
     echo "xdp.invalidated_connections：$invalidated_connections"
+    echo "xdp.refresh_mode：$refresh_mode"
+    echo "xdp.refresh_total_ms：$refresh_total_ms"
+    echo "xdp.refresh_map_load_ms：$refresh_map_load_ms"
+    echo "xdp.refresh_reconcile_ms：$refresh_reconcile_ms"
+    echo "xdp.rules_added：$refresh_rules_added"
+    echo "xdp.rules_updated：$refresh_rules_updated"
+    echo "xdp.rules_deleted：$refresh_rules_deleted"
+    echo "xdp.users_added：$refresh_users_added"
+    echo "xdp.users_updated：$refresh_users_updated"
+    echo "xdp.users_deleted：$refresh_users_deleted"
+    echo "xdp.counters_preserved：$refresh_counters_preserved"
+    echo "xdp.counters_reset：$refresh_counters_reset"
     echo "xdp.profile_counts：${profile_counts:-"-"}"
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi

@@ -271,6 +271,42 @@ type statusPayload struct {
 	UserCounterPin         string         `json:"user_counter_pin,omitempty"`
 	StatsPin               string         `json:"stats_pin,omitempty"`
 	ActiveSummary          *connSummary   `json:"active_summary,omitempty"`
+	RefreshReport          *refreshReport `json:"refresh_report,omitempty"`
+}
+
+type refreshReport struct {
+	Mode                    string `json:"mode"`
+	Reason                  string `json:"reason,omitempty"`
+	StartedAt               string `json:"started_at,omitempty"`
+	CompletedAt             string `json:"completed_at,omitempty"`
+	TotalDurationMillis     int64  `json:"total_duration_ms"`
+	LoadDurationMillis      int64  `json:"load_duration_ms"`
+	MapLoadDurationMillis   int64  `json:"map_load_duration_ms"`
+	ReconcileDurationMillis int64  `json:"reconcile_duration_ms"`
+	StatusDurationMillis    int64  `json:"status_duration_ms"`
+	PreservedConnections    uint64 `json:"preserved_connections"`
+	InvalidatedConnections  uint64 `json:"invalidated_connections"`
+	RulesAdded              uint64 `json:"rules_added"`
+	RulesUpdated            uint64 `json:"rules_updated"`
+	RulesDeleted            uint64 `json:"rules_deleted"`
+	UsersAdded              uint64 `json:"users_added"`
+	UsersUpdated            uint64 `json:"users_updated"`
+	UsersDeleted            uint64 `json:"users_deleted"`
+	CountersPreserved       uint64 `json:"counters_preserved"`
+	CountersReset           uint64 `json:"counters_reset"`
+	Rules                   int    `json:"rules"`
+	Users                   int    `json:"users"`
+}
+
+type mapReconcileReport struct {
+	RulesAdded        uint64
+	RulesUpdated      uint64
+	RulesDeleted      uint64
+	UsersAdded        uint64
+	UsersUpdated      uint64
+	UsersDeleted      uint64
+	CountersPreserved uint64
+	CountersReset     uint64
 }
 
 type runtimeMapPins struct {
@@ -672,6 +708,8 @@ func applyRuntime(opts applyOptions) error {
 			fmt.Fprintf(os.Stderr, "pfwd-xdp: incremental apply 失败，回退到 full reattach: %v\n", err)
 		}
 	}
+	fullStartedAt := time.Now().UTC()
+	fullStartedAtText := fullStartedAt.Format(time.RFC3339)
 	if err := removeRuntime(removeOptions{
 		StatusFile:     opts.StatusFile,
 		XDPPin:         opts.XDPPin,
@@ -689,9 +727,11 @@ func applyRuntime(opts applyOptions) error {
 		return err
 	}
 	defer objs.Close()
+	mapLoadStart := time.Now()
 	if err := loadMaps(objs, runtimeData, opts); err != nil {
 		return err
 	}
+	mapLoadDuration := elapsedMillis(mapLoadStart)
 	if err := pinRuntimeMaps(objs, opts); err != nil {
 		return err
 	}
@@ -732,6 +772,7 @@ func applyRuntime(opts applyOptions) error {
 	if skLookupKind != "" && !opts.Quiet {
 		fmt.Fprintf(os.Stderr, "pfwd-xdp: sk_lookup attached via %s\n", skLookupKind)
 	}
+	statusStart := time.Now()
 	payload := statusPayload{
 		Applied:          true,
 		BinaryVersion:    binaryVersion,
@@ -767,6 +808,17 @@ func applyRuntime(opts applyOptions) error {
 	}
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		payload.ActiveSummary = summary
+	}
+	payload.RefreshReport = &refreshReport{
+		Mode:                  "full-reattach",
+		Reason:                payload.ReattachReason,
+		StartedAt:             fullStartedAtText,
+		CompletedAt:           time.Now().UTC().Format(time.RFC3339),
+		TotalDurationMillis:   elapsedMillis(fullStartedAt),
+		MapLoadDurationMillis: mapLoadDuration,
+		StatusDurationMillis:  elapsedMillis(statusStart),
+		Rules:                 len(runtimeData.Rules),
+		Users:                 len(runtimeData.Users),
 	}
 	return writeStatus(opts.StatusFile, payload)
 }
@@ -1285,6 +1337,31 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	return nil
 }
 
+func clearIncrementalAuxMaps(objs *bpfObjects) error {
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
+		return err
+	}
+	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+		return err
+	}
+	return nil
+}
+
 func pinnedPathExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
@@ -1386,6 +1463,10 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 	return runtimeData != nil && pinnedRuntimeMapsCompatible(opts)
 }
 
+func elapsedMillis(start time.Time) int64 {
+	return time.Since(start).Milliseconds()
+}
+
 type ruleSemantics struct {
 	RuleID             uint32
 	UserID             uint32
@@ -1480,6 +1561,262 @@ func connectionAllowedByRuntime(key connKey, value connVal, allowed map[ruleKey]
 	return ok && connectionMatchesRule(key, value, expected)
 }
 
+func runtimeRuleEntries(runtimeData *runtimeFile) (map[ruleKey]ruleVal, error) {
+	entries := make(map[ruleKey]ruleVal, len(runtimeData.Rules))
+	for _, rule := range runtimeData.Rules {
+		key, err := makeRuleKey(rule)
+		if err != nil {
+			return nil, fmt.Errorf("生成规则 key 失败 (%s): %w", rule.ID, err)
+		}
+		value, err := makeRuleVal(rule, runtimeData.Settings)
+		if err != nil {
+			return nil, fmt.Errorf("生成规则 value 失败 (%s): %w", rule.ID, err)
+		}
+		entries[key] = value
+	}
+	return entries, nil
+}
+
+func runtimeUserLimits(runtimeData *runtimeFile) map[uint32]uint64 {
+	limits := make(map[uint32]uint64, len(runtimeData.Rules))
+	for _, rule := range runtimeData.Rules {
+		limits[rule.UserIndex] = rule.UserLimit
+	}
+	return limits
+}
+
+func currentRuleUserLimits(objs *bpfObjects) (map[uint32]uint64, error) {
+	users := map[uint32]uint64{}
+	it := objs.PFWDRules.Iterate()
+	var key ruleKey
+	var value ruleVal
+	for it.Next(&key, &value) {
+		users[value.UserID] = value.UserLimitBytes
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("遍历旧规则用户失败: %w", err)
+	}
+	return users, nil
+}
+
+func zeroRuleCounter(objs *bpfObjects, key uint32, zeroCounter []counterVal) error {
+	if err := objs.PFWDRuleCounter.Update(&key, zeroCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("重置规则计数失败 (key=%d): %w", key, err)
+	}
+	return nil
+}
+
+func zeroUserCounter(objs *bpfObjects, key uint32, zeroCounter []counterVal) error {
+	if err := objs.PFWDUserCounter.Update(&key, zeroCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("重置用户计数失败 (key=%d): %w", key, err)
+	}
+	return nil
+}
+
+func zeroRuleCounterOnce(objs *bpfObjects, key uint32, zeroCounter []counterVal, resetKeys map[uint32]struct{}) (bool, error) {
+	if _, ok := resetKeys[key]; ok {
+		return false, nil
+	}
+	if err := zeroRuleCounter(objs, key, zeroCounter); err != nil {
+		return false, err
+	}
+	resetKeys[key] = struct{}{}
+	return true, nil
+}
+
+func ruleValEquivalentForRefresh(current ruleVal, expected ruleVal) bool {
+	current.RuleBillingUsedBaseBytes = expected.RuleBillingUsedBaseBytes
+	current.UserBillingUsedBaseBytes = expected.UserBillingUsedBaseBytes
+	return current == expected
+}
+
+func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconcileReport, error) {
+	var report mapReconcileReport
+	zeroCounter, err := zeroPerCPUCounterValues()
+	if err != nil {
+		return report, err
+	}
+	seen := make(map[ruleKey]struct{}, len(expected))
+	resetKeys := map[uint32]struct{}{}
+	it := objs.PFWDRules.Iterate()
+	var key ruleKey
+	var current ruleVal
+	for it.Next(&key, &current) {
+		expectedValue, ok := expected[key]
+		if !ok {
+			keyCopy := key
+			if err := objs.PFWDRules.Delete(&keyCopy); err != nil {
+				return report, fmt.Errorf("删除旧规则失败: %w", err)
+			}
+			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, resetKeys)
+			if err != nil {
+				return report, err
+			}
+			if reset {
+				report.CountersReset++
+			}
+			report.RulesDeleted++
+			continue
+		}
+		seen[key] = struct{}{}
+		if ruleValEquivalentForRefresh(current, expectedValue) {
+			report.CountersPreserved++
+			continue
+		}
+		keyCopy := key
+		valueCopy := expectedValue
+		if err := objs.PFWDRules.Update(&keyCopy, &valueCopy, ebpf.UpdateAny); err != nil {
+			return report, fmt.Errorf("更新规则失败: %w", err)
+		}
+		reset, err := zeroRuleCounterOnce(objs, expectedValue.RuleID, zeroCounter, resetKeys)
+		if err != nil {
+			return report, err
+		}
+		if reset {
+			report.CountersReset++
+		}
+		if current.RuleID != expectedValue.RuleID {
+			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, resetKeys)
+			if err != nil {
+				return report, err
+			}
+			if reset {
+				report.CountersReset++
+			}
+		}
+		report.RulesUpdated++
+	}
+	if err := it.Err(); err != nil {
+		return report, fmt.Errorf("遍历规则 map 失败: %w", err)
+	}
+	for key, value := range expected {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		keyCopy := key
+		valueCopy := value
+		if err := objs.PFWDRules.Update(&keyCopy, &valueCopy, ebpf.UpdateAny); err != nil {
+			return report, fmt.Errorf("新增规则失败: %w", err)
+		}
+		reset, err := zeroRuleCounterOnce(objs, value.RuleID, zeroCounter, resetKeys)
+		if err != nil {
+			return report, err
+		}
+		if reset {
+			report.CountersReset++
+		}
+		report.RulesAdded++
+	}
+	return report, nil
+}
+
+func reconcileUserCounters(objs *bpfObjects, oldUsers map[uint32]uint64, expected map[uint32]uint64) (mapReconcileReport, error) {
+	var report mapReconcileReport
+	zeroCounter, err := zeroPerCPUCounterValues()
+	if err != nil {
+		return report, err
+	}
+	for index, limit := range expected {
+		oldLimit, ok := oldUsers[index]
+		if ok && oldLimit == limit {
+			report.CountersPreserved++
+			continue
+		}
+		if err := zeroUserCounter(objs, index, zeroCounter); err != nil {
+			return report, err
+		}
+		if ok {
+			report.UsersUpdated++
+		} else {
+			report.UsersAdded++
+		}
+		report.CountersReset++
+	}
+	for index := range oldUsers {
+		if _, ok := expected[index]; ok {
+			continue
+		}
+		if err := zeroUserCounter(objs, index, zeroCounter); err != nil {
+			return report, err
+		}
+		report.UsersDeleted++
+		report.CountersReset++
+	}
+	return report, nil
+}
+
+func (r *mapReconcileReport) add(other mapReconcileReport) {
+	r.RulesAdded += other.RulesAdded
+	r.RulesUpdated += other.RulesUpdated
+	r.RulesDeleted += other.RulesDeleted
+	r.UsersAdded += other.UsersAdded
+	r.UsersUpdated += other.UsersUpdated
+	r.UsersDeleted += other.UsersDeleted
+	r.CountersPreserved += other.CountersPreserved
+	r.CountersReset += other.CountersReset
+}
+
+func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) (mapReconcileReport, error) {
+	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
+		return mapReconcileReport{}, fmt.Errorf("关键 BPF map 未加载")
+	}
+	oldUsers, err := currentRuleUserLimits(objs)
+	if err != nil {
+		return mapReconcileReport{}, err
+	}
+	if err := clearIncrementalAuxMaps(objs); err != nil {
+		return mapReconcileReport{}, fmt.Errorf("清理辅助 pinned maps 失败: %w", err)
+	}
+	var externalIfindex uint32
+	if opts.Iface != "" {
+		iface, err := net.InterfaceByName(opts.Iface)
+		if err != nil {
+			return mapReconcileReport{}, fmt.Errorf("查找外部网卡失败: %w", err)
+		}
+		externalIfindex = uint32(iface.Index)
+	}
+	settings := xdpSettings{
+		WhitelistEnabled: boolToUint8(runtimeData.Settings.WhitelistEnabled),
+		BlockHTTP:        boolToUint8(runtimeData.Settings.BlockHTTP),
+		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
+		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
+		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
+		HasSkipPorts:     boolToUint8(len(runtimeData.Settings.ProtocolSkipPorts) > 0),
+		ExternalIfindex:  externalIfindex,
+		LoopbackIfindex:  0,
+	}
+	key := uint32(0)
+	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
+		return mapReconcileReport{}, fmt.Errorf("写入 settings 失败: %w", err)
+	}
+	if err := loadProtocolSkipPorts(objs.PFWDSkipPorts, runtimeData.Settings.ProtocolSkipPorts); err != nil {
+		return mapReconcileReport{}, err
+	}
+	files := runtimeData.Settings.WhitelistFiles
+	if opts.WhitelistFile != "" {
+		files = splitFiles(opts.WhitelistFile)
+	}
+	if runtimeData.Settings.WhitelistEnabled {
+		if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, files); err != nil {
+			return mapReconcileReport{}, err
+		}
+	}
+	rules, err := runtimeRuleEntries(runtimeData)
+	if err != nil {
+		return mapReconcileReport{}, err
+	}
+	report, err := reconcileRuleMap(objs, rules)
+	if err != nil {
+		return report, err
+	}
+	userReport, err := reconcileUserCounters(objs, oldUsers, runtimeUserLimits(runtimeData))
+	if err != nil {
+		return report, err
+	}
+	report.add(userReport)
+	return report, nil
+}
+
 func reverseKeyFromConn(key connKey, value connVal) reverseKey {
 	return reverseKey{
 		Family:     key.Family,
@@ -1547,25 +1884,32 @@ func profileCounts(runtimeData *runtimeFile) map[string]int {
 }
 
 func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {
+	startedAt := time.Now().UTC()
+	startedAtText := startedAt.Format(time.RFC3339)
 	runtimeSemanticConfigHash, err := runtimeSemanticHash(runtimeData)
 	if err != nil {
 		return err
 	}
+	loadStart := time.Now()
 	objs, err := loadPinnedRuntimeMaps(runtimeMapPinsFromApplyOptions(opts))
 	if err != nil {
 		return err
 	}
+	loadDuration := elapsedMillis(loadStart)
 	defer objs.Close()
-	if err := clearMutableConfigMaps(objs); err != nil {
-		return fmt.Errorf("清理 pinned maps 失败: %w", err)
+	mapLoadStart := time.Now()
+	mapReport, err := reconcileRuntimeMaps(objs, runtimeData, opts)
+	if err != nil {
+		return fmt.Errorf("reconcile pinned maps 失败: %w", err)
 	}
-	if err := loadMaps(objs, runtimeData, opts); err != nil {
-		return fmt.Errorf("重载 pinned maps 失败: %w", err)
-	}
+	mapLoadDuration := elapsedMillis(mapLoadStart)
+	reconcileStart := time.Now()
 	preservedConnections, invalidatedConnections, err := reconcileConnections(objs, runtimeData)
 	if err != nil {
 		return fmt.Errorf("reconcile active connections 失败: %w", err)
 	}
+	reconcileDuration := elapsedMillis(reconcileStart)
+	statusStart := time.Now()
 	appliedAt := time.Now().UTC().Format(time.RFC3339)
 	updated := payload
 	updated.Applied = true
@@ -1597,6 +1941,28 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.StatsPin = opts.StatsPin
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		updated.ActiveSummary = summary
+	}
+	updated.RefreshReport = &refreshReport{
+		Mode:                    "incremental",
+		StartedAt:               startedAtText,
+		CompletedAt:             time.Now().UTC().Format(time.RFC3339),
+		TotalDurationMillis:     elapsedMillis(startedAt),
+		LoadDurationMillis:      loadDuration,
+		MapLoadDurationMillis:   mapLoadDuration,
+		ReconcileDurationMillis: reconcileDuration,
+		StatusDurationMillis:    elapsedMillis(statusStart),
+		PreservedConnections:    preservedConnections,
+		InvalidatedConnections:  invalidatedConnections,
+		RulesAdded:              mapReport.RulesAdded,
+		RulesUpdated:            mapReport.RulesUpdated,
+		RulesDeleted:            mapReport.RulesDeleted,
+		UsersAdded:              mapReport.UsersAdded,
+		UsersUpdated:            mapReport.UsersUpdated,
+		UsersDeleted:            mapReport.UsersDeleted,
+		CountersPreserved:       mapReport.CountersPreserved,
+		CountersReset:           mapReport.CountersReset,
+		Rules:                   len(runtimeData.Rules),
+		Users:                   len(runtimeData.Users),
 	}
 	return writeStatus(opts.StatusFile, updated)
 }
