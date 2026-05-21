@@ -396,6 +396,78 @@ static __always_inline __be32 ipv4_from16(const __u8 addr[16]) {
     return *value;
 }
 
+static __always_inline void fill_conn_key_v4(
+    struct pfwd_conn_key *key,
+    __u8 protocol,
+    __be32 client_addr,
+    __be32 listen_addr,
+    __be16 client_port,
+    __be16 listen_port,
+    __be16 target_port,
+    const __u8 target_addr[16]
+) {
+    key->family = 4;
+    key->protocol = protocol;
+    key->client_port = client_port;
+    key->listen_port = listen_port;
+    key->target_port = target_port;
+    set_ipv4_in16(key->client_addr, client_addr);
+    set_ipv4_in16(key->listen_addr, listen_addr);
+    pfwd_memcpy16(key->target_addr, target_addr);
+}
+
+static __always_inline void fill_conn_key_v6(
+    struct pfwd_conn_key *key,
+    __u8 protocol,
+    const __u8 client_addr[16],
+    const __u8 listen_addr[16],
+    __be16 client_port,
+    __be16 listen_port,
+    __be16 target_port,
+    const __u8 target_addr[16]
+) {
+    key->family = 6;
+    key->protocol = protocol;
+    key->client_port = client_port;
+    key->listen_port = listen_port;
+    key->target_port = target_port;
+    pfwd_memcpy16(key->client_addr, client_addr);
+    pfwd_memcpy16(key->listen_addr, listen_addr);
+    pfwd_memcpy16(key->target_addr, target_addr);
+}
+
+static __always_inline void fill_reverse_lookup_key_v4(
+    struct pfwd_reverse_key *key,
+    __u8 protocol,
+    __be32 source_addr,
+    __be32 target_addr,
+    __be16 source_port,
+    __be16 target_port
+) {
+    key->family = 4;
+    key->protocol = protocol;
+    key->source_port = source_port;
+    key->target_port = target_port;
+    set_ipv4_in16(key->source_addr, source_addr);
+    set_ipv4_in16(key->target_addr, target_addr);
+}
+
+static __always_inline void fill_reverse_lookup_key_v6(
+    struct pfwd_reverse_key *key,
+    __u8 protocol,
+    const __u8 source_addr[16],
+    const __u8 target_addr[16],
+    __be16 source_port,
+    __be16 target_port
+) {
+    key->family = 6;
+    key->protocol = protocol;
+    key->source_port = source_port;
+    key->target_port = target_port;
+    pfwd_memcpy16(key->source_addr, source_addr);
+    pfwd_memcpy16(key->target_addr, target_addr);
+}
+
 static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_end, __u16 value);
 
 static __always_inline __u16 csum_replace_addr16(__u16 csum, const __u8 old_addr[16], const __u8 new_addr[16]) {
@@ -1485,14 +1557,7 @@ static __always_inline int prepare_local_conn_v4(
         return -1;
     }
     __builtin_memset(scratch, 0, sizeof(*scratch));
-    scratch->conn_key.family = 4;
-    scratch->conn_key.protocol = protocol;
-    scratch->conn_key.client_port = client_port;
-    scratch->conn_key.listen_port = listen_port;
-    scratch->conn_key.target_port = rule->target_port;
-    set_ipv4_in16(scratch->conn_key.client_addr, client_addr);
-    set_ipv4_in16(scratch->conn_key.listen_addr, listen_addr);
-    pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+    fill_conn_key_v4(&scratch->conn_key, protocol, client_addr, listen_addr, client_port, listen_port, rule->target_port, rule->target_addr);
     existing_conn = bpf_map_lookup_elem(&pfwd_connections, &scratch->conn_key);
     if (existing_conn) {
         return 0;
@@ -1551,14 +1616,7 @@ static __always_inline int prepare_local_conn_v6(
         return -1;
     }
     __builtin_memset(scratch, 0, sizeof(*scratch));
-    scratch->conn_key.family = 6;
-    scratch->conn_key.protocol = protocol;
-    scratch->conn_key.client_port = client_port;
-    scratch->conn_key.listen_port = listen_port;
-    scratch->conn_key.target_port = rule->target_port;
-    pfwd_memcpy16(scratch->conn_key.client_addr, client_addr);
-    pfwd_memcpy16(scratch->conn_key.listen_addr, listen_addr);
-    pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+    fill_conn_key_v6(&scratch->conn_key, protocol, client_addr, listen_addr, client_port, listen_port, rule->target_port, rule->target_addr);
     existing_conn = bpf_map_lookup_elem(&pfwd_connections, &scratch->conn_key);
     if (existing_conn) {
         return 0;
@@ -1837,16 +1895,8 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 }
             }
             {
-                struct pfwd_conn_key conn_key = {
-                    .family = 4,
-                    .protocol = protocol,
-                    .client_port = sport,
-                    .listen_port = dport,
-                    .target_port = rule->target_port,
-                };
-                set_ipv4_in16(conn_key.client_addr, ip4->saddr);
-                set_ipv4_in16(conn_key.listen_addr, ip4->daddr);
-                pfwd_memcpy16(conn_key.target_addr, rule->target_addr);
+                struct pfwd_conn_key conn_key = {};
+                fill_conn_key_v4(&conn_key, protocol, ip4->saddr, ip4->daddr, sport, dport, rule->target_port, rule->target_addr);
                 existing_conn = bpf_map_lookup_elem(&pfwd_connections, &conn_key);
             }
             if (existing_conn) {
@@ -1863,14 +1913,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_DROP;
                 }
                 __builtin_memset(scratch, 0, sizeof(*scratch));
-                scratch->conn_key.family = 4;
-                scratch->conn_key.protocol = protocol;
-                scratch->conn_key.client_port = sport;
-                scratch->conn_key.listen_port = dport;
-                scratch->conn_key.target_port = rule->target_port;
-                set_ipv4_in16(scratch->conn_key.client_addr, ip4->saddr);
-                set_ipv4_in16(scratch->conn_key.listen_addr, ip4->daddr);
-                pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+                fill_conn_key_v4(&scratch->conn_key, protocol, ip4->saddr, ip4->daddr, sport, dport, rule->target_port, rule->target_addr);
                 scratch->reverse_key.family = 4;
                 scratch->reverse_key.protocol = protocol;
                 scratch->reverse_key.target_port = new_dport;
@@ -1927,12 +1970,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             struct pfwd_conn_val *conn;
             __be32 old_saddr = ip4->saddr;
             __be32 old_daddr = ip4->daddr;
-            reverse_key.family = 4;
-            reverse_key.protocol = protocol;
-            reverse_key.source_port = dport;
-            reverse_key.target_port = sport;
-            set_ipv4_in16(reverse_key.source_addr, ip4->daddr);
-            set_ipv4_in16(reverse_key.target_addr, ip4->saddr);
+            fill_reverse_lookup_key_v4(&reverse_key, protocol, ip4->daddr, ip4->saddr, dport, sport);
             conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
             if (conn) {
                 if (protocol == IPPROTO_TCP) {
@@ -2049,16 +2087,8 @@ int pfwd_xdp(struct xdp_md *ctx) {
             pfwd_memcpy16(old_saddr, ip6->saddr);
             pfwd_memcpy16(old_daddr, ip6->daddr);
             {
-                struct pfwd_conn_key conn_key = {
-                    .family = 6,
-                    .protocol = protocol,
-                    .client_port = sport,
-                    .listen_port = dport,
-                    .target_port = rule->target_port,
-                };
-                pfwd_memcpy16(conn_key.client_addr, old_saddr);
-                pfwd_memcpy16(conn_key.listen_addr, old_daddr);
-                pfwd_memcpy16(conn_key.target_addr, rule->target_addr);
+                struct pfwd_conn_key conn_key = {};
+                fill_conn_key_v6(&conn_key, protocol, old_saddr, old_daddr, sport, dport, rule->target_port, rule->target_addr);
                 existing_conn = bpf_map_lookup_elem(&pfwd_connections, &conn_key);
             }
             if (existing_conn) {
@@ -2075,14 +2105,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_DROP;
                 }
                 __builtin_memset(scratch, 0, sizeof(*scratch));
-                scratch->conn_key.family = 6;
-                scratch->conn_key.protocol = protocol;
-                scratch->conn_key.client_port = sport;
-                scratch->conn_key.listen_port = dport;
-                scratch->conn_key.target_port = rule->target_port;
-                pfwd_memcpy16(scratch->conn_key.client_addr, old_saddr);
-                pfwd_memcpy16(scratch->conn_key.listen_addr, old_daddr);
-                pfwd_memcpy16(scratch->conn_key.target_addr, rule->target_addr);
+                fill_conn_key_v6(&scratch->conn_key, protocol, old_saddr, old_daddr, sport, dport, rule->target_port, rule->target_addr);
                 pfwd_memcpy16(scratch->addr_a, old_saddr);
                 pfwd_memcpy16(scratch->addr_b, old_daddr);
                 if (rule_snat_fixed(rule)) {
@@ -2144,12 +2167,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
         {
             struct pfwd_reverse_key reverse_key = {};
             struct pfwd_conn_val *conn;
-            reverse_key.family = 6;
-            reverse_key.protocol = protocol;
-            reverse_key.source_port = dport;
-            reverse_key.target_port = sport;
-            pfwd_memcpy16(reverse_key.source_addr, ip6->daddr);
-            pfwd_memcpy16(reverse_key.target_addr, ip6->saddr);
+            fill_reverse_lookup_key_v6(&reverse_key, protocol, ip6->daddr, ip6->saddr, dport, sport);
             conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
             if (conn) {
                 if (protocol == IPPROTO_TCP) {
@@ -2398,12 +2416,7 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         }
         old_saddr = ip4->saddr;
         old_daddr = ip4->daddr;
-        reverse_key.family = 4;
-        reverse_key.protocol = protocol;
-        reverse_key.source_port = dport;
-        reverse_key.target_port = sport;
-        set_ipv4_in16(reverse_key.source_addr, ip4->daddr);
-        set_ipv4_in16(reverse_key.target_addr, ip4->saddr);
+        fill_reverse_lookup_key_v4(&reverse_key, protocol, ip4->daddr, ip4->saddr, dport, sport);
         conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
         if (!conn) {
             return TC_ACT_OK;
@@ -2469,12 +2482,7 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
             sport = udp->source;
             dport = udp->dest;
         }
-        reverse_key.family = 6;
-        reverse_key.protocol = protocol;
-        reverse_key.source_port = dport;
-        reverse_key.target_port = sport;
-        pfwd_memcpy16(reverse_key.source_addr, ip6->daddr);
-        pfwd_memcpy16(reverse_key.target_addr, ip6->saddr);
+        fill_reverse_lookup_key_v6(&reverse_key, protocol, ip6->daddr, ip6->saddr, dport, sport);
         conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
         if (!conn) {
             return TC_ACT_OK;
