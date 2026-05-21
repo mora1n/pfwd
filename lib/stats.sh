@@ -424,6 +424,9 @@ stats_current_snapshot() {
         PFWD_STATS_LAST_SNAPSHOT_ERROR="$(tr '\n' ' ' < "$snapshot_error" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
         rm -f "$snapshot_error"
         if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
+            if [[ "$PFWD_STATS_LAST_SNAPSHOT_ERROR" == *"doesn't consume all data"* ]]; then
+                pfwd_die "读取 XDP 计数失败：pfwd-xdp 与当前 pinned counter map ABI 不匹配，请使用包含 assets/$(guard_asset_name) 的完整安装包重新安装后再执行 restart"
+            fi
             pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
         fi
     fi

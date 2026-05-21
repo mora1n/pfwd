@@ -188,7 +188,6 @@ service_restore_unit_files() {
 
 service_copy_bundle_from_dir() {
     local source_root="$1"
-    local allow_existing_xdp="${2:-false}"
     local mode source_rel install_rel _
     local source_path target_path
 
@@ -197,9 +196,6 @@ service_copy_bundle_from_dir() {
         target_path="$(service_install_target_path "$install_rel")"
 
         if [ ! -f "$source_path" ]; then
-            if [ "$install_rel" = "bin/pfwd-xdp" ] && [ "$allow_existing_xdp" = "true" ] && [ -x "$target_path" ]; then
-                continue
-            fi
             pfwd_die "安装包不完整：缺少 $source_path"
         fi
         if [ "$source_path" != "$target_path" ]; then
@@ -225,10 +221,10 @@ service_install_files() {
     [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
     [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv4 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated.zone $PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
     [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv6 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated-v6.zone $PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    if [ ! -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ] && [ ! -x "$PFWD_XDP_BIN_PATH" ]; then
+    if [ ! -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ]; then
         pfwd_die "安装包不完整：缺少 XDP 预编译二进制 ($PFWD_SCRIPT_DIR/assets/$(guard_asset_name))"
     fi
-    service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR" true
+    service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_write_shortcuts
     service_write_unit_files
 }
