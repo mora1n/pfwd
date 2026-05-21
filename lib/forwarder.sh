@@ -238,6 +238,12 @@ forwarder_runtime_status_json() {
         interface: ($runtime.settings.interface // ""),
         protocol_guard: ($runtime.settings.guard_enabled // false),
         whitelist_enabled: ($runtime.settings.whitelist_enabled // false),
+        dataplane_version: ($runtime.dataplane_version // $xdp_status.dataplane_version // null),
+        map_abi_version: ($runtime.map_abi_version // $xdp_status.map_abi_version // null),
+        incremental_apply: ($xdp_status.incremental_apply // false),
+        preserved_connections: ($xdp_status.preserved_connections // 0),
+        invalidated_connections: ($xdp_status.invalidated_connections // 0),
+        profile_counts: ($runtime.summary.profile_counts // $xdp_status.profile_counts // {}),
         xdp_status: $xdp_status
       }'
 }
@@ -278,7 +284,13 @@ forwarder_status_json() {
             nft_rules_count: 0,
             interface: "",
             protocol_guard: false,
-            whitelist_enabled: false
+            whitelist_enabled: false,
+            dataplane_version: null,
+            map_abi_version: null,
+            incremental_apply: false,
+            preserved_connections: 0,
+            invalidated_connections: 0,
+            profile_counts: {}
           }')"
     fi
     xdp_status_json="$(forwarder_xdp_status_json)"
@@ -302,6 +314,12 @@ forwarder_render_status() {
         ["Guard 数据面", (if (.xdp_guard_rules_count // 0) > 0 then "开" else "关" end)],
         ["nft 规则", (.nft_rules_count | tostring)],
         ["绑定网卡", (.interface // "-")],
+        ["dataplane", ((.dataplane_version // .xdp_status.dataplane_version // "-") | tostring)],
+        ["map ABI", ((.map_abi_version // .xdp_status.map_abi_version // "-") | tostring)],
+        ["XDP 增量刷新", (if (.xdp_status.incremental_apply // .incremental_apply // false) then "是" else "否" end)],
+        ["XDP 保留连接", ((.xdp_status.preserved_connections // .preserved_connections // 0) | tostring)],
+        ["XDP 失效连接", ((.xdp_status.invalidated_connections // .invalidated_connections // 0) | tostring)],
+        ["XDP profile", (((.profile_counts // .xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $profiles | if $profiles == "" then "-" else $profiles end)],
         ["XDP 活动连接", ((.xdp_status.active_summary.total // 0) | tostring)],
         ["XDP TCP 预热中", ((.xdp_status.active_summary.tcp_syn_pending // 0) | tostring)],
         ["XDP TCP 已建链", ((.xdp_status.active_summary.tcp_established // 0) | tostring)],

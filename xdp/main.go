@@ -29,6 +29,8 @@ import (
 var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
+const dataplaneVersion = 2
+const mapABIVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
@@ -133,13 +135,20 @@ type connSummary struct {
 }
 
 type runtimeFile struct {
-	Rules      []runtimeRule     `json:"rules"`
-	Users      []runtimeUser     `json:"users"`
-	Settings   runtimeSettings   `json:"settings"`
-	Generated  string            `json:"generated_at,omitempty"`
-	RuleIndex  map[string]uint32 `json:"rule_index,omitempty"`
-	UserIndex  map[string]uint32 `json:"user_index,omitempty"`
-	ConfigHash string            `json:"config_hash,omitempty"`
+	Rules            []runtimeRule     `json:"rules"`
+	Users            []runtimeUser     `json:"users"`
+	Settings         runtimeSettings   `json:"settings"`
+	Generated        string            `json:"generated_at,omitempty"`
+	DataplaneVersion int               `json:"dataplane_version,omitempty"`
+	MapABIVersion    int               `json:"map_abi_version,omitempty"`
+	Summary          runtimeSummary    `json:"summary,omitempty"`
+	RuleIndex        map[string]uint32 `json:"rule_index,omitempty"`
+	UserIndex        map[string]uint32 `json:"user_index,omitempty"`
+	ConfigHash       string            `json:"config_hash,omitempty"`
+}
+
+type runtimeSummary struct {
+	ProfileCounts map[string]int `json:"profile_counts,omitempty"`
 }
 
 type whitelistContentHash struct {
@@ -200,58 +209,68 @@ type runtimeUser struct {
 }
 
 type runtimeRule struct {
-	ID                  string  `json:"id"`
-	Index               uint32  `json:"index"`
-	UserID              string  `json:"user_id"`
-	UserIndex           uint32  `json:"user_index"`
-	ListenIP            string  `json:"listen_ip"`
-	ListenPort          uint16  `json:"listen_port"`
-	Protocol            string  `json:"protocol"`
-	IPVersion           uint8   `json:"ip_version"`
-	ResolvedTarget      string  `json:"resolved_target"`
-	RemotePort          uint16  `json:"remote_port"`
-	SNATMode            string  `json:"snat_mode"`
-	SNATSource          string  `json:"snat_source,omitempty"`
-	MSSMode             string  `json:"mss_mode,omitempty"`
-	MSSValue            uint16  `json:"mss_value,omitempty"`
-	TrafficMode         string  `json:"traffic_mode"`
-	TrafficRatio        float64 `json:"traffic_ratio"`
-	RuleLimit           uint64  `json:"traffic_limit_bytes"`
-	UserLimit           uint64  `json:"user_limit_bytes"`
-	BillingUsedBase     uint64  `json:"billing_used_base_bytes"`
-	UserBillingUsedBase uint64  `json:"user_billing_used_base_bytes"`
-	XDPDisabled         bool    `json:"xdp_disabled,omitempty"`
-	RemoteInput         string  `json:"remote_input,omitempty"`
-	Comment             string  `json:"comment,omitempty"`
+	ID                  string   `json:"id"`
+	Index               uint32   `json:"index"`
+	UserID              string   `json:"user_id"`
+	UserIndex           uint32   `json:"user_index"`
+	ListenIP            string   `json:"listen_ip"`
+	ListenPort          uint16   `json:"listen_port"`
+	Protocol            string   `json:"protocol"`
+	IPVersion           uint8    `json:"ip_version"`
+	ResolvedTarget      string   `json:"resolved_target"`
+	RemotePort          uint16   `json:"remote_port"`
+	SNATMode            string   `json:"snat_mode"`
+	SNATSource          string   `json:"snat_source,omitempty"`
+	MSSMode             string   `json:"mss_mode,omitempty"`
+	MSSValue            uint16   `json:"mss_value,omitempty"`
+	TrafficMode         string   `json:"traffic_mode"`
+	TrafficRatio        float64  `json:"traffic_ratio"`
+	RuleLimit           uint64   `json:"traffic_limit_bytes"`
+	UserLimit           uint64   `json:"user_limit_bytes"`
+	BillingUsedBase     uint64   `json:"billing_used_base_bytes"`
+	UserBillingUsedBase uint64   `json:"user_billing_used_base_bytes"`
+	FeatureProfile      string   `json:"feature_profile,omitempty"`
+	FeatureFlags        []string `json:"feature_flags,omitempty"`
+	XDPDisabled         bool     `json:"xdp_disabled,omitempty"`
+	RemoteInput         string   `json:"remote_input,omitempty"`
+	Comment             string   `json:"comment,omitempty"`
 }
 
 type statusPayload struct {
-	Applied        bool         `json:"applied"`
-	BinaryVersion  string       `json:"binary_version"`
-	AppliedAt      string       `json:"applied_at,omitempty"`
-	Interface      string       `json:"interface,omitempty"`
-	InterfaceIndex int          `json:"interface_index,omitempty"`
-	GuardMode      string       `json:"guard_mode,omitempty"`
-	XDPEffective   string       `json:"xdp_effective,omitempty"`
-	XDPAttachKind  string       `json:"xdp_attach_kind,omitempty"`
-	XDPReason      string       `json:"xdp_reason,omitempty"`
-	IngressKind    string       `json:"ingress_kind,omitempty"`
-	LoopbackKind   string       `json:"loopback_kind,omitempty"`
-	SkLookupKind   string       `json:"sk_lookup_kind,omitempty"`
-	ProtocolGuard  bool         `json:"protocol_guard,omitempty"`
-	RuntimeFile    string       `json:"runtime_file,omitempty"`
-	StateFile      string       `json:"state_file,omitempty"`
-	ConfigHash     string       `json:"config_hash,omitempty"`
-	Rules          int          `json:"rules,omitempty"`
-	Users          int          `json:"users,omitempty"`
-	XDPPin         string       `json:"xdp_pin,omitempty"`
-	IngressPin     string       `json:"ingress_pin,omitempty"`
-	LoopbackPin    string       `json:"loopback_pin,omitempty"`
-	SkLookupPin    string       `json:"sk_lookup_pin,omitempty"`
-	RuleCounterPin string       `json:"rule_counter_pin,omitempty"`
-	UserCounterPin string       `json:"user_counter_pin,omitempty"`
-	StatsPin       string       `json:"stats_pin,omitempty"`
-	ActiveSummary  *connSummary `json:"active_summary,omitempty"`
+	Applied                bool           `json:"applied"`
+	BinaryVersion          string         `json:"binary_version"`
+	AppliedAt              string         `json:"applied_at,omitempty"`
+	Interface              string         `json:"interface,omitempty"`
+	InterfaceIndex         int            `json:"interface_index,omitempty"`
+	GuardMode              string         `json:"guard_mode,omitempty"`
+	XDPEffective           string         `json:"xdp_effective,omitempty"`
+	XDPAttachKind          string         `json:"xdp_attach_kind,omitempty"`
+	XDPReason              string         `json:"xdp_reason,omitempty"`
+	IngressKind            string         `json:"ingress_kind,omitempty"`
+	LoopbackKind           string         `json:"loopback_kind,omitempty"`
+	SkLookupKind           string         `json:"sk_lookup_kind,omitempty"`
+	ProtocolGuard          bool           `json:"protocol_guard,omitempty"`
+	RuntimeFile            string         `json:"runtime_file,omitempty"`
+	StateFile              string         `json:"state_file,omitempty"`
+	ConfigHash             string         `json:"config_hash,omitempty"`
+	RuntimeEpoch           string         `json:"runtime_epoch,omitempty"`
+	DataplaneVersion       int            `json:"dataplane_version,omitempty"`
+	MapABIVersion          int            `json:"map_abi_version,omitempty"`
+	IncrementalApply       bool           `json:"incremental_apply,omitempty"`
+	ReattachReason         string         `json:"reattach_reason,omitempty"`
+	PreservedConnections   uint64         `json:"preserved_connections,omitempty"`
+	InvalidatedConnections uint64         `json:"invalidated_connections,omitempty"`
+	ProfileCounts          map[string]int `json:"profile_counts,omitempty"`
+	Rules                  int            `json:"rules,omitempty"`
+	Users                  int            `json:"users,omitempty"`
+	XDPPin                 string         `json:"xdp_pin,omitempty"`
+	IngressPin             string         `json:"ingress_pin,omitempty"`
+	LoopbackPin            string         `json:"loopback_pin,omitempty"`
+	SkLookupPin            string         `json:"sk_lookup_pin,omitempty"`
+	RuleCounterPin         string         `json:"rule_counter_pin,omitempty"`
+	UserCounterPin         string         `json:"user_counter_pin,omitempty"`
+	StatsPin               string         `json:"stats_pin,omitempty"`
+	ActiveSummary          *connSummary   `json:"active_summary,omitempty"`
 }
 
 type runtimeMapPins struct {
@@ -714,31 +733,37 @@ func applyRuntime(opts applyOptions) error {
 		fmt.Fprintf(os.Stderr, "pfwd-xdp: sk_lookup attached via %s\n", skLookupKind)
 	}
 	payload := statusPayload{
-		Applied:        true,
-		BinaryVersion:  binaryVersion,
-		AppliedAt:      time.Now().UTC().Format(time.RFC3339),
-		Interface:      iface.Name,
-		InterfaceIndex: iface.Index,
-		GuardMode:      opts.GuardMode,
-		XDPEffective:   xdpEffective,
-		XDPAttachKind:  xdpKind,
-		XDPReason:      xdpReason,
-		IngressKind:    ingressKind,
-		LoopbackKind:   loopbackKind,
-		SkLookupKind:   skLookupKind,
-		ProtocolGuard:  protocolGuard,
-		RuntimeFile:    opts.RuntimeFile,
-		StateFile:      opts.StateFile,
-		ConfigHash:     runtimeSemanticConfigHash,
-		Rules:          len(runtimeData.Rules),
-		Users:          len(runtimeData.Users),
-		XDPPin:         opts.XDPPin,
-		IngressPin:     opts.IngressPin,
-		LoopbackPin:    opts.LoopbackPin,
-		SkLookupPin:    opts.SkLookupPin,
-		RuleCounterPin: opts.RuleCounterPin,
-		UserCounterPin: opts.UserCounterPin,
-		StatsPin:       opts.StatsPin,
+		Applied:          true,
+		BinaryVersion:    binaryVersion,
+		AppliedAt:        time.Now().UTC().Format(time.RFC3339),
+		Interface:        iface.Name,
+		InterfaceIndex:   iface.Index,
+		GuardMode:        opts.GuardMode,
+		XDPEffective:     xdpEffective,
+		XDPAttachKind:    xdpKind,
+		XDPReason:        xdpReason,
+		IngressKind:      ingressKind,
+		LoopbackKind:     loopbackKind,
+		SkLookupKind:     skLookupKind,
+		ProtocolGuard:    protocolGuard,
+		RuntimeFile:      opts.RuntimeFile,
+		StateFile:        opts.StateFile,
+		ConfigHash:       runtimeSemanticConfigHash,
+		RuntimeEpoch:     runtimeSemanticConfigHash,
+		DataplaneVersion: dataplaneVersion,
+		MapABIVersion:    mapABIVersion,
+		IncrementalApply: false,
+		ReattachReason:   "full-reattach",
+		ProfileCounts:    profileCounts(runtimeData),
+		Rules:            len(runtimeData.Rules),
+		Users:            len(runtimeData.Users),
+		XDPPin:           opts.XDPPin,
+		IngressPin:       opts.IngressPin,
+		LoopbackPin:      opts.LoopbackPin,
+		SkLookupPin:      opts.SkLookupPin,
+		RuleCounterPin:   opts.RuleCounterPin,
+		UserCounterPin:   opts.UserCounterPin,
+		StatsPin:         opts.StatsPin,
 	}
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		payload.ActiveSummary = summary
@@ -808,6 +833,12 @@ func loadRuntime(path string) (*runtimeFile, error) {
 	}
 	if len(runtimeData.Users) > maxUsers {
 		return nil, fmt.Errorf("用户数量超过上限：%d > %d", len(runtimeData.Users), maxUsers)
+	}
+	if runtimeData.DataplaneVersion != 0 && runtimeData.DataplaneVersion != dataplaneVersion {
+		return nil, fmt.Errorf("不支持的 dataplane_version：%d", runtimeData.DataplaneVersion)
+	}
+	if runtimeData.MapABIVersion != 0 && runtimeData.MapABIVersion != mapABIVersion {
+		return nil, fmt.Errorf("不支持的 map_abi_version：%d", runtimeData.MapABIVersion)
 	}
 	return &runtimeData, nil
 }
@@ -1220,6 +1251,40 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	return nil
 }
 
+func clearMutableConfigMaps(objs *bpfObjects) error {
+	if err := clearMap[ruleKey, ruleVal](objs.PFWDRules); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
+		return err
+	}
+	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+		return err
+	}
+	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearPerCPUCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
+		return err
+	}
+	return nil
+}
+
 func pinnedPathExists(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
@@ -1275,6 +1340,9 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 	if payload.BinaryVersion != "" && payload.BinaryVersion != binaryVersion {
 		return false
 	}
+	if payload.MapABIVersion != 0 && payload.MapABIVersion != mapABIVersion {
+		return false
+	}
 	if payload.Interface != "" && iface != nil && payload.Interface != iface.Name {
 		return false
 	}
@@ -1318,6 +1386,166 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 	return runtimeData != nil && pinnedRuntimeMapsCompatible(opts)
 }
 
+type ruleSemantics struct {
+	RuleID             uint32
+	UserID             uint32
+	TargetAddr         [16]byte
+	TargetPort         uint16
+	SourceAddr         [16]byte
+	SourceAddrFromRule bool
+	TrafficRatioScaled uint64
+	TrafficMode        uint8
+	UserLimitEnabled   uint8
+	BillingEnabled     uint8
+}
+
+func ruleSemanticsFromRule(rule runtimeRule) (ruleSemantics, error) {
+	value, err := makeRuleVal(rule, runtimeSettings{})
+	if err != nil {
+		return ruleSemantics{}, err
+	}
+	return ruleSemantics{
+		RuleID:             value.RuleID,
+		UserID:             value.UserID,
+		TargetAddr:         value.TargetAddr,
+		TargetPort:         value.TargetPort,
+		SourceAddr:         value.SNATAddr,
+		SourceAddrFromRule: value.SNATMode == 1,
+		TrafficRatioScaled: value.TrafficRatioScaled,
+		TrafficMode:        value.TrafficMode,
+		UserLimitEnabled:   value.UserLimitEnabled,
+		BillingEnabled:     value.BillingEnabled,
+	}, nil
+}
+
+func connectionRuleSignature(key connKey, value connVal) ruleSemantics {
+	return ruleSemantics{
+		RuleID:             value.RuleID,
+		UserID:             value.UserID,
+		TargetAddr:         key.TargetAddr,
+		TargetPort:         key.TargetPort,
+		TrafficRatioScaled: value.TrafficRatioScaled,
+		TrafficMode:        value.TrafficMode,
+		UserLimitEnabled:   value.UserLimitEnabled,
+		BillingEnabled:     value.BillingEnabled,
+	}
+}
+
+func connectionMatchesRule(key connKey, value connVal, expected ruleSemantics) bool {
+	actual := connectionRuleSignature(key, value)
+	if actual.RuleID != expected.RuleID ||
+		actual.UserID != expected.UserID ||
+		actual.TargetAddr != expected.TargetAddr ||
+		actual.TargetPort != expected.TargetPort ||
+		actual.TrafficRatioScaled != expected.TrafficRatioScaled ||
+		actual.TrafficMode != expected.TrafficMode ||
+		actual.UserLimitEnabled != expected.UserLimitEnabled ||
+		actual.BillingEnabled != expected.BillingEnabled {
+		return false
+	}
+	if expected.SourceAddrFromRule {
+		return value.SourceAddr == expected.SourceAddr
+	}
+	return value.SourceAddr == key.ListenAddr
+}
+
+func runtimeConnectionSemantics(runtimeData *runtimeFile) (map[ruleKey]ruleSemantics, error) {
+	allowed := make(map[ruleKey]ruleSemantics, len(runtimeData.Rules))
+	for _, rule := range runtimeData.Rules {
+		key, err := makeRuleKey(rule)
+		if err != nil {
+			return nil, fmt.Errorf("生成规则 key 失败 (%s): %w", rule.ID, err)
+		}
+		signature, err := ruleSemanticsFromRule(rule)
+		if err != nil {
+			return nil, fmt.Errorf("生成规则连接语义失败 (%s): %w", rule.ID, err)
+		}
+		allowed[key] = signature
+	}
+	return allowed, nil
+}
+
+func connectionAllowedByRuntime(key connKey, value connVal, allowed map[ruleKey]ruleSemantics) bool {
+	ruleLookup := ruleKey{
+		Family:     key.Family,
+		Protocol:   key.Protocol,
+		ListenPort: key.ListenPort,
+		ListenAddr: key.ListenAddr,
+	}
+	expected, ok := allowed[ruleLookup]
+	if !ok {
+		ruleLookup.ListenAddr = [16]byte{}
+		expected, ok = allowed[ruleLookup]
+	}
+	return ok && connectionMatchesRule(key, value, expected)
+}
+
+func reverseKeyFromConn(key connKey, value connVal) reverseKey {
+	return reverseKey{
+		Family:     key.Family,
+		Protocol:   key.Protocol,
+		SourcePort: value.SourcePort,
+		TargetPort: key.TargetPort,
+		ClientPort: key.ClientPort,
+		SourceAddr: value.SourceAddr,
+		TargetAddr: key.TargetAddr,
+		ClientAddr: key.ClientAddr,
+	}
+}
+
+func reconcileConnections(objs *bpfObjects, runtimeData *runtimeFile) (uint64, uint64, error) {
+	if objs.PFWDConnections == nil || objs.PFWDReverse == nil {
+		return 0, 0, fmt.Errorf("连接 map 未加载")
+	}
+	allowed, err := runtimeConnectionSemantics(runtimeData)
+	if err != nil {
+		return 0, 0, err
+	}
+	var preserved uint64
+	var invalidated uint64
+	it := objs.PFWDConnections.Iterate()
+	var key connKey
+	var value connVal
+	for it.Next(&key, &value) {
+		if connectionAllowedByRuntime(key, value, allowed) {
+			preserved++
+			continue
+		}
+		keyCopy := key
+		reverseCopy := reverseKeyFromConn(key, value)
+		if err := objs.PFWDConnections.Delete(&keyCopy); err != nil {
+			return preserved, invalidated, fmt.Errorf("删除失效 connection 失败: %w", err)
+		}
+		if err := objs.PFWDReverse.Delete(&reverseCopy); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return preserved, invalidated, fmt.Errorf("删除失效 reverse 失败: %w", err)
+		}
+		invalidated++
+	}
+	if err := it.Err(); err != nil {
+		return preserved, invalidated, fmt.Errorf("遍历 connection map 失败: %w", err)
+	}
+	return preserved, invalidated, nil
+}
+
+func profileCounts(runtimeData *runtimeFile) map[string]int {
+	counts := map[string]int{}
+	if runtimeData == nil {
+		return counts
+	}
+	for name, value := range runtimeData.Summary.ProfileCounts {
+		counts[name] = value
+	}
+	for _, rule := range runtimeData.Rules {
+		if rule.FeatureProfile == "" {
+			continue
+		}
+		if _, ok := counts[rule.FeatureProfile]; !ok {
+			counts[rule.FeatureProfile] = 0
+		}
+	}
+	return counts
+}
+
 func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {
 	runtimeSemanticConfigHash, err := runtimeSemanticHash(runtimeData)
 	if err != nil {
@@ -1328,16 +1556,21 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 		return err
 	}
 	defer objs.Close()
-	if err := clearRuntimeMaps(objs); err != nil {
+	if err := clearMutableConfigMaps(objs); err != nil {
 		return fmt.Errorf("清理 pinned maps 失败: %w", err)
 	}
 	if err := loadMaps(objs, runtimeData, opts); err != nil {
 		return fmt.Errorf("重载 pinned maps 失败: %w", err)
 	}
+	preservedConnections, invalidatedConnections, err := reconcileConnections(objs, runtimeData)
+	if err != nil {
+		return fmt.Errorf("reconcile active connections 失败: %w", err)
+	}
+	appliedAt := time.Now().UTC().Format(time.RFC3339)
 	updated := payload
 	updated.Applied = true
 	updated.BinaryVersion = binaryVersion
-	updated.AppliedAt = time.Now().UTC().Format(time.RFC3339)
+	updated.AppliedAt = appliedAt
 	updated.Interface = iface.Name
 	updated.InterfaceIndex = iface.Index
 	updated.GuardMode = opts.GuardMode
@@ -1345,6 +1578,14 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.RuntimeFile = opts.RuntimeFile
 	updated.StateFile = opts.StateFile
 	updated.ConfigHash = runtimeSemanticConfigHash
+	updated.RuntimeEpoch = runtimeSemanticConfigHash
+	updated.DataplaneVersion = dataplaneVersion
+	updated.MapABIVersion = mapABIVersion
+	updated.IncrementalApply = true
+	updated.ReattachReason = ""
+	updated.PreservedConnections = preservedConnections
+	updated.InvalidatedConnections = invalidatedConnections
+	updated.ProfileCounts = profileCounts(runtimeData)
 	updated.Rules = len(runtimeData.Rules)
 	updated.Users = len(runtimeData.Users)
 	updated.XDPPin = opts.XDPPin

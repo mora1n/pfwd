@@ -962,6 +962,7 @@ EOF
 cmd_render() {
     local target="${1:-forwarder}"
     case "$target" in
+        status) forwarder_status_json | jq '.' ;;
         xdp) forwarder_render_xdp_config ;;
         forwarder) forwarder_render_config ;;
         nft) fw_render_nft ;;
@@ -977,7 +978,7 @@ cmd_render() {
             echo "# pfwd-xdp.service"
             guard_service_unit
             ;;
-        *) pfwd_die "用法：pfwd render [forwarder|nft|tc|guard|units]" ;;
+        *) pfwd_die "用法：pfwd render [forwarder|status|nft|tc|guard|units]" ;;
     esac
 }
 
@@ -1055,6 +1056,7 @@ cmd_doctor() {
     done
     config_init >/dev/null
     local forwarder_status xdp_status backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
+    local dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts
     stats_runtime_cache_clear
     forwarder_status="$(forwarder_status_json)"
     xdp_status="$(forwarder_xdp_status_json)"
@@ -1065,6 +1067,12 @@ cmd_doctor() {
     xdp_tcp_prewarmed="$(jq -r '.active_summary.tcp_syn_pending // 0' <<< "$xdp_status")"
     xdp_tcp_established="$(jq -r '.active_summary.tcp_established // 0' <<< "$xdp_status")"
     xdp_udp_active="$(jq -r '.active_summary.udp // 0' <<< "$xdp_status")"
+    dataplane_version="$(jq -r '.dataplane_version // .xdp_status.dataplane_version // "-" ' <<< "$forwarder_status")"
+    map_abi_version="$(jq -r '.map_abi_version // .xdp_status.map_abi_version // "-" ' <<< "$forwarder_status")"
+    incremental_apply="$(jq -r '.xdp_status.incremental_apply // .incremental_apply // false' <<< "$forwarder_status")"
+    preserved_connections="$(jq -r '.xdp_status.preserved_connections // .preserved_connections // 0' <<< "$forwarder_status")"
+    invalidated_connections="$(jq -r '.xdp_status.invalidated_connections // .invalidated_connections // 0' <<< "$forwarder_status")"
+    profile_counts="$(jq -r '((.profile_counts // .xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $profiles | if $profiles == "" then "-" else $profiles end' <<< "$forwarder_status")"
     tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
     tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
     if [ -n "$tc_iface" ]; then
@@ -1082,6 +1090,12 @@ cmd_doctor() {
     elif [ "$hybrid_reason" = "loopback-split" ]; then
         echo "混合原因：localhost 分流"
     fi
+    echo "dataplane.version：$dataplane_version"
+    echo "dataplane.map_abi：$map_abi_version"
+    echo "xdp.incremental_apply：$incremental_apply"
+    echo "xdp.preserved_connections：$preserved_connections"
+    echo "xdp.invalidated_connections：$invalidated_connections"
+    echo "xdp.profile_counts：${profile_counts:-"-"}"
     echo "运行态文件：$PFWD_FORWARDER_RUNTIME_FILE"
     if [ -x "$(forwarder_bin_path)" ]; then echo "pfwd-xdp：$(forwarder_bin_path)"; else echo "pfwd-xdp：缺失"; fi
     if command -v tc >/dev/null 2>&1; then echo "tc：$(command -v tc)"; else echo "tc：缺失"; fi

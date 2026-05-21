@@ -156,10 +156,13 @@ pfwd install
 ├── stats.json
 ├── whitelist/
 └── xdp/
+    ├── indexes.json
     └── status.json
 
 /run/pfwd/
-└── runtime.json
+├── runtime.json
+├── runtime.xdp.json
+└── runtime.nft.json
 
 /sys/fs/bpf/
 ├── pfwd_xdp_link
@@ -206,6 +209,7 @@ pfwd add \
 | 批量限制 | `pfwd user-forwards-limit --user-id alice --rate 50Mbps --traffic-mode one-way` | 批量设置用户下全部端口 |
 | 刷新运行态 | `pfwd refresh` | 重新解析配置并应用当前数据面 |
 | 渲染数据面 | `pfwd render xdp` | 查看 XDP 候选 runtime JSON |
+| 渲染状态 | `pfwd render status` | 查看已应用数据面状态 JSON |
 | 渲染速率 | `pfwd render tc` | 查看速率限制命令 |
 | 诊断 | `pfwd doctor` | 查看配置、二进制、systemd 和运行态摘要；`--bench` 显示 benchmark |
 
@@ -217,6 +221,8 @@ pfwd add \
 - 非 localhost 规则优先走 XDP；localhost / `127.0.0.1` / `::1` 固定走 `nftables`。
 - localhost 规则与非 localhost 规则并存时，状态显示为 `hybrid`；这是正常规则级分流，不表示 XDP 故障。
 - 当 XDP 不可用时，原本应走 XDP 的规则才会自动回退到 `nftables`，此时状态才是 `nft-fallback`。
+- XDP runtime 使用稳定的 user/rule index，索引状态保存在 `/var/lib/pfwd/xdp/indexes.json`；`pfwd refresh` 会尽量增量刷新 pinned maps，并保留仍匹配新规则语义的活动连接。
+- `pfwd render status` / `pfwd doctor` 会显示 `dataplane.version`、`map_abi`、`xdp.incremental_apply`、保留/失效连接数和规则 profile 分布，便于区分普通增量刷新与 full reattach。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。

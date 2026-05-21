@@ -60,6 +60,84 @@ runtime_rule_counter_owner() {
     esac
 }
 
+runtime_index_store_json() {
+    local config_file="$1"
+    local persist="${2:-false}"
+    local existing='{"version":1,"rules":{},"users":{}}'
+    local index_json persist_json
+
+    if [ "$persist" = "true" ] && [ -f "$PFWD_XDP_INDEX_FILE" ]; then
+        jq -e '
+          type == "object"
+          and ((.version // 1) == 1)
+          and ((.rules // {}) | type == "object")
+          and ((.users // {}) | type == "object")
+          and all((.rules // {})[]?; (type == "number") and . >= 0)
+          and all((.users // {})[]?; (type == "number") and . >= 0)
+          and (((.rules // {}) | [.[]] | length) == ((.rules // {}) | [.[]] | unique | length))
+          and (((.users // {}) | [.[]] | length) == ((.users // {}) | [.[]] | unique | length))
+        ' "$PFWD_XDP_INDEX_FILE" >/dev/null || pfwd_die "XDP index 状态文件无效：$PFWD_XDP_INDEX_FILE"
+        existing="$(jq -c '.' "$PFWD_XDP_INDEX_FILE")"
+    fi
+
+    index_json="$(jq -n \
+      --slurpfile cfg "$config_file" \
+      --argjson existing "$existing" '
+      def clean_map($m):
+        reduce (($m // {}) | to_entries[]) as $e ({};
+          if (($e.value | type) == "number" and $e.value >= 0)
+          then .[$e.key] = ($e.value | floor)
+          else .
+          end
+        );
+      def used_map($m):
+        reduce ($m | to_entries[]) as $e ({};
+          .[($e.value | tostring)] = true
+        );
+      def next_free($used):
+        first(range(0; 4096) as $i | select((($used[($i | tostring)] // false) | not)) | $i);
+      def unique_order:
+        reduce .[] as $id ({seen: {}, out: []};
+          if (.seen[$id] // false) then
+            .
+          else
+            .seen[$id] = true
+            | .out += [$id]
+          end
+        ) | .out;
+      def assign($ids; $existing_map):
+        reduce $ids[] as $id (
+          {map: clean_map($existing_map), used: used_map(clean_map($existing_map))};
+          if ((.map[$id] // null) != null) then
+            .
+          else
+            (next_free(.used) // error("XDP index pool exhausted")) as $idx
+            | .map[$id] = $idx
+            | .used[($idx | tostring)] = true
+          end
+        ) | .map;
+
+      ([$cfg[0].users[]?.id] | unique_order) as $user_ids
+      | ([$cfg[0].forwards[]?.id] | unique_order) as $rule_ids
+      | (assign($user_ids; ($existing.users // {}))) as $users
+      | (assign($rule_ids; ($existing.rules // {}))) as $rules
+      | {
+          version: 1,
+          users: $users,
+          rules: $rules,
+          current_users: (reduce $user_ids[] as $id ({}; .[$id] = $users[$id])),
+          current_rules: (reduce $rule_ids[] as $id ({}; .[$id] = $rules[$id]))
+        }
+    ')"
+
+    if [ "$persist" = "true" ]; then
+        persist_json="$(jq '{version, users, rules}' <<< "$index_json")"
+        printf '%s\n' "$persist_json" | jq '.' | pfwd_write_atomic "$PFWD_XDP_INDEX_FILE"
+    fi
+
+    printf '%s\n' "$index_json"
+}
+
 runtime_rule_json_line() {
     local id="$1"
     local index="$2"
@@ -144,7 +222,7 @@ runtime_compiled_json() {
         config_file="$PFWD_CONFIG_SNAPSHOT_FILE"
     fi
 
-    local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json
+    local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json index_store_json persist_indexes="false"
     local rules_tmp=""
     local -A user_limit_by_id=() user_index_by_id=() rule_index_by_id=() rule_billing_by_id=() user_billing_by_id=()
     local -A resolve_rows_cache=() resolve_error_cache=()
@@ -172,16 +250,12 @@ runtime_compiled_json() {
         ] | @tsv
     ' "$config_file")"
 
-    user_index_json="$(jq -r '
-      reduce (.users[]? | .id) as $id ({};
-        .[$id] = (keys | length)
-      )
-    ' "$config_file")"
-    rule_index_json="$(jq -r '
-      reduce (.forwards[]? | .id) as $id ({};
-        .[$id] = (keys | length)
-      )
-    ' "$config_file")"
+    if [ "$config_file" = "$PFWD_CONFIG_FILE" ]; then
+        persist_indexes="true"
+    fi
+    index_store_json="$(runtime_index_store_json "$config_file" "$persist_indexes")"
+    user_index_json="$(jq '.current_users' <<< "$index_store_json")"
+    rule_index_json="$(jq '.current_rules' <<< "$index_store_json")"
 
     while IFS=$'\t' read -r user_id user_index user_limit user_used; do
         [ -n "$user_id" ] || continue
@@ -359,18 +433,43 @@ runtime_attach_metadata() {
     local runtime_json
     runtime_json="$(cat)"
     local config_hash
-    config_hash="$(printf '%s' "$runtime_json" | pfwd_stdin_checksum)"
-    jq --arg config_hash "$config_hash" '
-      .summary = (
+    runtime_json="$(jq '
+      .dataplane_version = 2
+      | .map_abi_version = 1
+      | .rules = [
+          .rules[]? as $rule
+          | (
+              [
+                (if (($rule.snat_mode // "masquerade") == "snat") then "fixed_snat" else empty end),
+                (if ((($rule.mss_mode // "") != "") and (($rule.mss_mode // "none") != "none")) then "mss" else empty end),
+                (if (($rule.traffic_limit_bytes // 0) > 0 or ($rule.user_limit_bytes // 0) > 0 or ($rule.billing_used_base_bytes // 0) > 0 or ($rule.user_billing_used_base_bytes // 0) > 0) then "metered" else empty end),
+                (if ((.settings.guard_enabled // false) == true and ($rule.protocol == "tcp")) then "guard" else empty end)
+              ] | unique
+            ) as $flags
+          | $rule
+          | .feature_flags = $flags
+          | .feature_profile = (
+              if ($flags | index("guard")) then "guarded_nat"
+              elif (($flags | index("fixed_snat")) or ($flags | index("mss"))) then "rewrite_nat"
+              elif ($flags | index("metered")) then "metered_nat"
+              else "basic_nat"
+              end
+            )
+        ]
+      | .summary = (
         reduce (.rules[]?) as $rule (
-          {rules: 0, xdp_rules: 0, nft_rules: 0, loopback_rules: 0};
+          {rules: 0, xdp_rules: 0, nft_rules: 0, loopback_rules: 0, profile_counts: {}};
           .rules += 1
           | .xdp_rules += (if $rule.execution_class == "xdp" then 1 else 0 end)
           | .nft_rules += (if $rule.execution_class == "nft" then 1 else 0 end)
           | .loopback_rules += (if ($rule.loopback_local == true) then 1 else 0 end)
+          | .profile_counts[$rule.feature_profile] = ((.profile_counts[$rule.feature_profile] // 0) + 1)
         )
       )
-      | .config_hash = $config_hash
+    ' <<< "$runtime_json")"
+    config_hash="$(printf '%s' "$runtime_json" | pfwd_stdin_checksum)"
+    jq --arg config_hash "$config_hash" '
+      .config_hash = $config_hash
     ' <<< "$runtime_json"
 }
 
@@ -385,13 +484,13 @@ runtime_backend_filter() {
         xdp)
             jq '
               .rules = [.rules[]? | select(.execution_class == "xdp")]
-              | .rule_index = (reduce (.rules[]? | .id) as $id ({}; .[$id] = (keys | length)))
+              | .rule_index = (reduce (.rules[]?) as $rule ({}; .[$rule.id] = $rule.index))
             '
             ;;
         nft)
             jq '
               .rules = [.rules[]? | select(.execution_class == "nft")]
-              | .rule_index = (reduce (.rules[]? | .id) as $id ({}; .[$id] = (keys | length)))
+              | .rule_index = (reduce (.rules[]?) as $rule ({}; .[$rule.id] = $rule.index))
             '
             ;;
         *)
@@ -575,7 +674,7 @@ runtime_merge_runtime_rules() {
     local extra_runtime="$2"
     jq \
       --argjson extra "$(jq '.rules // []' <<< "$extra_runtime")" \
-      '.rules += $extra | .rule_index = (reduce (.rules[]? | .id) as $id ({}; .[$id] = (keys | length)))' <<< "$base_runtime"
+      '.rules += $extra | .rule_index = (reduce (.rules[]?) as $rule ({}; .[$rule.id] = $rule.index))' <<< "$base_runtime"
 }
 
 runtime_apply_xdp_runtime() {

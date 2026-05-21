@@ -225,7 +225,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]
   pfwd import <file>
-  pfwd render [forwarder|xdp|nft|tc|guard|units]
+  pfwd render [forwarder|status|xdp|nft|tc|guard|units]
   pfwd refresh
   pfwd restart
   pfwd reconcile
