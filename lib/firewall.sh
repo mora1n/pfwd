@@ -363,7 +363,7 @@ fw_render_nft_objects() {
     done
 
     jq -r --slurpfile stats "$stats_file" '
-      .rules[]?
+      .rules | unique_by(.id)[]?
       | [
           .id,
           .user_id,
@@ -395,50 +395,72 @@ fw_render_prerouting_count_chain() {
     local runtime_json="$1"
     echo "  chain prerouting_count {"
     echo "    type filter hook prerouting priority -10; policy accept;"
-    jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json" |
-    while IFS=$'\t' read -r id port protocol; do
+    for proto in tcp udp; do
+        local entries=()
+        while IFS=$'\t' read -r id port protocol; do
+            [ -n "$id" ] || continue
+            case "${protocol:-tcp_udp}" in
+                "$proto"|tcp_udp)
+                    entries+=("$port : jump fwd_${id//-/_}_in_count")
+                    ;;
+            esac
+        done < <(jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json")
+        if [ "${#entries[@]}" -gt 0 ]; then
+            printf '    ct status dnat ct direction original meta l4proto %s ct original proto-dst vmap { ' "$proto"
+            local i
+            for i in "${!entries[@]}"; do
+                [ "$i" -eq 0 ] || printf ', '
+                printf '%s' "${entries[$i]}"
+            done
+            printf ' }\n'
+        fi
+    done
+    echo "  }"
+    jq -r '.rules | unique_by(.id)[]? | [.id] | @tsv' <<< "$runtime_json" |
+    while IFS=$'\t' read -r id; do
         [ -n "$id" ] || continue
         local in_counter
         read -r in_counter _ < <(fw_counter_names "$id")
-        case "${protocol:-tcp_udp}" in
-            tcp)
-                echo "    ct status dnat ct direction original meta l4proto tcp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
-                ;;
-            udp)
-                echo "    ct status dnat ct direction original meta l4proto udp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
-                ;;
-            *)
-                echo "    ct status dnat ct direction original meta l4proto tcp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
-                echo "    ct status dnat ct direction original meta l4proto udp ct original proto-dst $port counter name $in_counter jump fwd_${id//-/_}_limit"
-                ;;
-        esac
+        echo "  chain fwd_${id//-/_}_in_count {"
+        echo "    counter name $in_counter jump fwd_${id//-/_}_limit"
+        echo "  }"
     done
-    echo "  }"
 }
 
 fw_render_postrouting_count_chain() {
     local runtime_json="$1"
     echo "  chain postrouting_count {"
     echo "    type filter hook postrouting priority -10; policy accept;"
-    jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json" |
-    while IFS=$'\t' read -r id port protocol; do
+    for proto in tcp udp; do
+        local entries=()
+        while IFS=$'\t' read -r id port protocol; do
+            [ -n "$id" ] || continue
+            case "${protocol:-tcp_udp}" in
+                "$proto"|tcp_udp)
+                    entries+=("$port : jump fwd_${id//-/_}_out_count")
+                    ;;
+            esac
+        done < <(jq -r '.rules[]? | [.id, (.listen_port | tostring), (.protocol // "tcp_udp")] | @tsv' <<< "$runtime_json")
+        if [ "${#entries[@]}" -gt 0 ]; then
+            printf '    ct status dnat ct direction reply meta l4proto %s ct original proto-dst vmap { ' "$proto"
+            local i
+            for i in "${!entries[@]}"; do
+                [ "$i" -eq 0 ] || printf ', '
+                printf '%s' "${entries[$i]}"
+            done
+            printf ' }\n'
+        fi
+    done
+    echo "  }"
+    jq -r '.rules | unique_by(.id)[]? | [.id] | @tsv' <<< "$runtime_json" |
+    while IFS=$'\t' read -r id; do
         [ -n "$id" ] || continue
         local out_counter
         read -r _ out_counter < <(fw_counter_names "$id")
-        case "${protocol:-tcp_udp}" in
-            tcp)
-                echo "    ct status dnat ct direction reply meta l4proto tcp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
-                ;;
-            udp)
-                echo "    ct status dnat ct direction reply meta l4proto udp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
-                ;;
-            *)
-                echo "    ct status dnat ct direction reply meta l4proto tcp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
-                echo "    ct status dnat ct direction reply meta l4proto udp ct original proto-dst $port counter name $out_counter jump fwd_${id//-/_}_limit"
-                ;;
-        esac
+        echo "  chain fwd_${id//-/_}_out_count {"
+        echo "    counter name $out_counter jump fwd_${id//-/_}_limit"
+        echo "  }"
     done
-    echo "  }"
 }
 
 fw_render_accounting_to_stdout() {

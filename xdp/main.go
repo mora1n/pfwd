@@ -32,7 +32,15 @@ const binaryVersion = "0.2.3"
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
-const ruleFlagXDPDisabled = uint16(1 << 0)
+const (
+	ruleFlagXDPDisabled  = uint16(1 << 0)
+	ruleFlagNeedsCounter = uint16(1 << 1)
+	ruleFlagNeedsQuota   = uint16(1 << 2)
+	ruleFlagNeedsGuard   = uint16(1 << 3)
+	ruleFlagNeedsAllow   = uint16(1 << 4)
+	ruleFlagSNATFixed    = uint16(1 << 5)
+	ruleFlagMSSEnabled   = uint16(1 << 6)
+)
 const ruleCounterPinSuffix = "_rule_counters"
 const tcPrefBPFIngress = "10"
 const tcPrefBPFEgress = "10"
@@ -969,7 +977,7 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		}
 	}
 	for _, rule := range runtimeData.Rules {
-		if err := putRule(objs, rule); err != nil {
+		if err := putRule(objs, rule, runtimeData.Settings); err != nil {
 			return err
 		}
 	}
@@ -1408,12 +1416,12 @@ func loadProtocolSkipPorts(skipMap *ebpf.Map, ports []uint16) error {
 	return nil
 }
 
-func putRule(objs *bpfObjects, rule runtimeRule) error {
+func putRule(objs *bpfObjects, rule runtimeRule, settings runtimeSettings) error {
 	key, err := makeRuleKey(rule)
 	if err != nil {
 		return fmt.Errorf("生成规则 key 失败 (%s): %w", rule.ID, err)
 	}
-	value, err := makeRuleVal(rule)
+	value, err := makeRuleVal(rule, settings)
 	if err != nil {
 		return fmt.Errorf("生成规则 value 失败 (%s): %w", rule.ID, err)
 	}
@@ -1450,7 +1458,7 @@ func makeRuleKey(rule runtimeRule) (ruleKey, error) {
 	return key, nil
 }
 
-func makeRuleVal(rule runtimeRule) (ruleVal, error) {
+func makeRuleVal(rule runtimeRule, settings runtimeSettings) (ruleVal, error) {
 	var value ruleVal
 	target, err := netip.ParseAddr(rule.ResolvedTarget)
 	if err != nil {
@@ -1465,6 +1473,7 @@ func makeRuleVal(rule runtimeRule) (ruleVal, error) {
 		value.SNATMode = 0
 	case "snat":
 		value.SNATMode = 1
+		value.Flags |= ruleFlagSNATFixed
 		addr, err := netip.ParseAddr(rule.SNATSource)
 		if err != nil {
 			return value, err
@@ -1478,9 +1487,11 @@ func makeRuleVal(rule runtimeRule) (ruleVal, error) {
 		value.MSSMode = 0
 	case "clamp":
 		value.MSSMode = 1
+		value.Flags |= ruleFlagMSSEnabled
 	case "set":
 		value.MSSMode = 2
 		value.MSSValue = rule.MSSValue
+		value.Flags |= ruleFlagMSSEnabled
 	default:
 		return value, fmt.Errorf("无效 MSS 模式：%s", rule.MSSMode)
 	}
@@ -1500,6 +1511,18 @@ func makeRuleVal(rule runtimeRule) (ruleVal, error) {
 	}
 	if rule.RuleLimit > 0 || rule.UserLimit > 0 {
 		value.BillingEnabled = 1
+	}
+	if value.BillingEnabled != 0 {
+		value.Flags |= ruleFlagNeedsCounter
+	}
+	if rule.RuleLimit > 0 || rule.UserLimit > 0 {
+		value.Flags |= ruleFlagNeedsQuota
+	}
+	if settings.GuardEnabled && (settings.BlockHTTP || settings.BlockTLS || settings.BlockSOCKS) && strings.Contains(rule.Protocol, "tcp") {
+		value.Flags |= ruleFlagNeedsGuard
+	}
+	if settings.WhitelistEnabled {
+		value.Flags |= ruleFlagNeedsAllow
 	}
 	if rule.XDPDisabled {
 		value.Flags |= ruleFlagXDPDisabled

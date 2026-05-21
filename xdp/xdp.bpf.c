@@ -30,6 +30,12 @@ enum pfwd_mss_mode {
 
 enum pfwd_rule_flags {
     PFWD_RULE_F_XDP_DISABLED = 1U << 0,
+    PFWD_RULE_F_NEEDS_COUNTER = 1U << 1,
+    PFWD_RULE_F_NEEDS_QUOTA = 1U << 2,
+    PFWD_RULE_F_NEEDS_GUARD = 1U << 3,
+    PFWD_RULE_F_NEEDS_ALLOW = 1U << 4,
+    PFWD_RULE_F_SNAT_FIXED = 1U << 5,
+    PFWD_RULE_F_MSS_ENABLED = 1U << 6,
 };
 
 enum pfwd_inspect_result {
@@ -94,6 +100,34 @@ struct pfwd_rule_val {
     __u8 billing_enabled;
     __u8 pad[5];
 };
+
+static __always_inline int rule_xdp_disabled(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_XDP_DISABLED);
+}
+
+static __always_inline int rule_needs_counter(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_COUNTER);
+}
+
+static __always_inline int rule_needs_quota(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_QUOTA);
+}
+
+static __always_inline int rule_needs_guard(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_GUARD);
+}
+
+static __always_inline int rule_needs_allow(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_ALLOW);
+}
+
+static __always_inline int rule_snat_fixed(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_SNAT_FIXED);
+}
+
+static __always_inline int rule_mss_enabled(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_MSS_ENABLED);
+}
 
 struct pfwd_conn_key {
     __u8 family;
@@ -379,7 +413,7 @@ static __always_inline void rewrite_l4_forward_v4(
         tcp->check = csum_replace32(tcp->check, old_daddr, new_daddr);
         tcp->check = csum_replace16(tcp->check, old_sport, new_sport);
         tcp->check = csum_replace16(tcp->check, old_dport, new_dport);
-        if (rule && rule->mss_mode != PFWD_MSS_NONE) {
+        if (rule_mss_enabled(rule)) {
             adjust_tcp_mss(tcp, data_end, rule->mss_value);
         }
         return;
@@ -461,7 +495,7 @@ static __always_inline void rewrite_l4_forward_v6(
         tcp->check = csum_replace_addr16(tcp->check, old_daddr, new_daddr);
         tcp->check = csum_replace16(tcp->check, old_sport, new_sport);
         tcp->check = csum_replace16(tcp->check, old_dport, new_dport);
-        if (rule && rule->mss_mode != PFWD_MSS_NONE) {
+        if (rule_mss_enabled(rule)) {
             adjust_tcp_mss(tcp, data_end, rule->mss_value);
         }
         return;
@@ -1066,8 +1100,9 @@ static __always_inline int protocol_guard_active(const struct pfwd_settings *set
     return settings && settings->guard_enabled && (settings->block_http || settings->block_tls || settings->block_socks);
 }
 
-static __always_inline int rule_xdp_disabled(const struct pfwd_rule_val *rule) {
-    return rule && (rule->flags & PFWD_RULE_F_XDP_DISABLED);
+static __always_inline struct pfwd_settings *lookup_settings(void) {
+    __u32 settings_key = 0;
+    return bpf_map_lookup_elem(&pfwd_settings, &settings_key);
 }
 
 static __always_inline int append_guard_prefix(
@@ -1374,7 +1409,7 @@ static __always_inline int prepare_local_conn_v4(
     __u64 packet_len
 ) {
     struct pfwd_conn_val *existing_conn;
-    __be32 source_addr = rule->snat_mode == PFWD_SNAT_FIXED ? ipv4_from16(rule->snat_addr) : listen_addr;
+    __be32 source_addr = rule_snat_fixed(rule) ? ipv4_from16(rule->snat_addr) : listen_addr;
     __be16 source_port;
 
     if (!scratch) {
@@ -1467,7 +1502,7 @@ static __always_inline int prepare_local_conn_v6(
     pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
     pfwd_memcpy16(scratch->addr_a, client_addr);
     pfwd_memcpy16(scratch->addr_b, listen_addr);
-    if (rule->snat_mode == PFWD_SNAT_FIXED) {
+    if (rule_snat_fixed(rule)) {
         pfwd_memcpy16(scratch->addr_c, rule->snat_addr);
     } else {
         pfwd_memcpy16(scratch->addr_c, listen_addr);
@@ -1522,7 +1557,7 @@ static __always_inline int tc_local_forward_v4(
     struct pfwd_counter *user_counter = 0;
     __u64 billed = 0;
 
-    if (settings && settings->whitelist_enabled && !whitelist_allowed_v4(ip4->saddr)) {
+    if (rule_needs_allow(rule) && settings && !whitelist_allowed_v4(ip4->saddr)) {
         stat_inc(PFWD_STAT_WHITELIST_DROPPED);
         count_drop(rule, packet_len);
         return TC_ACT_SHOT;
@@ -1535,16 +1570,16 @@ static __always_inline int tc_local_forward_v4(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+        if (rule_needs_guard(rule) && inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
             return TC_ACT_SHOT;
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
-    if (rule->billing_enabled || rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) {
+    if (rule_needs_counter(rule)) {
         billed = billed_delta_for_rule(rule, packet_len, 0);
         load_input_counters(rule, &rule_counter, &user_counter);
     }
-    if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
+    if (rule_needs_quota(rule) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
         stat_inc(PFWD_STAT_QUOTA_DROPPED);
         count_drop_with_counter(rule, packet_len, rule_counter);
         return TC_ACT_SHOT;
@@ -1583,7 +1618,7 @@ static __always_inline int tc_local_forward_v6(
     struct pfwd_counter *user_counter = 0;
     __u64 billed = 0;
 
-    if (settings && settings->whitelist_enabled && !whitelist_allowed_v6(ip6->saddr)) {
+    if (rule_needs_allow(rule) && settings && !whitelist_allowed_v6(ip6->saddr)) {
         stat_inc(PFWD_STAT_WHITELIST_DROPPED);
         count_drop(rule, packet_len);
         return TC_ACT_SHOT;
@@ -1596,16 +1631,16 @@ static __always_inline int tc_local_forward_v6(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+        if (rule_needs_guard(rule) && inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
             return TC_ACT_SHOT;
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
-    if (rule->billing_enabled || rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) {
+    if (rule_needs_counter(rule)) {
         billed = billed_delta_for_rule(rule, packet_len, 0);
         load_input_counters(rule, &rule_counter, &user_counter);
     }
-    if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
+    if (rule_needs_quota(rule) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
         stat_inc(PFWD_STAT_QUOTA_DROPPED);
         count_drop_with_counter(rule, packet_len, rule_counter);
         return TC_ACT_SHOT;
@@ -1631,15 +1666,11 @@ int pfwd_xdp(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     struct ethhdr *eth = data;
     __u64 packet_len = (__u64)(data_end - data);
-    __u32 settings_key = 0;
-    struct pfwd_settings *settings;
 
     if ((void *)(eth + 1) > data_end) {
         stat_inc(PFWD_STAT_PARSE_SKIPPED);
         return XDP_PASS;
     }
-    settings = bpf_map_lookup_elem(&pfwd_settings, &settings_key);
-
     if (bpf_ntohs(eth->h_proto) == ETH_P_IP) {
         struct ipv4hdr_min *ip4 = (void *)(eth + 1);
         __u32 ihl;
@@ -1699,11 +1730,11 @@ int pfwd_xdp(struct xdp_md *ctx) {
             __be32 old_daddr = ip4->daddr;
             __be16 old_sport = sport;
             __be16 old_dport = dport;
-            __be32 new_saddr = rule->snat_mode == PFWD_SNAT_FIXED ? ipv4_from16(rule->snat_addr) : old_daddr;
+            __be32 new_saddr = rule_snat_fixed(rule) ? ipv4_from16(rule->snat_addr) : old_daddr;
             __be32 new_daddr = ipv4_from16(rule->target_addr);
             __be16 new_sport = sport;
             __be16 new_dport = rule->target_port;
-            if (settings && settings->whitelist_enabled && !whitelist_allowed_v4(ip4->saddr)) {
+            if (rule_needs_allow(rule) && !whitelist_allowed_v4(ip4->saddr)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -1716,16 +1747,19 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-                    return XDP_DROP;
+                if (rule_needs_guard(rule)) {
+                    struct pfwd_settings *settings = lookup_settings();
+                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                        return XDP_DROP;
+                    }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
-            if (rule->billing_enabled || rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) {
+            if (rule_needs_counter(rule)) {
                 billed = billed_delta_for_rule(rule, packet_len, 0);
                 load_input_counters(rule, &rule_counter, &user_counter);
             }
-            if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
+            if (rule_needs_quota(rule) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
                 count_drop_with_counter(rule, packet_len, rule_counter);
                 return XDP_DROP;
@@ -1905,7 +1939,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             struct pfwd_counter *user_counter = 0;
             __u64 billed = 0;
             __be16 new_sport = sport;
-            if (settings && settings->whitelist_enabled && !whitelist_allowed_v6(ip6->saddr)) {
+            if (rule_needs_allow(rule) && !whitelist_allowed_v6(ip6->saddr)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop(rule, packet_len);
                 return XDP_DROP;
@@ -1918,16 +1952,19 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-                    return XDP_DROP;
+                if (rule_needs_guard(rule)) {
+                    struct pfwd_settings *settings = lookup_settings();
+                    if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                        return XDP_DROP;
+                    }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
-            if (rule->billing_enabled || rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) {
+            if (rule_needs_counter(rule)) {
                 billed = billed_delta_for_rule(rule, packet_len, 0);
                 load_input_counters(rule, &rule_counter, &user_counter);
             }
-            if ((rule->rule_limit_bytes > 0 || rule->user_limit_bytes > 0) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
+            if (rule_needs_quota(rule) && traffic_over_limit(rule, billed, rule_counter, user_counter)) {
                 stat_inc(PFWD_STAT_QUOTA_DROPPED);
                 count_drop_with_counter(rule, packet_len, rule_counter);
                 return XDP_DROP;
@@ -1957,7 +1994,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             } else {
                 pfwd_memcpy16(scratch->addr_a, ip6->saddr);
                 pfwd_memcpy16(scratch->addr_b, ip6->daddr);
-                if (rule->snat_mode == PFWD_SNAT_FIXED) {
+                if (rule_snat_fixed(rule)) {
                     pfwd_memcpy16(scratch->addr_c, rule->snat_addr);
                 } else {
                     pfwd_memcpy16(scratch->addr_c, ip6->daddr);
@@ -2113,7 +2150,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
             }
-            if (!rule || !protocol_guard_active(settings) || (settings->has_skip_ports && port_skipped(dport))) {
+            if (!rule || !rule_needs_guard(rule)) {
                 return TC_ACT_OK;
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
@@ -2171,7 +2208,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
             }
-            if (!rule || !protocol_guard_active(settings) || (settings->has_skip_ports && port_skipped(dport))) {
+            if (!rule || !rule_needs_guard(rule)) {
                 return TC_ACT_OK;
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
