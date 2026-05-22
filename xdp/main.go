@@ -376,6 +376,11 @@ type counterVal struct {
 	BillingBytes   uint64 `json:"billing_bytes"`
 }
 
+type connCounter struct {
+	Bytes   uint64
+	Packets uint64
+}
+
 func (c *counterVal) add(other counterVal) {
 	c.InputBytes += other.InputBytes
 	c.OutputBytes += other.OutputBytes
@@ -384,6 +389,11 @@ func (c *counterVal) add(other counterVal) {
 	c.DroppedBytes += other.DroppedBytes
 	c.DroppedPackets += other.DroppedPackets
 	c.BillingBytes += other.BillingBytes
+}
+
+func (c *counterVal) addConnOutput(other connCounter) {
+	c.OutputBytes += other.Bytes
+	c.OutputPackets += other.Packets
 }
 
 type snapshotRow struct {
@@ -2351,6 +2361,16 @@ func snapshotCounters(opts snapshotOptions) error {
 	if opts.RuleCounterPin == "" {
 		opts.RuleCounterPin = "/sys/fs/bpf/pfwd_rule_counters"
 	}
+	pinLayout := runtimeMapPinsFromPaths(opts.RuleCounterPin, "/sys/fs/bpf/pfwd_user_counters", "/sys/fs/bpf/pfwd_stats")
+	reverseCounters := map[uint32]connCounter{}
+	reverseMap, reverseErr := ebpf.LoadPinnedMap(pinLayout.Reverse, nil)
+	if reverseErr == nil {
+		reverseCounters, reverseErr = collectBasicReverseCounters(reverseMap)
+		_ = reverseMap.Close()
+	}
+	if reverseErr != nil && applied {
+		return fmt.Errorf("读取 XDP reverse 连接计数失败 (%s): %w", pinLayout.Reverse, reverseErr)
+	}
 	counterMap, err := ebpf.LoadPinnedMap(opts.RuleCounterPin, nil)
 	if err != nil {
 		if applied {
@@ -2368,6 +2388,7 @@ func snapshotCounters(opts snapshotOptions) error {
 		if err != nil {
 			return fmt.Errorf("读取规则计数失败 (%s): %w", rule.ID, err)
 		}
+		counter.addConnOutput(reverseCounters[rule.Index])
 		rows = append(rows, snapshotRow{
 			ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio),
 			InputBytes: counter.InputBytes, OutputBytes: counter.OutputBytes,
@@ -2376,6 +2397,29 @@ func snapshotCounters(opts snapshotOptions) error {
 		})
 	}
 	return enc.Encode(rows)
+}
+
+func collectBasicReverseCounters(reverseMap *ebpf.Map) (map[uint32]connCounter, error) {
+	counters := map[uint32]connCounter{}
+	if reverseMap == nil {
+		return counters, nil
+	}
+	it := reverseMap.Iterate()
+	var key reverseKey
+	var value connVal
+	for it.Next(&key, &value) {
+		if value.BillingEnabled != 0 || value.UserLimitEnabled != 0 {
+			continue
+		}
+		current := counters[value.RuleID]
+		current.Bytes += value.Bytes
+		current.Packets += value.Packets
+		counters[value.RuleID] = current
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 reverse map 失败: %w", err)
+	}
+	return counters, nil
 }
 
 func dumpStats(opts statsOptions) error {

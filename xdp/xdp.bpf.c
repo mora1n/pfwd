@@ -468,6 +468,34 @@ static __always_inline void fill_reverse_lookup_key_v6(
     pfwd_memcpy16(key->target_addr, target_addr);
 }
 
+static __always_inline void init_reverse_alloc_key_v4(
+    struct pfwd_reverse_key *key,
+    __u8 protocol,
+    __be16 target_port,
+    __be32 source_addr,
+    const __u8 target_addr[16]
+) {
+    key->family = 4;
+    key->protocol = protocol;
+    key->target_port = target_port;
+    set_ipv4_in16(key->source_addr, source_addr);
+    pfwd_memcpy16(key->target_addr, target_addr);
+}
+
+static __always_inline void init_reverse_alloc_key_v6(
+    struct pfwd_reverse_key *key,
+    __u8 protocol,
+    __be16 target_port,
+    const __u8 source_addr[16],
+    const __u8 target_addr[16]
+) {
+    key->family = 6;
+    key->protocol = protocol;
+    key->target_port = target_port;
+    pfwd_memcpy16(key->source_addr, source_addr);
+    pfwd_memcpy16(key->target_addr, target_addr);
+}
+
 static __always_inline void adjust_tcp_mss(struct tcphdr_min *tcp, void *data_end, __u16 value);
 
 static __always_inline __u16 csum_replace_addr16(__u16 csum, const __u8 old_addr[16], const __u8 new_addr[16]) {
@@ -873,11 +901,16 @@ static __always_inline void count_input_with_plan(
     count_input_with_counters(rule, bytes, packets, plan->billed, plan->rule_counter, plan->user_counter);
 }
 
-static __always_inline void count_output(const struct pfwd_conn_val *conn, __u64 bytes, __u64 packets) {
+static __always_inline void count_output(struct pfwd_conn_val *conn, __u64 bytes, __u64 packets) {
     struct pfwd_counter *counter;
     __u32 key = conn->rule_id;
     __u64 billed = 0;
 
+    if (!conn->billing_enabled && !conn->user_limit_enabled) {
+        conn->bytes += bytes;
+        conn->packets += packets;
+        return;
+    }
     if (conn->billing_enabled) {
         billed = scaled_bytes(bytes, conn->traffic_ratio_scaled);
         if (conn->traffic_mode != 1) {
@@ -1563,10 +1596,7 @@ static __always_inline int prepare_local_conn_v4(
         return 0;
     }
 
-    scratch->reverse_key.family = 4;
-    scratch->reverse_key.protocol = protocol;
-    scratch->reverse_key.target_port = rule->target_port;
-    pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
+    init_reverse_alloc_key_v4(&scratch->reverse_key, protocol, rule->target_port, source_addr, rule->target_addr);
     source_port = allocate_source_port_v4(&scratch->reverse_key, client_port, client_addr, listen_addr, rule->target_port);
     if (source_port == 0) {
         stat_inc(PFWD_STAT_DROPPED);
@@ -1622,10 +1652,6 @@ static __always_inline int prepare_local_conn_v6(
         return 0;
     }
 
-    scratch->reverse_key.family = 6;
-    scratch->reverse_key.protocol = protocol;
-    scratch->reverse_key.target_port = rule->target_port;
-    pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
     pfwd_memcpy16(scratch->addr_a, client_addr);
     pfwd_memcpy16(scratch->addr_b, listen_addr);
     if (rule_snat_fixed(rule)) {
@@ -1633,6 +1659,7 @@ static __always_inline int prepare_local_conn_v6(
     } else {
         pfwd_memcpy16(scratch->addr_c, listen_addr);
     }
+    init_reverse_alloc_key_v6(&scratch->reverse_key, protocol, rule->target_port, scratch->addr_c, rule->target_addr);
     source_port = allocate_source_port_v6(&scratch->reverse_key, client_port, scratch->addr_a, scratch->addr_b, rule->target_port);
     if (source_port == 0) {
         stat_inc(PFWD_STAT_DROPPED);
@@ -1914,11 +1941,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 }
                 __builtin_memset(scratch, 0, sizeof(*scratch));
                 fill_conn_key_v4(&scratch->conn_key, protocol, ip4->saddr, ip4->daddr, sport, dport, rule->target_port, rule->target_addr);
-                scratch->reverse_key.family = 4;
-                scratch->reverse_key.protocol = protocol;
-                scratch->reverse_key.target_port = new_dport;
-                set_ipv4_in16(scratch->reverse_key.source_addr, new_saddr);
-                pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
+                init_reverse_alloc_key_v4(&scratch->reverse_key, protocol, new_dport, new_saddr, rule->target_addr);
                 new_sport = allocate_source_port_v4(&scratch->reverse_key, sport, old_saddr, old_daddr, new_dport);
                 if (new_sport == 0) {
                     stat_inc(PFWD_STAT_DROPPED);
@@ -2113,11 +2136,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 } else {
                     pfwd_memcpy16(scratch->addr_c, old_daddr);
                 }
-                scratch->reverse_key.family = 6;
-                scratch->reverse_key.protocol = protocol;
-                scratch->reverse_key.target_port = rule->target_port;
-                pfwd_memcpy16(scratch->reverse_key.source_addr, scratch->addr_c);
-                pfwd_memcpy16(scratch->reverse_key.target_addr, rule->target_addr);
+                init_reverse_alloc_key_v6(&scratch->reverse_key, protocol, rule->target_port, scratch->addr_c, rule->target_addr);
                 new_sport = allocate_source_port_v6(&scratch->reverse_key, sport, scratch->addr_a, scratch->addr_b, rule->target_port);
                 if (new_sport == 0) {
                     stat_inc(PFWD_STAT_DROPPED);
