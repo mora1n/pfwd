@@ -30,7 +30,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
-const mapABIVersion = 1
+const mapABIVersion = 5
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
@@ -60,6 +60,8 @@ type bpfObjects struct {
 	PFWDConnections      *ebpf.Map     `ebpf:"pfwd_connections"`
 	PFWDReverse          *ebpf.Map     `ebpf:"pfwd_reverse"`
 	PFWDRuleCounter      *ebpf.Map     `ebpf:"pfwd_rule_counters"`
+	PFWDRuleReplyCounter *ebpf.Map     `ebpf:"pfwd_rule_reply_counters"`
+	PFWDRuleDropCounter  *ebpf.Map     `ebpf:"pfwd_rule_drop_counters"`
 	PFWDUserCounter      *ebpf.Map     `ebpf:"pfwd_user_counters"`
 	PFWDStats            *ebpf.Map     `ebpf:"pfwd_stats"`
 	PFWDWhitelistV4      *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
@@ -78,7 +80,7 @@ func (o *bpfObjects) Close() {
 	}
 	for _, closer := range []interface{ Close() error }{
 		o.PFWDXDP, o.PFWDIngress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
-		o.PFWDRuleCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
+		o.PFWDRuleCounter, o.PFWDRuleReplyCounter, o.PFWDRuleDropCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
 		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDFlows, o.PFWDGuardPrefixes, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
@@ -315,6 +317,8 @@ type runtimeMapPins struct {
 	Connections      string
 	Reverse          string
 	RuleCounter      string
+	RuleReplyCounter string
+	RuleDropCounter  string
 	UserCounter      string
 	Stats            string
 	WhitelistV4      string
@@ -367,13 +371,26 @@ type ruleVal struct {
 }
 
 type counterVal struct {
-	InputBytes     uint64 `json:"input_bytes"`
-	OutputBytes    uint64 `json:"output_bytes"`
-	InputPackets   uint64 `json:"input_packets"`
-	OutputPackets  uint64 `json:"output_packets"`
+	InputBytes    uint64 `json:"input_bytes"`
+	OutputBytes   uint64 `json:"output_bytes"`
+	InputPackets  uint64 `json:"input_packets"`
+	OutputPackets uint64 `json:"output_packets"`
+	BillingBytes  uint64 `json:"billing_bytes"`
+}
+
+type userCounterVal struct {
+	BillingBytes uint64 `json:"billing_bytes"`
+}
+
+type replyCounterVal struct {
+	OutputBytes   uint64 `json:"output_bytes"`
+	OutputPackets uint64 `json:"output_packets"`
+	BillingBytes  uint64 `json:"billing_bytes"`
+}
+
+type dropCounterVal struct {
 	DroppedBytes   uint64 `json:"dropped_bytes"`
 	DroppedPackets uint64 `json:"dropped_packets"`
-	BillingBytes   uint64 `json:"billing_bytes"`
 }
 
 type connCounter struct {
@@ -386,14 +403,27 @@ func (c *counterVal) add(other counterVal) {
 	c.OutputBytes += other.OutputBytes
 	c.InputPackets += other.InputPackets
 	c.OutputPackets += other.OutputPackets
-	c.DroppedBytes += other.DroppedBytes
-	c.DroppedPackets += other.DroppedPackets
 	c.BillingBytes += other.BillingBytes
 }
 
 func (c *counterVal) addConnOutput(other connCounter) {
 	c.OutputBytes += other.Bytes
 	c.OutputPackets += other.Packets
+}
+
+func (c *userCounterVal) add(other userCounterVal) {
+	c.BillingBytes += other.BillingBytes
+}
+
+func (c *replyCounterVal) add(other replyCounterVal) {
+	c.OutputBytes += other.OutputBytes
+	c.OutputPackets += other.OutputPackets
+	c.BillingBytes += other.BillingBytes
+}
+
+func (c *dropCounterVal) add(other dropCounterVal) {
+	c.DroppedBytes += other.DroppedBytes
+	c.DroppedPackets += other.DroppedPackets
 }
 
 type snapshotRow struct {
@@ -445,10 +475,9 @@ type reverseKey struct {
 	Protocol   uint8
 	SourcePort uint16
 	TargetPort uint16
-	ClientPort uint16
+	Pad16      uint16
 	SourceAddr [16]byte
 	TargetAddr [16]byte
-	ClientAddr [16]byte
 }
 
 type whitelistKeyV4 struct {
@@ -863,6 +892,8 @@ func loadObjects(guardMode string) (*bpfObjects, error) {
 		PFWDConnections:      coll.Maps["pfwd_connections"],
 		PFWDReverse:          coll.Maps["pfwd_reverse"],
 		PFWDRuleCounter:      coll.Maps["pfwd_rule_counters"],
+		PFWDRuleReplyCounter: coll.Maps["pfwd_rule_reply_counters"],
+		PFWDRuleDropCounter:  coll.Maps["pfwd_rule_drop_counters"],
 		PFWDUserCounter:      coll.Maps["pfwd_user_counters"],
 		PFWDStats:            coll.Maps["pfwd_stats"],
 		PFWDWhitelistV4:      coll.Maps["pfwd_whitelist_v4"],
@@ -991,6 +1022,8 @@ func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) ru
 		Connections:      filepath.Join(dir, namespace+"_connections"),
 		Reverse:          filepath.Join(dir, namespace+"_reverse"),
 		RuleCounter:      ruleCounterPin,
+		RuleReplyCounter: filepath.Join(dir, namespace+"_rule_reply_counters"),
+		RuleDropCounter:  filepath.Join(dir, namespace+"_rule_drop_counters"),
 		UserCounter:      userCounterPin,
 		Stats:            statsPin,
 		WhitelistV4:      filepath.Join(dir, namespace+"_whitelist_v4"),
@@ -1022,8 +1055,32 @@ func zeroPerCPUCounterValues() ([]counterVal, error) {
 	return make([]counterVal, cpus), nil
 }
 
+func zeroPerCPUReplyCounterValues() ([]replyCounterVal, error) {
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return nil, fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	return make([]replyCounterVal, cpus), nil
+}
+
+func zeroPerCPUUserCounterValues() ([]userCounterVal, error) {
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return nil, fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	return make([]userCounterVal, cpus), nil
+}
+
+func zeroPerCPUDropCounterValues() ([]dropCounterVal, error) {
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return nil, fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+	}
+	return make([]dropCounterVal, cpus), nil
+}
+
 func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) error {
-	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
+	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDRuleReplyCounter == nil || objs.PFWDRuleDropCounter == nil || objs.PFWDUserCounter == nil {
 		return fmt.Errorf("关键 BPF map 未加载")
 	}
 	var externalIfindex uint32
@@ -1064,13 +1121,25 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 	if err != nil {
 		return err
 	}
+	zeroReplyCounter, err := zeroPerCPUReplyCounterValues()
+	if err != nil {
+		return err
+	}
+	zeroUserCounter, err := zeroPerCPUUserCounterValues()
+	if err != nil {
+		return err
+	}
+	zeroDropCounter, err := zeroPerCPUDropCounterValues()
+	if err != nil {
+		return err
+	}
 	for _, user := range runtimeData.Users {
-		if err := objs.PFWDUserCounter.Update(&user.Index, zeroCounter, ebpf.UpdateAny); err != nil {
+		if err := objs.PFWDUserCounter.Update(&user.Index, zeroUserCounter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("初始化用户计数失败 (%s): %w", user.ID, err)
 		}
 	}
 	for _, rule := range runtimeData.Rules {
-		if err := putRule(objs, rule, runtimeData.Settings); err != nil {
+		if err := putRule(objs, rule, runtimeData.Settings, zeroCounter, zeroReplyCounter, zeroDropCounter); err != nil {
 			return err
 		}
 	}
@@ -1085,6 +1154,8 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		pinLayout.Connections:      objs.PFWDConnections,
 		pinLayout.Reverse:          objs.PFWDReverse,
 		pinLayout.RuleCounter:      objs.PFWDRuleCounter,
+		pinLayout.RuleReplyCounter: objs.PFWDRuleReplyCounter,
+		pinLayout.RuleDropCounter:  objs.PFWDRuleDropCounter,
 		pinLayout.UserCounter:      objs.PFWDUserCounter,
 		pinLayout.Stats:            objs.PFWDStats,
 		pinLayout.WhitelistV4:      objs.PFWDWhitelistV4,
@@ -1144,6 +1215,25 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		reverse.Close()
 		return nil, fmt.Errorf("加载 pinned rule counter map 失败: %w", err)
 	}
+	ruleReplyCounter, err := load(pinLayout.RuleReplyCounter)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		reverse.Close()
+		ruleCounter.Close()
+		return nil, fmt.Errorf("加载 pinned rule reply counter map 失败: %w", err)
+	}
+	ruleDropCounter, err := load(pinLayout.RuleDropCounter)
+	if err != nil {
+		settings.Close()
+		rules.Close()
+		connections.Close()
+		reverse.Close()
+		ruleCounter.Close()
+		ruleReplyCounter.Close()
+		return nil, fmt.Errorf("加载 pinned rule drop counter map 失败: %w", err)
+	}
 	userCounter, err := load(pinLayout.UserCounter)
 	if err != nil {
 		settings.Close()
@@ -1151,6 +1241,8 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		connections.Close()
 		reverse.Close()
 		ruleCounter.Close()
+		ruleReplyCounter.Close()
+		ruleDropCounter.Close()
 		return nil, fmt.Errorf("加载 pinned user counter map 失败: %w", err)
 	}
 	stats, err := load(pinLayout.Stats)
@@ -1160,36 +1252,38 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		connections.Close()
 		reverse.Close()
 		ruleCounter.Close()
+		ruleReplyCounter.Close()
+		ruleDropCounter.Close()
 		userCounter.Close()
 		return nil, fmt.Errorf("加载 pinned stats map 失败: %w", err)
 	}
 	whitelistV4, err := load(pinLayout.WhitelistV4)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v4 map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v4 map 失败: %w", err))
 	}
 	whitelistV6, err := load(pinLayout.WhitelistV6)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v6 map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v6 map 失败: %w", err))
 	}
 	whitelistCacheV4, err := load(pinLayout.WhitelistCacheV4)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v4 map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v4 map 失败: %w", err))
 	}
 	whitelistCacheV6, err := load(pinLayout.WhitelistCacheV6)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v6 map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v6 map 失败: %w", err))
 	}
 	allowedFlows, err := load(pinLayout.AllowedFlows)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, nil, nil, nil, fmt.Errorf("加载 pinned allowed_flows map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, nil, nil, nil, fmt.Errorf("加载 pinned allowed_flows map 失败: %w", err))
 	}
 	guardPrefixes, err := load(pinLayout.GuardPrefixes)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, nil, nil, fmt.Errorf("加载 pinned guard_prefixes map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, nil, nil, fmt.Errorf("加载 pinned guard_prefixes map 失败: %w", err))
 	}
 	skipPorts, err := load(pinLayout.SkipPorts)
 	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, nil, fmt.Errorf("加载 pinned skip_ports map 失败: %w", err))
+		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, nil, fmt.Errorf("加载 pinned skip_ports map 失败: %w", err))
 	}
 	return &bpfObjects{
 		PFWDSettings:         settings,
@@ -1197,6 +1291,8 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		PFWDConnections:      connections,
 		PFWDReverse:          reverse,
 		PFWDRuleCounter:      ruleCounter,
+		PFWDRuleReplyCounter: ruleReplyCounter,
+		PFWDRuleDropCounter:  ruleDropCounter,
 		PFWDUserCounter:      userCounter,
 		PFWDStats:            stats,
 		PFWDWhitelistV4:      whitelistV4,
@@ -1209,8 +1305,8 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 	}, nil
 }
 
-func closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts *ebpf.Map, err error) (*bpfObjects, error) {
-	for _, m := range []*ebpf.Map{settings, rules, connections, reverse, ruleCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts} {
+func closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts *ebpf.Map, err error) (*bpfObjects, error) {
+	for _, m := range []*ebpf.Map{settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts} {
 		if m != nil {
 			_ = m.Close()
 		}
@@ -1238,15 +1334,65 @@ func clearPerCPUCounterMap(m *ebpf.Map, maxEntries uint32) error {
 	if m == nil {
 		return nil
 	}
-	cpus, err := ebpf.PossibleCPU()
+	zero, err := zeroPerCPUCounterValues()
 	if err != nil {
-		return fmt.Errorf("获取 PossibleCPU 失败: %w", err)
+		return err
 	}
-	zero := make([]counterVal, cpus)
 	for i := uint32(0); i < maxEntries; i++ {
 		key := i
 		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("重置 percpu counter 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
+func clearPerCPUReplyCounterMap(m *ebpf.Map, maxEntries uint32) error {
+	if m == nil {
+		return nil
+	}
+	zero, err := zeroPerCPUReplyCounterValues()
+	if err != nil {
+		return err
+	}
+	for i := uint32(0); i < maxEntries; i++ {
+		key := i
+		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 percpu reply counter 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
+func clearPerCPUDropCounterMap(m *ebpf.Map, maxEntries uint32) error {
+	if m == nil {
+		return nil
+	}
+	zero, err := zeroPerCPUDropCounterValues()
+	if err != nil {
+		return err
+	}
+	for i := uint32(0); i < maxEntries; i++ {
+		key := i
+		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 percpu drop counter 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
+func clearPerCPUUserCounterMap(m *ebpf.Map, maxEntries uint32) error {
+	if m == nil {
+		return nil
+	}
+	zero, err := zeroPerCPUUserCounterValues()
+	if err != nil {
+		return err
+	}
+	for i := uint32(0); i < maxEntries; i++ {
+		key := i
+		if err := m.Update(&key, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 percpu user counter 失败 (key=%d): %w", i, err)
 		}
 	}
 	return nil
@@ -1304,7 +1450,13 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
 		return err
 	}
-	if err := clearPerCPUCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
+	if err := clearPerCPUReplyCounterMap(objs.PFWDRuleReplyCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearPerCPUDropCounterMap(objs.PFWDRuleDropCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearPerCPUUserCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
 		return err
 	}
 	if err := clearPerCPUStatsMap(objs.PFWDStats); err != nil {
@@ -1341,7 +1493,13 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
 		return err
 	}
-	if err := clearPerCPUCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
+	if err := clearPerCPUReplyCounterMap(objs.PFWDRuleReplyCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearPerCPUDropCounterMap(objs.PFWDRuleDropCounter, maxRules); err != nil {
+		return err
+	}
+	if err := clearPerCPUUserCounterMap(objs.PFWDUserCounter, maxUsers); err != nil {
 		return err
 	}
 	return nil
@@ -1392,6 +1550,8 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 		"pfwd_connections":         pinLayout.Connections,
 		"pfwd_reverse":             pinLayout.Reverse,
 		"pfwd_rule_counters":       pinLayout.RuleCounter,
+		"pfwd_rule_reply_counters": pinLayout.RuleReplyCounter,
+		"pfwd_rule_drop_counters":  pinLayout.RuleDropCounter,
 		"pfwd_user_counters":       pinLayout.UserCounter,
 		"pfwd_stats":               pinLayout.Stats,
 		"pfwd_whitelist_v4":        pinLayout.WhitelistV4,
@@ -1455,6 +1615,7 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 		pinLayout.Connections,
 		pinLayout.Reverse,
 		pinLayout.RuleCounter,
+		pinLayout.RuleDropCounter,
 		pinLayout.UserCounter,
 		pinLayout.Stats,
 		pinLayout.WhitelistV4,
@@ -1609,25 +1770,31 @@ func currentRuleUserLimits(objs *bpfObjects) (map[uint32]uint64, error) {
 	return users, nil
 }
 
-func zeroRuleCounter(objs *bpfObjects, key uint32, zeroCounter []counterVal) error {
+func zeroRuleCounter(objs *bpfObjects, key uint32, zeroCounter []counterVal, zeroReplyCounter []replyCounterVal, zeroDropCounter []dropCounterVal) error {
 	if err := objs.PFWDRuleCounter.Update(&key, zeroCounter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("重置规则计数失败 (key=%d): %w", key, err)
+	}
+	if err := objs.PFWDRuleReplyCounter.Update(&key, zeroReplyCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("重置规则 reply 计数失败 (key=%d): %w", key, err)
+	}
+	if err := objs.PFWDRuleDropCounter.Update(&key, zeroDropCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("重置规则丢弃计数失败 (key=%d): %w", key, err)
 	}
 	return nil
 }
 
-func zeroUserCounter(objs *bpfObjects, key uint32, zeroCounter []counterVal) error {
+func zeroUserCounter(objs *bpfObjects, key uint32, zeroCounter []userCounterVal) error {
 	if err := objs.PFWDUserCounter.Update(&key, zeroCounter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("重置用户计数失败 (key=%d): %w", key, err)
 	}
 	return nil
 }
 
-func zeroRuleCounterOnce(objs *bpfObjects, key uint32, zeroCounter []counterVal, resetKeys map[uint32]struct{}) (bool, error) {
+func zeroRuleCounterOnce(objs *bpfObjects, key uint32, zeroCounter []counterVal, zeroReplyCounter []replyCounterVal, zeroDropCounter []dropCounterVal, resetKeys map[uint32]struct{}) (bool, error) {
 	if _, ok := resetKeys[key]; ok {
 		return false, nil
 	}
-	if err := zeroRuleCounter(objs, key, zeroCounter); err != nil {
+	if err := zeroRuleCounter(objs, key, zeroCounter, zeroReplyCounter, zeroDropCounter); err != nil {
 		return false, err
 	}
 	resetKeys[key] = struct{}{}
@@ -1648,6 +1815,14 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 	if err != nil {
 		return report, err
 	}
+	zeroReplyCounter, err := zeroPerCPUReplyCounterValues()
+	if err != nil {
+		return report, err
+	}
+	zeroDropCounter, err := zeroPerCPUDropCounterValues()
+	if err != nil {
+		return report, err
+	}
 	seen := make(map[ruleKey]struct{}, len(expected))
 	resetKeys := map[uint32]struct{}{}
 	it := objs.PFWDRules.Iterate()
@@ -1660,7 +1835,7 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 			if err := objs.PFWDRules.Delete(&keyCopy); err != nil {
 				return report, fmt.Errorf("删除旧规则失败: %w", err)
 			}
-			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, resetKeys)
+			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, zeroReplyCounter, zeroDropCounter, resetKeys)
 			if err != nil {
 				return report, err
 			}
@@ -1680,7 +1855,7 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 		if err := objs.PFWDRules.Update(&keyCopy, &valueCopy, ebpf.UpdateAny); err != nil {
 			return report, fmt.Errorf("更新规则失败: %w", err)
 		}
-		reset, err := zeroRuleCounterOnce(objs, expectedValue.RuleID, zeroCounter, resetKeys)
+		reset, err := zeroRuleCounterOnce(objs, expectedValue.RuleID, zeroCounter, zeroReplyCounter, zeroDropCounter, resetKeys)
 		if err != nil {
 			return report, err
 		}
@@ -1688,7 +1863,7 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 			report.CountersReset++
 		}
 		if current.RuleID != expectedValue.RuleID {
-			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, resetKeys)
+			reset, err := zeroRuleCounterOnce(objs, current.RuleID, zeroCounter, zeroReplyCounter, zeroDropCounter, resetKeys)
 			if err != nil {
 				return report, err
 			}
@@ -1710,7 +1885,7 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 		if err := objs.PFWDRules.Update(&keyCopy, &valueCopy, ebpf.UpdateAny); err != nil {
 			return report, fmt.Errorf("新增规则失败: %w", err)
 		}
-		reset, err := zeroRuleCounterOnce(objs, value.RuleID, zeroCounter, resetKeys)
+		reset, err := zeroRuleCounterOnce(objs, value.RuleID, zeroCounter, zeroReplyCounter, zeroDropCounter, resetKeys)
 		if err != nil {
 			return report, err
 		}
@@ -1724,7 +1899,7 @@ func reconcileRuleMap(objs *bpfObjects, expected map[ruleKey]ruleVal) (mapReconc
 
 func reconcileUserCounters(objs *bpfObjects, oldUsers map[uint32]uint64, expected map[uint32]uint64) (mapReconcileReport, error) {
 	var report mapReconcileReport
-	zeroCounter, err := zeroPerCPUCounterValues()
+	zeroCounter, err := zeroPerCPUUserCounterValues()
 	if err != nil {
 		return report, err
 	}
@@ -1769,7 +1944,7 @@ func (r *mapReconcileReport) add(other mapReconcileReport) {
 }
 
 func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) (mapReconcileReport, error) {
-	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDUserCounter == nil {
+	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDRuleReplyCounter == nil || objs.PFWDRuleDropCounter == nil || objs.PFWDUserCounter == nil {
 		return mapReconcileReport{}, fmt.Errorf("关键 BPF map 未加载")
 	}
 	oldUsers, err := currentRuleUserLimits(objs)
@@ -1835,10 +2010,8 @@ func reverseKeyFromConn(key connKey, value connVal) reverseKey {
 		Protocol:   key.Protocol,
 		SourcePort: value.SourcePort,
 		TargetPort: key.TargetPort,
-		ClientPort: key.ClientPort,
 		SourceAddr: value.SourceAddr,
 		TargetAddr: key.TargetAddr,
-		ClientAddr: key.ClientAddr,
 	}
 }
 
@@ -2035,7 +2208,7 @@ func loadProtocolSkipPorts(skipMap *ebpf.Map, ports []uint16) error {
 	return nil
 }
 
-func putRule(objs *bpfObjects, rule runtimeRule, settings runtimeSettings) error {
+func putRule(objs *bpfObjects, rule runtimeRule, settings runtimeSettings, zeroCounter []counterVal, zeroReplyCounter []replyCounterVal, zeroDropCounter []dropCounterVal) error {
 	key, err := makeRuleKey(rule)
 	if err != nil {
 		return fmt.Errorf("生成规则 key 失败 (%s): %w", rule.ID, err)
@@ -2047,12 +2220,14 @@ func putRule(objs *bpfObjects, rule runtimeRule, settings runtimeSettings) error
 	if err := objs.PFWDRules.Update(&key, &value, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("写入规则失败 (%s): %w", rule.ID, err)
 	}
-	zeroCounter, err := zeroPerCPUCounterValues()
-	if err != nil {
-		return err
-	}
 	if err := objs.PFWDRuleCounter.Update(&rule.Index, zeroCounter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("初始化规则计数失败 (%s): %w", rule.ID, err)
+	}
+	if err := objs.PFWDRuleReplyCounter.Update(&rule.Index, zeroReplyCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("初始化规则 reply 计数失败 (%s): %w", rule.ID, err)
+	}
+	if err := objs.PFWDRuleDropCounter.Update(&rule.Index, zeroDropCounter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("初始化规则丢弃计数失败 (%s): %w", rule.ID, err)
 	}
 	return nil
 }
@@ -2320,6 +2495,8 @@ func removeRuntime(opts removeOptions) error {
 		pinLayout.Connections,
 		pinLayout.Reverse,
 		pinLayout.RuleCounter,
+		pinLayout.RuleReplyCounter,
+		pinLayout.RuleDropCounter,
 		pinLayout.UserCounter,
 		pinLayout.Stats,
 		pinLayout.WhitelistV4,
@@ -2382,18 +2559,54 @@ func snapshotCounters(opts snapshotOptions) error {
 		return json.NewEncoder(os.Stdout).Encode(rows)
 	}
 	defer counterMap.Close()
+	replyCounterMap, err := ebpf.LoadPinnedMap(pinLayout.RuleReplyCounter, nil)
+	if err != nil {
+		if applied {
+			return fmt.Errorf("读取 XDP reply 计数 map 失败 (%s): %w", pinLayout.RuleReplyCounter, err)
+		}
+		replyCounterMap = nil
+	}
+	if replyCounterMap != nil {
+		defer replyCounterMap.Close()
+	}
+	var dropCounterMap *ebpf.Map
+	dropCounterMap, err = ebpf.LoadPinnedMap(pinLayout.RuleDropCounter, nil)
+	if err != nil && applied {
+		return fmt.Errorf("读取 XDP drop 计数 map 失败 (%s): %w", pinLayout.RuleDropCounter, err)
+	}
+	if dropCounterMap != nil {
+		defer dropCounterMap.Close()
+	}
 	enc := json.NewEncoder(os.Stdout)
 	for _, rule := range runtimeData.Rules {
 		counter, err := lookupPerCPUCounter(counterMap, rule.Index)
 		if err != nil {
 			return fmt.Errorf("读取规则计数失败 (%s): %w", rule.ID, err)
 		}
+		replyCounter := replyCounterVal{}
+		if replyCounterMap != nil {
+			replyCounter, err = lookupPerCPUReplyCounter(replyCounterMap, rule.Index)
+			if err != nil {
+				return fmt.Errorf("读取规则 reply 计数失败 (%s): %w", rule.ID, err)
+			}
+		}
+		dropCounter := dropCounterVal{}
+		if dropCounterMap != nil {
+			var dropErr error
+			dropCounter, dropErr = lookupPerCPUDropCounter(dropCounterMap, rule.Index)
+			if dropErr != nil {
+				return fmt.Errorf("读取规则丢弃计数失败 (%s): %w", rule.ID, dropErr)
+			}
+		}
+		counter.OutputBytes += replyCounter.OutputBytes
+		counter.OutputPackets += replyCounter.OutputPackets
+		counter.BillingBytes += replyCounter.BillingBytes
 		counter.addConnOutput(reverseCounters[rule.Index])
 		rows = append(rows, snapshotRow{
 			ID: rule.ID, UserID: rule.UserID, TrafficMode: rule.TrafficMode, TrafficRatio: nonzeroRatio(rule.TrafficRatio),
 			InputBytes: counter.InputBytes, OutputBytes: counter.OutputBytes,
 			InputPackets: counter.InputPackets, OutputPackets: counter.OutputPackets,
-			DroppedBytes: counter.DroppedBytes, DroppedPackets: counter.DroppedPackets,
+			DroppedBytes: dropCounter.DroppedBytes, DroppedPackets: dropCounter.DroppedPackets,
 		})
 	}
 	return enc.Encode(rows)
@@ -2555,6 +2768,30 @@ func lookupPerCPUCounter(m *ebpf.Map, key uint32) (counterVal, error) {
 		return counterVal{}, err
 	}
 	var total counterVal
+	for _, value := range values {
+		total.add(value)
+	}
+	return total, nil
+}
+
+func lookupPerCPUReplyCounter(m *ebpf.Map, key uint32) (replyCounterVal, error) {
+	var values []replyCounterVal
+	if err := m.Lookup(&key, &values); err != nil {
+		return replyCounterVal{}, err
+	}
+	var total replyCounterVal
+	for _, value := range values {
+		total.add(value)
+	}
+	return total, nil
+}
+
+func lookupPerCPUDropCounter(m *ebpf.Map, key uint32) (dropCounterVal, error) {
+	var values []dropCounterVal
+	if err := m.Lookup(&key, &values); err != nil {
+		return dropCounterVal{}, err
+	}
+	var total dropCounterVal
 	for _, value := range values {
 		total.add(value)
 	}
