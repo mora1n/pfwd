@@ -206,6 +206,17 @@ service_copy_bundle_from_dir() {
     done < <(service_bundle_rows)
 }
 
+service_verify_bundle_from_dir() {
+    local source_root="$1"
+    local _ source_rel __ ___
+    local source_path
+
+    while IFS=$'\t' read -r _ source_rel __ ___; do
+        source_path="${source_root%/}/$source_rel"
+        [ -f "$source_path" ] || pfwd_die "安装包不完整：缺少 $source_path"
+    done < <(service_bundle_rows)
+}
+
 service_write_unit_files() {
     mkdir -p "$PFWD_SYSTEMD_DIR"
     service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
@@ -217,13 +228,7 @@ service_write_unit_files() {
 service_install_files() {
     pfwd_mkdirs
     service_prepare_install_dirs
-    [ -f "$PFWD_SCRIPT_DIR/pfwd.sh" ] || pfwd_die "安装包不完整：缺少 pfwd.sh ($PFWD_SCRIPT_DIR/pfwd.sh)"
-    [ -f "$PFWD_SCRIPT_DIR/bbr.sh" ] || pfwd_die "安装包不完整：缺少 bbr.sh ($PFWD_SCRIPT_DIR/bbr.sh)"
-    [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv4 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated.zone $PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
-    [ -f "$PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone" ] || pfwd_die "安装包不完整：缺少国内 IPv6 白名单种子 ($PFWD_SCRIPT_DIR/assets/cn-aggregated-v6.zone)。离线手工安装时请先执行：install -d $PFWD_INSTALL_DIR/assets && install -m 644 assets/cn-aggregated-v6.zone $PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    if [ ! -x "$PFWD_SCRIPT_DIR/assets/$(guard_asset_name)" ]; then
-        pfwd_die "安装包不完整：缺少 XDP 预编译二进制 ($PFWD_SCRIPT_DIR/assets/$(guard_asset_name))"
-    fi
+    service_verify_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_write_shortcuts
     service_write_unit_files
@@ -343,14 +348,18 @@ service_remove_installation_artifacts() {
 }
 
 service_uninstall_files() {
-    service_disable
-    service_cleanup_pfwd_tc
-    guard_remove_runtime true || true
-    runtime_clear_accounting_runtime
-    runtime_remove_runtime_artifacts
-    runtime_remove_whitelist_runtime_files
-    runtime_remove_runtime_state_dirs
-    service_remove_installation_artifacts
+    local status=0
+
+    service_disable || status=1
+    service_cleanup_pfwd_tc || status=1
+    guard_remove_runtime true || status=1
+    runtime_clear_accounting_runtime || status=1
+    runtime_remove_runtime_artifacts || status=1
+    runtime_remove_whitelist_runtime_files || status=1
+    runtime_remove_runtime_state_dirs || status=1
+    service_remove_installation_artifacts || status=1
+
+    return "$status"
 }
 
 service_purge_state() {

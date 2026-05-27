@@ -78,15 +78,29 @@ pfwd_bootstrap_download() {
     fi
 }
 
-pfwd_bootstrap_install() {
-    local install_dir bin_path systemd_dir lib_dir xdp_bin_dir xdp_asset
+pfwd_bootstrap_cleanup_partial_install() {
+    local install_dir bin_path bbr_bin_path bbr_alias_path systemd_dir unit
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
-    xdp_bin_dir="$install_dir/bin"
+    bbr_bin_path="$(pfwd_bootstrap_path usr/local/bin/bbr.sh)"
+    bbr_alias_path="$(pfwd_bootstrap_path usr/local/bin/pfwd-bbr)"
+    systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
+
+    rm -f "$bin_path" "$bbr_bin_path" "$bbr_alias_path"
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service; do
+        rm -f "$systemd_dir/$unit"
+    done
+    rm -rf "$install_dir"
+}
+
+pfwd_bootstrap_install() {
+    local install_dir bin_path systemd_dir lib_dir xdp_asset status
+    install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
+    bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$xdp_bin_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
@@ -95,8 +109,8 @@ pfwd_bootstrap_install() {
         echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
     }
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$xdp_bin_dir/pfwd-xdp"
-    chmod +x "$xdp_bin_dir/pfwd-xdp"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$install_dir/assets/$xdp_asset"
+    chmod +x "$install_dir/assets/$xdp_asset"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
 
@@ -107,7 +121,13 @@ pfwd_bootstrap_install() {
 
     ln -sf "$install_dir/pfwd.sh" "$bin_path"
     echo "bootstrap 已完成，继续执行完整安装：$bin_path"
-    PFWD_BOOTSTRAPPED=1 exec "$bin_path" install
+    if PFWD_BOOTSTRAPPED=1 "$bin_path" install; then
+        return 0
+    fi
+    status=$?
+    echo "bootstrap 安装失败，正在回滚临时安装文件" >&2
+    pfwd_bootstrap_cleanup_partial_install || true
+    exit "$status"
 }
 
 pfwd_load_libs_or_bootstrap() {
@@ -121,6 +141,7 @@ pfwd_load_libs_or_bootstrap() {
     if [ "${#missing[@]}" -gt 0 ]; then
         if [ "$cmd" = "install" ]; then
             pfwd_bootstrap_install
+            exit 0
         fi
         echo "错误：缺少模块目录：${PFWD_LIB_DIR:-<stdin>}" >&2
         echo "缺少模块：${missing[*]}" >&2

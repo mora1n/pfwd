@@ -1387,11 +1387,14 @@ cmd_guard_whitelist_custom() {
 }
 
 cmd_uninstall() {
+    local uninstall_status=0
     while [ "$#" -gt 0 ]; do
         pfwd_die "未知选项：$1"
     done
-    service_uninstall_files
-    service_purge_state
-    service_verify_removed
+    service_uninstall_files || uninstall_status=1
+    config_snapshot_invalidate
+    service_purge_state || uninstall_status=1
+    service_verify_removed || uninstall_status=1
+    [ "$uninstall_status" -eq 0 ] || return "$uninstall_status"
     echo "已卸载 pfwd；若需卸载 BBR 调优，请另外执行：$PFWD_BBR_ALIAS_BIN_PATH uninstall"
 }
