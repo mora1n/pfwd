@@ -31,10 +31,11 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
-const mapABIVersion = 6
+const mapABIVersion = 7
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
+const protocolSkipPortEntries = 1 << 16
 const (
 	ruleFlagXDPDisabled  = uint16(1 << 0)
 	ruleFlagNeedsCounter = uint16(1 << 1)
@@ -515,11 +516,6 @@ type whitelistKeyV6 struct {
 
 type whitelistCacheKeyV6 struct {
 	Addr [16]byte
-}
-
-type portKey struct {
-	Port uint16
-	Pad  [4]byte
 }
 
 type flowKey struct {
@@ -1503,6 +1499,20 @@ func clearPerCPUStatsMap(m *ebpf.Map) error {
 	return nil
 }
 
+func clearPortArrayMap(m *ebpf.Map) error {
+	if m == nil {
+		return nil
+	}
+	zero := uint8(0)
+	for i := uint32(0); i < protocolSkipPortEntries; i++ {
+		key := i
+		if err := m.Update(&key, &zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("重置 skip-port array 失败 (key=%d): %w", i, err)
+		}
+	}
+	return nil
+}
+
 func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[ruleKey, ruleVal](objs.PFWDRules); err != nil {
 		return err
@@ -1546,7 +1556,7 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
 		return err
 	}
-	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
 		return err
 	}
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
@@ -1604,7 +1614,7 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
 		return err
 	}
-	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
 		return err
 	}
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
@@ -1653,7 +1663,7 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
 		return err
 	}
-	if err := clearMap[portKey, uint8](objs.PFWDSkipPorts); err != nil {
+	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
 		return err
 	}
 	return nil
@@ -2455,7 +2465,7 @@ func loadProtocolSkipPorts(skipMap *ebpf.Map, ports []uint16) error {
 		if port == 0 {
 			return fmt.Errorf("无效协议封锁跳过端口：%d", port)
 		}
-		key := portKey{Port: htons(port)}
+		key := uint32(port)
 		if err := skipMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("写入协议封锁跳过端口失败 (%d): %w", port, err)
 		}
@@ -2590,6 +2600,7 @@ func attachXDP(iface *net.Interface, prog *ebpf.Program, opts applyOptions) (str
 		return "", "", "", fmt.Errorf("创建 XDP pin 目录失败: %w", err)
 	}
 	_ = removePinnedLink(opts.XDPPin)
+	_ = removePinnedProgram(opts.XDPPin)
 	tryAttach := func(flags link.XDPAttachFlags, kind string) (string, string, string, error) {
 		attached, err := link.AttachXDP(link.XDPOptions{Program: prog, Interface: iface.Index, Flags: flags})
 		if err != nil {
@@ -2607,16 +2618,25 @@ func attachXDP(iface *net.Interface, prog *ebpf.Program, opts applyOptions) (str
 	if opts.GuardMode != "full" {
 		return "disabled", "", "guard-only", nil
 	}
-	if effective, kind, reason, err := tryAttach(link.XDPDriverMode, "driver"); err == nil {
-		return effective, kind, reason, nil
-	} else {
-		driverErr := err
-		if effective, kind, reason, err := tryAttach(link.XDPGenericMode, "generic"); err == nil {
+	failures := make([]string, 0, 3)
+	for _, attempt := range []struct {
+		flags link.XDPAttachFlags
+		kind  string
+	}{
+		{flags: link.XDPOffloadMode, kind: "offload"},
+		{flags: link.XDPDriverMode, kind: "driver"},
+		{flags: link.XDPGenericMode, kind: "generic"},
+	} {
+		effective, kind, reason, err := tryAttach(attempt.flags, attempt.kind)
+		if err == nil {
+			if len(failures) > 0 {
+				reason = strings.Join(failures, "; ")
+			}
 			return effective, kind, reason, nil
-		} else {
-			return "", "", "", fmt.Errorf("XDP auto attach 失败：driver=%v; generic=%w", driverErr, err)
 		}
+		failures = append(failures, fmt.Sprintf("%s=%v", attempt.kind, err))
 	}
+	return "", "", "", fmt.Errorf("XDP auto attach 失败：%s", strings.Join(failures, "; "))
 }
 
 func pinTCProgram(prog *ebpf.Program, pin string) error {
@@ -2656,8 +2676,24 @@ func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attac
 		return "", fmt.Errorf("创建 tc pin 目录失败: %w", err)
 	}
 	_ = removePinnedLink(pin)
+	_ = removePinnedProgram(pin)
+	attached, tcxErr := link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   prog,
+		Attach:    attach,
+	})
+	if tcxErr == nil {
+		defer attached.Close()
+		if err := attached.Pin(pin); err != nil {
+			return "", fmt.Errorf("pin tcx link 失败: %w", err)
+		}
+		if err := attached.Close(); err != nil {
+			return "", fmt.Errorf("关闭 tcx link fd 失败: %w", err)
+		}
+		return "tcx", nil
+	}
 	if err := runTC("qdisc", "replace", "dev", iface.Name, "clsact"); err != nil {
-		return "", err
+		return "", fmt.Errorf("TCX attach 失败 (%v)，且设置 clsact 失败: %w", tcxErr, err)
 	}
 	if err := prog.Pin(pin); err != nil {
 		return "", fmt.Errorf("pin tc program 失败: %w", err)
@@ -2667,7 +2703,7 @@ func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attac
 		pref = tcPrefBPFEgress
 	}
 	if err := runTC("filter", "replace", "dev", iface.Name, direction, "pref", pref, "bpf", "direct-action", "object-pinned", pin); err != nil {
-		return "", err
+		return "", fmt.Errorf("TCX attach 失败 (%v)，classic TC attach 失败: %w", tcxErr, err)
 	}
 	return "tc", nil
 }

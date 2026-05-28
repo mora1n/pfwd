@@ -76,11 +76,6 @@ struct pfwd_settings {
     __u32 loopback_ifindex;
 };
 
-struct pfwd_port_key {
-    __be16 port;
-    __u8 pad[4];
-};
-
 struct pfwd_rule_key {
     __u8 family;
     __u8 protocol;
@@ -375,9 +370,9 @@ struct {
 } pfwd_guard_prefixes SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
-    __type(key, struct pfwd_port_key);
+    __type(key, __u32);
     __type(value, __u8);
 } pfwd_protocol_skip_ports SEC(".maps");
 
@@ -1393,9 +1388,7 @@ static __always_inline void load_guard_payload_prefix(
 }
 
 static __always_inline int port_skipped(__be16 port) {
-    struct pfwd_port_key key = {
-        .port = port,
-    };
+    __u32 key = bpf_ntohs(port);
     __u8 *value = bpf_map_lookup_elem(&pfwd_protocol_skip_ports, &key);
     return value != 0;
 }

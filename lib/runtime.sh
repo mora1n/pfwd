@@ -470,7 +470,7 @@ runtime_attach_metadata() {
     local config_hash
     runtime_json="$(jq '
       .dataplane_version = 2
-      | .map_abi_version = 6
+      | .map_abi_version = 7
       | .rules = [
           .rules[]? as $rule
           | (
