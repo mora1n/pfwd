@@ -1147,6 +1147,9 @@ cmd_doctor() {
     whitelist_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard_whitelist.%s：%s\n' "$key" "$value"
     done
+    egress_whitelist_render_status | while IFS=$'\t' read -r key value; do
+        printf 'guard_egress_whitelist.%s：%s\n' "$key" "$value"
+    done
     if [ "$include_bench" = "true" ]; then
         cmd_doctor_benchmarks
     else
@@ -1271,8 +1274,14 @@ cmd_guard() {
         whitelist-custom)
             cmd_guard_whitelist_custom "$@"
             ;;
+        egress-whitelist)
+            cmd_guard_egress_whitelist "$@"
+            ;;
+        egress-whitelist-custom)
+            cmd_guard_egress_whitelist_custom "$@"
+            ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-custom"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-custom|egress-whitelist|egress-whitelist-custom"
             ;;
     esac
 }
@@ -1304,7 +1313,8 @@ cmd_guard_whitelist() {
 
     if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         whitelist_apply_runtime
-        echo "白名单数据已刷新"
+        cmd_apply_guard_runtime
+        echo "入口白名单数据已刷新"
         return 0
     fi
 
@@ -1338,7 +1348,7 @@ cmd_guard_whitelist() {
 
     whitelist_apply_runtime
     cmd_apply_guard_runtime
-    echo "协议封锁 / 白名单已更新"
+    echo "协议封锁 / 入口白名单已更新"
 }
 
 cmd_guard_whitelist_custom() {
@@ -1356,21 +1366,21 @@ cmd_guard_whitelist_custom() {
             whitelist_append_custom_cidr "$cidr"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
-            echo "自定义 CIDR 已添加：$cidr"
+            echo "入口白名单自定义 CIDR 已添加：$cidr"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-custom clear"
             whitelist_clear_custom_cidrs
             whitelist_apply_runtime
             cmd_apply_guard_runtime
-            echo "自定义 CIDR 已清空"
+            echo "入口白名单自定义 CIDR 已清空"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-custom delete <index...>"
             whitelist_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
-            echo "自定义 CIDR 已删除"
+            echo "入口白名单自定义 CIDR 已删除"
             ;;
         update)
             local index="${1:-}" cidr="${2:-}"
@@ -1378,10 +1388,138 @@ cmd_guard_whitelist_custom() {
             whitelist_replace_custom_cidr_by_index "$index" "$cidr"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
-            echo "自定义 CIDR 已更新：$index -> $cidr"
+            echo "入口白名单自定义 CIDR 已更新：$index -> $cidr"
             ;;
         *)
             pfwd_die "用法：pfwd guard whitelist-custom list|add|clear|delete|update"
+            ;;
+    esac
+}
+
+cmd_guard_egress_whitelist() {
+    config_init >/dev/null
+    local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local refresh_requested="false" status_requested="false"
+    local tmp_cidrs
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --enabled) enabled="${2:-}"; shift 2 ;;
+            --include-cn) include_cn="${2:-}"; shift 2 ;;
+            --source-url) source_url="${2:-}"; shift 2 ;;
+            --cidr) cidr="${2:-}"; shift 2 ;;
+            --replace-custom) replace_custom="true"; shift ;;
+            --clear-custom) clear_custom="true"; shift ;;
+            refresh) refresh_requested="true"; shift ;;
+            status) status_requested="true"; shift ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+
+    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+        egress_whitelist_render_status
+        return 0
+    fi
+
+    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+        egress_whitelist_apply_runtime
+        if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+            pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+        fi
+        cmd_apply_guard_runtime
+        echo "出口白名单数据已刷新"
+        return 0
+    fi
+
+    [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
+    [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
+    if [ -n "$cidr" ]; then
+        validate_ip_cidr "$cidr"
+    fi
+
+    if [ "$enabled" = "__KEEP__" ]; then
+        enabled="$(egress_whitelist_enabled)"
+    fi
+    if [ "$include_cn" = "__KEEP__" ]; then
+        include_cn="$(egress_whitelist_include_cn)"
+    fi
+    [ -n "$source_url" ] || source_url="$(egress_whitelist_source_url)"
+
+    egress_whitelist_config_set_state "$enabled" "$include_cn" "$source_url"
+
+    tmp_cidrs="$(mktemp)"
+    if [ "$clear_custom" != "true" ]; then
+        if [ "$replace_custom" != "true" ]; then
+            egress_whitelist_custom_cidrs_tsv > "$tmp_cidrs"
+        fi
+        if [ -n "$cidr" ]; then
+            printf '%s\n' "$cidr" >> "$tmp_cidrs"
+        fi
+    fi
+    egress_whitelist_config_set_custom_cidrs "$tmp_cidrs"
+    rm -f "$tmp_cidrs"
+
+    egress_whitelist_apply_runtime
+    if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+    fi
+    cmd_apply_guard_runtime
+    echo "出口白名单已更新"
+}
+
+cmd_guard_egress_whitelist_custom() {
+    config_init >/dev/null
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        list)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-custom list"
+            egress_whitelist_custom_cidrs_tsv
+            ;;
+        add)
+            local cidr="${1:-}"
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom add <IPv4/IPv6 CIDR>"
+            egress_whitelist_append_custom_cidr "$cidr"
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单自定义 CIDR 已添加：$cidr"
+            ;;
+        clear)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-custom clear"
+            egress_whitelist_clear_custom_cidrs
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单自定义 CIDR 已清空"
+            ;;
+        delete)
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard egress-whitelist-custom delete <index...>"
+            egress_whitelist_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单自定义 CIDR 已删除"
+            ;;
+        update)
+            local index="${1:-}" cidr="${2:-}"
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom update <index> <IPv4/IPv6 CIDR>"
+            egress_whitelist_replace_custom_cidr_by_index "$index" "$cidr"
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单自定义 CIDR 已更新：$index -> $cidr"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard egress-whitelist-custom list|add|clear|delete|update"
             ;;
     esac
 }

@@ -12,15 +12,16 @@
 | XDP 选项 | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
 | Rate | 使用 `tc` 做端口级或用户级双向速率限制 |
-| Guard | 入口侧白名单和 TCP 首包协议封锁，运行在 XDP / ingress 分层数据面 |
+| Guard | 入口白名单、出口白名单和 TCP 首包协议封锁；入口规则运行在 XDP / ingress 分层数据面，出口白名单在编译期校验 |
 | Notify | Telegram 定时通知和手动通知 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
 ## 流量防护
 
-`pfwd guard` 管理入口侧访问控制：
+`pfwd guard` 管理流量防护：
 
-- 白名单：限制入站来源 IPv4 / IPv6 CIDR，可启用国内 IP 白名单，也可追加自定义 CIDR。
+- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，可启用国内 IP 白名单，也可追加自定义 CIDR。
+- 出口白名单：限制转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但编译时解析出的每个目标 IP 都必须命中白名单。
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`。
 
 常用命令：
@@ -30,8 +31,11 @@ pfwd guard enable
 pfwd guard protocols --https true --socks true
 pfwd guard whitelist --enabled true --include-cn true
 pfwd guard whitelist --cidr 203.0.113.0/24
+pfwd guard egress-whitelist --enabled true --include-cn true
+pfwd guard egress-whitelist-custom add 203.0.113.0/24
 pfwd guard status
 pfwd guard whitelist status
+pfwd guard egress-whitelist status
 ```
 
 ## 依赖
@@ -224,6 +228,8 @@ pfwd add \
 - XDP runtime 使用稳定的 user/rule index，索引状态保存在 `/var/lib/pfwd/xdp/indexes.json`；`pfwd refresh` 会尽量增量刷新 pinned maps，并保留仍匹配新规则语义的活动连接。
 - `pfwd render status` / `pfwd doctor` 会显示 `dataplane.version`、`map_abi`、`xdp.incremental_apply`、保留/失效连接数和规则 profile 分布，便于区分普通增量刷新与 full reattach。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
+- `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 只限制转发目标，默认内置国内 IPv4/IPv6 段能力但默认关闭。
+- 出口白名单只接受 CIDR，不接受域名条目；当规则目标是域名时，`add` / `update` / `refresh` / `reconcile` 会按当前解析结果做白名单校验。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 

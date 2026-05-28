@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.1.8"
+PFWD_VERSION="0.1.9"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist forwarder runtime firewall stats notify guard service commands ui)
+PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard service commands ui)
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -259,6 +259,9 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard whitelist [--enabled true|false] [--include-cn true|false] [--cidr IPv4/IPv6 CIDR] [--replace-custom] [--clear-custom] [--source-url URL]
   pfwd guard whitelist refresh|status
   pfwd guard whitelist-custom list|add|clear|delete|update ...
+  pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cidr IPv4/IPv6 CIDR] [--replace-custom] [--clear-custom] [--source-url URL]
+  pfwd guard egress-whitelist refresh|status
+  pfwd guard egress-whitelist-custom list|add|clear|delete|update ...
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]
@@ -278,9 +281,10 @@ pfwd - XDP 端口转发管理脚本
   MSS 和固定 SNAT 通过 `.forwards[].net` 字段持久化；转发网卡通过 `settings.forward.interface` 指定。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
-  流量防护（协议封锁 + 白名单）由 `guard` 子命令管理；白名单配置通过 `guard whitelist` 子命令管理。
-  白名单限制的是入站来源 IPv4 / IPv6 CIDR；默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
-  白名单支持 IPv4 / IPv6 CIDR；国内 IPv4 默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`，国内 IPv6 默认数据源为 `https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone`。
+  流量防护（协议封锁 + 入口白名单 + 出口白名单）由 `guard` 子命令管理。
+  入口白名单限制的是入站来源 IPv4 / IPv6 CIDR；默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR。
+  出口白名单限制的是转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但解析出的每个目标 IP 都必须命中出口白名单。
+  两类白名单都支持 IPv4 / IPv6 CIDR；国内 IPv4 默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`，国内 IPv6 默认数据源为 `https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone`。
 EOF
 }
 

@@ -225,7 +225,7 @@ runtime_compiled_json() {
     local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json index_store_json persist_indexes="false"
     local rules_tmp=""
     local -A user_limit_by_id=() user_index_by_id=() rule_index_by_id=() rule_billing_by_id=() user_billing_by_id=()
-    local -A resolve_rows_cache=() resolve_error_cache=()
+    local -A resolve_rows_cache=() resolve_error_cache=() egress_allow_cache=() egress_error_cache=()
     now_minute="$(pfwd_now_minute)"
 
     rows="$(jq -r --arg now "$now_minute" '
@@ -300,6 +300,19 @@ runtime_compiled_json() {
       ]
     ')"
 
+    local guard_enabled whitelist_state egress_whitelist_state protocol_filters_enabled
+    guard_enabled="$(jq -r '.settings.guard.enabled // false' "$config_file")"
+    whitelist_state="false"
+    if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
+        whitelist_state="true"
+    fi
+    egress_whitelist_state="false"
+    if command -v egress_whitelist_enabled >/dev/null 2>&1 && [ "$(egress_whitelist_enabled "$config_file")" = "true" ]; then
+        egress_whitelist_state="true"
+        egress_whitelist_prepare_runtime "$config_file"
+    fi
+    protocol_filters_enabled="$(runtime_protocol_filters_enabled)"
+
     if [ -n "$rows" ]; then
         rules_tmp="$(mktemp "${PFWD_RUN_DIR}/compiled.rules.XXXXXX")"
         : > "$rules_tmp"
@@ -350,6 +363,20 @@ runtime_compiled_json() {
                     fi
                     continue
                 fi
+                if [ "$egress_whitelist_state" = "true" ]; then
+                    if [[ ! -v egress_allow_cache["$resolve_cache_key"] ]]; then
+                        if egress_whitelist_assert_target_rows_allowed "$remote_host" "$target_rows"; then
+                            egress_allow_cache["$resolve_cache_key"]="true"
+                            egress_error_cache["$resolve_cache_key"]=""
+                        else
+                            egress_allow_cache["$resolve_cache_key"]="false"
+                            egress_error_cache["$resolve_cache_key"]="$EGRESS_WHITELIST_LAST_ERROR"
+                        fi
+                    fi
+                    if [ "${egress_allow_cache[$resolve_cache_key]}" != "true" ]; then
+                        pfwd_die "出口白名单拒绝转发规则：$id ${egress_error_cache[$resolve_cache_key]}"
+                    fi
+                fi
 
                 while IFS= read -r proto; do
                     [ -n "$proto" ] || continue
@@ -380,19 +407,12 @@ runtime_compiled_json() {
         rm -f "$rules_tmp"
     fi
 
-    local guard_enabled whitelist_state protocol_filters_enabled
-    guard_enabled="$(jq -r '.settings.guard.enabled // false' "$config_file")"
-    whitelist_state="false"
-    if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
-        whitelist_state="true"
-    fi
-    protocol_filters_enabled="$(runtime_protocol_filters_enabled)"
-
     settings_json="$(jq -n \
       --arg iface "$(runtime_iface)" \
       --arg guard_ingress_mode "$(runtime_guard_ingress_mode)" \
       --argjson guard_enabled "$guard_enabled" \
       --argjson whitelist_enabled "$whitelist_state" \
+      --argjson egress_whitelist_enabled "$egress_whitelist_state" \
       --argjson block_http "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_http // false' "$config_file"; else echo false; fi)" \
       --argjson block_tls "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_tls // false' "$config_file"; else echo false; fi)" \
       --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$config_file"; else echo false; fi)" \
@@ -403,6 +423,7 @@ runtime_compiled_json() {
         guard_ingress_mode: $guard_ingress_mode,
         guard_enabled: $guard_enabled,
         whitelist_enabled: $whitelist_enabled,
+        egress_whitelist_enabled: $egress_whitelist_enabled,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
@@ -628,7 +649,7 @@ runtime_remove_whitelist_runtime_files() {
 }
 
 runtime_remove_runtime_state_dirs() {
-    rm -rf "$PFWD_GUARD_STATE_DIR" "$PFWD_WHITELIST_STATE_DIR"
+    rm -rf "$PFWD_GUARD_STATE_DIR" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_EGRESS_WHITELIST_STATE_DIR"
 }
 
 runtime_clear_nft_runtime() {
@@ -655,7 +676,7 @@ runtime_reset_runtime_files() {
 }
 
 runtime_write_stopped_status() {
-    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false}')"
+    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false,egress_whitelist_enabled:false}')"
 }
 
 runtime_stop_compiled_runtime() {
