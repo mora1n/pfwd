@@ -106,8 +106,9 @@ egress_whitelist_mark_last_good() {
 egress_whitelist_validate_custom_cidrs() {
     local cidr
     while IFS= read -r cidr; do
+        cidr="$(printf '%s' "$cidr" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -n "$cidr" ] || continue
-        validate_ip_cidr "$cidr"
+        normalize_ip_or_cidr "$cidr"
     done
 }
 
@@ -131,9 +132,11 @@ egress_whitelist_config_set_state() {
 
 egress_whitelist_config_set_custom_cidrs() {
     local cidrs_file="$1"
+    local normalized_file
     [ -f "$cidrs_file" ] || pfwd_die "出口白名单自定义 CIDR 临时文件不存在：$cidrs_file"
-    egress_whitelist_validate_custom_cidrs < "$cidrs_file"
-    config_update --rawfile cidrs "$cidrs_file" '
+    normalized_file="$(mktemp)"
+    egress_whitelist_validate_custom_cidrs < "$cidrs_file" > "$normalized_file"
+    config_update --rawfile cidrs "$normalized_file" '
       (.settings.egress_whitelist //= {})
       | .settings.egress_whitelist.custom_cidrs =
           (($cidrs
@@ -142,11 +145,12 @@ egress_whitelist_config_set_custom_cidrs() {
             | map(select(length > 0))
             | unique))
     '
+    rm -f "$normalized_file"
 }
 
 egress_whitelist_append_custom_cidr() {
     local cidr="$1"
-    validate_ip_cidr "$cidr"
+    cidr="$(normalize_ip_or_cidr "$cidr")"
     config_update --arg cidr "$cidr" '
       (.settings.egress_whitelist //= {})
       | .settings.egress_whitelist.custom_cidrs =
@@ -164,7 +168,7 @@ egress_whitelist_clear_custom_cidrs() {
 egress_whitelist_replace_custom_cidr_by_index() {
     local index="$1"
     local cidr="$2"
-    validate_ip_cidr "$cidr"
+    cidr="$(normalize_ip_or_cidr "$cidr")"
     [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "无效出口白名单自定义 CIDR 序号：$index"
     config_update --argjson index "$index" --arg cidr "$cidr" '
       (.settings.egress_whitelist //= {})

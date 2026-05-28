@@ -1321,7 +1321,7 @@ cmd_guard_whitelist() {
     [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
     [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
     if [ -n "$cidr" ]; then
-        validate_ip_cidr "$cidr"
+        cidr="$(normalize_ip_or_cidr "$cidr")"
     fi
 
     if [ "$enabled" = "__KEEP__" ]; then
@@ -1362,7 +1362,8 @@ cmd_guard_whitelist_custom() {
             ;;
         add)
             local cidr="${1:-}"
-            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom add <IPv4/IPv6 CIDR>"
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom add <IPv4/IPv6 CIDR 或单个 IP>"
+            cidr="$(normalize_ip_or_cidr "$cidr")"
             whitelist_append_custom_cidr "$cidr"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
@@ -1384,7 +1385,8 @@ cmd_guard_whitelist_custom() {
             ;;
         update)
             local index="${1:-}" cidr="${2:-}"
-            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom update <index> <IPv4/IPv6 CIDR>"
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom update <index> <IPv4/IPv6 CIDR 或单个 IP>"
+            cidr="$(normalize_ip_or_cidr "$cidr")"
             whitelist_replace_custom_cidr_by_index "$index" "$cidr"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
@@ -1434,7 +1436,7 @@ cmd_guard_egress_whitelist() {
     [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
     [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
     if [ -n "$cidr" ]; then
-        validate_ip_cidr "$cidr"
+        cidr="$(normalize_ip_or_cidr "$cidr")"
     fi
 
     if [ "$enabled" = "__KEEP__" ]; then
@@ -1478,7 +1480,8 @@ cmd_guard_egress_whitelist_custom() {
             ;;
         add)
             local cidr="${1:-}"
-            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom add <IPv4/IPv6 CIDR>"
+            [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom add <IPv4/IPv6 CIDR 或单个 IP>"
+            cidr="$(normalize_ip_or_cidr "$cidr")"
             egress_whitelist_append_custom_cidr "$cidr"
             egress_whitelist_apply_runtime
             if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
@@ -1509,7 +1512,8 @@ cmd_guard_egress_whitelist_custom() {
             ;;
         update)
             local index="${1:-}" cidr="${2:-}"
-            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom update <index> <IPv4/IPv6 CIDR>"
+            [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom update <index> <IPv4/IPv6 CIDR 或单个 IP>"
+            cidr="$(normalize_ip_or_cidr "$cidr")"
             egress_whitelist_replace_custom_cidr_by_index "$index" "$cidr"
             egress_whitelist_apply_runtime
             if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then

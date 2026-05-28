@@ -20,8 +20,8 @@
 
 `pfwd guard` 管理流量防护：
 
-- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，可启用国内 IP 白名单，也可追加自定义 CIDR。
-- 出口白名单：限制转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但编译时解析出的每个目标 IP 都必须命中白名单。
+- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，可启用国内 IP 白名单，也可追加自定义 CIDR；自定义项支持直接输入单个 IP，系统会规范成 `/32` 或 `/128`。
+- 出口白名单：限制转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但编译时解析出的每个目标 IP 都必须命中白名单；自定义项同样支持单个 IP 输入。
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`。
 
 常用命令：
@@ -31,6 +31,7 @@ pfwd guard enable
 pfwd guard protocols --https true --socks true
 pfwd guard whitelist --enabled true --include-cn true
 pfwd guard whitelist --cidr 203.0.113.0/24
+pfwd guard whitelist-custom add 203.0.113.5
 pfwd guard egress-whitelist --enabled true --include-cn true
 pfwd guard egress-whitelist-custom add 203.0.113.0/24
 pfwd guard status

@@ -328,6 +328,42 @@ validate_ip_cidr() {
     esac
 }
 
+normalize_ip_literal_to_cidr() {
+    local value="$1"
+    local output
+    output="$(python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    addr = ipaddress.ip_address(value)
+except Exception:
+    sys.exit(1)
+
+mask = 32 if addr.version == 4 else 128
+sys.stdout.write(f"{addr}/{mask}")
+PY
+)" || pfwd_die "无效 IP 地址：$value"
+    [ -n "$output" ] || pfwd_die "无效 IP 地址：$value"
+    printf '%s\n' "$output"
+}
+
+normalize_ip_or_cidr() {
+    local value="$1"
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$value" ] || pfwd_die "IP/CIDR 不能为空"
+    case "$value" in
+        */*)
+            validate_ip_cidr "$value"
+            printf '%s\n' "$value"
+            ;;
+        *)
+            normalize_ip_literal_to_cidr "$value"
+            ;;
+    esac
+}
+
 validate_reset_day() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "无效重置日：$value"

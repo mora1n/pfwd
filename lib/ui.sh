@@ -4430,10 +4430,10 @@ ui_menu_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "增加入口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR；会和允许国内 IP 共同组成入口白名单。输入 0 返回上级菜单。"
+                ui_form_set "增加入口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和允许国内 IP 共同组成入口白名单。输入 0 返回上级菜单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
                 ui_run cmd_guard_whitelist_custom add "$UI_REPLY"
                 ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单自定义 CIDR 已添加" "$UI_C_MENU_NUM"
@@ -4446,7 +4446,7 @@ ui_menu_whitelist_cidrs() {
             4)
                 count="$(whitelist_custom_cidrs_count)"
                 if [ "$count" -eq 0 ]; then
-                    ui_warn "暂无自定义 CIDR"
+                    ui_warn "暂无入口白名单自定义 CIDR"
                     ui_pause
                     continue
                 fi
@@ -4457,12 +4457,12 @@ ui_menu_whitelist_cidrs() {
                 [ "$display_index" -ge 2 ] && [ "$display_index" -le $((count + 1)) ] || { ui_warn "序号超出范围"; ui_pause; continue; }
                 real_index=$((display_index - 1))
                 current_cidr="$(whitelist_custom_cidr_by_index "$real_index")"
-                [ -n "$current_cidr" ] || { ui_warn "自定义 CIDR 序号不存在"; ui_pause; continue; }
-                ui_form_set "修改入口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR。输入 0 返回上级菜单。"
+                [ -n "$current_cidr" ] || { ui_warn "入口白名单自定义 CIDR 序号不存在"; ui_pause; continue; }
+                ui_form_set "修改入口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR，或单个 IP。输入 0 返回上级菜单。"
                 ui_form_add_kv "当前 CIDR" "$current_cidr"
                 ui_form_read "新 CIDR" "$current_cidr" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
                 ui_run cmd_guard_whitelist_custom update "$real_index" "$UI_REPLY"
                 ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单自定义 CIDR 已更新" "$UI_C_MENU_NUM"
@@ -4542,10 +4542,10 @@ ui_menu_egress_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "增加出口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR；会和允许国内 IP 共同组成出口白名单。输入 0 返回上级菜单。"
+                ui_form_set "增加出口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和允许国内 IP 共同组成出口白名单。输入 0 返回上级菜单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
                 ui_run cmd_guard_egress_whitelist_custom add "$UI_REPLY"
                 ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口白名单自定义 CIDR 已添加" "$UI_C_MENU_NUM"
@@ -4570,11 +4570,11 @@ ui_menu_egress_whitelist_cidrs() {
                 real_index=$((display_index - 1))
                 current_cidr="$(egress_whitelist_custom_cidr_by_index "$real_index")"
                 [ -n "$current_cidr" ] || { ui_warn "出口自定义 CIDR 序号不存在"; ui_pause; continue; }
-                ui_form_set "修改出口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR。输入 0 返回上级菜单。"
+                ui_form_set "修改出口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR，或单个 IP。输入 0 返回上级菜单。"
                 ui_form_add_kv "当前 CIDR" "$current_cidr"
                 ui_form_read "新 CIDR" "$current_cidr" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
-                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR"; ui_pause; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
                 ui_run cmd_guard_egress_whitelist_custom update "$real_index" "$UI_REPLY"
                 ui_form_reset
                 [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口白名单自定义 CIDR 已更新" "$UI_C_MENU_NUM"

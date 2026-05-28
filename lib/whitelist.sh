@@ -75,6 +75,12 @@ whitelist_filter_ipv4_cidrs() {
     awk '
       function valid_octet(v) { return v ~ /^[0-9]+$/ && v >= 0 && v <= 255 }
       function valid_mask(v) { return v ~ /^[0-9]+$/ && v >= 0 && v <= 32 }
+      /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+        split($0, a, /\./)
+        if (valid_octet(a[1]) && valid_octet(a[2]) && valid_octet(a[3]) && valid_octet(a[4])) {
+          print $0 "/32"
+        }
+      }
       /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {
         split($0, a, /[.\/]/)
         if (valid_octet(a[1]) && valid_octet(a[2]) && valid_octet(a[3]) && valid_octet(a[4]) && valid_mask(a[5])) {
@@ -97,17 +103,23 @@ whitelist_filter_ipv6_cidrs() {
       /^#/ || /^$/ { next }
       {
         n = split($0, parts, "/")
-        if (n != 2) next
-        addr = parts[1]
-        mask = parts[2]
-        if (mask !~ /^[0-9]+$/ || mask + 0 < 0 || mask + 0 > 128) next
+        if (n == 1) {
+          addr = parts[1]
+          mask = 128
+          normalized = addr "/128"
+        } else if (n == 2) {
+          addr = parts[1]
+          mask = parts[2]
+          normalized = $0
+          if (mask !~ /^[0-9]+$/ || mask + 0 < 0 || mask + 0 > 128) next
+        } else next
         np = split(addr, groups, ":")
         if (np < 2) next
         skip = 0
         for (i = 1; i <= np; i++) {
           if (groups[i] != "" && !valid_hex(groups[i])) { skip = 1; break }
         }
-        if (!skip) print $0
+        if (!skip) print normalized
       }
     ' | sort -u
 }
@@ -143,8 +155,9 @@ whitelist_mark_last_good() {
 whitelist_validate_custom_cidrs() {
     local cidr
     while IFS= read -r cidr; do
+        cidr="$(printf '%s' "$cidr" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -n "$cidr" ] || continue
-        validate_ip_cidr "$cidr"
+        normalize_ip_or_cidr "$cidr"
     done
 }
 
@@ -168,9 +181,11 @@ whitelist_config_set_state() {
 
 whitelist_config_set_custom_cidrs() {
     local cidrs_file="$1"
+    local normalized_file
     [ -f "$cidrs_file" ] || pfwd_die "自定义 CIDR 临时文件不存在：$cidrs_file"
-    whitelist_validate_custom_cidrs < "$cidrs_file"
-    config_update --rawfile cidrs "$cidrs_file" '
+    normalized_file="$(mktemp)"
+    whitelist_validate_custom_cidrs < "$cidrs_file" > "$normalized_file"
+    config_update --rawfile cidrs "$normalized_file" '
       (.settings.whitelist //= {})
       | .settings.whitelist.custom_cidrs =
           (($cidrs
@@ -179,11 +194,12 @@ whitelist_config_set_custom_cidrs() {
             | map(select(length > 0))
             | unique))
     '
+    rm -f "$normalized_file"
 }
 
 whitelist_append_custom_cidr() {
     local cidr="$1"
-    validate_ip_cidr "$cidr"
+    cidr="$(normalize_ip_or_cidr "$cidr")"
     config_update --arg cidr "$cidr" '
       (.settings.whitelist //= {})
       | .settings.whitelist.custom_cidrs =
@@ -201,7 +217,7 @@ whitelist_clear_custom_cidrs() {
 whitelist_replace_custom_cidr_by_index() {
     local index="$1"
     local cidr="$2"
-    validate_ip_cidr "$cidr"
+    cidr="$(normalize_ip_or_cidr "$cidr")"
     [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "无效自定义 CIDR 序号：$index"
     config_update --argjson index "$index" --arg cidr "$cidr" '
       (.settings.whitelist //= {})
