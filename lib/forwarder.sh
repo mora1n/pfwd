@@ -164,6 +164,24 @@ forwarder_whitelist_files_json() {
     printf '%s\n' "${files[@]}" | jq -R . | jq -s .
 }
 
+forwarder_egress_whitelist_files_json() {
+    local files=()
+    if command -v egress_whitelist_enabled >/dev/null 2>&1 &&
+       [ "$(egress_whitelist_enabled)" = "true" ]; then
+        if [ -f "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE" ]; then
+            files+=("$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE")
+        fi
+        if [ -f "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE" ]; then
+            files+=("$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE")
+        fi
+    fi
+    if [ "${#files[@]}" -eq 0 ]; then
+        printf '[]\n'
+        return 0
+    fi
+    printf '%s\n' "${files[@]}" | jq -R . | jq -s .
+}
+
 forwarder_protocol_skip_ports_json() {
     jq -c '.settings.guard.protocol_skip_ports // []' "$PFWD_CONFIG_FILE"
 }
@@ -239,6 +257,8 @@ forwarder_runtime_status_json() {
         protocol_guard: ($runtime.settings.guard_enabled // false),
         whitelist_enabled: ($runtime.settings.whitelist_enabled // false),
         egress_whitelist_enabled: ($runtime.settings.egress_whitelist_enabled // false),
+        host_egress_enabled: ($runtime.settings.host_egress_enabled // false),
+        host_egress_backend: ($runtime.settings.host_egress_backend // "off"),
         dataplane_version: ($runtime.dataplane_version // $xdp_status.dataplane_version // null),
         map_abi_version: ($runtime.map_abi_version // $xdp_status.map_abi_version // null),
         incremental_apply: ($xdp_status.incremental_apply // false),
@@ -288,6 +308,8 @@ forwarder_status_json() {
             protocol_guard: false,
             whitelist_enabled: false,
             egress_whitelist_enabled: false,
+            host_egress_enabled: false,
+            host_egress_backend: "off",
             dataplane_version: null,
             map_abi_version: null,
             incremental_apply: false,
@@ -318,6 +340,7 @@ forwarder_render_status() {
         ["Guard 数据面", (if (.xdp_guard_rules_count // 0) > 0 then "开" else "关" end)],
         ["入口白名单", (if (.whitelist_enabled // false) then "开" else "关" end)],
         ["出口白名单", (if (.egress_whitelist_enabled // false) then "开" else "关" end)],
+        ["宿主机出口白名单", (if (.host_egress_enabled // false) then (.host_egress_backend // "开") else "关" end)],
         ["nft 规则", (.nft_rules_count | tostring)],
         ["绑定网卡", (.interface // "-")],
         ["dataplane", ((.dataplane_version // .xdp_status.dataplane_version // "-") | tostring)],

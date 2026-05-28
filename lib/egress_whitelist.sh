@@ -25,6 +25,24 @@ egress_whitelist_allow_ipv6_file() {
     printf '%s\n' "$(egress_whitelist_state_dir "$state_dir")/allow_ipv6.txt"
 }
 
+egress_whitelist_host_allow_ipv4_file() {
+    local state_dir="${1:-}"
+    if [ -n "$state_dir" ]; then
+        printf '%s\n' "$(egress_whitelist_state_dir "$state_dir")/host_allow_ipv4.txt"
+    else
+        printf '%s\n' "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE"
+    fi
+}
+
+egress_whitelist_host_allow_ipv6_file() {
+    local state_dir="${1:-}"
+    if [ -n "$state_dir" ]; then
+        printf '%s\n' "$(egress_whitelist_state_dir "$state_dir")/host_allow_ipv6.txt"
+    else
+        printf '%s\n' "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE"
+    fi
+}
+
 egress_whitelist_enabled() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     jq -r '.settings.egress_whitelist.enabled // false' "$config_file"
@@ -79,6 +97,20 @@ egress_whitelist_entry_count() {
     echo "$total"
 }
 
+egress_whitelist_host_entry_count() {
+    local state_dir="${1:-}" total=0
+    local ipv4_file ipv6_file
+    ipv4_file="$(egress_whitelist_host_allow_ipv4_file "$state_dir")"
+    ipv6_file="$(egress_whitelist_host_allow_ipv6_file "$state_dir")"
+    if [ -s "$ipv4_file" ]; then
+        total=$((total + $(sed '/^$/d' "$ipv4_file" | wc -l | tr -d ' ')))
+    fi
+    if [ -s "$ipv6_file" ]; then
+        total=$((total + $(sed '/^$/d' "$ipv6_file" | wc -l | tr -d ' ')))
+    fi
+    echo "$total"
+}
+
 egress_whitelist_write_allow_ipv4_file() {
     local source_file="$1"
     local target_file="${2:-$(egress_whitelist_allow_ipv4_file)}"
@@ -91,6 +123,119 @@ egress_whitelist_write_allow_ipv6_file() {
     local target_file="${2:-$(egress_whitelist_allow_ipv6_file)}"
     mkdir -p "$(dirname "$target_file")"
     whitelist_filter_ipv6_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
+}
+
+egress_whitelist_write_host_allow_ipv4_file() {
+    local source_file="$1"
+    local target_file="${2:-$(egress_whitelist_host_allow_ipv4_file)}"
+    mkdir -p "$(dirname "$target_file")"
+    whitelist_filter_ipv4_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
+}
+
+egress_whitelist_write_host_allow_ipv6_file() {
+    local source_file="$1"
+    local target_file="${2:-$(egress_whitelist_host_allow_ipv6_file)}"
+    mkdir -p "$(dirname "$target_file")"
+    whitelist_filter_ipv6_cidrs < "$source_file" | pfwd_write_atomic "$target_file"
+}
+
+egress_whitelist_special_ipv4_cidrs() {
+    cat <<'EOF'
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.168.0.0/16
+224.0.0.0/4
+240.0.0.0/4
+255.255.255.255/32
+EOF
+}
+
+egress_whitelist_special_ipv6_cidrs() {
+    cat <<'EOF'
+::1/128
+fe80::/10
+fc00::/7
+ff00::/8
+EOF
+}
+
+egress_whitelist_non_loopback_onlink_cidrs() {
+    ip -o addr show up scope global 2>/dev/null | awk '
+      $2 != "lo" {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "inet" || $i == "inet6") {
+            print $(i + 1)
+          }
+        }
+      }
+    '
+}
+
+egress_whitelist_default_gateway_ips() {
+    {
+        ip route show default 2>/dev/null | awk '
+          /^default / {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "via" && (i + 1) <= NF) {
+                print $(i + 1)
+              }
+            }
+          }
+        '
+        ip -6 route show default 2>/dev/null | awk '
+          /^default / {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "via" && (i + 1) <= NF) {
+                print $(i + 1)
+              }
+            }
+          }
+        '
+    } | sed 's/%.*$//'
+}
+
+egress_whitelist_host_allow_rows() {
+    local state_dir="${1:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
+    local ipv4_file ipv6_file gateway
+    ipv4_file="$(egress_whitelist_allow_ipv4_file "$state_dir")"
+    ipv6_file="$(egress_whitelist_allow_ipv6_file "$state_dir")"
+
+    egress_whitelist_special_ipv4_cidrs
+    egress_whitelist_special_ipv6_cidrs
+    egress_whitelist_non_loopback_onlink_cidrs
+    while IFS= read -r gateway; do
+        [ -n "$gateway" ] || continue
+        printf '%s\n' "$gateway"
+    done < <(egress_whitelist_default_gateway_ips)
+    [ -f "$ipv4_file" ] && cat "$ipv4_file"
+    [ -f "$ipv6_file" ] && cat "$ipv6_file"
+}
+
+egress_whitelist_prepare_host_runtime() {
+    local state_dir="${1:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
+    local tmp_v4 tmp_v6 host_v4_file host_v6_file
+    host_v4_file="$(egress_whitelist_host_allow_ipv4_file "$state_dir")"
+    host_v6_file="$(egress_whitelist_host_allow_ipv6_file "$state_dir")"
+    tmp_v4="$(mktemp)"
+    tmp_v6="$(mktemp)"
+
+    egress_whitelist_host_allow_rows "$state_dir" | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
+    egress_whitelist_host_allow_rows "$state_dir" | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
+
+    if [ -s "$tmp_v4" ]; then
+        egress_whitelist_write_host_allow_ipv4_file "$tmp_v4" "$host_v4_file"
+    else
+        : > "$host_v4_file"
+    fi
+    if [ -s "$tmp_v6" ]; then
+        egress_whitelist_write_host_allow_ipv6_file "$tmp_v6" "$host_v6_file"
+    else
+        : > "$host_v6_file"
+    fi
+    rm -f "$tmp_v4" "$tmp_v6"
 }
 
 egress_whitelist_mark_last_good() {
@@ -210,13 +355,15 @@ egress_whitelist_custom_cidr_by_index() {
 egress_whitelist_prepare_runtime() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     local state_dir="${2:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
-    local ipv4_file ipv6_file cn_tmp tmp_v4 tmp_v6
+    local ipv4_file ipv6_file host_ipv4_file host_ipv6_file cn_tmp tmp_v4 tmp_v6
     ipv4_file="$(egress_whitelist_allow_ipv4_file "$state_dir")"
     ipv6_file="$(egress_whitelist_allow_ipv6_file "$state_dir")"
+    host_ipv4_file="$(egress_whitelist_host_allow_ipv4_file "$state_dir")"
+    host_ipv6_file="$(egress_whitelist_host_allow_ipv6_file "$state_dir")"
     mkdir -p "$(dirname "$ipv4_file")"
 
     if [ "$(egress_whitelist_enabled "$config_file")" != "true" ]; then
-        rm -f "$ipv4_file" "$ipv6_file" "${ipv4_file}.cn" "${ipv6_file}.cn" 2>/dev/null || true
+        rm -f "$ipv4_file" "$ipv6_file" "$host_ipv4_file" "$host_ipv6_file" "${ipv4_file}.cn" "${ipv6_file}.cn" 2>/dev/null || true
         return 0
     fi
 
@@ -270,14 +417,17 @@ egress_whitelist_prepare_runtime() {
         : > "$ipv6_file"
     fi
     rm -f "$tmp_v4" "$tmp_v6"
+    egress_whitelist_prepare_host_runtime "$state_dir"
 }
 
 egress_whitelist_runtime_hash_compute() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     local state_dir="${2:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
-    local ipv4_file ipv6_file payload
+    local ipv4_file ipv6_file host_ipv4_file host_ipv6_file payload
     ipv4_file="$(egress_whitelist_allow_ipv4_file "$state_dir")"
     ipv6_file="$(egress_whitelist_allow_ipv6_file "$state_dir")"
+    host_ipv4_file="$(egress_whitelist_host_allow_ipv4_file "$state_dir")"
+    host_ipv6_file="$(egress_whitelist_host_allow_ipv6_file "$state_dir")"
     payload="$(cat <<EOF
 enabled=$(egress_whitelist_enabled "$config_file")
 include_cn=$(egress_whitelist_include_cn "$config_file")
@@ -289,6 +439,10 @@ ipv4:
 $(cat "$ipv4_file" 2>/dev/null || true)
 ipv6:
 $(cat "$ipv6_file" 2>/dev/null || true)
+host_ipv4:
+$(cat "$host_ipv4_file" 2>/dev/null || true)
+host_ipv6:
+$(cat "$host_ipv6_file" 2>/dev/null || true)
 EOF
 )"
     printf '%s' "$payload" | cksum | awk '{print $1}'
@@ -317,9 +471,12 @@ egress_whitelist_status_json() {
       --arg source_url "$(egress_whitelist_source_url)" \
       --arg allow_ipv4_file "$(egress_whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(egress_whitelist_allow_ipv6_file)" \
+      --arg host_allow_ipv4_file "$(egress_whitelist_host_allow_ipv4_file)" \
+      --arg host_allow_ipv6_file "$(egress_whitelist_host_allow_ipv6_file)" \
       --arg last_good_source "$(egress_whitelist_last_good_source)" \
       --arg last_good_updated_at "$(egress_whitelist_last_good_updated_at)" \
       --argjson entries "$(egress_whitelist_entry_count)" \
+      --argjson host_entries "$(egress_whitelist_host_entry_count)" \
       --argjson custom_cidrs_count "$(egress_whitelist_custom_cidrs_count)" \
       '{
         enabled: $enabled,
@@ -327,9 +484,12 @@ egress_whitelist_status_json() {
         source_url: $source_url,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
+        host_allow_ipv4_file: $host_allow_ipv4_file,
+        host_allow_ipv6_file: $host_allow_ipv6_file,
         last_good_source: $last_good_source,
         last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
         entries: $entries,
+        host_entries: $host_entries,
         custom_cidrs_count: $custom_cidrs_count
       }'
 }
@@ -343,9 +503,12 @@ egress_whitelist_render_status() {
         ["出口包含国内 IP", (if .enabled then (if .include_cn then "开" else "关" end) else "-" end)],
         ["出口自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["出口白名单条目", (.entries | tostring)],
+        ["宿主机出口白名单条目", (.host_entries | tostring)],
         ["出口来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],
         ["出口 IPv4 文件", .allow_ipv4_file],
-        ["出口 IPv6 文件", .allow_ipv6_file]
+        ["出口 IPv6 文件", .allow_ipv6_file],
+        ["宿主机出口 IPv4 文件", .host_allow_ipv4_file],
+        ["宿主机出口 IPv6 文件", .host_allow_ipv6_file]
       ]
       | map(@tsv)
       | .[]

@@ -32,6 +32,10 @@ runtime_whitelist_files_json() {
     forwarder_whitelist_files_json
 }
 
+runtime_egress_whitelist_files_json() {
+    forwarder_egress_whitelist_files_json
+}
+
 runtime_protocol_skip_ports_json() {
     forwarder_protocol_skip_ports_json
 }
@@ -300,16 +304,18 @@ runtime_compiled_json() {
       ]
     ')"
 
-    local guard_enabled whitelist_state egress_whitelist_state protocol_filters_enabled
+    local guard_enabled whitelist_state egress_whitelist_state host_egress_state protocol_filters_enabled
     guard_enabled="$(jq -r '.settings.guard.enabled // false' "$config_file")"
     whitelist_state="false"
     if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
         whitelist_state="true"
     fi
     egress_whitelist_state="false"
+    host_egress_state="false"
     if command -v egress_whitelist_enabled >/dev/null 2>&1 && [ "$(egress_whitelist_enabled "$config_file")" = "true" ]; then
         egress_whitelist_state="true"
         egress_whitelist_prepare_runtime "$config_file"
+        host_egress_state="true"
     fi
     protocol_filters_enabled="$(runtime_protocol_filters_enabled)"
 
@@ -417,18 +423,26 @@ runtime_compiled_json() {
       --argjson block_tls "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_tls // false' "$config_file"; else echo false; fi)" \
       --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$config_file"; else echo false; fi)" \
       --argjson skip_ports "$(runtime_protocol_skip_ports_json)" \
-      --argjson files "$(runtime_whitelist_files_json)" '
+      --argjson files "$(runtime_whitelist_files_json)" \
+      --argjson egress_files "$(runtime_egress_whitelist_files_json)" \
+      --arg host_egress_allow_ipv4_file "$(egress_whitelist_host_allow_ipv4_file)" \
+      --arg host_egress_allow_ipv6_file "$(egress_whitelist_host_allow_ipv6_file)" \
+      --argjson host_egress_enabled "$host_egress_state" '
       {
         interface: $iface,
         guard_ingress_mode: $guard_ingress_mode,
         guard_enabled: $guard_enabled,
         whitelist_enabled: $whitelist_enabled,
         egress_whitelist_enabled: $egress_whitelist_enabled,
+        host_egress_enabled: $host_egress_enabled,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
         protocol_skip_ports: $skip_ports,
-        whitelist_files: $files
+        whitelist_files: $files,
+        egress_whitelist_files: $egress_files,
+        host_egress_allow_ipv4_file: $host_egress_allow_ipv4_file,
+        host_egress_allow_ipv6_file: $host_egress_allow_ipv6_file
       }
     ')"
 
@@ -599,6 +613,7 @@ runtime_remove_xdp_runtime() {
           --status-file "$PFWD_XDP_STATUS_FILE" \
           --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
           --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+          --host-egress-pin "$PFWD_XDP_HOST_EGRESS_PIN_PATH" \
           --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
           --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
           --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
@@ -609,14 +624,17 @@ runtime_remove_xdp_runtime() {
 
 runtime_remove_link_pins() {
     rm -f "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" \
-          "$PFWD_XDP_LOOPBACK_PIN_PATH" "$PFWD_XDP_SK_LOOKUP_PIN_PATH" || true
+          "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" "$PFWD_XDP_SK_LOOKUP_PIN_PATH" || true
 }
 
 runtime_remove_pinned_state() {
     rm -f "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
           "$PFWD_XDP_REVERSE_PIN_PATH" "$PFWD_XDP_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_V6_PIN_PATH" \
           "$PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH" \
-          "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
+          "$PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH" \
+          "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH" \
+          "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH" \
+          "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
           "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" || true
 }
 
@@ -645,7 +663,9 @@ runtime_remove_whitelist_runtime_files() {
     rm -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" \
           "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
           "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" \
-          "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" || true
+          "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
+          "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE" \
+          "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE" || true
 }
 
 runtime_remove_runtime_state_dirs() {
@@ -676,7 +696,7 @@ runtime_reset_runtime_files() {
 }
 
 runtime_write_stopped_status() {
-    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false,egress_whitelist_enabled:false}')"
+    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false,egress_whitelist_enabled:false,host_egress_enabled:false,host_egress_backend:"off"}')"
 }
 
 runtime_stop_compiled_runtime() {
@@ -733,6 +753,7 @@ runtime_apply_xdp_runtime() {
         --iface "$iface" \
         --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
         --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
+        --host-egress-pin "$PFWD_XDP_HOST_EGRESS_PIN_PATH" \
         --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
         --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
@@ -780,6 +801,20 @@ runtime_backend_label() {
     fi
 }
 
+runtime_host_egress_backend() {
+    local backend="$1"
+    local host_egress_enabled="$2"
+    if [ "$host_egress_enabled" != "true" ]; then
+        printf '%s\n' "off"
+        return 0
+    fi
+    case "$backend" in
+        xdp-only|hybrid|guard-only) printf '%s\n' "tc" ;;
+        nft-only|nft-fallback|none) printf '%s\n' "nft" ;;
+        *) printf '%s\n' "off" ;;
+    esac
+}
+
 runtime_loopback_split_active() {
     local runtime_json="$1"
     local xdp_forward_applied="$2"
@@ -799,7 +834,7 @@ runtime_loopback_split_active() {
 runtime_apply_compiled_runtime() {
     local runtime_json="$1"
     local xdp_runtime_json nft_runtime_json nft_applied="false" backend fallback_reason=""
-    local xdp_candidate_rules=0 total_rules=0 guard_required="false"
+    local xdp_candidate_rules=0 total_rules=0 guard_required="false" host_egress_required="false" host_egress_backend="off"
 
     runtime_write_compiled_file "$runtime_json"
     forwarder_split_runtime_json "$runtime_json"
@@ -813,35 +848,52 @@ runtime_apply_compiled_runtime() {
     if runtime_xdp_guard_required "$runtime_json"; then
         guard_required="true"
     fi
-    if [ "$total_rules" = "0" ] && [ "$guard_required" != "true" ]; then
+    if [ "$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")" = "true" ]; then
+        host_egress_required="true"
+    fi
+    if [ "$total_rules" = "0" ] && [ "$guard_required" != "true" ] && [ "$host_egress_required" != "true" ]; then
         forwarder_stop_runtime
         return 0
     fi
 
-    forwarder_ensure_ip_forwarding
-    if ! runtime_apply_xdp_runtime "$xdp_runtime_json"; then
-        if [ "$xdp_candidate_rules" -gt 0 ]; then
-            nft_runtime_json="$(runtime_merge_runtime_rules "$nft_runtime_json" "$xdp_runtime_json")"
-            forwarder_write_nft_runtime_file "$nft_runtime_json"
+    if [ "$total_rules" -gt 0 ]; then
+        forwarder_ensure_ip_forwarding
+    fi
+    if [ "$total_rules" -gt 0 ] || [ "$guard_required" = "true" ]; then
+        if ! runtime_apply_xdp_runtime "$xdp_runtime_json"; then
+            if [ "$xdp_candidate_rules" -gt 0 ]; then
+                nft_runtime_json="$(runtime_merge_runtime_rules "$nft_runtime_json" "$xdp_runtime_json")"
+                forwarder_write_nft_runtime_file "$nft_runtime_json"
+            fi
         fi
+    else
+        runtime_remove_xdp_runtime
+        runtime_remove_link_pins
+        runtime_remove_pinned_state
+        runtime_remove_xdp_status_file
+        runtime_reset_xdp_apply_state
     fi
 
     if [ "$total_rules" = "0" ]; then
         runtime_clear_nft_runtime
-        runtime_clear_accounting_runtime
-        fw_apply_tc
     elif [ "$(jq '.rules | length' <<< "$nft_runtime_json")" -gt 0 ]; then
         fw_apply_nft_runtime "$nft_runtime_json"
         nft_applied="true"
-        fw_apply_accounting_runtime "$runtime_json"
-        fw_apply_tc
     else
         runtime_clear_nft_runtime
-        fw_apply_accounting_runtime "$runtime_json"
-        fw_apply_tc
     fi
 
     backend="$(runtime_backend_label "$RUNTIME_XDP_FORWARD_APPLIED" "$nft_applied" "$RUNTIME_XDP_APPLIED" "$RUNTIME_XDP_ERROR")"
+    host_egress_backend="$(runtime_host_egress_backend "$backend" "$host_egress_required")"
+    runtime_json="$(jq --arg backend "$host_egress_backend" '.settings.host_egress_backend = $backend' <<< "$runtime_json")"
+
+    if [ "$total_rules" -gt 0 ] || [ "$host_egress_backend" = "nft" ]; then
+        fw_apply_accounting_runtime "$runtime_json"
+    else
+        runtime_clear_accounting_runtime
+    fi
+    fw_apply_tc
+
     if [ -n "$RUNTIME_XDP_ERROR" ] && [ "$nft_applied" = "true" ]; then
         fallback_reason="XDP 不可用，已自动切换到 nftables"
     fi

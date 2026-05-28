@@ -283,7 +283,7 @@ pfwd - XDP 端口转发管理脚本
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
   流量防护（协议封锁 + 入口白名单 + 出口白名单）由 `guard` 子命令管理。
   入口白名单限制的是入站来源 IPv4 / IPv6 CIDR；默认可直接启用国内 IP 白名单，也可额外追加自定义 CIDR，且支持输入单个 IP（自动规范化为 /32 或 /128）。
-  出口白名单限制的是转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但解析出的每个目标 IP 都必须命中出口白名单。
+  出口白名单限制的是转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但解析出的每个目标 IP 都必须命中出口白名单；同时会作用于宿主机全部非 loopback 出口流量。
   两类白名单都支持 IPv4 / IPv6 CIDR，也支持输入单个 IP（自动规范化为 /32 或 /128）；国内 IPv4 默认数据源为 `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`，国内 IPv6 默认数据源为 `https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone`。
 EOF
 }

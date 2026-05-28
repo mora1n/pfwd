@@ -213,6 +213,69 @@ fw_validate_render_file() {
     rm -f "$validate_file"
 }
 
+fw_host_egress_enabled() {
+    local runtime_json="$1"
+    jq -e '(.settings.host_egress_enabled // false) == true and (.settings.host_egress_backend // "off") == "nft"' >/dev/null <<< "$runtime_json"
+}
+
+fw_host_egress_allow_v4_set_name() {
+    printf '%s\n' "pfwd_host_egress_allow_v4"
+}
+
+fw_host_egress_allow_v6_set_name() {
+    printf '%s\n' "pfwd_host_egress_allow_v6"
+}
+
+fw_render_interval_set_elements() {
+    local file_path="$1"
+    local first=1 line
+    [ -f "$file_path" ] || return 0
+    while IFS= read -r line; do
+        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        [ "$first" -eq 1 ] || printf ', '
+        printf '%s' "$line"
+        first=0
+    done < "$file_path"
+}
+
+fw_render_host_egress_objects() {
+    local runtime_json="$1"
+    local host_v4_file host_v6_file
+    host_v4_file="$(jq -r '.settings.host_egress_allow_ipv4_file // empty' <<< "$runtime_json")"
+    host_v6_file="$(jq -r '.settings.host_egress_allow_ipv6_file // empty' <<< "$runtime_json")"
+
+    echo "  set $(fw_host_egress_allow_v4_set_name) {"
+    echo "    type ipv4_addr"
+    echo "    flags interval"
+    printf '    elements = { '
+    fw_render_interval_set_elements "$host_v4_file"
+    echo ' }'
+    echo "  }"
+    echo
+
+    echo "  set $(fw_host_egress_allow_v6_set_name) {"
+    echo "    type ipv6_addr"
+    echo "    flags interval"
+    printf '    elements = { '
+    fw_render_interval_set_elements "$host_v6_file"
+    echo ' }'
+    echo "  }"
+    echo
+}
+
+fw_render_host_egress_chain() {
+    echo "  chain output_host_egress {"
+    echo "    type filter hook output priority filter - 10; policy accept;"
+    echo '    oifname "lo" counter accept'
+    echo '    ct state established,related counter accept'
+    echo "    ip daddr @$(fw_host_egress_allow_v4_set_name) counter accept"
+    echo "    ip6 daddr @$(fw_host_egress_allow_v6_set_name) counter accept"
+    echo '    meta nfproto ipv4 counter drop comment "pfwd host egress whitelist drop v4"'
+    echo '    meta nfproto ipv6 counter drop comment "pfwd host egress whitelist drop v6"'
+    echo "  }"
+}
+
 fw_render_runtime_to_stdout() {
     local runtime_json="$1"
     local table family
@@ -350,6 +413,10 @@ fw_render_nft_objects() {
     stats_file="$PFWD_STATS_FILE"
     users_json="$(jq -c '.users // []' <<< "$runtime_json")"
 
+    if fw_host_egress_enabled "$runtime_json"; then
+        fw_render_host_egress_objects "$runtime_json"
+    fi
+
     jq -r --argjson users "$users_json" --slurpfile stats "$stats_file" '
       $users[]
       | select((.traffic_limit_bytes // 0) > 0)
@@ -470,6 +537,10 @@ fw_render_accounting_to_stdout() {
     table="$(fw_table)"
     echo "table $family $table {"
     fw_render_nft_objects "$runtime_json"
+    if fw_host_egress_enabled "$runtime_json"; then
+        fw_render_host_egress_chain
+        echo
+    fi
     fw_render_prerouting_count_chain "$runtime_json"
     fw_render_postrouting_count_chain "$runtime_json"
     echo "}"

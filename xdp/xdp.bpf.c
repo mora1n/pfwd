@@ -14,7 +14,8 @@ enum pfwd_stat_index {
     PFWD_STAT_PARSE_SKIPPED = 6,
     PFWD_STAT_TCP_PREWARMED = 7,
     PFWD_STAT_TCP_ESTABLISHED = 8,
-    PFWD_STAT_MAX = 9,
+    PFWD_STAT_HOST_EGRESS_DROPPED = 9,
+    PFWD_STAT_MAX = 10,
 };
 
 enum pfwd_snat_mode {
@@ -323,11 +324,48 @@ struct {
 } pfwd_whitelist_cache_v6 SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_whitelist_key_v4);
+    __type(value, __u8);
+} pfwd_egress_whitelist_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_whitelist_key_v6);
+    __type(value, __u8);
+} pfwd_egress_whitelist_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __be32);
+    __type(value, __u8);
+} pfwd_egress_whitelist_cache_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_whitelist_cache_key_v6);
+    __type(value, __u8);
+} pfwd_egress_whitelist_cache_v6 SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, struct pfwd_flow_key);
     __type(value, __u8);
 } pfwd_allowed_flows SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_flow_key);
+    __type(value, __u8);
+} pfwd_host_egress_flows SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -788,6 +826,78 @@ static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
     return verdict == PFWD_CACHE_ALLOW;
 }
 
+static __always_inline int egress_whitelist_match_v4(__be32 addr) {
+    struct pfwd_whitelist_key_v4 key = {
+        .prefixlen = 32,
+        .addr = addr,
+    };
+    __u8 *value = bpf_map_lookup_elem(&pfwd_egress_whitelist_v4, &key);
+    return value != 0;
+}
+
+static __always_inline int egress_whitelist_cache_hit_v4(__be32 addr) {
+    __u8 *value = bpf_map_lookup_elem(&pfwd_egress_whitelist_cache_v4, &addr);
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
+}
+
+static __always_inline void egress_whitelist_cache_store_v4(__be32 addr, __u8 verdict) {
+    __u8 value = verdict;
+    bpf_map_update_elem(&pfwd_egress_whitelist_cache_v4, &addr, &value, BPF_ANY);
+}
+
+static __always_inline int egress_whitelist_match_v6(const __u8 addr[16]) {
+    struct pfwd_whitelist_key_v6 key = {
+        .prefixlen = 128,
+    };
+    __u8 *value;
+    pfwd_memcpy16(key.addr, addr);
+    value = bpf_map_lookup_elem(&pfwd_egress_whitelist_v6, &key);
+    return value != 0;
+}
+
+static __always_inline int egress_whitelist_cache_hit_v6(const __u8 addr[16]) {
+    struct pfwd_whitelist_cache_key_v6 key = {};
+    __u8 *value;
+    pfwd_memcpy16(key.addr, addr);
+    value = bpf_map_lookup_elem(&pfwd_egress_whitelist_cache_v6, &key);
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
+}
+
+static __always_inline void egress_whitelist_cache_store_v6(const __u8 addr[16], __u8 verdict) {
+    struct pfwd_whitelist_cache_key_v6 key = {};
+    __u8 value = verdict;
+    pfwd_memcpy16(key.addr, addr);
+    bpf_map_update_elem(&pfwd_egress_whitelist_cache_v6, &key, &value, BPF_ANY);
+}
+
+static __always_inline int egress_whitelist_allowed_v4(__be32 addr) {
+    int verdict = egress_whitelist_cache_hit_v4(addr);
+
+    if (verdict != PFWD_CACHE_UNKNOWN) {
+        return verdict == PFWD_CACHE_ALLOW;
+    }
+    verdict = egress_whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    egress_whitelist_cache_store_v4(addr, verdict);
+    return verdict == PFWD_CACHE_ALLOW;
+}
+
+static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16]) {
+    int verdict = egress_whitelist_cache_hit_v6(addr);
+
+    if (verdict != PFWD_CACHE_UNKNOWN) {
+        return verdict == PFWD_CACHE_ALLOW;
+    }
+    verdict = egress_whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    egress_whitelist_cache_store_v6(addr, verdict);
+    return verdict == PFWD_CACHE_ALLOW;
+}
+
 static __always_inline __u64 rule_counter_billing_total(struct pfwd_counter *counter, __u64 base) {
     if (!counter) {
         return base;
@@ -1203,6 +1313,32 @@ static __always_inline void flow_store_allow(struct pfwd_flow_key *key) {
 
 static __always_inline void flow_store_drop(struct pfwd_flow_key *key) {
     flow_store_verdict(key, PFWD_CACHE_DROP);
+}
+
+static __always_inline int host_egress_flow_cached_verdict(struct pfwd_flow_key *key) {
+    __u8 *value = bpf_map_lookup_elem(&pfwd_host_egress_flows, key);
+    if (!value) {
+        return PFWD_CACHE_UNKNOWN;
+    }
+    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
+}
+
+static __always_inline void host_egress_flow_store_verdict(struct pfwd_flow_key *key, __u8 verdict) {
+    __u8 value = verdict;
+    bpf_map_update_elem(&pfwd_host_egress_flows, key, &value, BPF_ANY);
+}
+
+static __always_inline void host_egress_flow_store_allow(struct pfwd_flow_key *key) {
+    host_egress_flow_store_verdict(key, PFWD_CACHE_ALLOW);
+}
+
+static __always_inline void host_egress_flow_store_drop(struct pfwd_flow_key *key) {
+    host_egress_flow_store_verdict(key, PFWD_CACHE_DROP);
+}
+
+static __always_inline void count_host_egress_drop(void) {
+    stat_inc(PFWD_STAT_DROPPED);
+    stat_inc(PFWD_STAT_HOST_EGRESS_DROPPED);
 }
 
 static __always_inline void load_guard_payload_prefix(
@@ -1858,6 +1994,288 @@ static __always_inline int tc_local_forward_v6(
     }
     count_input_with_plan(rule, packet_len, 1, &counters);
     stat_inc(PFWD_STAT_FORWARDED);
+    return TC_ACT_OK;
+}
+
+static __always_inline int host_egress_allow_v4_tcp(
+    struct ipv4hdr_min *ip4,
+    __u32 ihl,
+    void *data_end
+) {
+    struct tcphdr_min *tcp = (void *)ip4 + ihl;
+    struct pfwd_flow_key flow = {};
+    int verdict;
+
+    if ((void *)(tcp + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    flow.family = 4;
+    flow.protocol = IPPROTO_TCP;
+    flow.sport = tcp->source;
+    flow.dport = tcp->dest;
+    *(__be32 *)&flow.saddr[0] = ip4->saddr;
+    *(__be32 *)&flow.daddr[0] = ip4->daddr;
+    verdict = host_egress_flow_cached_verdict(&flow);
+    if (verdict == PFWD_CACHE_ALLOW) {
+        return TC_ACT_OK;
+    }
+    if (verdict == PFWD_CACHE_DROP) {
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
+    if (egress_whitelist_allowed_v4(ip4->daddr)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    if (!tcp_syn_only(tcp)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    host_egress_flow_store_drop(&flow);
+    count_host_egress_drop();
+    return TC_ACT_SHOT;
+}
+
+static __always_inline int host_egress_allow_v4_udp(
+    struct ipv4hdr_min *ip4,
+    __u32 ihl,
+    void *data_end
+) {
+    struct udphdr_min *udp = (void *)ip4 + ihl;
+    struct pfwd_flow_key flow = {};
+    int verdict;
+
+    if ((void *)(udp + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    flow.family = 4;
+    flow.protocol = IPPROTO_UDP;
+    flow.sport = udp->source;
+    flow.dport = udp->dest;
+    *(__be32 *)&flow.saddr[0] = ip4->saddr;
+    *(__be32 *)&flow.daddr[0] = ip4->daddr;
+    verdict = host_egress_flow_cached_verdict(&flow);
+    if (verdict == PFWD_CACHE_ALLOW) {
+        return TC_ACT_OK;
+    }
+    if (verdict == PFWD_CACHE_DROP) {
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
+    if (egress_whitelist_allowed_v4(ip4->daddr)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    host_egress_flow_store_drop(&flow);
+    count_host_egress_drop();
+    return TC_ACT_SHOT;
+}
+
+static __always_inline int host_egress_allow_v6_tcp(
+    struct ipv6hdr_min *ip6,
+    void *data_end
+) {
+    struct tcphdr_min *tcp = (void *)(ip6 + 1);
+    struct pfwd_flow_key flow = {};
+    int verdict;
+
+    if ((void *)(tcp + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    flow.family = 6;
+    flow.protocol = IPPROTO_TCP;
+    flow.sport = tcp->source;
+    flow.dport = tcp->dest;
+    pfwd_memcpy16(flow.saddr, ip6->saddr);
+    pfwd_memcpy16(flow.daddr, ip6->daddr);
+    verdict = host_egress_flow_cached_verdict(&flow);
+    if (verdict == PFWD_CACHE_ALLOW) {
+        return TC_ACT_OK;
+    }
+    if (verdict == PFWD_CACHE_DROP) {
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
+    if (egress_whitelist_allowed_v6(ip6->daddr)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    if (!tcp_syn_only(tcp)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    host_egress_flow_store_drop(&flow);
+    count_host_egress_drop();
+    return TC_ACT_SHOT;
+}
+
+static __always_inline int host_egress_allow_v6_udp(
+    struct ipv6hdr_min *ip6,
+    void *data_end
+) {
+    struct udphdr_min *udp = (void *)(ip6 + 1);
+    struct pfwd_flow_key flow = {};
+    int verdict;
+
+    if ((void *)(udp + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    flow.family = 6;
+    flow.protocol = IPPROTO_UDP;
+    flow.sport = udp->source;
+    flow.dport = udp->dest;
+    pfwd_memcpy16(flow.saddr, ip6->saddr);
+    pfwd_memcpy16(flow.daddr, ip6->daddr);
+    verdict = host_egress_flow_cached_verdict(&flow);
+    if (verdict == PFWD_CACHE_ALLOW) {
+        return TC_ACT_OK;
+    }
+    if (verdict == PFWD_CACHE_DROP) {
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
+    if (egress_whitelist_allowed_v6(ip6->daddr)) {
+        host_egress_flow_store_allow(&flow);
+        return TC_ACT_OK;
+    }
+    host_egress_flow_store_drop(&flow);
+    count_host_egress_drop();
+    return TC_ACT_SHOT;
+}
+
+SEC("tc")
+int pfwd_host_egress(struct __sk_buff *skb) {
+    void *data;
+    void *data_end;
+    struct ethhdr *eth;
+
+    if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv4hdr_min)) < 0) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    data = (void *)(long)skb->data;
+    data_end = (void *)(long)skb->data_end;
+    eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        stat_inc(PFWD_STAT_PARSE_SKIPPED);
+        return TC_ACT_OK;
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IP) {
+        struct ipv4hdr_min *ip4 = (void *)(eth + 1);
+        __u32 ihl;
+        __u8 protocol;
+
+        if ((void *)(ip4 + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        ihl = (__u32)(ip4->version_ihl & 0x0f) * 4;
+        if (ihl < sizeof(*ip4)) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        protocol = ip4->protocol;
+        if (protocol == IPPROTO_TCP) {
+            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct tcphdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip4 = (void *)(eth + 1);
+            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            return host_egress_allow_v4_tcp(ip4, ihl, data_end);
+        }
+        if (protocol == IPPROTO_UDP) {
+            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct udphdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip4 = (void *)(eth + 1);
+            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            return host_egress_allow_v4_udp(ip4, ihl, data_end);
+        }
+        if (egress_whitelist_allowed_v4(ip4->daddr)) {
+            return TC_ACT_OK;
+        }
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
+    if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
+        struct ipv6hdr_min *ip6 = (void *)(eth + 1);
+        __u8 protocol;
+
+        if ((void *)(ip6 + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        protocol = ip6->nexthdr;
+        if (protocol == IPPROTO_TCP) {
+            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct tcphdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip6 = (void *)(eth + 1);
+            if ((void *)(ip6 + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            return host_egress_allow_v6_tcp(ip6, data_end);
+        }
+        if (protocol == IPPROTO_UDP) {
+            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct udphdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip6 = (void *)(eth + 1);
+            if ((void *)(ip6 + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            return host_egress_allow_v6_udp(ip6, data_end);
+        }
+        if (egress_whitelist_allowed_v6(ip6->daddr)) {
+            return TC_ACT_OK;
+        }
+        count_host_egress_drop();
+        return TC_ACT_SHOT;
+    }
     return TC_ACT_OK;
 }
 

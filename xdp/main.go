@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
-const mapABIVersion = 5
+const mapABIVersion = 6
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
@@ -48,30 +49,38 @@ const tcPrefBPFIngress = "10"
 const tcPrefBPFEgress = "10"
 const connStateTCPSynPending = uint8(1)
 const connStateTCPEstablished = uint8(2)
-const statsEntryCount = 9
+const statsEntryCount = 10
+const cacheVerdictAllow = uint8(1)
+const cacheVerdictDrop = uint8(2)
 
 type bpfObjects struct {
-	PFWDXDP              *ebpf.Program `ebpf:"pfwd_xdp"`
-	PFWDIngress          *ebpf.Program `ebpf:"pfwd_ingress"`
-	PFWDLoopbackEgress   *ebpf.Program `ebpf:"pfwd_loopback_egress"`
-	PFWDSkLookup         *ebpf.Program `ebpf:"pfwd_sk_lookup"`
-	PFWDSettings         *ebpf.Map     `ebpf:"pfwd_settings"`
-	PFWDRules            *ebpf.Map     `ebpf:"pfwd_rules"`
-	PFWDConnections      *ebpf.Map     `ebpf:"pfwd_connections"`
-	PFWDReverse          *ebpf.Map     `ebpf:"pfwd_reverse"`
-	PFWDRuleCounter      *ebpf.Map     `ebpf:"pfwd_rule_counters"`
-	PFWDRuleReplyCounter *ebpf.Map     `ebpf:"pfwd_rule_reply_counters"`
-	PFWDRuleDropCounter  *ebpf.Map     `ebpf:"pfwd_rule_drop_counters"`
-	PFWDUserCounter      *ebpf.Map     `ebpf:"pfwd_user_counters"`
-	PFWDStats            *ebpf.Map     `ebpf:"pfwd_stats"`
-	PFWDWhitelistV4      *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
-	PFWDWhitelistV6      *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
-	PFWDWhitelistCacheV4 *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v4"`
-	PFWDWhitelistCacheV6 *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v6"`
-	PFWDFlows            *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
-	PFWDGuardPrefixes    *ebpf.Map     `ebpf:"pfwd_guard_prefixes"`
-	PFWDSkipPorts        *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
-	PFWDScratch          *ebpf.Map     `ebpf:"pfwd_scratch"`
+	PFWDXDP                    *ebpf.Program `ebpf:"pfwd_xdp"`
+	PFWDIngress                *ebpf.Program `ebpf:"pfwd_ingress"`
+	PFWDHostEgress             *ebpf.Program `ebpf:"pfwd_host_egress"`
+	PFWDLoopbackEgress         *ebpf.Program `ebpf:"pfwd_loopback_egress"`
+	PFWDSkLookup               *ebpf.Program `ebpf:"pfwd_sk_lookup"`
+	PFWDSettings               *ebpf.Map     `ebpf:"pfwd_settings"`
+	PFWDRules                  *ebpf.Map     `ebpf:"pfwd_rules"`
+	PFWDConnections            *ebpf.Map     `ebpf:"pfwd_connections"`
+	PFWDReverse                *ebpf.Map     `ebpf:"pfwd_reverse"`
+	PFWDRuleCounter            *ebpf.Map     `ebpf:"pfwd_rule_counters"`
+	PFWDRuleReplyCounter       *ebpf.Map     `ebpf:"pfwd_rule_reply_counters"`
+	PFWDRuleDropCounter        *ebpf.Map     `ebpf:"pfwd_rule_drop_counters"`
+	PFWDUserCounter            *ebpf.Map     `ebpf:"pfwd_user_counters"`
+	PFWDStats                  *ebpf.Map     `ebpf:"pfwd_stats"`
+	PFWDWhitelistV4            *ebpf.Map     `ebpf:"pfwd_whitelist_v4"`
+	PFWDWhitelistV6            *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
+	PFWDWhitelistCacheV4       *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v4"`
+	PFWDWhitelistCacheV6       *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v6"`
+	PFWDEgressWhitelistV4      *ebpf.Map     `ebpf:"pfwd_egress_whitelist_v4"`
+	PFWDEgressWhitelistV6      *ebpf.Map     `ebpf:"pfwd_egress_whitelist_v6"`
+	PFWDEgressWhitelistCacheV4 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v4"`
+	PFWDEgressWhitelistCacheV6 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v6"`
+	PFWDFlows                  *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
+	PFWDHostEgressFlows        *ebpf.Map     `ebpf:"pfwd_host_egress_flows"`
+	PFWDGuardPrefixes          *ebpf.Map     `ebpf:"pfwd_guard_prefixes"`
+	PFWDSkipPorts              *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
+	PFWDScratch                *ebpf.Map     `ebpf:"pfwd_scratch"`
 }
 
 func (o *bpfObjects) Close() {
@@ -79,9 +88,10 @@ func (o *bpfObjects) Close() {
 		return
 	}
 	for _, closer := range []interface{ Close() error }{
-		o.PFWDXDP, o.PFWDIngress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
+		o.PFWDXDP, o.PFWDIngress, o.PFWDHostEgress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
 		o.PFWDRuleCounter, o.PFWDRuleReplyCounter, o.PFWDRuleDropCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
-		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDFlows, o.PFWDGuardPrefixes, o.PFWDSkipPorts, o.PFWDScratch,
+		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDEgressWhitelistV4, o.PFWDEgressWhitelistV6,
+		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDHostEgressFlows, o.PFWDGuardPrefixes, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
 			_ = closer.Close()
@@ -97,6 +107,7 @@ type applyOptions struct {
 	StatusFile     string
 	XDPPin         string
 	IngressPin     string
+	HostEgressPin  string
 	LoopbackPin    string
 	SkLookupPin    string
 	RuleCounterPin string
@@ -110,6 +121,7 @@ type removeOptions struct {
 	StatusFile     string
 	XDPPin         string
 	IngressPin     string
+	HostEgressPin  string
 	LoopbackPin    string
 	SkLookupPin    string
 	RuleCounterPin string
@@ -162,6 +174,7 @@ type runtimeSemanticSettings struct {
 	Interface         string   `json:"interface"`
 	GuardEnabled      bool     `json:"guard_enabled"`
 	WhitelistEnabled  bool     `json:"whitelist_enabled"`
+	HostEgressEnabled bool     `json:"host_egress_enabled"`
 	BlockHTTP         bool     `json:"block_http"`
 	BlockTLS          bool     `json:"block_tls"`
 	BlockSOCKS        bool     `json:"block_socks"`
@@ -192,15 +205,17 @@ type runtimeSemanticRule struct {
 }
 
 type runtimeSettings struct {
-	Interface         string   `json:"interface"`
-	GuardEnabled      bool     `json:"guard_enabled"`
-	WhitelistEnabled  bool     `json:"whitelist_enabled"`
-	BlockHTTP         bool     `json:"block_http"`
-	BlockTLS          bool     `json:"block_tls"`
-	BlockSOCKS        bool     `json:"block_socks"`
-	ProtocolSkipPorts []uint16 `json:"protocol_skip_ports,omitempty"`
-	WhitelistFiles    []string `json:"whitelist_files,omitempty"`
-	GuardIngressMode  string   `json:"guard_ingress_mode,omitempty"`
+	Interface            string   `json:"interface"`
+	GuardEnabled         bool     `json:"guard_enabled"`
+	WhitelistEnabled     bool     `json:"whitelist_enabled"`
+	HostEgressEnabled    bool     `json:"host_egress_enabled"`
+	BlockHTTP            bool     `json:"block_http"`
+	BlockTLS             bool     `json:"block_tls"`
+	BlockSOCKS           bool     `json:"block_socks"`
+	ProtocolSkipPorts    []uint16 `json:"protocol_skip_ports,omitempty"`
+	WhitelistFiles       []string `json:"whitelist_files,omitempty"`
+	EgressWhitelistFiles []string `json:"egress_whitelist_files,omitempty"`
+	GuardIngressMode     string   `json:"guard_ingress_mode,omitempty"`
 }
 
 type runtimeUser struct {
@@ -249,6 +264,8 @@ type statusPayload struct {
 	XDPAttachKind          string         `json:"xdp_attach_kind,omitempty"`
 	XDPReason              string         `json:"xdp_reason,omitempty"`
 	IngressKind            string         `json:"ingress_kind,omitempty"`
+	HostEgressEnabled      bool           `json:"host_egress_enabled,omitempty"`
+	HostEgressInterfaces   []string       `json:"host_egress_interfaces,omitempty"`
 	LoopbackKind           string         `json:"loopback_kind,omitempty"`
 	SkLookupKind           string         `json:"sk_lookup_kind,omitempty"`
 	ProtocolGuard          bool           `json:"protocol_guard,omitempty"`
@@ -267,6 +284,7 @@ type statusPayload struct {
 	Users                  int            `json:"users,omitempty"`
 	XDPPin                 string         `json:"xdp_pin,omitempty"`
 	IngressPin             string         `json:"ingress_pin,omitempty"`
+	HostEgressPin          string         `json:"host_egress_pin,omitempty"`
 	LoopbackPin            string         `json:"loopback_pin,omitempty"`
 	SkLookupPin            string         `json:"sk_lookup_pin,omitempty"`
 	RuleCounterPin         string         `json:"rule_counter_pin,omitempty"`
@@ -312,22 +330,27 @@ type mapReconcileReport struct {
 }
 
 type runtimeMapPins struct {
-	Settings         string
-	Rules            string
-	Connections      string
-	Reverse          string
-	RuleCounter      string
-	RuleReplyCounter string
-	RuleDropCounter  string
-	UserCounter      string
-	Stats            string
-	WhitelistV4      string
-	WhitelistV6      string
-	WhitelistCacheV4 string
-	WhitelistCacheV6 string
-	AllowedFlows     string
-	GuardPrefixes    string
-	SkipPorts        string
+	Settings               string
+	Rules                  string
+	Connections            string
+	Reverse                string
+	RuleCounter            string
+	RuleReplyCounter       string
+	RuleDropCounter        string
+	UserCounter            string
+	Stats                  string
+	WhitelistV4            string
+	WhitelistV6            string
+	WhitelistCacheV4       string
+	WhitelistCacheV6       string
+	EgressWhitelistV4      string
+	EgressWhitelistV6      string
+	EgressWhitelistCacheV4 string
+	EgressWhitelistCacheV6 string
+	AllowedFlows           string
+	HostEgressFlows        string
+	GuardPrefixes          string
+	SkipPorts              string
 }
 
 type xdpSettings struct {
@@ -558,6 +581,7 @@ func runApply(args []string) error {
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
 	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs xdp link pin")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs ingress link pin")
+	fs.StringVar(&opts.HostEgressPin, "host-egress-pin", "", "bpffs host egress tc program pin")
 	fs.StringVar(&opts.LoopbackPin, "loopback-pin", "", "bpffs loopback egress link pin")
 	fs.StringVar(&opts.SkLookupPin, "sk-lookup-pin", "", "bpffs sk_lookup link pin")
 	fs.StringVar(&opts.RuleCounterPin, "rule-counter-pin", "/sys/fs/bpf/pfwd_rule_counters", "bpffs rule counter map pin")
@@ -581,6 +605,7 @@ func runRemove(args []string) error {
 	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
 	fs.StringVar(&opts.XDPPin, "xdp-pin", "", "bpffs xdp link pin")
 	fs.StringVar(&opts.IngressPin, "ingress-pin", "", "bpffs ingress link pin")
+	fs.StringVar(&opts.HostEgressPin, "host-egress-pin", "", "bpffs host egress tc program pin")
 	fs.StringVar(&opts.LoopbackPin, "loopback-pin", "", "bpffs loopback egress link pin")
 	fs.StringVar(&opts.SkLookupPin, "sk-lookup-pin", "", "bpffs sk_lookup link pin")
 	fs.StringVar(&opts.RuleCounterPin, "rule-counter-pin", "", "bpffs rule counter map pin")
@@ -693,6 +718,9 @@ func applyRuntime(opts applyOptions) error {
 	if opts.IngressPin == "" {
 		return fmt.Errorf("缺少 --ingress-pin")
 	}
+	if runtimeData.Settings.HostEgressEnabled && opts.HostEgressPin == "" {
+		return fmt.Errorf("缺少 --host-egress-pin")
+	}
 	if opts.RuleCounterPin == "" {
 		return fmt.Errorf("缺少 --rule-counter-pin")
 	}
@@ -710,6 +738,7 @@ func applyRuntime(opts applyOptions) error {
 			StatusFile:     opts.StatusFile,
 			XDPPin:         opts.XDPPin,
 			IngressPin:     opts.IngressPin,
+			HostEgressPin:  opts.HostEgressPin,
 			LoopbackPin:    opts.LoopbackPin,
 			SkLookupPin:    opts.SkLookupPin,
 			RuleCounterPin: opts.RuleCounterPin,
@@ -725,6 +754,18 @@ func applyRuntime(opts applyOptions) error {
 	if err != nil {
 		return fmt.Errorf("查找网卡 %q 失败: %w", opts.Iface, err)
 	}
+	hostEgressIfaces := []net.Interface{}
+	hostEgressNames := []string{}
+	if runtimeData.Settings.HostEgressEnabled {
+		hostEgressIfaces, err = listHostEgressInterfaces()
+		if err != nil {
+			return err
+		}
+		if len(hostEgressIfaces) == 0 {
+			return fmt.Errorf("未发现可附着宿主机出口白名单的非 loopback 网卡")
+		}
+		hostEgressNames = interfaceNames(hostEgressIfaces)
+	}
 	currentStatus, _ := readStatus(opts.StatusFile)
 	protocolGuard := protocolGuardEnabled(runtimeData.Settings)
 	needIngress := opts.GuardMode == "ingress" || (protocolGuard && guardIngressEnabled(runtimeData.Settings))
@@ -737,11 +778,14 @@ func applyRuntime(opts applyOptions) error {
 		currentStatus.ConfigHash == runtimeSemanticConfigHash &&
 		currentStatus.GuardMode == opts.GuardMode &&
 		currentStatus.Interface == iface.Name &&
+		currentStatus.HostEgressEnabled == runtimeData.Settings.HostEgressEnabled &&
+		(!runtimeData.Settings.HostEgressEnabled || stringSlicesEqual(currentStatus.HostEgressInterfaces, hostEgressNames)) &&
+		(!runtimeData.Settings.HostEgressEnabled || pinnedPathExists(firstNonEmpty(opts.HostEgressPin, currentStatus.HostEgressPin))) &&
 		pinnedRuntimeMapsCompatible(opts) {
 		return nil
 	}
-	if canIncrementalApply(currentStatus, runtimeData, opts, iface, needIngress) {
-		if err := applyIncrementalRuntime(currentStatus, runtimeData, opts, iface, protocolGuard); err == nil {
+	if canIncrementalApply(currentStatus, runtimeData, opts, iface, needIngress, hostEgressNames) {
+		if err := applyIncrementalRuntime(currentStatus, runtimeData, opts, iface, protocolGuard, hostEgressNames); err == nil {
 			return nil
 		} else if !opts.Quiet {
 			fmt.Fprintf(os.Stderr, "pfwd-xdp: incremental apply 失败，回退到 full reattach: %v\n", err)
@@ -753,6 +797,7 @@ func applyRuntime(opts applyOptions) error {
 		StatusFile:     opts.StatusFile,
 		XDPPin:         opts.XDPPin,
 		IngressPin:     opts.IngressPin,
+		HostEgressPin:  opts.HostEgressPin,
 		LoopbackPin:    opts.LoopbackPin,
 		SkLookupPin:    opts.SkLookupPin,
 		RuleCounterPin: opts.RuleCounterPin,
@@ -761,7 +806,7 @@ func applyRuntime(opts applyOptions) error {
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧运行态失败: %w", err)
 	}
-	objs, err := loadObjects(opts.GuardMode)
+	objs, err := loadObjects(opts.GuardMode, runtimeData.Settings.HostEgressEnabled)
 	if err != nil {
 		return err
 	}
@@ -794,6 +839,13 @@ func applyRuntime(opts applyOptions) error {
 	} else if err := removeIngressRuntime(opts.IngressPin, iface.Name); err != nil {
 		return err
 	}
+	if runtimeData.Settings.HostEgressEnabled {
+		if hostEgressNames, err = attachHostEgress(hostEgressIfaces, objs.PFWDHostEgress, opts.HostEgressPin); err != nil {
+			return err
+		}
+	} else if err := removeHostEgressRuntime(opts.HostEgressPin, nil); err != nil {
+		return err
+	}
 	loopbackKind := ""
 	skLookupKind := ""
 	if err := removeSkLookupRuntime(opts.SkLookupPin); err != nil {
@@ -805,6 +857,9 @@ func applyRuntime(opts applyOptions) error {
 	if ingressKind != "" && !opts.Quiet {
 		fmt.Fprintf(os.Stderr, "pfwd-xdp: tc ingress attached via %s\n", ingressKind)
 	}
+	if len(hostEgressNames) > 0 && !opts.Quiet {
+		fmt.Fprintf(os.Stderr, "pfwd-xdp: host egress attached on %s\n", strings.Join(hostEgressNames, ","))
+	}
 	if loopbackKind != "" && !opts.Quiet {
 		fmt.Fprintf(os.Stderr, "pfwd-xdp: loopback egress attached via %s\n", loopbackKind)
 	}
@@ -813,37 +868,40 @@ func applyRuntime(opts applyOptions) error {
 	}
 	statusStart := time.Now()
 	payload := statusPayload{
-		Applied:          true,
-		BinaryVersion:    binaryVersion,
-		AppliedAt:        time.Now().UTC().Format(time.RFC3339),
-		Interface:        iface.Name,
-		InterfaceIndex:   iface.Index,
-		GuardMode:        opts.GuardMode,
-		XDPEffective:     xdpEffective,
-		XDPAttachKind:    xdpKind,
-		XDPReason:        xdpReason,
-		IngressKind:      ingressKind,
-		LoopbackKind:     loopbackKind,
-		SkLookupKind:     skLookupKind,
-		ProtocolGuard:    protocolGuard,
-		RuntimeFile:      opts.RuntimeFile,
-		StateFile:        opts.StateFile,
-		ConfigHash:       runtimeSemanticConfigHash,
-		RuntimeEpoch:     runtimeSemanticConfigHash,
-		DataplaneVersion: dataplaneVersion,
-		MapABIVersion:    mapABIVersion,
-		IncrementalApply: false,
-		ReattachReason:   "full-reattach",
-		ProfileCounts:    profileCounts(runtimeData),
-		Rules:            len(runtimeData.Rules),
-		Users:            len(runtimeData.Users),
-		XDPPin:           opts.XDPPin,
-		IngressPin:       opts.IngressPin,
-		LoopbackPin:      opts.LoopbackPin,
-		SkLookupPin:      opts.SkLookupPin,
-		RuleCounterPin:   opts.RuleCounterPin,
-		UserCounterPin:   opts.UserCounterPin,
-		StatsPin:         opts.StatsPin,
+		Applied:              true,
+		BinaryVersion:        binaryVersion,
+		AppliedAt:            time.Now().UTC().Format(time.RFC3339),
+		Interface:            iface.Name,
+		InterfaceIndex:       iface.Index,
+		GuardMode:            opts.GuardMode,
+		XDPEffective:         xdpEffective,
+		XDPAttachKind:        xdpKind,
+		XDPReason:            xdpReason,
+		IngressKind:          ingressKind,
+		HostEgressEnabled:    runtimeData.Settings.HostEgressEnabled,
+		HostEgressInterfaces: hostEgressNames,
+		LoopbackKind:         loopbackKind,
+		SkLookupKind:         skLookupKind,
+		ProtocolGuard:        protocolGuard,
+		RuntimeFile:          opts.RuntimeFile,
+		StateFile:            opts.StateFile,
+		ConfigHash:           runtimeSemanticConfigHash,
+		RuntimeEpoch:         runtimeSemanticConfigHash,
+		DataplaneVersion:     dataplaneVersion,
+		MapABIVersion:        mapABIVersion,
+		IncrementalApply:     false,
+		ReattachReason:       "full-reattach",
+		ProfileCounts:        profileCounts(runtimeData),
+		Rules:                len(runtimeData.Rules),
+		Users:                len(runtimeData.Users),
+		XDPPin:               opts.XDPPin,
+		IngressPin:           opts.IngressPin,
+		HostEgressPin:        opts.HostEgressPin,
+		LoopbackPin:          opts.LoopbackPin,
+		SkLookupPin:          opts.SkLookupPin,
+		RuleCounterPin:       opts.RuleCounterPin,
+		UserCounterPin:       opts.UserCounterPin,
+		StatsPin:             opts.StatsPin,
 	}
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		payload.ActiveSummary = summary
@@ -862,13 +920,16 @@ func applyRuntime(opts applyOptions) error {
 	return writeStatus(opts.StatusFile, payload)
 }
 
-func loadObjects(guardMode string) (*bpfObjects, error) {
+func loadObjects(guardMode string, hostEgressEnabled bool) (*bpfObjects, error) {
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpBPFEL))
 	if err != nil {
 		return nil, fmt.Errorf("加载 eBPF spec 失败: %w", err)
 	}
 	delete(spec.Programs, "pfwd_loopback_egress")
 	delete(spec.Programs, "pfwd_sk_lookup")
+	if !hostEgressEnabled {
+		delete(spec.Programs, "pfwd_host_egress")
+	}
 	if guardMode != "full" {
 		delete(spec.Programs, "pfwd_xdp")
 	}
@@ -883,27 +944,33 @@ func loadObjects(guardMode string) (*bpfObjects, error) {
 		return nil, fmt.Errorf("加载 eBPF 对象失败: %+v", err)
 	}
 	objs := &bpfObjects{
-		PFWDXDP:              coll.Programs["pfwd_xdp"],
-		PFWDIngress:          coll.Programs["pfwd_ingress"],
-		PFWDLoopbackEgress:   coll.Programs["pfwd_loopback_egress"],
-		PFWDSkLookup:         coll.Programs["pfwd_sk_lookup"],
-		PFWDSettings:         coll.Maps["pfwd_settings"],
-		PFWDRules:            coll.Maps["pfwd_rules"],
-		PFWDConnections:      coll.Maps["pfwd_connections"],
-		PFWDReverse:          coll.Maps["pfwd_reverse"],
-		PFWDRuleCounter:      coll.Maps["pfwd_rule_counters"],
-		PFWDRuleReplyCounter: coll.Maps["pfwd_rule_reply_counters"],
-		PFWDRuleDropCounter:  coll.Maps["pfwd_rule_drop_counters"],
-		PFWDUserCounter:      coll.Maps["pfwd_user_counters"],
-		PFWDStats:            coll.Maps["pfwd_stats"],
-		PFWDWhitelistV4:      coll.Maps["pfwd_whitelist_v4"],
-		PFWDWhitelistV6:      coll.Maps["pfwd_whitelist_v6"],
-		PFWDWhitelistCacheV4: coll.Maps["pfwd_whitelist_cache_v4"],
-		PFWDWhitelistCacheV6: coll.Maps["pfwd_whitelist_cache_v6"],
-		PFWDFlows:            coll.Maps["pfwd_allowed_flows"],
-		PFWDGuardPrefixes:    coll.Maps["pfwd_guard_prefixes"],
-		PFWDSkipPorts:        coll.Maps["pfwd_protocol_skip_ports"],
-		PFWDScratch:          coll.Maps["pfwd_scratch"],
+		PFWDXDP:                    coll.Programs["pfwd_xdp"],
+		PFWDIngress:                coll.Programs["pfwd_ingress"],
+		PFWDHostEgress:             coll.Programs["pfwd_host_egress"],
+		PFWDLoopbackEgress:         coll.Programs["pfwd_loopback_egress"],
+		PFWDSkLookup:               coll.Programs["pfwd_sk_lookup"],
+		PFWDSettings:               coll.Maps["pfwd_settings"],
+		PFWDRules:                  coll.Maps["pfwd_rules"],
+		PFWDConnections:            coll.Maps["pfwd_connections"],
+		PFWDReverse:                coll.Maps["pfwd_reverse"],
+		PFWDRuleCounter:            coll.Maps["pfwd_rule_counters"],
+		PFWDRuleReplyCounter:       coll.Maps["pfwd_rule_reply_counters"],
+		PFWDRuleDropCounter:        coll.Maps["pfwd_rule_drop_counters"],
+		PFWDUserCounter:            coll.Maps["pfwd_user_counters"],
+		PFWDStats:                  coll.Maps["pfwd_stats"],
+		PFWDWhitelistV4:            coll.Maps["pfwd_whitelist_v4"],
+		PFWDWhitelistV6:            coll.Maps["pfwd_whitelist_v6"],
+		PFWDWhitelistCacheV4:       coll.Maps["pfwd_whitelist_cache_v4"],
+		PFWDWhitelistCacheV6:       coll.Maps["pfwd_whitelist_cache_v6"],
+		PFWDEgressWhitelistV4:      coll.Maps["pfwd_egress_whitelist_v4"],
+		PFWDEgressWhitelistV6:      coll.Maps["pfwd_egress_whitelist_v6"],
+		PFWDEgressWhitelistCacheV4: coll.Maps["pfwd_egress_whitelist_cache_v4"],
+		PFWDEgressWhitelistCacheV6: coll.Maps["pfwd_egress_whitelist_cache_v6"],
+		PFWDFlows:                  coll.Maps["pfwd_allowed_flows"],
+		PFWDHostEgressFlows:        coll.Maps["pfwd_host_egress_flows"],
+		PFWDGuardPrefixes:          coll.Maps["pfwd_guard_prefixes"],
+		PFWDSkipPorts:              coll.Maps["pfwd_protocol_skip_ports"],
+		PFWDScratch:                coll.Maps["pfwd_scratch"],
 	}
 	return objs, nil
 }
@@ -944,10 +1011,15 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	egressHashes, err := whitelistFileHashes(runtimeData.Settings.EgressWhitelistFiles)
+	if err != nil {
+		return "", err
+	}
 	settings := runtimeSemanticSettings{
 		Interface:         runtimeData.Settings.Interface,
 		GuardEnabled:      runtimeData.Settings.GuardEnabled,
 		WhitelistEnabled:  runtimeData.Settings.WhitelistEnabled,
+		HostEgressEnabled: runtimeData.Settings.HostEgressEnabled,
 		BlockHTTP:         runtimeData.Settings.BlockHTTP,
 		BlockTLS:          runtimeData.Settings.BlockTLS,
 		BlockSOCKS:        runtimeData.Settings.BlockSOCKS,
@@ -982,13 +1054,15 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 		rules = append(rules, semanticRule)
 	}
 	payload := struct {
-		Settings        runtimeSemanticSettings `json:"settings"`
-		Rules           []runtimeSemanticRule   `json:"rules"`
-		WhitelistHashes []whitelistContentHash  `json:"whitelist_hashes"`
+		Settings              runtimeSemanticSettings `json:"settings"`
+		Rules                 []runtimeSemanticRule   `json:"rules"`
+		WhitelistHashes       []whitelistContentHash  `json:"whitelist_hashes"`
+		EgressWhitelistHashes []whitelistContentHash  `json:"egress_whitelist_hashes"`
 	}{
-		Settings:        settings,
-		Rules:           rules,
-		WhitelistHashes: hashes,
+		Settings:              settings,
+		Rules:                 rules,
+		WhitelistHashes:       hashes,
+		EgressWhitelistHashes: egressHashes,
 	}
 	content, err := json.Marshal(payload)
 	if err != nil {
@@ -1017,22 +1091,27 @@ func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) ru
 	dir := filepath.Dir(ruleCounterPin)
 	namespace := runtimePinNamespace(ruleCounterPin)
 	return runtimeMapPins{
-		Settings:         filepath.Join(dir, namespace+"_settings"),
-		Rules:            filepath.Join(dir, namespace+"_rules"),
-		Connections:      filepath.Join(dir, namespace+"_connections"),
-		Reverse:          filepath.Join(dir, namespace+"_reverse"),
-		RuleCounter:      ruleCounterPin,
-		RuleReplyCounter: filepath.Join(dir, namespace+"_rule_reply_counters"),
-		RuleDropCounter:  filepath.Join(dir, namespace+"_rule_drop_counters"),
-		UserCounter:      userCounterPin,
-		Stats:            statsPin,
-		WhitelistV4:      filepath.Join(dir, namespace+"_whitelist_v4"),
-		WhitelistV6:      filepath.Join(dir, namespace+"_whitelist_v6"),
-		WhitelistCacheV4: filepath.Join(dir, namespace+"_whitelist_cache_v4"),
-		WhitelistCacheV6: filepath.Join(dir, namespace+"_whitelist_cache_v6"),
-		AllowedFlows:     filepath.Join(dir, namespace+"_allowed_flows"),
-		GuardPrefixes:    filepath.Join(dir, namespace+"_guard_prefixes"),
-		SkipPorts:        filepath.Join(dir, namespace+"_protocol_skip_ports"),
+		Settings:               filepath.Join(dir, namespace+"_settings"),
+		Rules:                  filepath.Join(dir, namespace+"_rules"),
+		Connections:            filepath.Join(dir, namespace+"_connections"),
+		Reverse:                filepath.Join(dir, namespace+"_reverse"),
+		RuleCounter:            ruleCounterPin,
+		RuleReplyCounter:       filepath.Join(dir, namespace+"_rule_reply_counters"),
+		RuleDropCounter:        filepath.Join(dir, namespace+"_rule_drop_counters"),
+		UserCounter:            userCounterPin,
+		Stats:                  statsPin,
+		WhitelistV4:            filepath.Join(dir, namespace+"_whitelist_v4"),
+		WhitelistV6:            filepath.Join(dir, namespace+"_whitelist_v6"),
+		WhitelistCacheV4:       filepath.Join(dir, namespace+"_whitelist_cache_v4"),
+		WhitelistCacheV6:       filepath.Join(dir, namespace+"_whitelist_cache_v6"),
+		EgressWhitelistV4:      filepath.Join(dir, namespace+"_egress_whitelist_v4"),
+		EgressWhitelistV6:      filepath.Join(dir, namespace+"_egress_whitelist_v6"),
+		EgressWhitelistCacheV4: filepath.Join(dir, namespace+"_egress_whitelist_cache_v4"),
+		EgressWhitelistCacheV6: filepath.Join(dir, namespace+"_egress_whitelist_cache_v6"),
+		AllowedFlows:           filepath.Join(dir, namespace+"_allowed_flows"),
+		HostEgressFlows:        filepath.Join(dir, namespace+"_host_egress_flows"),
+		GuardPrefixes:          filepath.Join(dir, namespace+"_guard_prefixes"),
+		SkipPorts:              filepath.Join(dir, namespace+"_protocol_skip_ports"),
 	}
 }
 
@@ -1117,6 +1196,14 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 			return err
 		}
 	}
+	if runtimeData.Settings.HostEgressEnabled {
+		if objs.PFWDEgressWhitelistV4 == nil || objs.PFWDEgressWhitelistV6 == nil || objs.PFWDEgressWhitelistCacheV4 == nil || objs.PFWDEgressWhitelistCacheV6 == nil || objs.PFWDHostEgressFlows == nil {
+			return fmt.Errorf("宿主机出口白名单 BPF map 未加载")
+		}
+		if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
+			return err
+		}
+	}
 	zeroCounter, err := zeroPerCPUCounterValues()
 	if err != nil {
 		return err
@@ -1149,22 +1236,27 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 	pinLayout := runtimeMapPinsFromApplyOptions(opts)
 	pins := map[string]*ebpf.Map{
-		pinLayout.Settings:         objs.PFWDSettings,
-		pinLayout.Rules:            objs.PFWDRules,
-		pinLayout.Connections:      objs.PFWDConnections,
-		pinLayout.Reverse:          objs.PFWDReverse,
-		pinLayout.RuleCounter:      objs.PFWDRuleCounter,
-		pinLayout.RuleReplyCounter: objs.PFWDRuleReplyCounter,
-		pinLayout.RuleDropCounter:  objs.PFWDRuleDropCounter,
-		pinLayout.UserCounter:      objs.PFWDUserCounter,
-		pinLayout.Stats:            objs.PFWDStats,
-		pinLayout.WhitelistV4:      objs.PFWDWhitelistV4,
-		pinLayout.WhitelistV6:      objs.PFWDWhitelistV6,
-		pinLayout.WhitelistCacheV4: objs.PFWDWhitelistCacheV4,
-		pinLayout.WhitelistCacheV6: objs.PFWDWhitelistCacheV6,
-		pinLayout.AllowedFlows:     objs.PFWDFlows,
-		pinLayout.GuardPrefixes:    objs.PFWDGuardPrefixes,
-		pinLayout.SkipPorts:        objs.PFWDSkipPorts,
+		pinLayout.Settings:               objs.PFWDSettings,
+		pinLayout.Rules:                  objs.PFWDRules,
+		pinLayout.Connections:            objs.PFWDConnections,
+		pinLayout.Reverse:                objs.PFWDReverse,
+		pinLayout.RuleCounter:            objs.PFWDRuleCounter,
+		pinLayout.RuleReplyCounter:       objs.PFWDRuleReplyCounter,
+		pinLayout.RuleDropCounter:        objs.PFWDRuleDropCounter,
+		pinLayout.UserCounter:            objs.PFWDUserCounter,
+		pinLayout.Stats:                  objs.PFWDStats,
+		pinLayout.WhitelistV4:            objs.PFWDWhitelistV4,
+		pinLayout.WhitelistV6:            objs.PFWDWhitelistV6,
+		pinLayout.WhitelistCacheV4:       objs.PFWDWhitelistCacheV4,
+		pinLayout.WhitelistCacheV6:       objs.PFWDWhitelistCacheV6,
+		pinLayout.EgressWhitelistV4:      objs.PFWDEgressWhitelistV4,
+		pinLayout.EgressWhitelistV6:      objs.PFWDEgressWhitelistV6,
+		pinLayout.EgressWhitelistCacheV4: objs.PFWDEgressWhitelistCacheV4,
+		pinLayout.EgressWhitelistCacheV6: objs.PFWDEgressWhitelistCacheV6,
+		pinLayout.AllowedFlows:           objs.PFWDFlows,
+		pinLayout.HostEgressFlows:        objs.PFWDHostEgressFlows,
+		pinLayout.GuardPrefixes:          objs.PFWDGuardPrefixes,
+		pinLayout.SkipPorts:              objs.PFWDSkipPorts,
 	}
 	for path, m := range pins {
 		if m == nil {
@@ -1182,136 +1274,131 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 }
 
 func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
-	load := func(path string) (*ebpf.Map, error) {
-		return ebpf.LoadPinnedMap(path, nil)
-	}
-	settings, err := load(pinLayout.Settings)
-	if err != nil {
-		return nil, fmt.Errorf("加载 pinned settings map 失败: %w", err)
-	}
-	rules, err := load(pinLayout.Rules)
-	if err != nil {
-		settings.Close()
-		return nil, fmt.Errorf("加载 pinned rules map 失败: %w", err)
-	}
-	connections, err := load(pinLayout.Connections)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		return nil, fmt.Errorf("加载 pinned connections map 失败: %w", err)
-	}
-	reverse, err := load(pinLayout.Reverse)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		return nil, fmt.Errorf("加载 pinned reverse map 失败: %w", err)
-	}
-	ruleCounter, err := load(pinLayout.RuleCounter)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		reverse.Close()
-		return nil, fmt.Errorf("加载 pinned rule counter map 失败: %w", err)
-	}
-	ruleReplyCounter, err := load(pinLayout.RuleReplyCounter)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		reverse.Close()
-		ruleCounter.Close()
-		return nil, fmt.Errorf("加载 pinned rule reply counter map 失败: %w", err)
-	}
-	ruleDropCounter, err := load(pinLayout.RuleDropCounter)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		reverse.Close()
-		ruleCounter.Close()
-		ruleReplyCounter.Close()
-		return nil, fmt.Errorf("加载 pinned rule drop counter map 失败: %w", err)
-	}
-	userCounter, err := load(pinLayout.UserCounter)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		reverse.Close()
-		ruleCounter.Close()
-		ruleReplyCounter.Close()
-		ruleDropCounter.Close()
-		return nil, fmt.Errorf("加载 pinned user counter map 失败: %w", err)
-	}
-	stats, err := load(pinLayout.Stats)
-	if err != nil {
-		settings.Close()
-		rules.Close()
-		connections.Close()
-		reverse.Close()
-		ruleCounter.Close()
-		ruleReplyCounter.Close()
-		ruleDropCounter.Close()
-		userCounter.Close()
-		return nil, fmt.Errorf("加载 pinned stats map 失败: %w", err)
-	}
-	whitelistV4, err := load(pinLayout.WhitelistV4)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v4 map 失败: %w", err))
-	}
-	whitelistV6, err := load(pinLayout.WhitelistV6)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, nil, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_v6 map 失败: %w", err))
-	}
-	whitelistCacheV4, err := load(pinLayout.WhitelistCacheV4)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, nil, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v4 map 失败: %w", err))
-	}
-	whitelistCacheV6, err := load(pinLayout.WhitelistCacheV6)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, nil, nil, nil, nil, fmt.Errorf("加载 pinned whitelist_cache_v6 map 失败: %w", err))
-	}
-	allowedFlows, err := load(pinLayout.AllowedFlows)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, nil, nil, nil, fmt.Errorf("加载 pinned allowed_flows map 失败: %w", err))
-	}
-	guardPrefixes, err := load(pinLayout.GuardPrefixes)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, nil, nil, fmt.Errorf("加载 pinned guard_prefixes map 失败: %w", err))
-	}
-	skipPorts, err := load(pinLayout.SkipPorts)
-	if err != nil {
-		return closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, nil, fmt.Errorf("加载 pinned skip_ports map 失败: %w", err))
-	}
-	return &bpfObjects{
-		PFWDSettings:         settings,
-		PFWDRules:            rules,
-		PFWDConnections:      connections,
-		PFWDReverse:          reverse,
-		PFWDRuleCounter:      ruleCounter,
-		PFWDRuleReplyCounter: ruleReplyCounter,
-		PFWDRuleDropCounter:  ruleDropCounter,
-		PFWDUserCounter:      userCounter,
-		PFWDStats:            stats,
-		PFWDWhitelistV4:      whitelistV4,
-		PFWDWhitelistV6:      whitelistV6,
-		PFWDWhitelistCacheV4: whitelistCacheV4,
-		PFWDWhitelistCacheV6: whitelistCacheV6,
-		PFWDFlows:            allowedFlows,
-		PFWDGuardPrefixes:    guardPrefixes,
-		PFWDSkipPorts:        skipPorts,
-	}, nil
-}
-
-func closePinnedMapsOnError(settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts *ebpf.Map, err error) (*bpfObjects, error) {
-	for _, m := range []*ebpf.Map{settings, rules, connections, reverse, ruleCounter, ruleReplyCounter, ruleDropCounter, userCounter, stats, whitelistV4, whitelistV6, whitelistCacheV4, whitelistCacheV6, allowedFlows, guardPrefixes, skipPorts} {
-		if m != nil {
-			_ = m.Close()
+	closeMaps := func(maps ...*ebpf.Map) {
+		for _, m := range maps {
+			if m != nil {
+				_ = m.Close()
+			}
 		}
 	}
-	return nil, err
+	opened := make([]*ebpf.Map, 0, 20)
+	load := func(path string, message string) (*ebpf.Map, error) {
+		m, err := ebpf.LoadPinnedMap(path, nil)
+		if err != nil {
+			closeMaps(opened...)
+			return nil, fmt.Errorf("%s: %w", message, err)
+		}
+		opened = append(opened, m)
+		return m, nil
+	}
+
+	settings, err := load(pinLayout.Settings, "加载 pinned settings map 失败")
+	if err != nil {
+		return nil, err
+	}
+	rules, err := load(pinLayout.Rules, "加载 pinned rules map 失败")
+	if err != nil {
+		return nil, err
+	}
+	connections, err := load(pinLayout.Connections, "加载 pinned connections map 失败")
+	if err != nil {
+		return nil, err
+	}
+	reverse, err := load(pinLayout.Reverse, "加载 pinned reverse map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ruleCounter, err := load(pinLayout.RuleCounter, "加载 pinned rule counter map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ruleReplyCounter, err := load(pinLayout.RuleReplyCounter, "加载 pinned rule reply counter map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ruleDropCounter, err := load(pinLayout.RuleDropCounter, "加载 pinned rule drop counter map 失败")
+	if err != nil {
+		return nil, err
+	}
+	userCounter, err := load(pinLayout.UserCounter, "加载 pinned user counter map 失败")
+	if err != nil {
+		return nil, err
+	}
+	stats, err := load(pinLayout.Stats, "加载 pinned stats map 失败")
+	if err != nil {
+		return nil, err
+	}
+	whitelistV4, err := load(pinLayout.WhitelistV4, "加载 pinned whitelist_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	whitelistV6, err := load(pinLayout.WhitelistV6, "加载 pinned whitelist_v6 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	whitelistCacheV4, err := load(pinLayout.WhitelistCacheV4, "加载 pinned whitelist_cache_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	whitelistCacheV6, err := load(pinLayout.WhitelistCacheV6, "加载 pinned whitelist_cache_v6 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	egressWhitelistV4, err := load(pinLayout.EgressWhitelistV4, "加载 pinned egress_whitelist_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	egressWhitelistV6, err := load(pinLayout.EgressWhitelistV6, "加载 pinned egress_whitelist_v6 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	egressWhitelistCacheV4, err := load(pinLayout.EgressWhitelistCacheV4, "加载 pinned egress_whitelist_cache_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	egressWhitelistCacheV6, err := load(pinLayout.EgressWhitelistCacheV6, "加载 pinned egress_whitelist_cache_v6 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	allowedFlows, err := load(pinLayout.AllowedFlows, "加载 pinned allowed_flows map 失败")
+	if err != nil {
+		return nil, err
+	}
+	hostEgressFlows, err := load(pinLayout.HostEgressFlows, "加载 pinned host_egress_flows map 失败")
+	if err != nil {
+		return nil, err
+	}
+	guardPrefixes, err := load(pinLayout.GuardPrefixes, "加载 pinned guard_prefixes map 失败")
+	if err != nil {
+		return nil, err
+	}
+	skipPorts, err := load(pinLayout.SkipPorts, "加载 pinned skip_ports map 失败")
+	if err != nil {
+		return nil, err
+	}
+	return &bpfObjects{
+		PFWDSettings:               settings,
+		PFWDRules:                  rules,
+		PFWDConnections:            connections,
+		PFWDReverse:                reverse,
+		PFWDRuleCounter:            ruleCounter,
+		PFWDRuleReplyCounter:       ruleReplyCounter,
+		PFWDRuleDropCounter:        ruleDropCounter,
+		PFWDUserCounter:            userCounter,
+		PFWDStats:                  stats,
+		PFWDWhitelistV4:            whitelistV4,
+		PFWDWhitelistV6:            whitelistV6,
+		PFWDWhitelistCacheV4:       whitelistCacheV4,
+		PFWDWhitelistCacheV6:       whitelistCacheV6,
+		PFWDEgressWhitelistV4:      egressWhitelistV4,
+		PFWDEgressWhitelistV6:      egressWhitelistV6,
+		PFWDEgressWhitelistCacheV4: egressWhitelistCacheV4,
+		PFWDEgressWhitelistCacheV6: egressWhitelistCacheV6,
+		PFWDFlows:                  allowedFlows,
+		PFWDHostEgressFlows:        hostEgressFlows,
+		PFWDGuardPrefixes:          guardPrefixes,
+		PFWDSkipPorts:              skipPorts,
+	}, nil
 }
 
 func clearMap[K comparable, V any](m *ebpf.Map) error {
@@ -1438,7 +1525,22 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
 		return err
 	}
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDEgressWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDEgressWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
+		return err
+	}
 	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
@@ -1481,7 +1583,22 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
 		return err
 	}
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDEgressWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDEgressWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
+		return err
+	}
 	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+		return err
+	}
+	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
@@ -1518,6 +1635,18 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
 		return err
 	}
+	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDEgressWhitelistV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](objs.PFWDEgressWhitelistCacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
+		return err
+	}
 	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
 		return err
 	}
@@ -1528,6 +1657,25 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 		return err
 	}
 	return nil
+}
+
+func clearVerdictEntriesByValue(m *ebpf.Map, verdict uint8) error {
+	if m == nil {
+		return nil
+	}
+	it := m.Iterate()
+	var key flowKey
+	var value uint8
+	for it.Next(&key, &value) {
+		if value != verdict {
+			continue
+		}
+		keyCopy := key
+		if err := m.Delete(&keyCopy); err != nil {
+			return fmt.Errorf("删除 verdict entry 失败: %w", err)
+		}
+	}
+	return it.Err()
 }
 
 func pinnedPathExists(path string) bool {
@@ -1545,22 +1693,27 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 	}
 	pinLayout := runtimeMapPinsFromApplyOptions(opts)
 	pins := map[string]string{
-		"pfwd_settings":            pinLayout.Settings,
-		"pfwd_rules":               pinLayout.Rules,
-		"pfwd_connections":         pinLayout.Connections,
-		"pfwd_reverse":             pinLayout.Reverse,
-		"pfwd_rule_counters":       pinLayout.RuleCounter,
-		"pfwd_rule_reply_counters": pinLayout.RuleReplyCounter,
-		"pfwd_rule_drop_counters":  pinLayout.RuleDropCounter,
-		"pfwd_user_counters":       pinLayout.UserCounter,
-		"pfwd_stats":               pinLayout.Stats,
-		"pfwd_whitelist_v4":        pinLayout.WhitelistV4,
-		"pfwd_whitelist_v6":        pinLayout.WhitelistV6,
-		"pfwd_whitelist_cache_v4":  pinLayout.WhitelistCacheV4,
-		"pfwd_whitelist_cache_v6":  pinLayout.WhitelistCacheV6,
-		"pfwd_allowed_flows":       pinLayout.AllowedFlows,
-		"pfwd_guard_prefixes":      pinLayout.GuardPrefixes,
-		"pfwd_protocol_skip_ports": pinLayout.SkipPorts,
+		"pfwd_settings":                  pinLayout.Settings,
+		"pfwd_rules":                     pinLayout.Rules,
+		"pfwd_connections":               pinLayout.Connections,
+		"pfwd_reverse":                   pinLayout.Reverse,
+		"pfwd_rule_counters":             pinLayout.RuleCounter,
+		"pfwd_rule_reply_counters":       pinLayout.RuleReplyCounter,
+		"pfwd_rule_drop_counters":        pinLayout.RuleDropCounter,
+		"pfwd_user_counters":             pinLayout.UserCounter,
+		"pfwd_stats":                     pinLayout.Stats,
+		"pfwd_whitelist_v4":              pinLayout.WhitelistV4,
+		"pfwd_whitelist_v6":              pinLayout.WhitelistV6,
+		"pfwd_whitelist_cache_v4":        pinLayout.WhitelistCacheV4,
+		"pfwd_whitelist_cache_v6":        pinLayout.WhitelistCacheV6,
+		"pfwd_egress_whitelist_v4":       pinLayout.EgressWhitelistV4,
+		"pfwd_egress_whitelist_v6":       pinLayout.EgressWhitelistV6,
+		"pfwd_egress_whitelist_cache_v4": pinLayout.EgressWhitelistCacheV4,
+		"pfwd_egress_whitelist_cache_v6": pinLayout.EgressWhitelistCacheV6,
+		"pfwd_allowed_flows":             pinLayout.AllowedFlows,
+		"pfwd_host_egress_flows":         pinLayout.HostEgressFlows,
+		"pfwd_guard_prefixes":            pinLayout.GuardPrefixes,
+		"pfwd_protocol_skip_ports":       pinLayout.SkipPorts,
 	}
 	for name, path := range pins {
 		mapSpec := spec.Maps[name]
@@ -1580,7 +1733,77 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 	return true
 }
 
-func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, needIngress bool) bool {
+func listHostEgressInterfaces() ([]net.Interface, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("列出网卡失败: %w", err)
+	}
+	out := make([]net.Interface, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		out = append(out, iface)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+func interfaceNames(ifaces []net.Interface) []string {
+	if len(ifaces) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		names = append(names, iface.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		set[value] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for value := range set {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func stringSlicesEqual(left []string, right []string) bool {
+	left = uniqueSortedStrings(left)
+	right = uniqueSortedStrings(right)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, needIngress bool, hostEgressInterfaces []string) bool {
 	if !payload.Applied {
 		return false
 	}
@@ -1608,6 +1831,17 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 	if needIngress && !pinnedPathExists(firstNonEmpty(opts.IngressPin, payload.IngressPin)) {
 		return false
 	}
+	if payload.HostEgressEnabled != runtimeData.Settings.HostEgressEnabled {
+		return false
+	}
+	if runtimeData.Settings.HostEgressEnabled {
+		if !stringSlicesEqual(payload.HostEgressInterfaces, hostEgressInterfaces) {
+			return false
+		}
+		if !pinnedPathExists(firstNonEmpty(opts.HostEgressPin, payload.HostEgressPin)) {
+			return false
+		}
+	}
 	pinLayout := runtimeMapPinsFromApplyOptions(opts)
 	requiredMapPins := []string{
 		pinLayout.Settings,
@@ -1622,7 +1856,12 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 		pinLayout.WhitelistV6,
 		pinLayout.WhitelistCacheV4,
 		pinLayout.WhitelistCacheV6,
+		pinLayout.EgressWhitelistV4,
+		pinLayout.EgressWhitelistV6,
+		pinLayout.EgressWhitelistCacheV4,
+		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
+		pinLayout.HostEgressFlows,
 		pinLayout.GuardPrefixes,
 		pinLayout.SkipPorts,
 	}
@@ -1988,6 +2227,19 @@ func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts apply
 			return mapReconcileReport{}, err
 		}
 	}
+	if runtimeData.Settings.HostEgressEnabled {
+		if objs.PFWDEgressWhitelistV4 == nil || objs.PFWDEgressWhitelistV6 == nil || objs.PFWDHostEgressFlows == nil {
+			return mapReconcileReport{}, fmt.Errorf("宿主机出口白名单 BPF map 未加载")
+		}
+		if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
+			return mapReconcileReport{}, err
+		}
+		if err := clearVerdictEntriesByValue(objs.PFWDHostEgressFlows, cacheVerdictDrop); err != nil {
+			return mapReconcileReport{}, fmt.Errorf("清理宿主机出口 drop cache 失败: %w", err)
+		}
+	} else if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
+		return mapReconcileReport{}, err
+	}
 	rules, err := runtimeRuleEntries(runtimeData)
 	if err != nil {
 		return mapReconcileReport{}, err
@@ -2068,7 +2320,7 @@ func profileCounts(runtimeData *runtimeFile) map[string]int {
 	return counts
 }
 
-func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool) error {
+func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, opts applyOptions, iface *net.Interface, protocolGuard bool, hostEgressInterfaces []string) error {
 	startedAt := time.Now().UTC()
 	startedAtText := startedAt.Format(time.RFC3339)
 	runtimeSemanticConfigHash, err := runtimeSemanticHash(runtimeData)
@@ -2119,6 +2371,9 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.Users = len(runtimeData.Users)
 	updated.XDPPin = opts.XDPPin
 	updated.IngressPin = opts.IngressPin
+	updated.HostEgressEnabled = runtimeData.Settings.HostEgressEnabled
+	updated.HostEgressInterfaces = uniqueSortedStrings(hostEgressInterfaces)
+	updated.HostEgressPin = opts.HostEgressPin
 	updated.LoopbackPin = opts.LoopbackPin
 	updated.SkLookupPin = opts.SkLookupPin
 	updated.RuleCounterPin = opts.RuleCounterPin
@@ -2364,6 +2619,35 @@ func attachXDP(iface *net.Interface, prog *ebpf.Program, opts applyOptions) (str
 	}
 }
 
+func pinTCProgram(prog *ebpf.Program, pin string) error {
+	if prog == nil {
+		return fmt.Errorf("tc program 未加载")
+	}
+	if err := os.MkdirAll(filepath.Dir(pin), 0o755); err != nil {
+		return fmt.Errorf("创建 tc pin 目录失败: %w", err)
+	}
+	_ = removePinnedLink(pin)
+	_ = removePinnedProgram(pin)
+	if err := prog.Pin(pin); err != nil {
+		return fmt.Errorf("pin tc program 失败: %w", err)
+	}
+	return nil
+}
+
+func attachPinnedTCFilter(ifaceName string, pin string, direction string) error {
+	if err := runTC("qdisc", "replace", "dev", ifaceName, "clsact"); err != nil {
+		return err
+	}
+	pref := tcPrefBPFIngress
+	if direction == "egress" {
+		pref = tcPrefBPFEgress
+	}
+	if err := runTC("filter", "replace", "dev", ifaceName, direction, "pref", pref, "bpf", "direct-action", "object-pinned", pin); err != nil {
+		return err
+	}
+	return nil
+}
+
 func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attach ebpf.AttachType, direction string) (string, error) {
 	if prog == nil {
 		return "", fmt.Errorf("tc program 未加载")
@@ -2386,6 +2670,27 @@ func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attac
 		return "", err
 	}
 	return "tc", nil
+}
+
+func attachHostEgress(ifaces []net.Interface, prog *ebpf.Program, pin string) ([]string, error) {
+	if prog == nil {
+		return nil, fmt.Errorf("host egress tc program 未加载")
+	}
+	if len(ifaces) == 0 {
+		return nil, fmt.Errorf("没有可附着的宿主机出口网卡")
+	}
+	if err := pinTCProgram(prog, pin); err != nil {
+		return nil, err
+	}
+	attached := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if err := attachPinnedTCFilter(iface.Name, pin, "egress"); err != nil {
+			_ = removeHostEgressRuntime(pin, attached)
+			return nil, err
+		}
+		attached = append(attached, iface.Name)
+	}
+	return uniqueSortedStrings(attached), nil
 }
 
 func attachIngress(iface *net.Interface, prog *ebpf.Program, pin string) (string, error) {
@@ -2455,6 +2760,17 @@ func removeLoopbackRuntime(pin string, ifaceName string) error {
 	return removeTCRuntime(pin, ifaceName, "egress")
 }
 
+func removeHostEgressRuntime(pin string, ifaceNames []string) error {
+	for _, ifaceName := range uniqueSortedStrings(ifaceNames) {
+		_ = runTC("filter", "delete", "dev", ifaceName, "egress", "pref", tcPrefBPFEgress)
+	}
+	if pin != "" {
+		_ = removePinnedLink(pin)
+		_ = removePinnedProgram(pin)
+	}
+	return nil
+}
+
 func removeSkLookupRuntime(pin string) error {
 	if pin == "" {
 		return nil
@@ -2467,6 +2783,7 @@ func removeRuntime(opts removeOptions) error {
 	payload, _ := readStatus(opts.StatusFile)
 	xdpPin := firstNonEmpty(opts.XDPPin, payload.XDPPin)
 	ingressPin := firstNonEmpty(opts.IngressPin, payload.IngressPin)
+	hostEgressPin := firstNonEmpty(opts.HostEgressPin, payload.HostEgressPin)
 	loopbackPin := firstNonEmpty(opts.LoopbackPin, payload.LoopbackPin)
 	skLookupPin := firstNonEmpty(opts.SkLookupPin, payload.SkLookupPin)
 	pinLayout := runtimeMapPinsFromRemoveOptions(opts, payload)
@@ -2477,6 +2794,13 @@ func removeRuntime(opts removeOptions) error {
 		_ = removeIngressRuntime(ingressPin, payload.Interface)
 	} else if payload.Interface != "" {
 		_ = removeIngressRuntime("", payload.Interface)
+	}
+	if hostEgressPin != "" || len(payload.HostEgressInterfaces) > 0 {
+		hostEgressNames := append([]string{}, payload.HostEgressInterfaces...)
+		if currentIfaces, err := listHostEgressInterfaces(); err == nil {
+			hostEgressNames = append(hostEgressNames, interfaceNames(currentIfaces)...)
+		}
+		_ = removeHostEgressRuntime(hostEgressPin, hostEgressNames)
 	}
 	if loopbackPin != "" {
 		_ = removeLoopbackRuntime(loopbackPin, "lo")
@@ -2503,7 +2827,12 @@ func removeRuntime(opts removeOptions) error {
 		pinLayout.WhitelistV6,
 		pinLayout.WhitelistCacheV4,
 		pinLayout.WhitelistCacheV6,
+		pinLayout.EgressWhitelistV4,
+		pinLayout.EgressWhitelistV6,
+		pinLayout.EgressWhitelistCacheV4,
+		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
+		pinLayout.HostEgressFlows,
 		pinLayout.GuardPrefixes,
 		pinLayout.SkipPorts,
 	} {
@@ -2654,16 +2983,17 @@ func dumpStats(opts statsOptions) error {
 	defer statsMap.Close()
 
 	var payload struct {
-		Passed           uint64       `json:"passed"`
-		Dropped          uint64       `json:"dropped"`
-		Forwarded        uint64       `json:"forwarded"`
-		QuotaDropped     uint64       `json:"quota_dropped"`
-		WhitelistDropped uint64       `json:"whitelist_dropped"`
-		ProtocolDropped  uint64       `json:"protocol_dropped"`
-		ParseSkipped     uint64       `json:"parse_skipped"`
-		TCPPrewarmed     uint64       `json:"tcp_prewarmed"`
-		TCPEstablished   uint64       `json:"tcp_established"`
-		ActiveSummary    *connSummary `json:"active_summary,omitempty"`
+		Passed            uint64       `json:"passed"`
+		Dropped           uint64       `json:"dropped"`
+		Forwarded         uint64       `json:"forwarded"`
+		QuotaDropped      uint64       `json:"quota_dropped"`
+		WhitelistDropped  uint64       `json:"whitelist_dropped"`
+		ProtocolDropped   uint64       `json:"protocol_dropped"`
+		ParseSkipped      uint64       `json:"parse_skipped"`
+		TCPPrewarmed      uint64       `json:"tcp_prewarmed"`
+		TCPEstablished    uint64       `json:"tcp_established"`
+		HostEgressDropped uint64       `json:"host_egress_dropped"`
+		ActiveSummary     *connSummary `json:"active_summary,omitempty"`
 	}
 	values := []*uint64{
 		&payload.Passed,
@@ -2675,6 +3005,7 @@ func dumpStats(opts statsOptions) error {
 		&payload.ParseSkipped,
 		&payload.TCPPrewarmed,
 		&payload.TCPEstablished,
+		&payload.HostEgressDropped,
 	}
 	for i, dst := range values {
 		key := uint32(i)
@@ -3027,8 +3358,8 @@ func usageError() error {
 
 func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "用法：")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --guard-mode off|ingress|full --xdp-pin PATH --ingress-pin PATH [--loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH --ingress-pin PATH [--loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --guard-mode off|ingress|full --xdp-pin PATH --ingress-pin PATH [--host-egress-pin PATH --loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH --ingress-pin PATH [--host-egress-pin PATH --loopback-pin PATH --rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")

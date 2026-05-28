@@ -12,7 +12,7 @@
 | XDP 选项 | 支持 `MSS clamp`、固定 `MSS`、`masquerade`、固定 `SNAT` |
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
 | Rate | 使用 `tc` 做端口级或用户级双向速率限制 |
-| Guard | 入口白名单、出口白名单和 TCP 首包协议封锁；入口规则运行在 XDP / ingress 分层数据面，出口白名单在编译期校验 |
+| Guard | 入口白名单、出口白名单和 TCP 首包协议封锁；入口规则运行在 XDP / ingress 分层数据面，出口白名单同时做规则目标校验和宿主机出口限制 |
 | Notify | Telegram 定时通知和手动通知 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
@@ -21,7 +21,7 @@
 `pfwd guard` 管理流量防护：
 
 - 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，可启用国内 IP 白名单，也可追加自定义 CIDR；自定义项支持直接输入单个 IP，系统会规范成 `/32` 或 `/128`。
-- 出口白名单：限制转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但编译时解析出的每个目标 IP 都必须命中白名单；自定义项同样支持单个 IP 输入。
+- 出口白名单：限制转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但编译时解析出的每个目标 IP 都必须命中白名单；同时会对宿主机全部非 loopback 出口流量生效，默认自动包含私网/链路本地/默认网关/本机直连网段；自定义项同样支持单个 IP 输入。
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`。
 
 常用命令：
@@ -229,8 +229,9 @@ pfwd add \
 - XDP runtime 使用稳定的 user/rule index，索引状态保存在 `/var/lib/pfwd/xdp/indexes.json`；`pfwd refresh` 会尽量增量刷新 pinned maps，并保留仍匹配新规则语义的活动连接。
 - `pfwd render status` / `pfwd doctor` 会显示 `dataplane.version`、`map_abi`、`xdp.incremental_apply`、保留/失效连接数和规则 profile 分布，便于区分普通增量刷新与 full reattach。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
-- `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 只限制转发目标，默认内置国内 IPv4/IPv6 段能力且默认包含国内 IP。
+- `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 一方面限制转发目标，另一方面限制宿主机全部非 loopback 出口流量，默认内置国内 IPv4/IPv6 段能力且默认包含国内 IP。
 - 出口白名单只接受 CIDR，不接受域名条目；当规则目标是域名时，`add` / `update` / `refresh` / `reconcile` 会按当前解析结果做白名单校验。
+- 当 XDP / hybrid / guard-only 数据面生效时，宿主机出口白名单走 tc egress；当运行态是 nft-only / nft-fallback / none 时，宿主机出口白名单走 nftables output hook。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 
