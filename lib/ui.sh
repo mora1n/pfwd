@@ -4309,8 +4309,7 @@ ui_print_egress_whitelist_summary() {
 }
 
 ui_custom_cidr_rows() {
-    local idx=2 cidr
-    printf '1\t删除所有自定义 CIDR\n'
+    local idx=1 cidr
     while IFS= read -r cidr; do
         [ -n "$cidr" ] || continue
         printf '%s\t%s\n' "$idx" "$cidr"
@@ -4323,7 +4322,7 @@ ui_print_custom_cidr_list() {
 }
 
 ui_menu_whitelist_cidrs_delete() {
-    local count raw indexes cidr_indexes resolved_indexes
+    local count raw indexes
     count="$(whitelist_custom_cidrs_count)"
     if [ "$count" -eq 0 ]; then
         ui_warn "暂无自定义 CIDR"
@@ -4331,21 +4330,11 @@ ui_menu_whitelist_cidrs_delete() {
         return 0
     fi
     ui_render_page ui_render_whitelist_cidrs_menu_page
-    ui_read "选择 CIDR 序号，可单/多/连续选择；1 表示删除全部" || return 1
+    ui_read "选择 CIDR 序号，可单/多/连续选择" || return 1
     raw="$UI_REPLY"
-    ui_multiselect_parse_indexes "$raw" "$((count + 1))" false || return 1
+    ui_multiselect_parse_indexes "$raw" "$count" false || return 1
     indexes="$UI_REPLY"
-    if printf '%s\n' "$indexes" | grep -qx '1'; then
-        ui_run cmd_guard_whitelist_custom clear
-        if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "入口白名单自定义 CIDR 已清空" "$UI_C_MENU_NUM"
-            ui_pause
-        fi
-        return 0
-    fi
-    resolved_indexes="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
-    [ -n "$resolved_indexes" ] || { ui_warn "请选择要删除的入口白名单自定义 CIDR"; return 1; }
-    ui_run cmd_guard_whitelist_custom delete $resolved_indexes
+    ui_run cmd_guard_whitelist_custom delete $indexes
     if [ "$UI_STATUS" -eq 0 ]; then
         ui_notice_set "入口白名单自定义 CIDR 已删除" "$UI_C_MENU_NUM"
         ui_pause
@@ -4353,13 +4342,20 @@ ui_menu_whitelist_cidrs_delete() {
 }
 
 ui_render_ingress_whitelist_menu_page() {
+    local include_cn action_label
+    include_cn="$(whitelist_include_cn)"
+    if [ "$include_cn" = "true" ]; then
+        action_label="排除国内 IP"
+    else
+        action_label="包含国内 IP"
+    fi
     ui_header "入口白名单"
     ui_notice_render
     ui_print_whitelist_summary
     echo
     ui_menu_item 1 "启用入口白名单"
     ui_menu_item 2 "关闭入口白名单"
-    ui_menu_item 3 "入口允许国内 IP"
+    ui_menu_item 3 "$action_label"
     ui_menu_item 4 "入口自定义 CIDR"
     ui_menu_item 5 "刷新入口白名单"
     ui_menu_item 0 "返回"
@@ -4430,7 +4426,7 @@ ui_menu_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "增加入口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和允许国内 IP 共同组成入口白名单。输入 0 返回上级菜单。"
+                ui_form_set "增加入口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和国内 IP 配置共同组成入口白名单。输入 0 返回上级菜单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
@@ -4451,11 +4447,11 @@ ui_menu_whitelist_cidrs() {
                     continue
                 fi
                 ui_render_page ui_render_whitelist_cidrs_menu_page
-                ui_read "选择要修改的 CIDR 序号（2-${count}+1）" || return 0
+                ui_read "选择要修改的 CIDR 序号（1-$count）" || return 0
                 [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
                 display_index="$UI_REPLY"
-                [ "$display_index" -ge 2 ] && [ "$display_index" -le $((count + 1)) ] || { ui_warn "序号超出范围"; ui_pause; continue; }
-                real_index=$((display_index - 1))
+                [ "$display_index" -ge 1 ] && [ "$display_index" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; continue; }
+                real_index="$display_index"
                 current_cidr="$(whitelist_custom_cidr_by_index "$real_index")"
                 [ -n "$current_cidr" ] || { ui_warn "入口白名单自定义 CIDR 序号不存在"; ui_pause; continue; }
                 ui_form_set "修改入口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR，或单个 IP。输入 0 返回上级菜单。"
@@ -4475,8 +4471,7 @@ ui_menu_whitelist_cidrs() {
 }
 
 ui_egress_custom_cidr_rows() {
-    local idx=2 cidr
-    printf '1\t删除所有出口自定义 CIDR\n'
+    local idx=1 cidr
     while IFS= read -r cidr; do
         [ -n "$cidr" ] || continue
         printf '%s\t%s\n' "$idx" "$cidr"
@@ -4489,7 +4484,7 @@ ui_print_egress_custom_cidr_list() {
 }
 
 ui_menu_egress_whitelist_cidrs_delete() {
-    local count raw indexes resolved_indexes
+    local count raw indexes
     count="$(egress_whitelist_custom_cidrs_count)"
     if [ "$count" -eq 0 ]; then
         ui_warn "暂无出口自定义 CIDR"
@@ -4497,21 +4492,11 @@ ui_menu_egress_whitelist_cidrs_delete() {
         return 0
     fi
     ui_render_page ui_render_egress_whitelist_cidrs_menu_page
-    ui_read "选择 CIDR 序号，可单/多/连续选择；1 表示删除全部" || return 1
+    ui_read "选择 CIDR 序号，可单/多/连续选择" || return 1
     raw="$UI_REPLY"
-    indexes="$(ui_parse_multi_indexes "$raw")" || return 1
-    resolved_indexes=""
-    while IFS= read -r index; do
-        [ -n "$index" ] || continue
-        if [ "$index" = "1" ]; then
-            ui_run cmd_guard_egress_whitelist_custom clear
-            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口白名单自定义 CIDR 已清空" "$UI_C_MENU_NUM"
-            return 0
-        fi
-        resolved_indexes="${resolved_indexes}${resolved_indexes:+ }$((index - 1))"
-    done <<< "$indexes"
-    [ -n "$resolved_indexes" ] || { ui_warn "请选择要删除的出口自定义 CIDR"; return 1; }
-    ui_run cmd_guard_egress_whitelist_custom delete $resolved_indexes
+    ui_multiselect_parse_indexes "$raw" "$count" false || return 1
+    indexes="$UI_REPLY"
+    ui_run cmd_guard_egress_whitelist_custom delete $indexes
     if [ "$UI_STATUS" -eq 0 ]; then
         ui_notice_set "出口白名单自定义 CIDR 已删除" "$UI_C_MENU_NUM"
         ui_pause
@@ -4542,7 +4527,7 @@ ui_menu_egress_whitelist_cidrs() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "增加出口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和允许国内 IP 共同组成出口白名单。输入 0 返回上级菜单。"
+                ui_form_set "增加出口自定义 CIDR" "输入一个 IPv4 或 IPv6 CIDR，或单个 IP；会和国内 IP 配置共同组成出口白名单。输入 0 返回上级菜单。"
                 ui_form_read "CIDR" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
@@ -4563,11 +4548,11 @@ ui_menu_egress_whitelist_cidrs() {
                     continue
                 fi
                 ui_render_page ui_render_egress_whitelist_cidrs_menu_page
-                ui_read "选择要修改的 CIDR 序号（2-${count}+1）" || return 0
+                ui_read "选择要修改的 CIDR 序号（1-$count）" || return 0
                 [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
                 display_index="$UI_REPLY"
-                [ "$display_index" -ge 2 ] && [ "$display_index" -le $((count + 1)) ] || { ui_warn "序号超出范围"; ui_pause; continue; }
-                real_index=$((display_index - 1))
+                [ "$display_index" -ge 1 ] && [ "$display_index" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; continue; }
+                real_index="$display_index"
                 current_cidr="$(egress_whitelist_custom_cidr_by_index "$real_index")"
                 [ -n "$current_cidr" ] || { ui_warn "出口自定义 CIDR 序号不存在"; ui_pause; continue; }
                 ui_form_set "修改出口自定义 CIDR" "输入新的 IPv4 或 IPv6 CIDR，或单个 IP。输入 0 返回上级菜单。"
@@ -4587,13 +4572,20 @@ ui_menu_egress_whitelist_cidrs() {
 }
 
 ui_render_egress_whitelist_menu_page() {
+    local include_cn action_label
+    include_cn="$(egress_whitelist_include_cn)"
+    if [ "$include_cn" = "true" ]; then
+        action_label="排除国内 IP"
+    else
+        action_label="包含国内 IP"
+    fi
     ui_header "出口白名单"
     ui_notice_render
     ui_print_egress_whitelist_summary
     echo
     ui_menu_item 1 "启用出口白名单"
     ui_menu_item 2 "关闭出口白名单"
-    ui_menu_item 3 "出口允许国内 IP"
+    ui_menu_item 3 "$action_label"
     ui_menu_item 4 "出口自定义 CIDR"
     ui_menu_item 5 "刷新出口白名单"
     ui_menu_item 0 "返回"

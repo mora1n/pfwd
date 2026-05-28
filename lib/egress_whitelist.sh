@@ -32,7 +32,7 @@ egress_whitelist_enabled() {
 
 egress_whitelist_include_cn() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
-    jq -r '.settings.egress_whitelist.include_cn // true' "$config_file"
+    jq -r 'if (.settings.egress_whitelist.include_cn? | type) == "boolean" then .settings.egress_whitelist.include_cn else true end' "$config_file"
 }
 
 egress_whitelist_source_url() {

@@ -29,7 +29,7 @@ whitelist_enabled() {
 }
 
 whitelist_include_cn() {
-    jq -r '.settings.whitelist.include_cn // true' "$PFWD_CONFIG_FILE"
+    jq -r 'if (.settings.whitelist.include_cn? | type) == "boolean" then .settings.whitelist.include_cn else true end' "$PFWD_CONFIG_FILE"
 }
 
 whitelist_source_url() {

@@ -229,7 +229,7 @@ pfwd add \
 - XDP runtime 使用稳定的 user/rule index，索引状态保存在 `/var/lib/pfwd/xdp/indexes.json`；`pfwd refresh` 会尽量增量刷新 pinned maps，并保留仍匹配新规则语义的活动连接。
 - `pfwd render status` / `pfwd doctor` 会显示 `dataplane.version`、`map_abi`、`xdp.incremental_apply`、保留/失效连接数和规则 profile 分布，便于区分普通增量刷新与 full reattach。
 - MSS 和固定 SNAT 持久化在 `.forwards[].net`；转发网卡通过 `.settings.forward.interface` 指定。
-- `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 只限制转发目标，默认内置国内 IPv4/IPv6 段能力但默认关闭。
+- `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 只限制转发目标，默认内置国内 IPv4/IPv6 段能力且默认包含国内 IP。
 - 出口白名单只接受 CIDR，不接受域名条目；当规则目标是域名时，`add` / `update` / `refresh` / `reconcile` 会按当前解析结果做白名单校验。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
