@@ -236,7 +236,25 @@ fw_render_interval_set_elements() {
         [ "$first" -eq 1 ] || printf ', '
         printf '%s' "$line"
         first=0
-    done < "$file_path"
+    done < <(
+        python3 - "$file_path" <<'PY'
+import ipaddress
+import sys
+
+path = sys.argv[1]
+networks = []
+
+with open(path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.strip()
+        if not line:
+            continue
+        networks.append(ipaddress.ip_network(line, strict=False))
+
+for network in ipaddress.collapse_addresses(networks):
+    print(network)
+PY
+    )
 }
 
 fw_render_host_egress_objects() {

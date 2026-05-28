@@ -2006,8 +2006,74 @@ ui_format_reset_day() {
     reset_day_display "$value"
 }
 
+ui_main_usage_config_file() {
+    if [ -n "$PFWD_CONFIG_SNAPSHOT_FILE" ] && [ -f "$PFWD_CONFIG_SNAPSHOT_FILE" ]; then
+        printf '%s\n' "$PFWD_CONFIG_SNAPSHOT_FILE"
+    else
+        printf '%s\n' "$PFWD_CONFIG_FILE"
+    fi
+}
+
+ui_main_usage_stats_json() {
+    local stats_json="${1:-}"
+    [ -n "$stats_json" ] || stats_json="$(fw_read_counters 2>/dev/null || true)"
+    if [ -z "$stats_json" ] || ! jq -e '
+      type == "object"
+      and ((.users // null) | type == "array")
+      and ((.forwards // null) | type == "array")
+    ' >/dev/null 2>&1 <<< "$stats_json"; then
+        printf '%s\n' '{"users":[],"forwards":[]}'
+        return 0
+    fi
+    printf '%s\n' "$stats_json"
+}
+
+ui_main_usage_build_json() {
+    local cfg_file stats_json
+    cfg_file="$(ui_main_usage_config_file)"
+    stats_json="$(ui_main_usage_stats_json)"
+
+    jq -n \
+      --slurpfile cfg "$cfg_file" \
+      --argjson stats "$stats_json" '
+      def user_stats($id):
+        ($stats.users // [] | map(select(.id == $id)) | .[0] // {});
+      def forward_stats($id):
+        ($stats.forwards // [] | map(select(.id == $id)) | .[0] // {});
+      {
+        users: [
+          $cfg[0].users[]? as $u
+          | $u + {
+              input_bytes: ((user_stats($u.id).input_bytes // 0) | tonumber),
+              output_bytes: ((user_stats($u.id).output_bytes // 0) | tonumber),
+              one_way_bytes: ((user_stats($u.id).one_way_bytes // 0) | tonumber),
+              two_way_bytes: ((user_stats($u.id).two_way_bytes // 0) | tonumber),
+              billing_used_bytes: ((user_stats($u.id).billing_used_bytes // 0) | tonumber),
+              reset_day: (user_stats($u.id).reset_day // null)
+            }
+        ],
+        forwards: [
+          $cfg[0].forwards[]? as $f
+          | $f + {
+              input_bytes: ((forward_stats($f.id).input_bytes // 0) | tonumber),
+              output_bytes: ((forward_stats($f.id).output_bytes // 0) | tonumber),
+              one_way_bytes: ((forward_stats($f.id).one_way_bytes // 0) | tonumber),
+              two_way_bytes: ((forward_stats($f.id).two_way_bytes // 0) | tonumber),
+              total_bytes: (
+                if (forward_stats($f.id) | has("total_bytes")) then
+                  ((forward_stats($f.id).total_bytes // 0) | tonumber)
+                else
+                  (((forward_stats($f.id).one_way_bytes // 0) | tonumber) + ((forward_stats($f.id).two_way_bytes // 0) | tonumber))
+                end
+              ),
+              billing_used_bytes: ((forward_stats($f.id).billing_used_bytes // 0) | tonumber)
+            }
+        ]
+      }'
+}
+
 ui_main_usage_json() {
-    ui_cached_data "main_usage_json" fw_read_counters
+    ui_cached_data "main_usage_json" ui_main_usage_build_json
 }
 
 ui_forward_usage_json() {
@@ -2031,9 +2097,10 @@ ui_user_forward_count() {
 
 ui_main_user_rows() {
     local data="$1"
-    jq -r --slurpfile cfg "$PFWD_CONFIG_FILE" '
-      .users[]? as $u
-      | ($cfg[0].forwards | map(select(.user_id == $u.id)) | length) as $count
+    jq -r '
+      . as $data
+      | .users[]? as $u
+      | ($data.forwards | map(select(.user_id == $u.id)) | length) as $count
       | [
           $u.id,
           ($count | tostring),
