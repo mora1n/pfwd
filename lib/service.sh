@@ -75,6 +75,16 @@ guard_service_unit() {
     xdp_service_unit
 }
 
+downmask_asset_name() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) echo "pfwd-downmask-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-downmask-linux-arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
 service_unit_names() {
     cat <<'EOF'
 pfwd-forward.service
@@ -82,6 +92,7 @@ pfwd.service
 pfwd.timer
 pfwd-bbr.service
 pfwd-xdp.service
+pfwd-downmask-feed.service
 EOF
 }
 
@@ -93,11 +104,13 @@ service_shortcut_rows() {
 
 service_bundle_rows() {
     local asset_rel="assets/$(guard_asset_name)"
+    local downmask_rel="assets/$(downmask_asset_name 2>/dev/null || echo pfwd-downmask-linux-amd64)"
     local lib
 
     printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
     printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
     printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
+    printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
     printf '0644\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\n'
     printf '0644\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -116,6 +129,8 @@ service_prepare_install_dirs() {
         "$(dirname "$PFWD_BBR_BIN_PATH")" \
         "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" \
         "$(dirname "$PFWD_XDP_BIN_PATH")" \
+        "$(dirname "$PFWD_DOWNMASK_BIN_PATH")" \
+        "$PFWD_DOWNMASK_STATE_DIR" \
         "$PFWD_SYSTEMD_DIR"
 }
 
@@ -223,6 +238,9 @@ service_write_unit_files() {
     service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
     bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
     xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
+    if command -v downmask_write_feed_unit_if_needed >/dev/null 2>&1; then
+        downmask_write_feed_unit_if_needed || true
+    fi
 }
 
 service_install_files() {
@@ -286,8 +304,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -363,7 +381,7 @@ service_uninstall_files() {
 }
 
 service_purge_state() {
-    rm -rf "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"
+    rm -rf "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_DOWNMASK_STATE_DIR"
 }
 
 service_verify_removed() {
@@ -371,6 +389,7 @@ service_verify_removed() {
     local path _ source_rel install_rel __
     for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" \
+        "$PFWD_DOWNMASK_STATE_DIR" "$PFWD_DOWNMASK_STATUS_FILE" "$PFWD_DOWNMASK_BIN_PATH" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
         "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         "$PFWD_XDP_SK_LOOKUP_PIN_PATH" "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \

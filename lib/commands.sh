@@ -968,6 +968,7 @@ cmd_render() {
         nft) fw_render_nft ;;
         tc) fw_render_tc ;;
         guard) guard_render_status ;;
+        downmask) downmask_status_json | jq '.' ;;
         units)
             echo "# pfwd.service"
             service_manager_unit
@@ -977,8 +978,12 @@ cmd_render() {
             bbr_service_unit
             echo "# pfwd-xdp.service"
             guard_service_unit
+            if [ -f "$(downmask_feed_unit_path)" ]; then
+                echo "# pfwd-downmask-feed.service"
+                cat "$(downmask_feed_unit_path)"
+            fi
             ;;
-        *) pfwd_die "用法：pfwd render [forwarder|status|nft|tc|guard|units]" ;;
+        *) pfwd_die "用法：pfwd render [forwarder|status|nft|tc|guard|downmask|units]" ;;
     esac
 }
 
@@ -991,6 +996,7 @@ cmd_refresh() {
     config_init >/dev/null
     stats_rollup_current
     cmd_apply_forwarding_bundle
+    downmask_reload_feed_service 2>/dev/null || true
     echo "已刷新"
 }
 
@@ -1001,6 +1007,7 @@ cmd_restart() {
     cmd_runtime_ready || return 0
     forwarder_stop_runtime
     cmd_apply_forwarding_bundle
+    downmask_reload_feed_service 2>/dev/null || true
     echo "已重启运行态"
 }
 
@@ -1023,6 +1030,7 @@ cmd_reconcile() {
         cmd_apply_forwarding_bundle
     fi
     sent="$(notify_reconcile_schedules)"
+    downmask_reconcile_pull 2>/dev/null || true
     echo "已同步：active_before=$before active_after=$after notify_sent=$sent"
 }
 
@@ -1143,6 +1151,8 @@ cmd_doctor() {
     if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
     if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
     if service_unit_exists pfwd-xdp.service; then echo "pfwd-xdp.service：已安装"; else echo "pfwd-xdp.service：未安装"; fi
+    if service_unit_exists pfwd-downmask-feed.service; then echo "pfwd-downmask-feed.service：已安装"; else echo "pfwd-downmask-feed.service：未安装"; fi
+    if [ -x "$PFWD_DOWNMASK_BIN_PATH" ]; then echo "pfwd-downmask：$PFWD_DOWNMASK_BIN_PATH"; else echo "pfwd-downmask：缺失"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
     guard_render_status | while IFS=$'\t' read -r key value; do
@@ -1153,6 +1163,9 @@ cmd_doctor() {
     done
     egress_whitelist_render_status | while IFS=$'\t' read -r key value; do
         printf 'guard_egress_whitelist.%s：%s\n' "$key" "$value"
+    done
+    downmask_render_status | while IFS=$'\t' read -r key value; do
+        printf 'downmask.%s：%s\n' "$key" "$value"
     done
     if [ "$include_bench" = "true" ]; then
         cmd_doctor_benchmarks

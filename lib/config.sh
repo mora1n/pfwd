@@ -39,6 +39,41 @@ config_default_json() {
       "last_good_source": "",
       "last_good_updated_at": null,
       "runtime_hash": ""
+    },
+    "downmask": {
+      "iface": "",
+      "min_ratio": 1.5,
+      "max_ratio": 2.8,
+      "time_window_start": "08:00",
+      "time_window_end": "23:00",
+      "max_jitter_seconds": 900,
+      "min_deficit_bytes": 20971520,
+      "max_bytes_per_run": 838860800,
+      "pull_mode": "off",
+      "public": {
+        "speed_limit": "4M",
+        "active_source": "cloudflare_dynamic",
+        "custom_sources": []
+      },
+      "ab_pull": {
+        "protocol": "tcp",
+        "remote_host": "",
+        "remote_port": 0,
+        "local_ip": "",
+        "token": "",
+        "speed_limit": "4M",
+        "timeout_seconds": 1200
+      },
+      "ab_feed": {
+        "tcp_enabled": false,
+        "udp_enabled": false,
+        "bind_ip": "0.0.0.0",
+        "tcp_port": 0,
+        "udp_port": 0,
+        "token": "",
+        "seed_file": "/var/lib/pfwd/downmask/seed.bin",
+        "udp_payload_bytes": 1200
+      }
     }
   },
   "users": [],
@@ -79,6 +114,7 @@ config_validate_file() {
       and (.settings.forward | type == "object")
       and ((.settings.forward.interface // "") | type == "string")
       and all(.forwards[]?; (type == "object") and (.net | type == "object"))
+      and ((.settings.downmask // {}) | type == "object")
     ' "$file" >/dev/null || pfwd_die "无效配置文件：$file"
 }
 
@@ -135,6 +171,11 @@ config_import_bundle() {
         rm -f "$config_tmp" "$stats_tmp"
         pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
     fi
+
+    local defaults config_filled
+    defaults="$(config_default_json)"
+    config_filled="$(jq --argjson defaults "$defaults" '.settings.downmask //= $defaults.settings.downmask' "$config_tmp")"
+    printf '%s\n' "$config_filled" > "$config_tmp"
 
     mv "$config_tmp" "$PFWD_CONFIG_FILE"
     mv "$stats_tmp" "$PFWD_STATS_FILE"

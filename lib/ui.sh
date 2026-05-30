@@ -4699,6 +4699,200 @@ ui_menu_egress_whitelist() {
     done
 }
 
+ui_print_downmask_summary() {
+    local pull_mode iface ratio
+    pull_mode="$(downmask_config_get '.pull_mode' 2>/dev/null || echo off)"
+    iface="$(downmask_iface 2>/dev/null || echo -)"
+    ratio="$(jq -r '.target_ratio // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
+    local rx tx
+    rx="$(jq -r '.rx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
+    tx="$(jq -r '.tx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
+    local feed_tcp feed_udp
+    feed_tcp="$(downmask_config_get '.ab_feed.tcp_enabled' 2>/dev/null || echo false)"
+    feed_udp="$(downmask_config_get '.ab_feed.udp_enabled' 2>/dev/null || echo false)"
+    printf '  拉流模式：%s  接口：%s  今日比例：%s\n' "$pull_mode" "$iface" "$ratio"
+    printf '  今日 RX：%s  TX：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
+    printf '  B机喂流 TCP：%s  UDP：%s\n' "$feed_tcp" "$feed_udp"
+}
+
+ui_render_downmask_menu_page() {
+    ui_header "下行伪装"
+    ui_notice_render
+    ui_print_downmask_summary
+    echo
+    ui_menu_item 1 "对冲策略"
+    ui_menu_item 2 "公网下载源"
+    ui_menu_item 3 "A机拉流"
+    ui_menu_item 4 "B机喂流"
+    ui_menu_item 5 "生成随机种子文件"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_downmask() {
+    while true; do
+        ui_render_page ui_render_downmask_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1) ui_menu_downmask_policy ;;
+            2) ui_menu_downmask_public ;;
+            3) ui_menu_downmask_ab_pull ;;
+            4) ui_menu_downmask_ab_feed ;;
+            5) ui_menu_downmask_seed ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_menu_downmask_policy() {
+    ui_form_set "对冲策略" "设置下行伪装的拉流模式与参数"
+    local pull_mode min_r max_r tws twe jitter mindef maxrun
+
+    ui_form_select_read "拉流模式" "1" "0) 返回" "1) off（关闭）" "2) public（公网）" "3) ab（A/B 拉流）" || { ui_form_reset; return; }
+    [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
+    case "$UI_REPLY" in 1) pull_mode="off" ;; 2) pull_mode="public" ;; 3) pull_mode="ab" ;; esac
+    ui_form_add_kv "拉流模式" "$pull_mode"
+
+    ui_form_edit_read "最小比例（如 1.5）" "$(downmask_config_get '.min_ratio')" || { ui_form_reset; return; }
+    min_r="$UI_REPLY"
+    ui_form_add_kv "最小比例" "$min_r"
+    ui_form_edit_read "最大比例（如 2.8）" "$(downmask_config_get '.max_ratio')" || { ui_form_reset; return; }
+    max_r="$UI_REPLY"
+    ui_form_add_kv "最大比例" "$max_r"
+    ui_form_edit_read "时间窗口开始（HH:MM）" "$(downmask_config_get '.time_window_start')" || { ui_form_reset; return; }
+    tws="$UI_REPLY"
+    ui_form_add_kv "窗口开始" "$tws"
+    ui_form_edit_read "时间窗口结束（HH:MM）" "$(downmask_config_get '.time_window_end')" || { ui_form_reset; return; }
+    twe="$UI_REPLY"
+    ui_form_add_kv "窗口结束" "$twe"
+    ui_form_edit_read "最大随机延迟（秒）" "$(downmask_config_get '.max_jitter_seconds')" || { ui_form_reset; return; }
+    jitter="$UI_REPLY"
+    ui_form_edit_read "最小触发缺口（字节）" "$(downmask_config_get '.min_deficit_bytes')" || { ui_form_reset; return; }
+    mindef="$UI_REPLY"
+    ui_form_edit_read "单次最大补流（字节）" "$(downmask_config_get '.max_bytes_per_run')" || { ui_form_reset; return; }
+    maxrun="$UI_REPLY"
+
+    local args=()
+    [ -z "$pull_mode" ] || args+=(--pull-mode "$pull_mode")
+    [ -z "$min_r" ] || args+=(--min-ratio "$min_r")
+    [ -z "$max_r" ] || args+=(--max-ratio "$max_r")
+    [ -z "$tws" ] || args+=(--time-window-start "$tws")
+    [ -z "$twe" ] || args+=(--time-window-end "$twe")
+    [ -z "$jitter" ] || args+=(--max-jitter "$jitter")
+    [ -z "$mindef" ] || args+=(--min-deficit-bytes "$mindef")
+    [ -z "$maxrun" ] || args+=(--max-bytes-per-run "$maxrun")
+    if [ "${#args[@]}" -gt 0 ]; then
+        ui_run cmd_downmask_policy "${args[@]}"
+    fi
+    ui_form_reset
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "策略已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_downmask_public() {
+    ui_form_set "公网下载源" "选择活跃源并设置限速"
+    local active speed
+    ui_form_select_read "选择源" "1" "0) 返回" "1) cloudflare_dynamic" "2) cachefly_100mb" "3) digitalocean_100mb" "4) aliyun_ubuntu_iso" || { ui_form_reset; return; }
+    [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
+    case "$UI_REPLY" in 1) active="cloudflare_dynamic" ;; 2) active="cachefly_100mb" ;; 3) active="digitalocean_100mb" ;; 4) active="aliyun_ubuntu_iso" ;; esac
+    ui_form_add_kv "活跃源" "$active"
+    ui_form_edit_read "限速（如 4M、500K）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
+    speed="$UI_REPLY"
+    local args=(--active-source "$active")
+    [ -z "$speed" ] || args+=(--speed-limit "$speed")
+    ui_run cmd_downmask_public "${args[@]}"
+    ui_form_reset
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "公网源已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_downmask_ab_pull() {
+    ui_form_set "A机拉流" "配置从 B 机拉流的连接参数"
+    local protocol host port local_ip token speed timeout
+    ui_form_select_read "协议" "1" "0) 返回" "1) tcp" "2) udp" || { ui_form_reset; return; }
+    [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
+    case "$UI_REPLY" in 1) protocol="tcp" ;; 2) protocol="udp" ;; esac
+    ui_form_add_kv "协议" "$protocol"
+    ui_form_edit_read "远端主机" "$(downmask_config_get '.ab_pull.remote_host')" || { ui_form_reset; return; }
+    host="$UI_REPLY"
+    ui_form_add_kv "远端主机" "$host"
+    ui_form_edit_read "远端端口" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; return; }
+    port="$UI_REPLY"
+    ui_form_add_kv "远端端口" "$port"
+    ui_form_edit_read "A机本地源 IP（可填内网 IP）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; return; }
+    local_ip="$UI_REPLY"
+    [ -z "$local_ip" ] || ui_form_add_kv "A机本地源 IP" "$local_ip"
+    ui_form_edit_read "预共享 Token" "" || { ui_form_reset; return; }
+    token="$UI_REPLY"
+    ui_form_edit_read "限速（如 4M）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
+    speed="$UI_REPLY"
+    ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; return; }
+    timeout="$UI_REPLY"
+
+    local args=(--protocol "$protocol")
+    [ -z "$host" ] || args+=(--remote-host "$host")
+    [ -z "$port" ] || args+=(--remote-port "$port")
+    [ -z "$local_ip" ] || args+=(--local-ip "$local_ip")
+    [ -z "$token" ] || args+=(--token "$token")
+    [ -z "$speed" ] || args+=(--speed-limit "$speed")
+    [ -z "$timeout" ] || args+=(--timeout "$timeout")
+    ui_run cmd_downmask_ab_pull "${args[@]}"
+    ui_form_reset
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "AB 拉流已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_downmask_ab_feed() {
+    ui_form_set "B机喂流" "配置 B 机 TCP/UDP 喂流服务与返回 IP"
+    local tcp udp bind tcp_port udp_port token seed_file payload
+
+    ui_form_select_read "TCP 喂流" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
+    [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
+    case "$UI_REPLY" in 1) tcp="false" ;; 2) tcp="true" ;; esac
+    ui_form_add_kv "TCP" "$tcp"
+    ui_form_select_read "UDP 喂流" "1" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
+    case "$UI_REPLY" in 1) udp="false" ;; 2) udp="true" ;; esac
+    ui_form_add_kv "UDP" "$udp"
+    ui_form_edit_read "B机返回/监听 IP" "$(downmask_config_get '.ab_feed.bind_ip')" || { ui_form_reset; return; }
+    bind="$UI_REPLY"
+    ui_form_add_kv "B机返回/监听 IP" "$bind"
+    ui_form_edit_read "TCP 端口" "$(downmask_config_get '.ab_feed.tcp_port')" || { ui_form_reset; return; }
+    tcp_port="$UI_REPLY"
+    ui_form_edit_read "UDP 端口" "$(downmask_config_get '.ab_feed.udp_port')" || { ui_form_reset; return; }
+    udp_port="$UI_REPLY"
+    ui_form_edit_read "预共享 Token" "" || { ui_form_reset; return; }
+    token="$UI_REPLY"
+    ui_form_edit_read "种子文件路径" "$(downmask_config_get '.ab_feed.seed_file')" || { ui_form_reset; return; }
+    seed_file="$UI_REPLY"
+    ui_form_edit_read "UDP 包大小（字节）" "$(downmask_config_get '.ab_feed.udp_payload_bytes')" || { ui_form_reset; return; }
+    payload="$UI_REPLY"
+
+    local args=()
+    args+=(--tcp-enabled "$tcp" --udp-enabled "$udp")
+    [ -z "$bind" ] || args+=(--bind-ip "$bind")
+    [ -z "$tcp_port" ] || args+=(--tcp-port "$tcp_port")
+    [ -z "$udp_port" ] || args+=(--udp-port "$udp_port")
+    [ -z "$token" ] || args+=(--token "$token")
+    [ -z "$seed_file" ] || args+=(--seed-file "$seed_file")
+    [ -z "$payload" ] || args+=(--udp-payload-bytes "$payload")
+    ui_run cmd_downmask_ab_feed "${args[@]}"
+    ui_form_reset
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机喂流已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_downmask_seed() {
+    ui_clear_screen
+    ui_header "生成随机种子文件"
+    echo "默认生成 64MB 高熵文件到 /var/lib/pfwd/downmask/seed.bin"
+    if ui_confirm_text "yes" "输入 yes 确认生成"; then
+        ui_run cmd_downmask_seed generate
+    else
+        ui_warn "已跳过"
+    fi
+    ui_pause
+}
+
 ui_render_guard_menu_page() {
     ui_header "流量防护"
     ui_notice_render
@@ -4722,11 +4916,12 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "流量防护"
-    ui_menu_item 6 "配置导入导出"
-    ui_menu_item 7 "更新"
-    ui_menu_item 8 "重启服务"
-    ui_menu_item 9 "卸载"
+    ui_menu_item 5 "下行伪装"
+    ui_menu_item 6 "流量防护"
+    ui_menu_item 7 "配置导入导出"
+    ui_menu_item 8 "更新"
+    ui_menu_item 9 "重启服务"
+    ui_menu_item u "卸载"
     ui_menu_item 0 "退出"
 }
 
@@ -4855,11 +5050,12 @@ cmd_menu() {
             2) ui_menu_forwards ;;
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
-            5) ui_menu_guard ;;
-            6) ui_menu_export_import ;;
-            7) ui_menu_update ;;
-            8) ui_menu_restart_runtime ;;
-            9) ui_menu_uninstall ;;
+            5) ui_menu_downmask ;;
+            6) ui_menu_guard ;;
+            7) ui_menu_export_import ;;
+            8) ui_menu_update ;;
+            9) ui_menu_restart_runtime ;;
+            u) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac

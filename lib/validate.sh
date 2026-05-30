@@ -437,6 +437,58 @@ normalize_ui_traffic_input() {
     pfwd_die "无效流量大小：$1；支持数字(默认GB)或小数 + B/KB/MB/GB/TB"
 }
 
+validate_downmask_pull_mode() {
+    local value="$1"
+    case "$value" in
+        off|public|ab) ;;
+        *) pfwd_die "无效 pull_mode：$value，必须是 off|public|ab" ;;
+    esac
+}
+
+validate_downmask_bind_ip() {
+    local value="$1"
+    case "$value" in
+        ""|"::"|"0.0.0.0") ;;
+        *) validate_ip_literal "$value" ;;
+    esac
+}
+
+validate_downmask_ratio() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || pfwd_die "无效比例：$value"
+    awk -v value="$value" 'BEGIN { exit !(value >= 1.0) }' || pfwd_die "比例必须 >= 1.0：$value"
+}
+
+validate_downmask_speed_limit() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?[KkMmGg]?$ ]] || pfwd_die "无效限速值：$value，支持 4M、500K、1G"
+}
+
+validate_downmask_time_window() {
+    local value="$1"
+    validate_hhmm_time "$value"
+}
+
+validate_downmask_protocol() {
+    local value="$1"
+    case "$value" in
+        tcp|udp) ;;
+        *) pfwd_die "无效协议：$value，必须是 tcp 或 udp" ;;
+    esac
+}
+
+validate_downmask_local_ip() {
+    local value="$1"
+    [ -n "$value" ] || pfwd_die "local_ip 不能为空"
+    validate_ip_literal "$value"
+}
+
+validate_downmask_token() {
+    local value="$1"
+    [ -n "$value" ] || pfwd_die "token 不能为空"
+}
+
+
 normalize_rate() {
     local raw="$1"
     raw="$(echo "$raw" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"

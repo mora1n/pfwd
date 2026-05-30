@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.2"
+PFWD_VERSION="0.2.3"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard service commands ui)
+PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask service commands ui)
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -36,6 +36,16 @@ pfwd_bootstrap_xdp_asset_name() {
     case "$arch" in
         x86_64|amd64) echo "pfwd-xdp-linux-amd64" ;;
         aarch64|arm64) echo "pfwd-xdp-linux-arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
+pfwd_bootstrap_downmask_asset_name() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) echo "pfwd-downmask-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-downmask-linux-arm64" ;;
         *) return 1 ;;
     esac
 }
@@ -87,7 +97,7 @@ pfwd_bootstrap_cleanup_partial_install() {
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
 
     rm -f "$bin_path" "$bbr_bin_path" "$bbr_alias_path"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service; do
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service; do
         rm -f "$systemd_dir/$unit"
     done
     rm -rf "$install_dir"
@@ -111,6 +121,11 @@ pfwd_bootstrap_install() {
     }
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$install_dir/assets/$xdp_asset"
     chmod +x "$install_dir/assets/$xdp_asset"
+    local downmask_asset
+    if downmask_asset="$(pfwd_bootstrap_downmask_asset_name)"; then
+        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$downmask_asset" "$install_dir/assets/$downmask_asset" || true
+        [ -f "$install_dir/assets/$downmask_asset" ] && chmod +x "$install_dir/assets/$downmask_asset"
+    fi
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
 
@@ -202,6 +217,7 @@ pfwd_main() {
         notify-disable) cmd_notify_disable "$@" ;;
         notify-delete) cmd_notify_delete "$@" ;;
         guard) cmd_guard "$@" ;;
+        downmask) cmd_downmask "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
@@ -262,6 +278,13 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom] [--source-url URL]
   pfwd guard egress-whitelist refresh|status
   pfwd guard egress-whitelist-custom list|add|clear|delete|update ...
+  pfwd downmask status
+  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio 1.5] [--max-ratio 2.8] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes N] [--max-bytes-per-run N] [--iface NAME]
+  pfwd downmask public [--active-source NAME] [--speed-limit 4M]
+  pfwd downmask public custom list|add|delete|clear ...
+  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST] [--remote-port PORT] [--local-ip IP] [--token TOKEN] [--speed-limit 4M] [--timeout SEC]
+  pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN] [--seed-file PATH] [--udp-payload-bytes 1200]
+  pfwd downmask seed generate [--path PATH] [--size BYTES]
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]

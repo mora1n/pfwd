@@ -13,6 +13,7 @@
 | Traffic | 按用户和转发规则统计流量，支持单向/双向计费、倍率、总量限制 |
 | Rate | 使用 `tc` 做端口级或用户级双向速率限制 |
 | Guard | 入口白名单、出口白名单和 TCP 首包协议封锁；入口规则运行在 XDP / ingress 分层数据面，出口白名单同时做规则目标校验和宿主机出口限制 |
+| Downmask | 按日内收发比补下行流量，支持公网下载源和 A/B 机拉流 / 喂流 |
 | Notify | Telegram 定时通知和手动通知 |
 | Tuning | `pfwd-bbr` 负责 BBR、sysctl、tc shaping、BQL、RPS/XPS |
 
@@ -39,6 +40,33 @@ pfwd guard whitelist status
 pfwd guard egress-whitelist status
 ```
 
+## 下行伪装
+
+`pfwd downmask` 用于按日内收发比例补下行流量，适合把机器的下行流量做成更接近目标比值。当前支持两种补流来源：
+
+- `public`：从公网测速源或大文件源下载。
+- `ab`：A/B 机模式。A 机执行 `ab-pull` 主动拉流，B 机执行 `ab-feed` 返回高熵内容。
+
+关键语义：
+
+- `ab-pull --local-ip IP` / `settings.downmask.ab_pull.local_ip`：A 机拉流时绑定本地源 IP，可填额外内网 IP；TCP / UDP 都会绑定该源地址，且必须和远端地址族匹配。
+- `ab-feed --bind-ip IP` / `settings.downmask.ab_feed.bind_ip`：B 机监听并从该 IP 返回内容；UI 中对应文案是“B机返回/监听 IP”。
+- 启用 `ab-feed` 的 TCP 或 UDP 时，必须同时配置对应端口和 `token`，否则命令会直接失败，不会生成一个看似启用但实际无法启动的服务。
+- `pfwd-downmask-feed.service` 仅在 `ab-feed` 启用时生成并启动；关闭后会同步清理旧状态文件。
+
+常用命令：
+
+```bash
+pfwd downmask policy --pull-mode public --iface eth0
+pfwd downmask public --active-source cloudflare_dynamic --speed-limit 4M
+pfwd downmask policy --pull-mode ab --iface eth0
+pfwd downmask ab-pull --protocol tcp --remote-host 10.0.0.2 --remote-port 5301 --local-ip 10.0.0.10 --token secret --speed-limit 4M
+pfwd downmask ab-feed --tcp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --token secret
+pfwd downmask seed generate
+pfwd downmask status
+pfwd render downmask
+```
+
 ## 依赖
 
 | 依赖 | 用途 |
@@ -49,20 +77,23 @@ pfwd guard egress-whitelist status
 | `curl` 或 `wget` | bootstrap / update 下载 |
 | `bpffs` | eBPF link/map pinning，通常挂载在 `/sys/fs/bpf` |
 
-构建 `pfwd-xdp` 还需要 Go、clang 和可用的 eBPF 工具链；普通安装使用预编译 assets。
+构建 `pfwd-xdp` 还需要 Go、clang 和可用的 eBPF 工具链；构建 `pfwd-downmask` 需要 Go；普通安装使用预编译 assets。
 
 ## 源码构建
 
-需要预编译 `pfwd-xdp` 时，直接在仓库根目录执行：
+需要预编译 `pfwd-xdp` / `pfwd-downmask` 时，直接在仓库根目录执行：
 
 ```bash
 ./xdp/build.sh
+./downmask/build.sh
 ```
 
 构建脚本会重建 `xdp/xdp_bpfel.o`，并把目标架构二进制输出到：
 
 - `assets/pfwd-xdp-linux-amd64`
 - `assets/pfwd-xdp-linux-arm64`
+- `assets/pfwd-downmask-linux-amd64`
+- `assets/pfwd-downmask-linux-arm64`
 
 ## 安装
 
@@ -74,7 +105,7 @@ pfwd guard egress-whitelist status
 wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
 ```
 
-离线安装时，在仓库根目录打包脚本、模块、白名单种子和目标架构的 `pfwd-xdp` 二进制即可。这里以 `amd64` 为例；`arm64` 主机把 `pfwd-xdp-linux-amd64` 换成 `pfwd-xdp-linux-arm64`。
+离线安装时，在仓库根目录打包脚本、模块、白名单种子，以及目标架构的 `pfwd-xdp` / `pfwd-downmask` 二进制即可。这里以 `amd64` 为例；`arm64` 主机把对应文件名替换成 `*-linux-arm64`。
 
 ```bash
 tar -czf pfwd.tar.gz \
@@ -82,6 +113,7 @@ tar -czf pfwd.tar.gz \
   bbr.sh \
   lib/ \
   assets/pfwd-xdp-linux-amd64 \
+  assets/pfwd-downmask-linux-amd64 \
   assets/cn-aggregated.zone \
   assets/cn-aggregated-v6.zone
 ```
@@ -100,9 +132,10 @@ pfwd doctor
 pfwd doctor --bench
 pfwd render units
 /usr/local/lib/pfwd/bin/pfwd-xdp version
+/usr/local/lib/pfwd/bin/pfwd-downmask version
 ```
 
-如果需要完全手工复制文件，可以使用下面的命令。这里以 `amd64` 为例；`arm64` 主机把 `pfwd-xdp-linux-amd64` 换成 `pfwd-xdp-linux-arm64`。
+如果需要完全手工复制文件，可以使用下面的命令。这里以 `amd64` 为例；`arm64` 主机把对应文件名替换成 `*-linux-arm64`。
 
 ```bash
 install -d \
@@ -115,6 +148,7 @@ install -m 755 pfwd.sh /usr/local/lib/pfwd/pfwd.sh
 install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 install -m 755 assets/pfwd-xdp-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-xdp
+install -m 755 assets/pfwd-downmask-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-downmask
 install -m 644 assets/cn-aggregated.zone /usr/local/lib/pfwd/assets/cn-aggregated.zone
 install -m 644 assets/cn-aggregated-v6.zone /usr/local/lib/pfwd/assets/cn-aggregated-v6.zone
 
@@ -138,7 +172,8 @@ pfwd install
         ├── pfwd.sh
         ├── bbr.sh
         ├── bin/
-        │   └── pfwd-xdp
+        │   ├── pfwd-xdp
+        │   └── pfwd-downmask
         ├── assets/
         │   ├── cn-aggregated.zone
         │   └── cn-aggregated-v6.zone
@@ -155,10 +190,14 @@ pfwd install
     ├── pfwd.service
     ├── pfwd.timer
     ├── pfwd-xdp.service
-    └── pfwd-bbr.service
+    ├── pfwd-bbr.service
+    └── pfwd-downmask-feed.service
 
 /var/lib/pfwd/
 ├── stats.json
+├── downmask/
+│   ├── day_state.json
+│   └── status.json
 ├── whitelist/
 └── xdp/
     ├── indexes.json
@@ -216,6 +255,8 @@ pfwd add \
 | 渲染数据面 | `pfwd render xdp` | 查看 XDP 候选 runtime JSON |
 | 渲染状态 | `pfwd render status` | 查看已应用数据面状态 JSON |
 | 渲染速率 | `pfwd render tc` | 查看速率限制命令 |
+| 下行伪装状态 | `pfwd downmask status` | 查看策略、日内统计和 AB feed 监听状态 |
+| 渲染下行伪装 | `pfwd render downmask` | 输出 downmask JSON 状态 |
 | 诊断 | `pfwd doctor` | 查看配置、二进制、systemd 和运行态摘要；`--bench` 显示 benchmark |
 
 ## 配置语义
@@ -232,6 +273,8 @@ pfwd add \
 - `settings.whitelist` 只限制入站来源；`settings.egress_whitelist` 一方面限制转发目标，另一方面限制宿主机全部非 loopback 出口流量，默认内置国内 IPv4/IPv6 段能力且默认包含国内 IP。
 - 出口白名单只接受 CIDR，不接受域名条目；当规则目标是域名时，`add` / `update` / `refresh` / `reconcile` 会按当前解析结果做白名单校验。
 - 当 XDP / hybrid / guard-only 数据面生效时，宿主机出口白名单走 tc egress；当运行态是 nft-only / nft-fallback / none 时，宿主机出口白名单走 nftables output hook。
+- `settings.downmask` 控制下行伪装；`ab_pull.local_ip` 用于 A 机显式绑定拉流源 IP，`ab_feed.bind_ip` 用于 B 机监听并从指定 IP 返回内容。
+- `ab-feed` 启用某个协议时，必须同时配置该协议对应的端口和 `token`；`pfwd render units` 会在启用时渲染 `pfwd-downmask-feed.service`。
 - 总量限制仍按现有 `traffic_mode` / `traffic_ratio` 语义计算。
 - 速率限制由 `tc` 执行；单个 `rate` 同时作用于上下行，入口方向通过 IFB 做整形；转发、计数和 guard 由 XDP / `nftables` 组合数据面共同完成。
 
