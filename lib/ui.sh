@@ -4859,6 +4859,7 @@ ui_menu_downmask_ab_pull() {
 ui_menu_downmask_ab_feed() {
     ui_form_set "B机喂流" "配置 B 机 TCP/UDP 喂流服务与返回 IP。输入 0 返回上级菜单。"
     local tcp udp bind tcp_port udp_port token seed_file payload
+    local seed_default="/var/lib/pfwd/downmask/seed.bin"
 
     ui_form_select_read "TCP 喂流" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
@@ -4881,10 +4882,12 @@ ui_menu_downmask_ab_feed() {
     ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     token="$UI_REPLY"
-    ui_form_edit_read "种子文件路径" "$(downmask_config_get '.ab_feed.seed_file')" || { ui_form_reset; return; }
+    seed_file="$(downmask_config_get '.ab_feed.seed_file')"
+    [ -n "$seed_file" ] || seed_file="$seed_default"
+    ui_form_edit_read "种子文件路径（默认 $seed_default）" "$seed_file" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     seed_file="$UI_REPLY"
-    ui_form_edit_read "UDP 包大小（字节）" "$(downmask_config_get '.ab_feed.udp_payload_bytes')" || { ui_form_reset; return; }
+    ui_form_edit_read "UDP 包大小（支持 1200、1.2KB；裸数字按字节）" "$(downmask_config_get '.ab_feed.udp_payload_bytes')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     payload="$UI_REPLY"
 

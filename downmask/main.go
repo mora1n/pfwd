@@ -30,8 +30,17 @@ const (
 	headerSize               = 56
 	udpSessionLen            = 16
 	udpDefaultPayload        = 1200
+	udpMinPayload            = udpSessionLen + 1
+	udpMaxPayload            = 65507
 	udpMaxRetries            = 3
 )
+
+func validateUDPPayloadBytes(payload int) error {
+	if payload < udpMinPayload || payload > udpMaxPayload {
+		return fmt.Errorf("udp payload 必须位于 %d-%d 字节", udpMinPayload, udpMaxPayload)
+	}
+	return nil
+}
 
 type requestHeader struct {
 	Magic       uint32
@@ -110,7 +119,7 @@ func printUsage(w io.Writer) {
 
 用法:
   pfwd-downmask pull   --protocol tcp|udp --remote-host HOST(IP) --remote-port PORT --token TOKEN(openssl rand -hex 16) --wanted-bytes N [--speed-limit BPS] [--timeout SEC]
-  pfwd-downmask serve  [--tcp-addr HOST:PORT] [--udp-addr HOST:PORT] --token TOKEN(openssl rand -hex 16) [--seed-file PATH] [--max-rate BPS] [--udp-payload-bytes N] [--status-file PATH]
+  pfwd-downmask serve  [--tcp-addr HOST:PORT] [--udp-addr HOST:PORT] --token TOKEN(openssl rand -hex 16) [--seed-file PATH] [--max-rate BPS] [--udp-payload-bytes N(17-65507)] [--status-file PATH]
   pfwd-downmask seed   [--path PATH] [--size BYTES]
   pfwd-downmask version`)
 }
@@ -412,9 +421,9 @@ func runServe(args []string) error {
 	fs.StringVar(&opts.TCPAddr, "tcp-addr", "", "TCP 监听地址，例 0.0.0.0:5301，空表示不启用")
 	fs.StringVar(&opts.UDPAddr, "udp-addr", "", "UDP 监听地址，空表示不启用")
 	fs.StringVar(&opts.Token, "token", "", "预共享 token，A/B 两端需一致；可用 openssl rand -hex 16 生成")
-	fs.StringVar(&opts.SeedFile, "seed-file", "", "高熵种子文件路径")
+	fs.StringVar(&opts.SeedFile, "seed-file", "", "高熵种子文件路径；默认生成路径通常为 /var/lib/pfwd/downmask/seed.bin")
 	fs.Uint64Var(&opts.MaxRate, "max-rate", 0, "服务端每会话最大发送速率 bytes/s，0 表示不限")
-	fs.IntVar(&opts.UDPPayload, "udp-payload-bytes", udpDefaultPayload, "UDP 单包 payload 字节")
+	fs.IntVar(&opts.UDPPayload, "udp-payload-bytes", udpDefaultPayload, "UDP 单包 payload 字节；必须位于 17-65507")
 	fs.StringVar(&opts.StatusFile, "status-file", "", "状态 JSON 文件路径")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -425,8 +434,8 @@ func runServe(args []string) error {
 	if opts.TCPAddr == "" && opts.UDPAddr == "" {
 		return errors.New("必须至少启用 --tcp-addr 或 --udp-addr")
 	}
-	if opts.UDPPayload < udpSessionLen+1 {
-		opts.UDPPayload = udpDefaultPayload
+	if err := validateUDPPayloadBytes(opts.UDPPayload); err != nil {
+		return fmt.Errorf("--udp-payload-bytes %w", err)
 	}
 
 	seed, err := loadOrGenSeed(opts.SeedFile)
@@ -699,8 +708,8 @@ func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen
 	defer status.sessionDone()
 
 	limiter := newRateLimiter(rate)
-	if payload < udpSessionLen+1 {
-		payload = udpDefaultPayload
+	if err := validateUDPPayloadBytes(payload); err != nil {
+		return
 	}
 	offset := mrand.Intn(len(seed))
 	var sent uint64
@@ -796,7 +805,7 @@ func runSeed(args []string) error {
 	fs.SetOutput(os.Stderr)
 	var path string
 	var size int64
-	fs.StringVar(&path, "path", "/var/lib/pfwd/downmask/seed.bin", "种子文件路径")
+	fs.StringVar(&path, "path", "/var/lib/pfwd/downmask/seed.bin", "种子文件路径，默认 /var/lib/pfwd/downmask/seed.bin")
 	fs.Int64Var(&size, "size", 64*1024*1024, "种子文件字节大小")
 	if err := fs.Parse(args); err != nil {
 		return err

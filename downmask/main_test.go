@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -109,39 +110,9 @@ func TestPullIntegration(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			seed := make([]byte, 1024*1024)
-			for i := range seed {
-				seed[i] = byte(i)
-			}
 			status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
-
-			var port int
-			if tc.protocol == "tcp" {
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
-				if err != nil {
-					t.Fatalf("listen: %v", err)
-				}
-				defer ln.Close()
-				port = ln.Addr().(*net.TCPAddr).Port
-				done := make(chan struct{})
-				go func() {
-					defer close(done)
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					handleTCPSession(conn, tokenDigest(tc.serverToken), seed, 0, status)
-				}()
-				defer func() { <-done }()
-			} else {
-				pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-				if err != nil {
-					t.Fatalf("listen packet: %v", err)
-				}
-				defer pc.Close()
-				port = pc.LocalAddr().(*net.UDPAddr).Port
-				go serveUDPLoop(pc, tokenDigest(tc.serverToken), seed, 0, udpDefaultPayload, status)
-			}
+			port, cleanup := startPullTestServer(t, tc.protocol, tc.serverToken, newTestSeed(1024*1024), status)
+			defer cleanup()
 
 			stdout, restore := captureStdout(t)
 			defer restore()
@@ -172,6 +143,213 @@ func TestPullIntegration(t *testing.T) {
 	}
 }
 
+func TestUDPPayloadValidation(t *testing.T) {
+	t.Run("helper", func(t *testing.T) {
+		testCases := []struct {
+			name    string
+			payload int
+			wantErr string
+		}{
+			{name: "min_ok", payload: udpMinPayload},
+			{name: "default_ok", payload: udpDefaultPayload},
+			{name: "max_ok", payload: udpMaxPayload},
+			{name: "too_small", payload: udpMinPayload - 1, wantErr: "udp payload 必须位于"},
+			{name: "too_large", payload: udpMaxPayload + 1, wantErr: "udp payload 必须位于"},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := validateUDPPayloadBytes(tc.payload)
+				if tc.wantErr == "" {
+					if err != nil {
+						t.Fatalf("validateUDPPayloadBytes(%d): %v", tc.payload, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("validateUDPPayloadBytes(%d) = %v, want substring %q", tc.payload, err, tc.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("run_serve_rejects_invalid_payload", func(t *testing.T) {
+		testCases := []struct {
+			name    string
+			payload int
+		}{
+			{name: "too_small", payload: udpMinPayload - 1},
+			{name: "too_large", payload: udpMaxPayload + 1},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := runServe([]string{
+					"--udp-addr", "127.0.0.1:0",
+					"--token", "test-token",
+					"--udp-payload-bytes", strconv.Itoa(tc.payload),
+				})
+				if err == nil || !strings.Contains(err.Error(), "--udp-payload-bytes") {
+					t.Fatalf("runServe invalid payload error = %v, want udp-payload-bytes error", err)
+				}
+			})
+		}
+	})
+
+	t.Run("run_serve_accepts_valid_payload", func(t *testing.T) {
+		done := make(chan error, 1)
+		go func() {
+			done <- runServe([]string{
+				"--udp-addr", "127.0.0.1:0",
+				"--token", "test-token",
+				"--udp-payload-bytes", strconv.Itoa(udpDefaultPayload),
+			})
+		}()
+
+		time.Sleep(150 * time.Millisecond)
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			t.Fatalf("send SIGTERM: %v", err)
+		}
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("runServe valid payload: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("runServe did not stop after SIGTERM")
+		}
+	})
+}
+
+func TestServeHelpersAndUDPFlow(t *testing.T) {
+	t.Run("local_addr_helpers", func(t *testing.T) {
+		addr, err := localTCPAddr(net.ParseIP("127.0.0.2"), &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80})
+		if err != nil {
+			t.Fatalf("localTCPAddr: %v", err)
+		}
+		if got := addr.IP.String(); got != "127.0.0.2" {
+			t.Fatalf("addr.IP = %s", got)
+		}
+
+		_, err = localUDPAddr(net.ParseIP("127.0.0.2"), &net.UDPAddr{IP: net.ParseIP("::1"), Port: 53})
+		if err == nil || !strings.Contains(err.Error(), "地址族不匹配") {
+			t.Fatalf("expected family mismatch, got %v", err)
+		}
+	})
+
+	t.Run("write_status_snapshot", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "status.json")
+		status := &serveStatus{
+			tcpListening:   true,
+			udpListening:   true,
+			bindIP:         "127.0.0.1",
+			tcpPort:        1001,
+			udpPort:        1002,
+			totalBytesSent: 4096,
+			activeSessions: 2,
+			udpSessions:    make(map[udpSessionKey]struct{}),
+		}
+		writeStatusFile(path, status)
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read status file: %v", err)
+		}
+		var snap serveStatusJSON
+		if err := json.Unmarshal(data, &snap); err != nil {
+			t.Fatalf("unmarshal status: %v", err)
+		}
+		if !snap.TCPListening || !snap.UDPListening {
+			t.Fatalf("unexpected listening flags: %+v", snap)
+		}
+		if snap.TotalBytesSent != 4096 || snap.ActiveSessions != 2 {
+			t.Fatalf("unexpected counters: %+v", snap)
+		}
+	})
+
+	t.Run("udp_session_dedup", func(t *testing.T) {
+		status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
+		var sessionID [udpSessionLen]byte
+		copy(sessionID[:], []byte("dedup-session-01"))
+		key := udpSessionKey{Addr: "127.0.0.1:12345", SessionID: sessionID}
+
+		if !status.tryStartUDPSession(key) {
+			t.Fatalf("first start should succeed")
+		}
+		if status.tryStartUDPSession(key) {
+			t.Fatalf("duplicate start should be rejected")
+		}
+		status.finishUDPSession(key)
+		if !status.tryStartUDPSession(key) {
+			t.Fatalf("start after finish should succeed")
+		}
+	})
+
+	t.Run("handle_udp_session", func(t *testing.T) {
+		testCases := []struct {
+			name             string
+			wanted           uint64
+			payload          int
+			wantBytes        int
+			wantPackets      int
+			wantMaxPacketLen int
+		}{
+			{
+				name:             "exact_remaining_default_payload",
+				wanted:           1500,
+				payload:          udpDefaultPayload,
+				wantBytes:        1500,
+				wantPackets:      2,
+				wantMaxPacketLen: udpDefaultPayload,
+			},
+			{
+				name:             "custom_payload_respected",
+				wanted:           2000,
+				payload:          600,
+				wantBytes:        2000,
+				wantPackets:      4,
+				wantMaxPacketLen: 600,
+			},
+			{
+				name:             "invalid_payload_skips_send",
+				wanted:           1024,
+				payload:          udpMinPayload - 1,
+				wantBytes:        0,
+				wantPackets:      0,
+				wantMaxPacketLen: 0,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				pc := newRecordingPacketConn()
+				status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
+				var sessionID [udpSessionLen]byte
+				copy(sessionID[:], []byte("udp-flow-check01"))
+				key := udpSessionKey{Addr: "peer", SessionID: sessionID}
+				if !status.tryStartUDPSession(key) {
+					t.Fatalf("failed to register UDP session")
+				}
+
+				handleUDPSession(pc, dummyAddr("peer"), sessionID, tc.wanted, 0, bytes.Repeat([]byte("a"), 4096), tc.payload, key, status)
+
+				totalPayload, maxPacketLen := pc.payloadStats()
+				if totalPayload != tc.wantBytes {
+					t.Fatalf("payload = %d, want %d", totalPayload, tc.wantBytes)
+				}
+				if len(pc.packets) != tc.wantPackets {
+					t.Fatalf("packets = %d, want %d", len(pc.packets), tc.wantPackets)
+				}
+				if maxPacketLen != tc.wantMaxPacketLen {
+					t.Fatalf("max packet len = %d, want %d", maxPacketLen, tc.wantMaxPacketLen)
+				}
+			})
+		}
+	})
+}
+
 func TestRateLimiterShape(t *testing.T) {
 	r := newRateLimiter(1024 * 1024)
 	start := time.Now()
@@ -184,96 +362,48 @@ func TestRateLimiterShape(t *testing.T) {
 	}
 }
 
-func TestLocalAddrHelpers(t *testing.T) {
-	t.Run("ipv4_tcp", func(t *testing.T) {
-		addr, err := localTCPAddr(net.ParseIP("127.0.0.2"), &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80})
+func newTestSeed(size int) []byte {
+	seed := make([]byte, size)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	return seed
+}
+
+func startPullTestServer(t *testing.T, protocol, serverToken string, seed []byte, status *serveStatus) (int, func()) {
+	t.Helper()
+
+	if protocol == "tcp" {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			t.Fatalf("localTCPAddr: %v", err)
+			t.Fatalf("listen tcp: %v", err)
 		}
-		if got := addr.IP.String(); got != "127.0.0.2" {
-			t.Fatalf("addr.IP = %s", got)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			handleTCPSession(conn, tokenDigest(serverToken), seed, 0, status)
+		}()
+		return ln.Addr().(*net.TCPAddr).Port, func() {
+			_ = ln.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("tcp test server did not stop")
+			}
 		}
-	})
-
-	t.Run("family_mismatch", func(t *testing.T) {
-		_, err := localUDPAddr(net.ParseIP("127.0.0.2"), &net.UDPAddr{IP: net.ParseIP("::1"), Port: 53})
-		if err == nil || !strings.Contains(err.Error(), "地址族不匹配") {
-			t.Fatalf("expected family mismatch, got %v", err)
-		}
-	})
-}
-
-func TestWriteStatusFileAndSnapshot(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "status.json")
-	status := &serveStatus{
-		tcpListening:   true,
-		udpListening:   true,
-		bindIP:         "127.0.0.1",
-		tcpPort:        1001,
-		udpPort:        1002,
-		totalBytesSent: 4096,
-		activeSessions: 2,
-		udpSessions:    make(map[udpSessionKey]struct{}),
 	}
-	writeStatusFile(path, status)
 
-	data, err := os.ReadFile(path)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("read status file: %v", err)
+		t.Fatalf("listen udp: %v", err)
 	}
-	var snap serveStatusJSON
-	if err := json.Unmarshal(data, &snap); err != nil {
-		t.Fatalf("unmarshal status: %v", err)
-	}
-	if !snap.TCPListening || !snap.UDPListening {
-		t.Fatalf("unexpected listening flags: %+v", snap)
-	}
-	if snap.TotalBytesSent != 4096 || snap.ActiveSessions != 2 {
-		t.Fatalf("unexpected counters: %+v", snap)
-	}
-}
-
-func TestUDPSessionDedupPreventsDuplicateStart(t *testing.T) {
-	status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
-	var sessionID [udpSessionLen]byte
-	copy(sessionID[:], []byte("dedup-session-01"))
-	key := udpSessionKey{Addr: "127.0.0.1:12345", SessionID: sessionID}
-
-	if !status.tryStartUDPSession(key) {
-		t.Fatalf("first start should succeed")
-	}
-	if status.tryStartUDPSession(key) {
-		t.Fatalf("duplicate start should be rejected")
-	}
-	status.finishUDPSession(key)
-	if !status.tryStartUDPSession(key) {
-		t.Fatalf("start after finish should succeed")
-	}
-}
-
-func TestHandleUDPSessionExactRemaining(t *testing.T) {
-	pc := newRecordingPacketConn()
-	status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
-	seed := bytes.Repeat([]byte("a"), 4096)
-	var sessionID [udpSessionLen]byte
-	copy(sessionID[:], []byte("udp-exact-check1"))
-	key := udpSessionKey{Addr: "peer", SessionID: sessionID}
-	if !status.tryStartUDPSession(key) {
-		t.Fatalf("failed to register UDP session")
-	}
-
-	handleUDPSession(pc, dummyAddr("peer"), sessionID, 1500, 0, seed, udpDefaultPayload, key, status)
-
-	totalPayload := 0
-	for _, pkt := range pc.packets {
-		if len(pkt) < udpSessionLen {
-			t.Fatalf("short packet: %d", len(pkt))
-		}
-		totalPayload += len(pkt) - udpSessionLen
-	}
-	if totalPayload != 1500 {
-		t.Fatalf("payload = %d, want 1500", totalPayload)
+	go serveUDPLoop(pc, tokenDigest(serverToken), seed, 0, udpDefaultPayload, status)
+	return pc.LocalAddr().(*net.UDPAddr).Port, func() {
+		_ = pc.Close()
 	}
 }
 
@@ -296,6 +426,21 @@ func (r *recordingPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	cp := append([]byte(nil), p...)
 	r.packets = append(r.packets, cp)
 	return len(p), nil
+}
+
+func (r *recordingPacketConn) payloadStats() (totalPayload, maxPacketLen int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, pkt := range r.packets {
+		if len(pkt) < udpSessionLen {
+			continue
+		}
+		totalPayload += len(pkt) - udpSessionLen
+		if len(pkt) > maxPacketLen {
+			maxPacketLen = len(pkt)
+		}
+	}
+	return totalPayload, maxPacketLen
 }
 
 func (r *recordingPacketConn) Close() error                     { return nil }
@@ -333,7 +478,7 @@ func captureStdout(t *testing.T) (func() string, func()) {
 		done <- string(buf)
 	}()
 	get := func() string {
-		w.Close()
+		_ = w.Close()
 		os.Stdout = orig
 		return <-done
 	}

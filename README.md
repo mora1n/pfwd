@@ -55,7 +55,9 @@ pfwd guard egress-whitelist status
 - `--token` / `settings.downmask.ab_pull.token` / `settings.downmask.ab_feed.token`：A/B 两端必须完全一致；建议使用随机值，例如 `openssl rand -hex 16`。
 - 启用 `ab-feed` 的 TCP 或 UDP 时，必须同时配置对应端口和 `token`，否则命令会直接失败，不会生成一个看似启用但实际无法启动的服务。
 - `pfwd-downmask-feed.service` 仅在 `ab-feed` 启用时生成并启动；关闭后会同步清理旧状态文件。
-- `min_deficit_bytes`、`max_bytes_per_run` 和 `seed generate --size` 支持 `B/KB/MB/GB/TB`；裸数字继续按字节解释，兼容现有配置。
+- `min_deficit_bytes`、`max_bytes_per_run`、`ab_feed.udp_payload_bytes` 和 `seed generate --size` 支持 `B/KB/MB/GB/TB`；裸数字继续按字节解释，兼容现有配置。
+- `ab_feed.udp_payload_bytes` 最终必须位于 `17-65507` 字节；超出范围时命令或服务会直接报错，不会静默回退。
+- `ab_feed.seed_file` 的常规默认生成路径是 `/var/lib/pfwd/downmask/seed.bin`；B 机喂流界面会按这个路径提示默认值。
 - `public.active_source` 可选内置源：
   `cloudflare_dynamic` 按目标字节数动态下载，最适合精确补量；
   `cachefly_100mb` / `digitalocean_100mb` 是固定 100MB 测速文件；
@@ -74,7 +76,7 @@ pfwd downmask public --active-source cloudflare_dynamic --speed-limit 4M
 pfwd downmask policy --pull-mode ab --iface eth0
 TOKEN="$(openssl rand -hex 16)"
 pfwd downmask ab-pull --protocol tcp --remote-host 10.0.0.2 --remote-port 5301 --local-ip 10.0.0.10 --token "$TOKEN" --speed-limit 4M
-pfwd downmask ab-feed --tcp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --token "$TOKEN"
+pfwd downmask ab-feed --tcp-enabled true --udp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --udp-port 5301 --udp-payload-bytes 1.2KB --token "$TOKEN"
 pfwd downmask seed generate --size 256MB
 pfwd downmask status
 pfwd render downmask

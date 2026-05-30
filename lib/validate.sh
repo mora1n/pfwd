@@ -451,6 +451,15 @@ normalize_ui_downmask_size_input() {
     pfwd_die "无效 downmask 容量：$1；支持数字(默认字节)或小数 + B/KB/MB/GB/TB"
 }
 
+validate_downmask_udp_payload_bytes() {
+    local value="$1"
+    local min_payload=17
+    local max_payload=65507
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "udp-payload-bytes 必须是非负整数"
+    [ "$value" -ge "$min_payload" ] || pfwd_die "udp-payload-bytes 必须 >= ${min_payload} 字节"
+    [ "$value" -le "$max_payload" ] || pfwd_die "udp-payload-bytes 必须 <= ${max_payload} 字节"
+}
+
 normalize_ui_traffic_input() {
     local raw="$1"
     raw="$(printf '%s' "$raw" | tr -d ' ')"

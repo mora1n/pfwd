@@ -560,7 +560,7 @@ cmd_downmask() {
   pfwd downmask public custom list
   pfwd downmask public custom clear
   pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M] [--timeout SEC]
-  pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes N]
+  pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
   pfwd downmask seed generate [--path PATH] [--size 64MB]
 EOF
             ;;
@@ -748,7 +748,10 @@ cmd_downmask_ab_feed() {
     [ -z "$bind" ] || validate_downmask_bind_ip "$bind"
     [ -z "$tcp_port" ] || validate_port "$tcp_port"
     [ -z "$udp_port" ] || validate_port "$udp_port"
-    [ -z "$payload" ] || [[ "$payload" =~ ^[0-9]+$ ]] || pfwd_die "udp-payload-bytes 必须是非负整数"
+    if [ -n "$payload" ]; then
+        payload="$(parse_downmask_size_bytes "$payload")"
+        validate_downmask_udp_payload_bytes "$payload"
+    fi
 
     local cur_tcp cur_udp cur_tcp_port cur_udp_port cur_token
     cur_tcp="$(downmask_config_get '.ab_feed.tcp_enabled')"
