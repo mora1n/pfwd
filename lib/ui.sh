@@ -4908,6 +4908,13 @@ ui_menu_downmask_ab_feed() {
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) udp="false" ;; 2) udp="true" ;; esac
     ui_form_add_kv "UDP" "$udp"
+    if [ "$tcp" = "false" ] && [ "$udp" = "false" ]; then
+        ui_run cmd_downmask_ab_feed --tcp-enabled false --udp-enabled false
+        ui_form_reset
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机喂流已更新" "$UI_C_MENU_NUM"
+        ui_maybe_pause success
+        return
+    fi
     ui_form_edit_read "B机返回/监听 IP（填本机用于返回内容的 IP）" "$(downmask_config_get '.ab_feed.bind_ip')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     bind="$UI_REPLY"
