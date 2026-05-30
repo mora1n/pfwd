@@ -32,6 +32,7 @@ var xdpBPFEL []byte
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
 const mapABIVersion = 7
+const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
 const maxUsers = 4096
@@ -171,6 +172,29 @@ type whitelistContentHash struct {
 	Hash string `json:"hash"`
 }
 
+type runtimeAuxState struct {
+	GuardEnabled          bool                   `json:"guard_enabled,omitempty"`
+	WhitelistEnabled      bool                   `json:"whitelist_enabled,omitempty"`
+	HostEgressEnabled     bool                   `json:"host_egress_enabled,omitempty"`
+	BlockHTTP             bool                   `json:"block_http,omitempty"`
+	BlockTLS              bool                   `json:"block_tls,omitempty"`
+	BlockSOCKS            bool                   `json:"block_socks,omitempty"`
+	ProtocolSkipPorts     []uint16               `json:"protocol_skip_ports,omitempty"`
+	WhitelistHashes       []whitelistContentHash `json:"whitelist_hashes,omitempty"`
+	EgressWhitelistHashes []whitelistContentHash `json:"egress_whitelist_hashes,omitempty"`
+}
+
+type auxActionSummary struct {
+	Component    string `json:"component"`
+	Action       string `json:"action"`
+	ChangedItems int    `json:"changed_items,omitempty"`
+}
+
+type attachTiming struct {
+	Component      string `json:"component"`
+	DurationMillis int64  `json:"duration_ms"`
+}
+
 type runtimeSemanticSettings struct {
 	Interface         string   `json:"interface"`
 	GuardEnabled      bool     `json:"guard_enabled"`
@@ -255,68 +279,72 @@ type runtimeRule struct {
 }
 
 type statusPayload struct {
-	Applied                bool           `json:"applied"`
-	BinaryVersion          string         `json:"binary_version"`
-	AppliedAt              string         `json:"applied_at,omitempty"`
-	Interface              string         `json:"interface,omitempty"`
-	InterfaceIndex         int            `json:"interface_index,omitempty"`
-	GuardMode              string         `json:"guard_mode,omitempty"`
-	XDPEffective           string         `json:"xdp_effective,omitempty"`
-	XDPAttachKind          string         `json:"xdp_attach_kind,omitempty"`
-	XDPReason              string         `json:"xdp_reason,omitempty"`
-	IngressKind            string         `json:"ingress_kind,omitempty"`
-	HostEgressEnabled      bool           `json:"host_egress_enabled,omitempty"`
-	HostEgressInterfaces   []string       `json:"host_egress_interfaces,omitempty"`
-	LoopbackKind           string         `json:"loopback_kind,omitempty"`
-	SkLookupKind           string         `json:"sk_lookup_kind,omitempty"`
-	ProtocolGuard          bool           `json:"protocol_guard,omitempty"`
-	RuntimeFile            string         `json:"runtime_file,omitempty"`
-	StateFile              string         `json:"state_file,omitempty"`
-	ConfigHash             string         `json:"config_hash,omitempty"`
-	RuntimeEpoch           string         `json:"runtime_epoch,omitempty"`
-	DataplaneVersion       int            `json:"dataplane_version,omitempty"`
-	MapABIVersion          int            `json:"map_abi_version,omitempty"`
-	IncrementalApply       bool           `json:"incremental_apply,omitempty"`
-	ReattachReason         string         `json:"reattach_reason,omitempty"`
-	PreservedConnections   uint64         `json:"preserved_connections,omitempty"`
-	InvalidatedConnections uint64         `json:"invalidated_connections,omitempty"`
-	ProfileCounts          map[string]int `json:"profile_counts,omitempty"`
-	Rules                  int            `json:"rules,omitempty"`
-	Users                  int            `json:"users,omitempty"`
-	XDPPin                 string         `json:"xdp_pin,omitempty"`
-	IngressPin             string         `json:"ingress_pin,omitempty"`
-	HostEgressPin          string         `json:"host_egress_pin,omitempty"`
-	LoopbackPin            string         `json:"loopback_pin,omitempty"`
-	SkLookupPin            string         `json:"sk_lookup_pin,omitempty"`
-	RuleCounterPin         string         `json:"rule_counter_pin,omitempty"`
-	UserCounterPin         string         `json:"user_counter_pin,omitempty"`
-	StatsPin               string         `json:"stats_pin,omitempty"`
-	ActiveSummary          *connSummary   `json:"active_summary,omitempty"`
-	RefreshReport          *refreshReport `json:"refresh_report,omitempty"`
+	Applied                bool            `json:"applied"`
+	BinaryVersion          string          `json:"binary_version"`
+	AppliedAt              string          `json:"applied_at,omitempty"`
+	Interface              string          `json:"interface,omitempty"`
+	InterfaceIndex         int             `json:"interface_index,omitempty"`
+	GuardMode              string          `json:"guard_mode,omitempty"`
+	XDPEffective           string          `json:"xdp_effective,omitempty"`
+	XDPAttachKind          string          `json:"xdp_attach_kind,omitempty"`
+	XDPReason              string          `json:"xdp_reason,omitempty"`
+	IngressKind            string          `json:"ingress_kind,omitempty"`
+	HostEgressEnabled      bool            `json:"host_egress_enabled,omitempty"`
+	HostEgressInterfaces   []string        `json:"host_egress_interfaces,omitempty"`
+	LoopbackKind           string          `json:"loopback_kind,omitempty"`
+	SkLookupKind           string          `json:"sk_lookup_kind,omitempty"`
+	ProtocolGuard          bool            `json:"protocol_guard,omitempty"`
+	RuntimeFile            string          `json:"runtime_file,omitempty"`
+	StateFile              string          `json:"state_file,omitempty"`
+	ConfigHash             string          `json:"config_hash,omitempty"`
+	RuntimeEpoch           string          `json:"runtime_epoch,omitempty"`
+	DataplaneVersion       int             `json:"dataplane_version,omitempty"`
+	MapABIVersion          int             `json:"map_abi_version,omitempty"`
+	IncrementalApply       bool            `json:"incremental_apply,omitempty"`
+	ReattachReason         string          `json:"reattach_reason,omitempty"`
+	PreservedConnections   uint64          `json:"preserved_connections,omitempty"`
+	InvalidatedConnections uint64          `json:"invalidated_connections,omitempty"`
+	ProfileCounts          map[string]int  `json:"profile_counts,omitempty"`
+	Rules                  int             `json:"rules,omitempty"`
+	Users                  int             `json:"users,omitempty"`
+	XDPPin                 string          `json:"xdp_pin,omitempty"`
+	IngressPin             string          `json:"ingress_pin,omitempty"`
+	HostEgressPin          string          `json:"host_egress_pin,omitempty"`
+	LoopbackPin            string          `json:"loopback_pin,omitempty"`
+	SkLookupPin            string          `json:"sk_lookup_pin,omitempty"`
+	RuleCounterPin         string          `json:"rule_counter_pin,omitempty"`
+	UserCounterPin         string          `json:"user_counter_pin,omitempty"`
+	StatsPin               string          `json:"stats_pin,omitempty"`
+	AuxStateVersion        int             `json:"aux_state_version,omitempty"`
+	AuxState               runtimeAuxState `json:"aux_state,omitempty"`
+	ActiveSummary          *connSummary    `json:"active_summary,omitempty"`
+	RefreshReport          *refreshReport  `json:"refresh_report,omitempty"`
 }
 
 type refreshReport struct {
-	Mode                    string `json:"mode"`
-	Reason                  string `json:"reason,omitempty"`
-	StartedAt               string `json:"started_at,omitempty"`
-	CompletedAt             string `json:"completed_at,omitempty"`
-	TotalDurationMillis     int64  `json:"total_duration_ms"`
-	LoadDurationMillis      int64  `json:"load_duration_ms"`
-	MapLoadDurationMillis   int64  `json:"map_load_duration_ms"`
-	ReconcileDurationMillis int64  `json:"reconcile_duration_ms"`
-	StatusDurationMillis    int64  `json:"status_duration_ms"`
-	PreservedConnections    uint64 `json:"preserved_connections"`
-	InvalidatedConnections  uint64 `json:"invalidated_connections"`
-	RulesAdded              uint64 `json:"rules_added"`
-	RulesUpdated            uint64 `json:"rules_updated"`
-	RulesDeleted            uint64 `json:"rules_deleted"`
-	UsersAdded              uint64 `json:"users_added"`
-	UsersUpdated            uint64 `json:"users_updated"`
-	UsersDeleted            uint64 `json:"users_deleted"`
-	CountersPreserved       uint64 `json:"counters_preserved"`
-	CountersReset           uint64 `json:"counters_reset"`
-	Rules                   int    `json:"rules"`
-	Users                   int    `json:"users"`
+	Mode                    string             `json:"mode"`
+	Reason                  string             `json:"reason,omitempty"`
+	StartedAt               string             `json:"started_at,omitempty"`
+	CompletedAt             string             `json:"completed_at,omitempty"`
+	TotalDurationMillis     int64              `json:"total_duration_ms"`
+	LoadDurationMillis      int64              `json:"load_duration_ms"`
+	MapLoadDurationMillis   int64              `json:"map_load_duration_ms"`
+	ReconcileDurationMillis int64              `json:"reconcile_duration_ms"`
+	StatusDurationMillis    int64              `json:"status_duration_ms"`
+	PreservedConnections    uint64             `json:"preserved_connections"`
+	InvalidatedConnections  uint64             `json:"invalidated_connections"`
+	RulesAdded              uint64             `json:"rules_added"`
+	RulesUpdated            uint64             `json:"rules_updated"`
+	RulesDeleted            uint64             `json:"rules_deleted"`
+	UsersAdded              uint64             `json:"users_added"`
+	UsersUpdated            uint64             `json:"users_updated"`
+	UsersDeleted            uint64             `json:"users_deleted"`
+	CountersPreserved       uint64             `json:"counters_preserved"`
+	CountersReset           uint64             `json:"counters_reset"`
+	Rules                   int                `json:"rules"`
+	Users                   int                `json:"users"`
+	AuxActions              []auxActionSummary `json:"aux_actions,omitempty"`
+	AttachTimings           []attachTiming     `json:"attach_timings,omitempty"`
 }
 
 type mapReconcileReport struct {
@@ -328,6 +356,7 @@ type mapReconcileReport struct {
 	UsersDeleted      uint64
 	CountersPreserved uint64
 	CountersReset     uint64
+	AuxActions        []auxActionSummary
 }
 
 type runtimeMapPins struct {
@@ -818,27 +847,34 @@ func applyRuntime(opts applyOptions) error {
 	xdpEffective := "disabled"
 	xdpKind := ""
 	xdpReason := ""
+	attachTimings := make([]attachTiming, 0, 5)
 	if opts.GuardMode == "full" {
+		xdpAttachStart := time.Now()
 		xdpEffective, xdpKind, xdpReason, err = attachXDP(iface, objs.PFWDXDP, opts)
 		if err != nil {
 			return err
 		}
+		recordAttachTiming(&attachTimings, "xdp", xdpAttachStart)
 	} else if err := removeXDPLink(opts.XDPPin); err != nil {
 		return err
 	}
 	ingressKind := ""
 	if needIngress {
+		ingressStart := time.Now()
 		ingressKind, err = attachIngress(iface, objs.PFWDIngress, opts.IngressPin)
 		if err != nil {
 			return err
 		}
+		recordAttachTiming(&attachTimings, "ingress", ingressStart)
 	} else if err := removeIngressRuntime(opts.IngressPin, iface.Name); err != nil {
 		return err
 	}
 	if runtimeData.Settings.HostEgressEnabled {
+		hostEgressStart := time.Now()
 		if hostEgressNames, err = attachHostEgress(hostEgressIfaces, objs.PFWDHostEgress, opts.HostEgressPin); err != nil {
 			return err
 		}
+		recordAttachTiming(&attachTimings, "host_egress", hostEgressStart)
 	} else if err := removeHostEgressRuntime(opts.HostEgressPin, nil); err != nil {
 		return err
 	}
@@ -898,6 +934,10 @@ func applyRuntime(opts applyOptions) error {
 		RuleCounterPin:       opts.RuleCounterPin,
 		UserCounterPin:       opts.UserCounterPin,
 		StatsPin:             opts.StatsPin,
+		AuxStateVersion:      auxStateVersion,
+	}
+	if payload.AuxState, err = runtimeAuxStateFromRuntime(runtimeData); err != nil {
+		return err
 	}
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		payload.ActiveSummary = summary
@@ -912,6 +952,14 @@ func applyRuntime(opts applyOptions) error {
 		StatusDurationMillis:  elapsedMillis(statusStart),
 		Rules:                 len(runtimeData.Rules),
 		Users:                 len(runtimeData.Users),
+		AuxActions: []auxActionSummary{
+			{Component: "whitelist", Action: "reload", ChangedItems: len(payload.AuxState.WhitelistHashes)},
+			{Component: "protocol_skip_ports", Action: "reload", ChangedItems: len(normalizeProtocolSkipPorts(payload.AuxState.ProtocolSkipPorts))},
+			{Component: "egress_whitelist", Action: "reload", ChangedItems: len(payload.AuxState.EgressWhitelistHashes)},
+			{Component: "host_egress_drop_cache", Action: "reload"},
+			{Component: "guard_runtime_cache", Action: "reload"},
+		},
+		AttachTimings: attachTimings,
 	}
 	return writeStatus(opts.StatusFile, payload)
 }
@@ -1066,6 +1114,373 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 	}
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func runtimeAuxStateFromRuntime(runtimeData *runtimeFile) (runtimeAuxState, error) {
+	if runtimeData == nil {
+		return runtimeAuxState{}, fmt.Errorf("runtime 为空")
+	}
+	whitelistHashes, err := whitelistFileHashes(runtimeData.Settings.WhitelistFiles)
+	if err != nil {
+		return runtimeAuxState{}, err
+	}
+	egressHashes, err := whitelistFileHashes(runtimeData.Settings.EgressWhitelistFiles)
+	if err != nil {
+		return runtimeAuxState{}, err
+	}
+	return runtimeAuxState{
+		GuardEnabled:          runtimeData.Settings.GuardEnabled,
+		WhitelistEnabled:      runtimeData.Settings.WhitelistEnabled,
+		HostEgressEnabled:     runtimeData.Settings.HostEgressEnabled,
+		BlockHTTP:             runtimeData.Settings.BlockHTTP,
+		BlockTLS:              runtimeData.Settings.BlockTLS,
+		BlockSOCKS:            runtimeData.Settings.BlockSOCKS,
+		ProtocolSkipPorts:     append([]uint16{}, runtimeData.Settings.ProtocolSkipPorts...),
+		WhitelistHashes:       whitelistHashes,
+		EgressWhitelistHashes: egressHashes,
+	}, nil
+}
+
+func normalizeWhitelistHashes(hashes []whitelistContentHash) []whitelistContentHash {
+	if len(hashes) == 0 {
+		return nil
+	}
+	out := make([]whitelistContentHash, 0, len(hashes))
+	for _, hash := range hashes {
+		path := strings.TrimSpace(hash.Path)
+		value := strings.TrimSpace(hash.Hash)
+		if path == "" || value == "" {
+			continue
+		}
+		out = append(out, whitelistContentHash{Path: path, Hash: value})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path == out[j].Path {
+			return out[i].Hash < out[j].Hash
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+func whitelistHashesEqual(left []whitelistContentHash, right []whitelistContentHash) bool {
+	left = normalizeWhitelistHashes(left)
+	right = normalizeWhitelistHashes(right)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func protocolSkipPortsEqual(left []uint16, right []uint16) bool {
+	if len(left) == 0 && len(right) == 0 {
+		return true
+	}
+	leftSorted := append([]uint16{}, left...)
+	rightSorted := append([]uint16{}, right...)
+	sort.Slice(leftSorted, func(i, j int) bool { return leftSorted[i] < leftSorted[j] })
+	sort.Slice(rightSorted, func(i, j int) bool { return rightSorted[i] < rightSorted[j] })
+	if len(leftSorted) != len(rightSorted) {
+		return false
+	}
+	for i := range leftSorted {
+		if leftSorted[i] != rightSorted[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func countChangedWhitelistHashes(left []whitelistContentHash, right []whitelistContentHash) int {
+	left = normalizeWhitelistHashes(left)
+	right = normalizeWhitelistHashes(right)
+	leftMap := make(map[string]string, len(left))
+	rightMap := make(map[string]string, len(right))
+	for _, hash := range left {
+		leftMap[hash.Path] = hash.Hash
+	}
+	for _, hash := range right {
+		rightMap[hash.Path] = hash.Hash
+	}
+	changed := 0
+	seen := map[string]struct{}{}
+	for path, value := range leftMap {
+		seen[path] = struct{}{}
+		if other, ok := rightMap[path]; !ok || other != value {
+			changed++
+		}
+	}
+	for path, value := range rightMap {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		if other, ok := leftMap[path]; !ok || other != value {
+			changed++
+		}
+	}
+	return changed
+}
+
+func normalizeProtocolSkipPorts(ports []uint16) []uint16 {
+	if len(ports) == 0 {
+		return nil
+	}
+	set := make(map[uint16]struct{}, len(ports))
+	for _, port := range ports {
+		if port == 0 {
+			continue
+		}
+		set[port] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]uint16, 0, len(set))
+	for port := range set {
+		out = append(out, port)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func countChangedProtocolSkipPorts(left []uint16, right []uint16) int {
+	leftSet := make(map[uint16]struct{}, len(left))
+	rightSet := make(map[uint16]struct{}, len(right))
+	for _, port := range normalizeProtocolSkipPorts(left) {
+		leftSet[port] = struct{}{}
+	}
+	for _, port := range normalizeProtocolSkipPorts(right) {
+		rightSet[port] = struct{}{}
+	}
+	changed := 0
+	for port := range leftSet {
+		if _, ok := rightSet[port]; !ok {
+			changed++
+		}
+	}
+	for port := range rightSet {
+		if _, ok := leftSet[port]; !ok {
+			changed++
+		}
+	}
+	return changed
+}
+
+func auxStateValid(payload statusPayload) bool {
+	return payload.AuxStateVersion == auxStateVersion
+}
+
+func recordAuxAction(out *[]auxActionSummary, component string, action string, changedItems int) {
+	if out == nil {
+		return
+	}
+	entry := auxActionSummary{
+		Component: component,
+		Action:    action,
+	}
+	if changedItems > 0 {
+		entry.ChangedItems = changedItems
+	}
+	*out = append(*out, entry)
+}
+
+func clearSkipPortEntries(skipMap *ebpf.Map, ports []uint16) error {
+	if skipMap == nil {
+		return fmt.Errorf("协议封锁 skip-port map 未加载")
+	}
+	for _, port := range normalizeProtocolSkipPorts(ports) {
+		key := uint32(port)
+		if err := skipMap.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("删除协议封锁跳过端口失败 (%d): %w", port, err)
+		}
+	}
+	return nil
+}
+
+func updateProtocolSkipPorts(skipMap *ebpf.Map, current []uint16, next []uint16) (int, error) {
+	currentSet := make(map[uint16]struct{}, len(current))
+	nextSet := make(map[uint16]struct{}, len(next))
+	for _, port := range normalizeProtocolSkipPorts(current) {
+		currentSet[port] = struct{}{}
+	}
+	for _, port := range normalizeProtocolSkipPorts(next) {
+		nextSet[port] = struct{}{}
+	}
+	removed := make([]uint16, 0)
+	added := make([]uint16, 0)
+	for port := range currentSet {
+		if _, ok := nextSet[port]; !ok {
+			removed = append(removed, port)
+		}
+	}
+	for port := range nextSet {
+		if _, ok := currentSet[port]; !ok {
+			added = append(added, port)
+		}
+	}
+	if err := clearSkipPortEntries(skipMap, removed); err != nil {
+		return 0, err
+	}
+	if err := loadProtocolSkipPorts(skipMap, added); err != nil {
+		return 0, err
+	}
+	return len(removed) + len(added), nil
+}
+
+func clearWhitelistMaps(mapV4 *ebpf.Map, mapV6 *ebpf.Map, cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
+	if err := clearMap[whitelistKeyV4, uint8](mapV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](mapV6); err != nil {
+		return err
+	}
+	if err := clearMap[uint32, uint8](cacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](cacheV6); err != nil {
+		return err
+	}
+	return nil
+}
+
+func effectiveWhitelistFiles(runtimeData *runtimeFile, opts applyOptions) []string {
+	files := runtimeData.Settings.WhitelistFiles
+	if opts.WhitelistFile != "" {
+		files = splitFiles(opts.WhitelistFile)
+	}
+	return files
+}
+
+func applyIncrementalAuxState(
+	objs *bpfObjects,
+	runtimeData *runtimeFile,
+	opts applyOptions,
+	current runtimeAuxState,
+	currentValid bool,
+) (runtimeAuxState, []auxActionSummary, error) {
+	nextState, err := runtimeAuxStateFromRuntime(runtimeData)
+	if err != nil {
+		return runtimeAuxState{}, nil, err
+	}
+	actions := make([]auxActionSummary, 0, 4)
+
+	whitelistFiles := effectiveWhitelistFiles(runtimeData, opts)
+	if !currentValid {
+		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if nextState.WhitelistEnabled {
+			if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, whitelistFiles); err != nil {
+				return runtimeAuxState{}, nil, err
+			}
+		}
+		recordAuxAction(&actions, "whitelist", "reload", len(nextState.WhitelistHashes))
+	} else if nextState.WhitelistEnabled && whitelistHashesEqual(current.WhitelistHashes, nextState.WhitelistHashes) {
+		recordAuxAction(&actions, "whitelist", "reuse", 0)
+	} else if !nextState.WhitelistEnabled && len(current.WhitelistHashes) == 0 {
+		recordAuxAction(&actions, "whitelist", "reuse", 0)
+	} else {
+		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if nextState.WhitelistEnabled {
+			if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, whitelistFiles); err != nil {
+				return runtimeAuxState{}, nil, err
+			}
+		}
+		recordAuxAction(&actions, "whitelist", "reload", countChangedWhitelistHashes(current.WhitelistHashes, nextState.WhitelistHashes))
+	}
+
+	if !currentValid {
+		if _, err := updateProtocolSkipPorts(objs.PFWDSkipPorts, nil, nextState.ProtocolSkipPorts); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		recordAuxAction(&actions, "protocol_skip_ports", "delta-update", len(normalizeProtocolSkipPorts(nextState.ProtocolSkipPorts)))
+	} else if protocolSkipPortsEqual(current.ProtocolSkipPorts, nextState.ProtocolSkipPorts) {
+		recordAuxAction(&actions, "protocol_skip_ports", "reuse", 0)
+	} else {
+		changedItems, err := updateProtocolSkipPorts(objs.PFWDSkipPorts, current.ProtocolSkipPorts, nextState.ProtocolSkipPorts)
+		if err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		recordAuxAction(&actions, "protocol_skip_ports", "delta-update", changedItems)
+	}
+
+	if !currentValid {
+		if err := clearWhitelistMaps(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if nextState.HostEgressEnabled {
+			if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
+				return runtimeAuxState{}, nil, err
+			}
+		}
+		recordAuxAction(&actions, "egress_whitelist", "reload", len(nextState.EgressWhitelistHashes))
+	} else if nextState.HostEgressEnabled && whitelistHashesEqual(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes) {
+		recordAuxAction(&actions, "egress_whitelist", "reuse", 0)
+	} else if !nextState.HostEgressEnabled && len(current.EgressWhitelistHashes) == 0 {
+		recordAuxAction(&actions, "egress_whitelist", "reuse", 0)
+	} else {
+		if err := clearWhitelistMaps(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if nextState.HostEgressEnabled {
+			if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
+				return runtimeAuxState{}, nil, err
+			}
+		}
+		recordAuxAction(&actions, "egress_whitelist", "reload", countChangedWhitelistHashes(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes))
+	}
+
+	if nextState.HostEgressEnabled {
+		if err := clearVerdictEntriesByValue(objs.PFWDHostEgressFlows, cacheVerdictDrop); err != nil {
+			return runtimeAuxState{}, nil, fmt.Errorf("清理宿主机出口 drop cache 失败: %w", err)
+		}
+		recordAuxAction(&actions, "host_egress_drop_cache", "reload", 0)
+	} else if current.HostEgressEnabled {
+		if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		recordAuxAction(&actions, "host_egress_drop_cache", "reload", 0)
+	} else {
+		recordAuxAction(&actions, "host_egress_drop_cache", "reuse", 0)
+	}
+
+	guardStateChanged := !currentValid ||
+		current.GuardEnabled != nextState.GuardEnabled ||
+		current.WhitelistEnabled != nextState.WhitelistEnabled ||
+		current.BlockHTTP != nextState.BlockHTTP ||
+		current.BlockTLS != nextState.BlockTLS ||
+		current.BlockSOCKS != nextState.BlockSOCKS ||
+		!protocolSkipPortsEqual(current.ProtocolSkipPorts, nextState.ProtocolSkipPorts)
+	if guardStateChanged {
+		if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		recordAuxAction(&actions, "guard_runtime_cache", "reload", 0)
+	} else {
+		recordAuxAction(&actions, "guard_runtime_cache", "reuse", 0)
+	}
+
+	return nextState, actions, nil
+}
+
+func recordAttachTiming(out *[]attachTiming, component string, started time.Time) {
+	if out == nil {
+		return
+	}
+	*out = append(*out, attachTiming{
+		Component:      component,
+		DurationMillis: elapsedMillis(started),
+	})
 }
 
 func runtimePinNamespace(ruleCounterPin string) string {
@@ -2192,22 +2607,19 @@ func (r *mapReconcileReport) add(other mapReconcileReport) {
 	r.CountersReset += other.CountersReset
 }
 
-func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) (mapReconcileReport, error) {
+func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions, currentStatus statusPayload) (mapReconcileReport, runtimeAuxState, error) {
 	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDRuleReplyCounter == nil || objs.PFWDRuleDropCounter == nil || objs.PFWDUserCounter == nil {
-		return mapReconcileReport{}, fmt.Errorf("关键 BPF map 未加载")
+		return mapReconcileReport{}, runtimeAuxState{}, fmt.Errorf("关键 BPF map 未加载")
 	}
 	oldUsers, err := currentRuleUserLimits(objs)
 	if err != nil {
-		return mapReconcileReport{}, err
-	}
-	if err := clearIncrementalAuxMaps(objs); err != nil {
-		return mapReconcileReport{}, fmt.Errorf("清理辅助 pinned maps 失败: %w", err)
+		return mapReconcileReport{}, runtimeAuxState{}, err
 	}
 	var externalIfindex uint32
 	if opts.Iface != "" {
 		iface, err := net.InterfaceByName(opts.Iface)
 		if err != nil {
-			return mapReconcileReport{}, fmt.Errorf("查找外部网卡失败: %w", err)
+			return mapReconcileReport{}, runtimeAuxState{}, fmt.Errorf("查找外部网卡失败: %w", err)
 		}
 		externalIfindex = uint32(iface.Index)
 	}
@@ -2223,47 +2635,30 @@ func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts apply
 	}
 	key := uint32(0)
 	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
-		return mapReconcileReport{}, fmt.Errorf("写入 settings 失败: %w", err)
+		return mapReconcileReport{}, runtimeAuxState{}, fmt.Errorf("写入 settings 失败: %w", err)
 	}
-	if err := loadProtocolSkipPorts(objs.PFWDSkipPorts, runtimeData.Settings.ProtocolSkipPorts); err != nil {
-		return mapReconcileReport{}, err
+	if objs.PFWDEgressWhitelistV4 == nil || objs.PFWDEgressWhitelistV6 == nil || objs.PFWDHostEgressFlows == nil {
+		return mapReconcileReport{}, runtimeAuxState{}, fmt.Errorf("宿主机出口白名单 BPF map 未加载")
 	}
-	files := runtimeData.Settings.WhitelistFiles
-	if opts.WhitelistFile != "" {
-		files = splitFiles(opts.WhitelistFile)
-	}
-	if runtimeData.Settings.WhitelistEnabled {
-		if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, files); err != nil {
-			return mapReconcileReport{}, err
-		}
-	}
-	if runtimeData.Settings.HostEgressEnabled {
-		if objs.PFWDEgressWhitelistV4 == nil || objs.PFWDEgressWhitelistV6 == nil || objs.PFWDHostEgressFlows == nil {
-			return mapReconcileReport{}, fmt.Errorf("宿主机出口白名单 BPF map 未加载")
-		}
-		if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
-			return mapReconcileReport{}, err
-		}
-		if err := clearVerdictEntriesByValue(objs.PFWDHostEgressFlows, cacheVerdictDrop); err != nil {
-			return mapReconcileReport{}, fmt.Errorf("清理宿主机出口 drop cache 失败: %w", err)
-		}
-	} else if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
-		return mapReconcileReport{}, err
+	nextAuxState, auxActions, err := applyIncrementalAuxState(objs, runtimeData, opts, currentStatus.AuxState, auxStateValid(currentStatus))
+	if err != nil {
+		return mapReconcileReport{}, runtimeAuxState{}, err
 	}
 	rules, err := runtimeRuleEntries(runtimeData)
 	if err != nil {
-		return mapReconcileReport{}, err
+		return mapReconcileReport{}, runtimeAuxState{}, err
 	}
 	report, err := reconcileRuleMap(objs, rules)
 	if err != nil {
-		return report, err
+		return report, runtimeAuxState{}, err
 	}
 	userReport, err := reconcileUserCounters(objs, oldUsers, runtimeUserLimits(runtimeData))
 	if err != nil {
-		return report, err
+		return report, runtimeAuxState{}, err
 	}
 	report.add(userReport)
-	return report, nil
+	report.AuxActions = auxActions
+	return report, nextAuxState, nil
 }
 
 func reverseKeyFromConn(key connKey, value connVal) reverseKey {
@@ -2345,7 +2740,7 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	loadDuration := elapsedMillis(loadStart)
 	defer objs.Close()
 	mapLoadStart := time.Now()
-	mapReport, err := reconcileRuntimeMaps(objs, runtimeData, opts)
+	mapReport, nextAuxState, err := reconcileRuntimeMaps(objs, runtimeData, opts, payload)
 	if err != nil {
 		return fmt.Errorf("reconcile pinned maps 失败: %w", err)
 	}
@@ -2389,6 +2784,8 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 	updated.RuleCounterPin = opts.RuleCounterPin
 	updated.UserCounterPin = opts.UserCounterPin
 	updated.StatsPin = opts.StatsPin
+	updated.AuxStateVersion = auxStateVersion
+	updated.AuxState = nextAuxState
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
 		updated.ActiveSummary = summary
 	}
@@ -2413,6 +2810,7 @@ func applyIncrementalRuntime(payload statusPayload, runtimeData *runtimeFile, op
 		CountersReset:           mapReport.CountersReset,
 		Rules:                   len(runtimeData.Rules),
 		Users:                   len(runtimeData.Users),
+		AuxActions:              mapReport.AuxActions,
 	}
 	return writeStatus(opts.StatusFile, updated)
 }

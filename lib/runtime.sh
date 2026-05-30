@@ -720,12 +720,13 @@ runtime_merge_runtime_rules() {
 
 runtime_apply_xdp_runtime() {
     local runtime_json="$1"
-    local total_rules xdp_forward_rules guard_mode iface xdp_status
+    local total_rules xdp_forward_rules guard_mode iface xdp_status host_egress_enabled
 
     runtime_reset_xdp_apply_state
     total_rules="$(jq '.rules | length' <<< "$runtime_json")"
     xdp_forward_rules="$(runtime_xdp_forward_rule_count "$runtime_json")"
-    if [ "$total_rules" = "0" ] && ! runtime_xdp_guard_required "$runtime_json"; then
+    host_egress_enabled="$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")"
+    if [ "$total_rules" = "0" ] && ! runtime_xdp_guard_required "$runtime_json" && [ "$host_egress_enabled" != "true" ]; then
         runtime_remove_xdp_runtime
         RUNTIME_XDP_STATUS_JSON='{"applied":false}'
         return 0
@@ -859,7 +860,7 @@ runtime_apply_compiled_runtime() {
     if [ "$total_rules" -gt 0 ]; then
         forwarder_ensure_ip_forwarding
     fi
-    if [ "$total_rules" -gt 0 ] || [ "$guard_required" = "true" ]; then
+    if [ "$total_rules" -gt 0 ] || [ "$guard_required" = "true" ] || [ "$host_egress_required" = "true" ]; then
         if ! runtime_apply_xdp_runtime "$xdp_runtime_json"; then
             if [ "$xdp_candidate_rules" -gt 0 ]; then
                 nft_runtime_json="$(runtime_merge_runtime_rules "$nft_runtime_json" "$xdp_runtime_json")"

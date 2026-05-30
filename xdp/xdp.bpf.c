@@ -432,6 +432,28 @@ static __always_inline int tc_pull_data_min(struct __sk_buff *skb, __u32 len) {
     return bpf_skb_pull_data(skb, len);
 }
 
+static __always_inline int tc_load_tcp_min(
+    struct __sk_buff *skb,
+    __u32 offset,
+    struct tcphdr_min *tcp
+) {
+    if (!skb || !tcp) {
+        return -1;
+    }
+    return bpf_skb_load_bytes(skb, offset, tcp, sizeof(*tcp));
+}
+
+static __always_inline int tc_load_udp_min(
+    struct __sk_buff *skb,
+    __u32 offset,
+    struct udphdr_min *udp
+) {
+    if (!skb || !udp) {
+        return -1;
+    }
+    return bpf_skb_load_bytes(skb, offset, udp, sizeof(*udp));
+}
+
 static __always_inline void set_ipv4_in16(__u8 dst[16], __be32 addr) {
     *(__be32 *)&dst[0] = addr;
     *(__u32 *)&dst[4] = 0;
@@ -1877,10 +1899,15 @@ static __always_inline int tc_local_forward_v4(
 
     init_counter_plan(rule, &counters);
     if (counter_plan_needs_policy(&counters)) {
-        if (counter_plan_needs_allow(&counters) && settings && !whitelist_allowed_v4(ip4->saddr)) {
-            stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-            count_drop_with_plan(rule, packet_len, &counters);
-            return TC_ACT_SHOT;
+        if (counter_plan_needs_allow(&counters)) {
+            if (!settings) {
+                settings = lookup_settings();
+            }
+            if (settings && !whitelist_allowed_v4(ip4->saddr)) {
+                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                count_drop_with_plan(rule, packet_len, &counters);
+                return TC_ACT_SHOT;
+            }
         }
     }
     if (protocol == IPPROTO_TCP) {
@@ -1892,8 +1919,13 @@ static __always_inline int tc_local_forward_v4(
             return TC_ACT_OK;
         }
         if (counter_plan_needs_policy(&counters)) {
-            if (counter_plan_needs_guard(&counters) && inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-                return TC_ACT_SHOT;
+            if (counter_plan_needs_guard(&counters)) {
+                if (!settings) {
+                    settings = lookup_settings();
+                }
+                if (inspect_xdp_tcp_flow_v4(payload_start, data_end, settings, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                    return TC_ACT_SHOT;
+                }
             }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -1942,10 +1974,15 @@ static __always_inline int tc_local_forward_v6(
 
     init_counter_plan(rule, &counters);
     if (counter_plan_needs_policy(&counters)) {
-        if (counter_plan_needs_allow(&counters) && settings && !whitelist_allowed_v6(ip6->saddr)) {
-            stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-            count_drop_with_plan(rule, packet_len, &counters);
-            return TC_ACT_SHOT;
+        if (counter_plan_needs_allow(&counters)) {
+            if (!settings) {
+                settings = lookup_settings();
+            }
+            if (settings && !whitelist_allowed_v6(ip6->saddr)) {
+                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                count_drop_with_plan(rule, packet_len, &counters);
+                return TC_ACT_SHOT;
+            }
         }
     }
     if (protocol == IPPROTO_TCP) {
@@ -1957,8 +1994,13 @@ static __always_inline int tc_local_forward_v6(
             return TC_ACT_OK;
         }
         if (counter_plan_needs_policy(&counters)) {
-            if (counter_plan_needs_guard(&counters) && inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-                return TC_ACT_SHOT;
+            if (counter_plan_needs_guard(&counters)) {
+                if (!settings) {
+                    settings = lookup_settings();
+                }
+                if (inspect_xdp_tcp_flow(payload_start, data_end, settings, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                    return TC_ACT_SHOT;
+                }
             }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -1992,17 +2034,11 @@ static __always_inline int tc_local_forward_v6(
 
 static __always_inline int host_egress_allow_v4_tcp(
     struct ipv4hdr_min *ip4,
-    __u32 ihl,
-    void *data_end
+    const struct tcphdr_min *tcp
 ) {
-    struct tcphdr_min *tcp = (void *)ip4 + ihl;
     struct pfwd_flow_key flow = {};
     int verdict;
 
-    if ((void *)(tcp + 1) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
-    }
     flow.family = 4;
     flow.protocol = IPPROTO_TCP;
     flow.sport = tcp->source;
@@ -2032,17 +2068,11 @@ static __always_inline int host_egress_allow_v4_tcp(
 
 static __always_inline int host_egress_allow_v4_udp(
     struct ipv4hdr_min *ip4,
-    __u32 ihl,
-    void *data_end
+    const struct udphdr_min *udp
 ) {
-    struct udphdr_min *udp = (void *)ip4 + ihl;
     struct pfwd_flow_key flow = {};
     int verdict;
 
-    if ((void *)(udp + 1) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
-    }
     flow.family = 4;
     flow.protocol = IPPROTO_UDP;
     flow.sport = udp->source;
@@ -2068,16 +2098,11 @@ static __always_inline int host_egress_allow_v4_udp(
 
 static __always_inline int host_egress_allow_v6_tcp(
     struct ipv6hdr_min *ip6,
-    void *data_end
+    const struct tcphdr_min *tcp
 ) {
-    struct tcphdr_min *tcp = (void *)(ip6 + 1);
     struct pfwd_flow_key flow = {};
     int verdict;
 
-    if ((void *)(tcp + 1) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
-    }
     flow.family = 6;
     flow.protocol = IPPROTO_TCP;
     flow.sport = tcp->source;
@@ -2107,16 +2132,11 @@ static __always_inline int host_egress_allow_v6_tcp(
 
 static __always_inline int host_egress_allow_v6_udp(
     struct ipv6hdr_min *ip6,
-    void *data_end
+    const struct udphdr_min *udp
 ) {
-    struct udphdr_min *udp = (void *)(ip6 + 1);
     struct pfwd_flow_key flow = {};
     int verdict;
 
-    if ((void *)(udp + 1) > data_end) {
-        stat_inc(PFWD_STAT_PARSE_SKIPPED);
-        return TC_ACT_OK;
-    }
     flow.family = 6;
     flow.protocol = IPPROTO_UDP;
     flow.sport = udp->source;
@@ -2161,6 +2181,7 @@ int pfwd_host_egress(struct __sk_buff *skb) {
         struct ipv4hdr_min *ip4 = (void *)(eth + 1);
         __u32 ihl;
         __u8 protocol;
+        __u32 l4_off;
 
         if ((void *)(ip4 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -2172,43 +2193,24 @@ int pfwd_host_egress(struct __sk_buff *skb) {
             return TC_ACT_OK;
         }
         protocol = ip4->protocol;
+        l4_off = ETH_HLEN + ihl;
         if (protocol == IPPROTO_TCP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct tcphdr_min)) < 0) {
+            struct tcphdr_min tcp = {};
+
+            if (tc_load_tcp_min(skb, l4_off, &tcp) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip4 = (void *)(eth + 1);
-            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            return host_egress_allow_v4_tcp(ip4, ihl, data_end);
+            return host_egress_allow_v4_tcp(ip4, &tcp);
         }
         if (protocol == IPPROTO_UDP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp = {};
+
+            if (tc_load_udp_min(skb, l4_off, &udp) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip4 = (void *)(eth + 1);
-            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            return host_egress_allow_v4_udp(ip4, ihl, data_end);
+            return host_egress_allow_v4_udp(ip4, &udp);
         }
         if (egress_whitelist_allowed_v4(ip4->daddr)) {
             return TC_ACT_OK;
@@ -2219,49 +2221,44 @@ int pfwd_host_egress(struct __sk_buff *skb) {
     if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
         struct ipv6hdr_min *ip6 = (void *)(eth + 1);
         __u8 protocol;
+        __u32 l4_off = ETH_HLEN + sizeof(struct ipv6hdr_min);
 
+        if ((void *)(ip6 + 1) > data_end) {
+            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip6 = (void *)(eth + 1);
+        }
         if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
         protocol = ip6->nexthdr;
         if (protocol == IPPROTO_TCP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct tcphdr_min)) < 0) {
+            struct tcphdr_min tcp = {};
+
+            if (tc_load_tcp_min(skb, l4_off, &tcp) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip6 = (void *)(eth + 1);
-            if ((void *)(ip6 + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            return host_egress_allow_v6_tcp(ip6, data_end);
+            return host_egress_allow_v6_tcp(ip6, &tcp);
         }
         if (protocol == IPPROTO_UDP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp = {};
+
+            if (tc_load_udp_min(skb, l4_off, &udp) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip6 = (void *)(eth + 1);
-            if ((void *)(ip6 + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            return host_egress_allow_v6_udp(ip6, data_end);
+            return host_egress_allow_v6_udp(ip6, &udp);
         }
         if (egress_whitelist_allowed_v6(ip6->daddr)) {
             return TC_ACT_OK;
@@ -2700,7 +2697,26 @@ int pfwd_ingress(struct __sk_buff *skb) {
             return TC_ACT_OK;
         }
         if (protocol == IPPROTO_TCP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct tcphdr_min)) < 0) {
+            struct tcphdr_min tcp_hdr = {};
+            __u32 l4_off = ETH_HLEN + ihl;
+            int needs_pull = 0;
+
+            if (tc_load_tcp_min(skb, l4_off, &tcp_hdr) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp_hdr.source;
+            dport = tcp_hdr.dest;
+            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
+                needs_pull = 1;
+            } else if (rule && rule_needs_guard(rule)) {
+                needs_pull = 1;
+            }
+            if (!needs_pull) {
+                return TC_ACT_OK;
+            }
+            if (tc_pull_data_min(skb, l4_off + sizeof(struct tcphdr_min)) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
@@ -2716,27 +2732,36 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            struct tcphdr_min *tcp = (void *)ip4 + ihl;
+            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
+            if (!rule) {
+                return TC_ACT_OK;
+            }
+            if (rule_xdp_disabled(rule)) {
+                return TC_ACT_OK;
+            }
+            {
+                struct tcphdr_min *tcp = (void *)ip4 + ihl;
+                if ((void *)(tcp + 1) > data_end) {
+                    stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                    return TC_ACT_OK;
+                }
+            }
+            if (rule_target_is_loopback(4, rule)) {
+                return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
+            }
+            if (!rule_needs_guard(rule)) {
+                return TC_ACT_OK;
+            }
+            if (!settings) {
+                settings = lookup_settings();
+            }
+            {
+                struct tcphdr_min *tcp = (void *)ip4 + ihl;
             __u32 tcp_len;
             void *payload_start;
             if ((void *)(tcp + 1) > data_end) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
-            }
-            sport = tcp->source;
-            dport = tcp->dest;
-            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
-            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
-                if (!settings) {
-                    settings = lookup_settings();
-                }
-                return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
-            }
-            if (!rule || !rule_needs_guard(rule)) {
-                return TC_ACT_OK;
-            }
-            if (!settings) {
-                settings = lookup_settings();
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
             payload_start = (void *)tcp + tcp_len;
@@ -2748,36 +2773,20 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
+            }
         }
         {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp_hdr = {};
+            __u32 l4_off = ETH_HLEN + ihl;
+
+            if (tc_load_udp_min(skb, l4_off, &udp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip4 = (void *)(eth + 1);
-            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct udphdr_min *udp = (void *)ip4 + ihl;
-            if ((void *)(udp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = udp->source;
-            dport = udp->dest;
+            sport = udp_hdr.source;
+            dport = udp_hdr.dest;
             rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
-                if (!settings) {
-                    settings = lookup_settings();
-                }
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, settings, rule, packet_len);
             }
             return TC_ACT_OK;
@@ -2791,6 +2800,20 @@ int pfwd_ingress(struct __sk_buff *skb) {
         struct pfwd_rule_val *rule;
 
         if ((void *)(ip6 + 1) > data_end) {
+            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip6 = (void *)(eth + 1);
+        }
+        if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
@@ -2799,6 +2822,24 @@ int pfwd_ingress(struct __sk_buff *skb) {
             return TC_ACT_OK;
         }
         if (protocol == IPPROTO_TCP) {
+            struct tcphdr_min tcp_hdr = {};
+            int needs_pull = 0;
+
+            if (tc_load_tcp_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min), &tcp_hdr) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            sport = tcp_hdr.source;
+            dport = tcp_hdr.dest;
+            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
+                needs_pull = 1;
+            } else if (rule && rule_needs_guard(rule)) {
+                needs_pull = 1;
+            }
+            if (!needs_pull) {
+                return TC_ACT_OK;
+            }
             if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct tcphdr_min)) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
@@ -2815,27 +2856,36 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            struct tcphdr_min *tcp = (void *)(ip6 + 1);
+            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            if (!rule) {
+                return TC_ACT_OK;
+            }
+            if (rule_xdp_disabled(rule)) {
+                return TC_ACT_OK;
+            }
+            {
+                struct tcphdr_min *tcp = (void *)(ip6 + 1);
+                if ((void *)(tcp + 1) > data_end) {
+                    stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                    return TC_ACT_OK;
+                }
+            }
+            if (rule_target_is_loopback(6, rule)) {
+                return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
+            }
+            if (!rule_needs_guard(rule)) {
+                return TC_ACT_OK;
+            }
+            if (!settings) {
+                settings = lookup_settings();
+            }
+            {
+                struct tcphdr_min *tcp = (void *)(ip6 + 1);
             __u32 tcp_len;
             void *payload_start;
             if ((void *)(tcp + 1) > data_end) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
-            }
-            sport = tcp->source;
-            dport = tcp->dest;
-            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
-            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
-                if (!settings) {
-                    settings = lookup_settings();
-                }
-                return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
-            }
-            if (!rule || !rule_needs_guard(rule)) {
-                return TC_ACT_OK;
-            }
-            if (!settings) {
-                settings = lookup_settings();
             }
             tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
             payload_start = (void *)tcp + tcp_len;
@@ -2847,36 +2897,19 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
+            }
         }
         {
-            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp_hdr = {};
+
+            if (tc_load_udp_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min), &udp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip6 = (void *)(eth + 1);
-            if ((void *)(ip6 + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct udphdr_min *udp = (void *)(ip6 + 1);
-            if ((void *)(udp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = udp->source;
-            dport = udp->dest;
+            sport = udp_hdr.source;
+            dport = udp_hdr.dest;
             rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
-                if (!settings) {
-                    settings = lookup_settings();
-                }
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, settings, rule, packet_len);
             }
             return TC_ACT_OK;
@@ -2912,8 +2945,7 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         __be16 dport = 0;
         struct pfwd_reverse_key reverse_key;
         struct pfwd_conn_val *conn;
-        __be32 old_saddr;
-        __be32 old_daddr;
+        __u32 l4_off;
 
         if ((void *)(ip4 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -2928,58 +2960,47 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
+        l4_off = ETH_HLEN + ihl;
         if (protocol == IPPROTO_TCP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct tcphdr_min)) < 0) {
+            struct tcphdr_min tcp_hdr = {};
+
+            if (tc_load_tcp_min(skb, l4_off, &tcp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip4 = (void *)(eth + 1);
-            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct tcphdr_min *tcp = (void *)ip4 + ihl;
-            if ((void *)(tcp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = tcp->source;
-            dport = tcp->dest;
+            sport = tcp_hdr.source;
+            dport = tcp_hdr.dest;
         } else {
-            if (tc_pull_data_min(skb, ETH_HLEN + ihl + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp_hdr = {};
+
+            if (tc_load_udp_min(skb, l4_off, &udp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip4 = (void *)(eth + 1);
-            if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct udphdr_min *udp = (void *)ip4 + ihl;
-            if ((void *)(udp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = udp->source;
-            dport = udp->dest;
+            sport = udp_hdr.source;
+            dport = udp_hdr.dest;
         }
-        old_saddr = ip4->saddr;
-        old_daddr = ip4->daddr;
         fill_reverse_lookup_key_v4(&reverse_key, protocol, ip4->daddr, ip4->saddr, dport, sport);
+        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
+        if (!conn) {
+            return TC_ACT_OK;
+        }
+        if (tc_pull_data_min(skb, l4_off + (protocol == IPPROTO_TCP ? sizeof(struct tcphdr_min) : sizeof(struct udphdr_min))) < 0) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        eth = data;
+        if ((void *)(eth + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        ip4 = (void *)(eth + 1);
+        if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
         conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
         if (!conn) {
             return TC_ACT_OK;
@@ -3000,7 +3021,7 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
             __be32 new_daddr = ipv4_from16(conn->client_addr);
             rewrite_l4_reply_v4(
                 ip4, ihl, protocol,
-                old_saddr, old_daddr,
+                ip4->saddr, ip4->daddr,
                 new_saddr, new_daddr,
                 sport, dport,
                 new_sport, new_dport
@@ -3025,6 +3046,20 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         struct pfwd_conn_val *conn;
 
         if ((void *)(ip6 + 1) > data_end) {
+            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min)) < 0) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end) {
+                stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            ip6 = (void *)(eth + 1);
+        }
+        if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
@@ -3033,55 +3068,45 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
             return TC_ACT_OK;
         }
         if (protocol == IPPROTO_TCP) {
-            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct tcphdr_min)) < 0) {
+            struct tcphdr_min tcp_hdr = {};
+
+            if (tc_load_tcp_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min), &tcp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip6 = (void *)(eth + 1);
-            if ((void *)(ip6 + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct tcphdr_min *tcp = (void *)(ip6 + 1);
-            if ((void *)(tcp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = tcp->source;
-            dport = tcp->dest;
+            sport = tcp_hdr.source;
+            dport = tcp_hdr.dest;
         } else {
-            if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + sizeof(struct udphdr_min)) < 0) {
+            struct udphdr_min udp_hdr = {};
+
+            if (tc_load_udp_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min), &udp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            eth = data;
-            if ((void *)(eth + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            ip6 = (void *)(eth + 1);
-            if ((void *)(ip6 + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            struct udphdr_min *udp = (void *)(ip6 + 1);
-            if ((void *)(udp + 1) > data_end) {
-                stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            sport = udp->source;
-            dport = udp->dest;
+            sport = udp_hdr.source;
+            dport = udp_hdr.dest;
         }
         fill_reverse_lookup_key_v6(&reverse_key, protocol, ip6->daddr, ip6->saddr, dport, sport);
+        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
+        if (!conn) {
+            return TC_ACT_OK;
+        }
+        if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min) + (protocol == IPPROTO_TCP ? sizeof(struct tcphdr_min) : sizeof(struct udphdr_min))) < 0) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        eth = data;
+        if ((void *)(eth + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
+        ip6 = (void *)(eth + 1);
+        if ((void *)(ip6 + 1) > data_end) {
+            stat_inc(PFWD_STAT_PARSE_SKIPPED);
+            return TC_ACT_OK;
+        }
         conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
         if (!conn) {
             return TC_ACT_OK;
