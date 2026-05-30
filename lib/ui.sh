@@ -4784,6 +4784,13 @@ ui_menu_downmask_policy() {
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) pull_mode="off" ;; 2) pull_mode="public" ;; 3) pull_mode="ab" ;; esac
     ui_form_add_kv "拉流模式" "$pull_mode"
+    if [ "$pull_mode" = "off" ]; then
+        ui_run cmd_downmask_policy --pull-mode off
+        ui_form_reset
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "策略已更新" "$UI_C_MENU_NUM"
+        ui_maybe_pause success
+        return
+    fi
 
     ui_form_edit_read "最小比例（如 1.5）" "$(downmask_config_get '.min_ratio')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
