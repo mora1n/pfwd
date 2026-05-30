@@ -95,6 +95,8 @@ pfwd render downmask
 - `assets/pfwd-downmask-linux-amd64`
 - `assets/pfwd-downmask-linux-arm64`
 
+如果你是直接从源码仓库离线打包或执行本地 `pfwd install`，上述 `assets/pfwd-xdp-linux-*` 与 `assets/pfwd-downmask-linux-*` 都必须实际存在；缺失时安装和打包会直接失败。
+
 ## 安装
 
 > 以下操作默认root权限下进行
@@ -105,7 +107,16 @@ pfwd render downmask
 wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -- install
 ```
 
+在线安装和 `pfwd update` 同样要求更新源提供完整的 `pfwd-xdp` / `pfwd-downmask` 预编译资产；缺少任一必需资产时会直接失败，而不会静默跳过。
+
 离线安装时，在仓库根目录打包脚本、模块、白名单种子，以及目标架构的 `pfwd-xdp` / `pfwd-downmask` 二进制即可。这里以 `amd64` 为例；`arm64` 主机把对应文件名替换成 `*-linux-arm64`。
+
+如果提示 `assets/pfwd-downmask-linux-amd64` 或 `assets/pfwd-xdp-linux-amd64` 不存在，请先执行对应的构建脚本：
+
+```bash
+./xdp/build.sh
+./downmask/build.sh
+```
 
 ```bash
 tar -czf pfwd.tar.gz \

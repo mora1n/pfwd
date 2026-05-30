@@ -118,6 +118,21 @@ service_bundle_rows() {
     done
 }
 
+service_missing_bundle_hint() {
+    local source_path="$1"
+    case "$source_path" in
+        */assets/pfwd-downmask-linux-*)
+            printf '请先执行 ./downmask/build.sh 生成预编译资产，或使用包含 pfwd-downmask 资产的完整源码/发布包。\n'
+            ;;
+        */assets/pfwd-xdp-linux-*)
+            printf '请先执行 ./xdp/build.sh 生成预编译资产，或使用包含 pfwd-xdp 资产的完整源码/发布包。\n'
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 service_install_target_path() {
     printf '%s/%s\n' "$PFWD_INSTALL_DIR" "$1"
 }
@@ -211,7 +226,11 @@ service_copy_bundle_from_dir() {
         target_path="$(service_install_target_path "$install_rel")"
 
         if [ ! -f "$source_path" ]; then
-            pfwd_die "安装包不完整：缺少 $source_path"
+            {
+                printf '安装包不完整：缺少 %s\n' "$source_path"
+                service_missing_bundle_hint "$source_path"
+            } >&2
+            exit 1
         fi
         if [ "$source_path" != "$target_path" ]; then
             install -m "$mode" "$source_path" "$target_path"
@@ -228,7 +247,13 @@ service_verify_bundle_from_dir() {
 
     while IFS=$'\t' read -r _ source_rel __ ___; do
         source_path="${source_root%/}/$source_rel"
-        [ -f "$source_path" ] || pfwd_die "安装包不完整：缺少 $source_path"
+        if [ ! -f "$source_path" ]; then
+            {
+                printf '安装包不完整：缺少 %s\n' "$source_path"
+                service_missing_bundle_hint "$source_path"
+            } >&2
+            exit 1
+        fi
     done < <(service_bundle_rows)
 }
 
@@ -454,7 +479,8 @@ service_update_validate_bundle() {
     local _ source_rel __ ___
     while IFS=$'\t' read -r _ source_rel __ ___; do
         [ -f "$dir/$source_rel" ] || {
-            echo "更新包缺少 $source_rel" >&2
+            echo "更新包不完整：缺少 $source_rel" >&2
+            service_missing_bundle_hint "$dir/$source_rel" >&2 || true
             return 1
         }
         case "$source_rel" in

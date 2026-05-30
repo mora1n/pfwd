@@ -182,7 +182,7 @@ cmd_update() {
     staged_dir="$work_dir/staged"
 
     if ! service_update_download_bundle "$work_dir"; then
-        pfwd_die "下载更新包失败；临时目录保留：$work_dir"
+        pfwd_die "下载更新包失败；请确认更新源包含必需的 pfwd-xdp/pfwd-downmask 预编译资产。临时目录保留：$work_dir"
     fi
     if ! service_update_validate_bundle "$staged_dir"; then
         pfwd_die "更新包校验失败；临时目录保留：$work_dir"

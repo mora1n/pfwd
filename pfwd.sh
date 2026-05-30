@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.3"
+PFWD_VERSION="0.2.4"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -123,8 +123,12 @@ pfwd_bootstrap_install() {
     chmod +x "$install_dir/assets/$xdp_asset"
     local downmask_asset
     if downmask_asset="$(pfwd_bootstrap_downmask_asset_name)"; then
-        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$downmask_asset" "$install_dir/assets/$downmask_asset" || true
-        [ -f "$install_dir/assets/$downmask_asset" ] && chmod +x "$install_dir/assets/$downmask_asset"
+        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$downmask_asset" "$install_dir/assets/$downmask_asset"; then
+            echo "错误：缺少必需的 downmask 预编译资产：assets/$downmask_asset" >&2
+            echo "请补齐发布源中的该文件，或在源码仓库中先执行 ./downmask/build.sh 后再安装。" >&2
+            exit 1
+        fi
+        chmod +x "$install_dir/assets/$downmask_asset"
     fi
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
