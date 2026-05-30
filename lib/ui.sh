@@ -4835,7 +4835,7 @@ ui_menu_downmask_public() {
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) active="cloudflare_dynamic" ;; 2) active="cachefly_100mb" ;; 3) active="digitalocean_100mb" ;; 4) active="aliyun_ubuntu_iso" ;; esac
     ui_form_add_kv "活跃源" "$active"
-    ui_form_edit_read "限速（如 4M、500K；建议略低于出口可用带宽）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
+    ui_form_edit_read "限速（默认 4M，如 4M、500K；按字节速率，建议略低于出口可用带宽）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     speed="$UI_REPLY"
     local args=(--active-source "$active")
@@ -4868,7 +4868,7 @@ ui_menu_downmask_ab_pull() {
     ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     token="$UI_REPLY"
-    ui_form_edit_read "限速（如 4M）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
+    ui_form_edit_read "限速（默认 4M，如 4M、500K；按字节速率）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     speed="$UI_REPLY"
     ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; return; }

@@ -51,6 +51,7 @@ pfwd guard egress-whitelist status
 
 - `ab-pull --local-ip IP` / `settings.downmask.ab_pull.local_ip`：A 机拉流时绑定本地源 IP，可填额外内网 IP；TCP / UDP 都会绑定该源地址，且必须和远端地址族匹配。
 - `ab-pull --remote-host HOST`：建议直接填写 B 机的 IPv4 / IPv6 地址，避免 DNS 变化影响 A/B 拉流链路。
+- `ab_pull.speed_limit` / `ab-pull --speed-limit`：默认 `4M`，表示按字节速率限速；支持 `500K`、`4M`、`1G` 这类写法。
 - `ab-feed --bind-ip IP` / `settings.downmask.ab_feed.bind_ip`：B 机监听并从该 IP 返回内容；UI 中对应文案是“B机返回/监听 IP”。
 - `--token` / `settings.downmask.ab_pull.token` / `settings.downmask.ab_feed.token`：A/B 两端必须完全一致；建议使用随机值，例如 `openssl rand -hex 16`。
 - 启用 `ab-feed` 的 TCP 或 UDP 时，必须同时配置对应端口和 `token`，否则命令会直接失败，不会生成一个看似启用但实际无法启动的服务。
@@ -65,7 +66,7 @@ pfwd guard egress-whitelist status
 - `public.custom_sources` 中：
   `query` 类型的 URL 需要使用 `{bytes}` 占位，例如 `https://example.com/file?bytes={bytes}`；
   `range` 类型需要目标源支持 HTTP Range 请求。
-- `public.speed_limit` 建议设置为略低于机器实际可用出口带宽，避免补流把正常业务出口打满。
+- `public.speed_limit` 默认 `4M`，表示按字节速率限速；支持 `500K`、`4M`、`1G` 这类写法，建议设置为略低于机器实际可用出口带宽，避免补流把正常业务出口打满。
 
 常用命令：
 

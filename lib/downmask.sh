@@ -554,12 +554,12 @@ cmd_downmask() {
 用法：
   pfwd downmask status
   pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio N] [--max-ratio N] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
-  pfwd downmask public [--active-source NAME(cloudflare_dynamic|cachefly_100mb|digitalocean_100mb|aliyun_ubuntu_iso)] [--speed-limit 4M]
+  pfwd downmask public [--active-source NAME(cloudflare_dynamic|cachefly_100mb|digitalocean_100mb|aliyun_ubuntu_iso)] [--speed-limit 4M(default, bytes/s)]
   pfwd downmask public custom add --name NAME --kind query|range --url URL(query 用 {bytes} 占位；range 需支持 Range 请求)
   pfwd downmask public custom delete --name NAME
   pfwd downmask public custom list
   pfwd downmask public custom clear
-  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M] [--timeout SEC]
+  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s)] [--timeout SEC]
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
   pfwd downmask seed generate [--path PATH] [--size 64MB]
 EOF
