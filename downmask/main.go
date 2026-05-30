@@ -109,8 +109,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `pfwd-downmask - 下行伪装辅助二进制
 
 用法:
-  pfwd-downmask pull   --protocol tcp|udp --remote-host HOST --remote-port PORT --token TOKEN --wanted-bytes N [--speed-limit BPS] [--timeout SEC]
-  pfwd-downmask serve  [--tcp-addr HOST:PORT] [--udp-addr HOST:PORT] --token TOKEN [--seed-file PATH] [--max-rate BPS] [--udp-payload-bytes N] [--status-file PATH]
+  pfwd-downmask pull   --protocol tcp|udp --remote-host HOST(IP) --remote-port PORT --token TOKEN(openssl rand -hex 16) --wanted-bytes N [--speed-limit BPS] [--timeout SEC]
+  pfwd-downmask serve  [--tcp-addr HOST:PORT] [--udp-addr HOST:PORT] --token TOKEN(openssl rand -hex 16) [--seed-file PATH] [--max-rate BPS] [--udp-payload-bytes N] [--status-file PATH]
   pfwd-downmask seed   [--path PATH] [--size BYTES]
   pfwd-downmask version`)
 }
@@ -167,10 +167,10 @@ func runPull(args []string) error {
 	var opts pullOptions
 	var timeoutSec int
 	fs.StringVar(&opts.Protocol, "protocol", "tcp", "tcp|udp")
-	fs.StringVar(&opts.RemoteHost, "remote-host", "", "远端主机")
+	fs.StringVar(&opts.RemoteHost, "remote-host", "", "远端主机，建议直填 B 机 IPv4/IPv6")
 	fs.IntVar(&opts.RemotePort, "remote-port", 0, "远端端口")
 	fs.StringVar(&opts.LocalIP, "local-ip", "", "本地源 IP，可选")
-	fs.StringVar(&opts.Token, "token", "", "预共享 token")
+	fs.StringVar(&opts.Token, "token", "", "预共享 token，A/B 两端需一致；可用 openssl rand -hex 16 生成")
 	fs.Uint64Var(&opts.WantedBytes, "wanted-bytes", 0, "目标拉流字节")
 	fs.Uint64Var(&opts.SpeedLimit, "speed-limit", 0, "限速 bytes/s，0 表示不限")
 	fs.IntVar(&timeoutSec, "timeout", 1200, "超时秒数")
@@ -411,7 +411,7 @@ func runServe(args []string) error {
 	var opts serveOptions
 	fs.StringVar(&opts.TCPAddr, "tcp-addr", "", "TCP 监听地址，例 0.0.0.0:5301，空表示不启用")
 	fs.StringVar(&opts.UDPAddr, "udp-addr", "", "UDP 监听地址，空表示不启用")
-	fs.StringVar(&opts.Token, "token", "", "预共享 token")
+	fs.StringVar(&opts.Token, "token", "", "预共享 token，A/B 两端需一致；可用 openssl rand -hex 16 生成")
 	fs.StringVar(&opts.SeedFile, "seed-file", "", "高熵种子文件路径")
 	fs.Uint64Var(&opts.MaxRate, "max-rate", 0, "服务端每会话最大发送速率 bytes/s，0 表示不限")
 	fs.IntVar(&opts.UDPPayload, "udp-payload-bytes", udpDefaultPayload, "UDP 单包 payload 字节")

@@ -4790,13 +4790,13 @@ ui_menu_downmask_policy() {
 }
 
 ui_menu_downmask_public() {
-    ui_form_set "公网下载源" "选择活跃源并设置限速"
+    ui_form_set "公网下载源" "选择活跃源并设置限速；建议优先选直连稳定、目标地区就近的下载源"
     local active speed
-    ui_form_select_read "选择源" "1" "0) 返回" "1) cloudflare_dynamic" "2) cachefly_100mb" "3) digitalocean_100mb" "4) aliyun_ubuntu_iso" || { ui_form_reset; return; }
+    ui_form_select_read "选择源" "1" "0) 返回" "1) cloudflare_dynamic（按字节动态下载）" "2) cachefly_100mb（固定 100MB 文件）" "3) digitalocean_100mb（固定 100MB 文件）" "4) aliyun_ubuntu_iso（大文件镜像）" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) active="cloudflare_dynamic" ;; 2) active="cachefly_100mb" ;; 3) active="digitalocean_100mb" ;; 4) active="aliyun_ubuntu_iso" ;; esac
     ui_form_add_kv "活跃源" "$active"
-    ui_form_edit_read "限速（如 4M、500K）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
+    ui_form_edit_read "限速（如 4M、500K；建议略低于出口可用带宽）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
     speed="$UI_REPLY"
     local args=(--active-source "$active")
     [ -z "$speed" ] || args+=(--speed-limit "$speed")
@@ -4813,7 +4813,7 @@ ui_menu_downmask_ab_pull() {
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) protocol="tcp" ;; 2) protocol="udp" ;; esac
     ui_form_add_kv "协议" "$protocol"
-    ui_form_edit_read "远端主机" "$(downmask_config_get '.ab_pull.remote_host')" || { ui_form_reset; return; }
+    ui_form_edit_read "远端主机（填 B 机 IP，建议直填 IPv4/IPv6）" "$(downmask_config_get '.ab_pull.remote_host')" || { ui_form_reset; return; }
     host="$UI_REPLY"
     ui_form_add_kv "远端主机" "$host"
     ui_form_edit_read "远端端口" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; return; }
@@ -4822,7 +4822,7 @@ ui_menu_downmask_ab_pull() {
     ui_form_edit_read "A机本地源 IP（可填内网 IP）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; return; }
     local_ip="$UI_REPLY"
     [ -z "$local_ip" ] || ui_form_add_kv "A机本地源 IP" "$local_ip"
-    ui_form_edit_read "预共享 Token" "" || { ui_form_reset; return; }
+    ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
     token="$UI_REPLY"
     ui_form_edit_read "限速（如 4M）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
     speed="$UI_REPLY"
@@ -4853,14 +4853,14 @@ ui_menu_downmask_ab_feed() {
     ui_form_select_read "UDP 喂流" "1" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
     case "$UI_REPLY" in 1) udp="false" ;; 2) udp="true" ;; esac
     ui_form_add_kv "UDP" "$udp"
-    ui_form_edit_read "B机返回/监听 IP" "$(downmask_config_get '.ab_feed.bind_ip')" || { ui_form_reset; return; }
+    ui_form_edit_read "B机返回/监听 IP（填本机用于返回内容的 IP）" "$(downmask_config_get '.ab_feed.bind_ip')" || { ui_form_reset; return; }
     bind="$UI_REPLY"
     ui_form_add_kv "B机返回/监听 IP" "$bind"
     ui_form_edit_read "TCP 端口" "$(downmask_config_get '.ab_feed.tcp_port')" || { ui_form_reset; return; }
     tcp_port="$UI_REPLY"
     ui_form_edit_read "UDP 端口" "$(downmask_config_get '.ab_feed.udp_port')" || { ui_form_reset; return; }
     udp_port="$UI_REPLY"
-    ui_form_edit_read "预共享 Token" "" || { ui_form_reset; return; }
+    ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
     token="$UI_REPLY"
     ui_form_edit_read "种子文件路径" "$(downmask_config_get '.ab_feed.seed_file')" || { ui_form_reset; return; }
     seed_file="$UI_REPLY"
