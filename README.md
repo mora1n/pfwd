@@ -53,16 +53,18 @@ pfwd guard egress-whitelist status
 - `ab-feed --bind-ip IP` / `settings.downmask.ab_feed.bind_ip`：B 机监听并从该 IP 返回内容；UI 中对应文案是“B机返回/监听 IP”。
 - 启用 `ab-feed` 的 TCP 或 UDP 时，必须同时配置对应端口和 `token`，否则命令会直接失败，不会生成一个看似启用但实际无法启动的服务。
 - `pfwd-downmask-feed.service` 仅在 `ab-feed` 启用时生成并启动；关闭后会同步清理旧状态文件。
+- `min_deficit_bytes`、`max_bytes_per_run` 和 `seed generate --size` 支持 `B/KB/MB/GB/TB`；裸数字继续按字节解释，兼容现有配置。
 
 常用命令：
 
 ```bash
 pfwd downmask policy --pull-mode public --iface eth0
+pfwd downmask policy --min-deficit-bytes 20MB --max-bytes-per-run 800MB
 pfwd downmask public --active-source cloudflare_dynamic --speed-limit 4M
 pfwd downmask policy --pull-mode ab --iface eth0
 pfwd downmask ab-pull --protocol tcp --remote-host 10.0.0.2 --remote-port 5301 --local-ip 10.0.0.10 --token secret --speed-limit 4M
 pfwd downmask ab-feed --tcp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --token secret
-pfwd downmask seed generate
+pfwd downmask seed generate --size 256MB
 pfwd downmask status
 pfwd render downmask
 ```

@@ -4767,10 +4767,10 @@ ui_menu_downmask_policy() {
     ui_form_add_kv "窗口结束" "$twe"
     ui_form_edit_read "最大随机延迟（秒）" "$(downmask_config_get '.max_jitter_seconds')" || { ui_form_reset; return; }
     jitter="$UI_REPLY"
-    ui_form_edit_read "最小触发缺口（字节）" "$(downmask_config_get '.min_deficit_bytes')" || { ui_form_reset; return; }
-    mindef="$UI_REPLY"
-    ui_form_edit_read "单次最大补流（字节）" "$(downmask_config_get '.max_bytes_per_run')" || { ui_form_reset; return; }
-    maxrun="$UI_REPLY"
+    ui_form_edit_read "最小触发缺口（支持 20MB、1GB；裸数字按字节）" "$(downmask_config_get '.min_deficit_bytes')" || { ui_form_reset; return; }
+    mindef="$(normalize_ui_downmask_size_input "$UI_REPLY")"
+    ui_form_edit_read "单次最大补流（支持 500MB、2GB；裸数字按字节）" "$(downmask_config_get '.max_bytes_per_run')" || { ui_form_reset; return; }
+    maxrun="$(normalize_ui_downmask_size_input "$UI_REPLY")"
 
     local args=()
     [ -z "$pull_mode" ] || args+=(--pull-mode "$pull_mode")

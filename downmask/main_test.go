@@ -39,21 +39,36 @@ func TestRequestHeaderRoundtrip(t *testing.T) {
 }
 
 func TestSeedGenerate(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "seed.bin")
-	if err := runSeed([]string{"--path", path, "--size", "65536"}); err != nil {
-		t.Fatalf("runSeed: %v", err)
+	testCases := []struct {
+		name     string
+		sizeArg  string
+		wantSize int64
+	}{
+		{name: "raw_bytes", sizeArg: "65536", wantSize: 65536},
+		{name: "unit_bytes_from_shell", sizeArg: "268435456", wantSize: 268435456},
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if info.Size() != 65536 {
-		t.Fatalf("size = %d, want 65536", info.Size())
-	}
-	data, _ := os.ReadFile(path)
-	if bytes.Equal(data, make([]byte, 65536)) {
-		t.Fatalf("seed file is all zeros")
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "seed.bin")
+			if err := runSeed([]string{"--path", path, "--size", tc.sizeArg}); err != nil {
+				t.Fatalf("runSeed: %v", err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if info.Size() != tc.wantSize {
+				t.Fatalf("size = %d, want %d", info.Size(), tc.wantSize)
+			}
+			if tc.wantSize <= 65536 {
+				data, _ := os.ReadFile(path)
+				if bytes.Equal(data, make([]byte, len(data))) {
+					t.Fatalf("seed file is all zeros")
+				}
+			}
+		})
 	}
 }
 

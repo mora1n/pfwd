@@ -553,7 +553,7 @@ cmd_downmask() {
             cat <<'EOF'
 用法：
   pfwd downmask status
-  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio N] [--max-ratio N] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes N] [--max-bytes-per-run N] [--iface NAME]
+  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio N] [--max-ratio N] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
   pfwd downmask public [--active-source NAME] [--speed-limit 4M]
   pfwd downmask public custom add --name NAME --kind query|range --url URL
   pfwd downmask public custom delete --name NAME
@@ -561,7 +561,7 @@ cmd_downmask() {
   pfwd downmask public custom clear
   pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST] [--remote-port PORT] [--local-ip IP] [--token TOKEN] [--speed-limit 4M] [--timeout SEC]
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN] [--seed-file PATH] [--udp-payload-bytes N]
-  pfwd downmask seed generate [--path PATH] [--size BYTES]
+  pfwd downmask seed generate [--path PATH] [--size 64MB]
 EOF
             ;;
         *) pfwd_die "未知 downmask 子命令：$sub" ;;
@@ -590,8 +590,8 @@ cmd_downmask_policy() {
     [ -z "$tws" ] || validate_downmask_time_window "$tws"
     [ -z "$twe" ] || validate_downmask_time_window "$twe"
     [ -z "$jitter" ] || [[ "$jitter" =~ ^[0-9]+$ ]] || pfwd_die "max-jitter 必须是非负整数"
-    [ -z "$mindef" ] || [[ "$mindef" =~ ^[0-9]+$ ]] || pfwd_die "min-deficit-bytes 必须是非负整数"
-    [ -z "$maxrun" ] || [[ "$maxrun" =~ ^[0-9]+$ ]] || pfwd_die "max-bytes-per-run 必须是非负整数"
+    [ -z "$mindef" ] || mindef="$(parse_downmask_size_bytes "$mindef")"
+    [ -z "$maxrun" ] || maxrun="$(parse_downmask_size_bytes "$maxrun")"
 
     config_update \
         --arg pull_mode "$pull_mode" \
@@ -802,7 +802,7 @@ cmd_downmask_ab_feed() {
 cmd_downmask_seed() {
     local sub="${1:-generate}"
     shift || true
-    [ "$sub" = "generate" ] || pfwd_die "用法：pfwd downmask seed generate [--path PATH] [--size BYTES]"
+    [ "$sub" = "generate" ] || pfwd_die "用法：pfwd downmask seed generate [--path PATH] [--size 64MB]"
     local path="" size=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -812,6 +812,7 @@ cmd_downmask_seed() {
         esac
     done
     [ -x "$PFWD_DOWNMASK_BIN_PATH" ] || pfwd_die "pfwd-downmask 二进制不存在：$PFWD_DOWNMASK_BIN_PATH"
+    [ -z "$size" ] || size="$(parse_downmask_size_bytes "$size")"
     local args=("seed" "generate")
     [ -z "$path" ] || args+=("--path" "$path")
     [ -z "$size" ] || args+=("--size" "$size")

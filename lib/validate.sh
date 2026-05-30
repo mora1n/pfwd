@@ -413,6 +413,44 @@ parse_size_bytes() {
     awk -v value="$value" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", value * multiplier }'
 }
 
+parse_downmask_size_bytes() {
+    local raw="$1"
+    local value unit multiplier
+    raw="$(printf '%s' "$raw" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+    [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(B|KB|MB|GB|TB|K|M|G|T)?$ ]] || pfwd_die "无效 downmask 容量：$1；支持数字(默认字节)或小数 + B/KB/MB/GB/TB"
+    value="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[3]:-B}"
+    case "$unit" in
+        B) multiplier=1 ;;
+        K|KB) multiplier=1024 ;;
+        M|MB) multiplier=$((1024 * 1024)) ;;
+        G|GB) multiplier=$((1024 * 1024 * 1024)) ;;
+        T|TB) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        *) pfwd_die "无效 downmask 容量单位：$1" ;;
+    esac
+    awk -v value="$value" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", value * multiplier }'
+}
+
+normalize_ui_downmask_size_input() {
+    local raw="$1"
+    raw="$(printf '%s' "$raw" | tr -d ' ')"
+    [ -n "$raw" ] || return 0
+    raw="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+    if [[ "$raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    if [[ "$raw" =~ ^[0-9]+([.][0-9]+)?(B|KB|MB|GB|TB)$ ]]; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(K|M|G|T)$ ]]; then
+        printf '%s%sB\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    pfwd_die "无效 downmask 容量：$1；支持数字(默认字节)或小数 + B/KB/MB/GB/TB"
+}
+
 normalize_ui_traffic_input() {
     local raw="$1"
     raw="$(printf '%s' "$raw" | tr -d ' ')"
