@@ -401,20 +401,21 @@ downmask_ab_pull_target_update() {
       --arg weight "$weight" \
       --arg tcp_enabled "$tcp_enabled" \
       --arg udp_enabled "$udp_enabled" '
+      def merged_target($existing):
+        {
+          host: $host,
+          port: (if $port == "" then ($existing.port // null) else ($port | tonumber) end),
+          token: (if $token == "" then ($existing.token // null) else $token end),
+          local_ip: (if $local_ip == "" then ($existing.local_ip // null) else $local_ip end),
+          weight: (if $weight == "" then ($existing.weight // 1) else ($weight | tonumber) end),
+          tcp_enabled: (if $tcp_enabled == "" then ($existing.tcp_enabled // true) else ($tcp_enabled == "true") end),
+          udp_enabled: (if $udp_enabled == "" then ($existing.udp_enabled // true) else ($udp_enabled == "true") end)
+        };
       .settings.downmask.ab_pull.targets |= (
         (. // [])
+        | ([ .[] | select((.host // "") == $host) ][0] // {}) as $existing
         | map(select((.host // "") != $host))
-        + [
-            {
-              host: $host,
-              port: (if $port == "" then null else ($port | tonumber) end),
-              token: (if $token == "" then null else $token end),
-              local_ip: (if $local_ip == "" then null else $local_ip end),
-              weight: (if $weight == "" then 1 else ($weight | tonumber) end),
-              tcp_enabled: (if $tcp_enabled == "" then true else ($tcp_enabled == "true") end),
-              udp_enabled: (if $udp_enabled == "" then true else ($udp_enabled == "true") end)
-            }
-          ]
+        + [merged_target($existing)]
       )
     '
 }
@@ -429,6 +430,45 @@ downmask_ab_pull_target_delete() {
 
 downmask_ab_pull_targets_clear() {
     config_update '.settings.downmask.ab_pull.targets = []'
+}
+
+downmask_ab_pull_targets_json_list() {
+    jq -c '.settings.downmask.ab_pull.targets // []' "$PFWD_CONFIG_FILE"
+}
+
+downmask_ab_pull_target_count() {
+    jq '.settings.downmask.ab_pull.targets // [] | length' "$PFWD_CONFIG_FILE"
+}
+
+downmask_ab_pull_targets_table_rows() {
+    jq -r '
+      (.settings.downmask.ab_pull.targets // [])
+      | to_entries[]
+      | .key as $idx
+      | .value as $item
+      | [
+          (($idx + 1) | tostring),
+          ($item.host // ""),
+          (if ($item.port // null) == null then "-" else ($item.port | tostring) end),
+          (($item.weight // 1) | tostring),
+          (if ($item.tcp_enabled // null) == null then "true" elif $item.tcp_enabled then "true" else "false" end),
+          (if ($item.udp_enabled // null) == null then "true" elif $item.udp_enabled then "true" else "false" end),
+          ($item.local_ip // ""),
+          (if ($item.token // "") == "" then "-" else "set" end)
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE"
+}
+
+downmask_ab_pull_target_by_index() {
+    local index="$1"
+    jq -c --argjson idx "$index" '.settings.downmask.ab_pull.targets[$idx - 1] // {}' "$PFWD_CONFIG_FILE"
+}
+
+downmask_ab_pull_target_field_by_index() {
+    local index="$1"
+    local field="$2"
+    jq -r --argjson idx "$index" --arg field "$field" '.settings.downmask.ab_pull.targets[$idx - 1][$field] // empty' "$PFWD_CONFIG_FILE"
 }
 
 downmask_ab_pull_targets_list() {

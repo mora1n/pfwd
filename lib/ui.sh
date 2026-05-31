@@ -4765,6 +4765,26 @@ ui_print_downmask_summary() {
     printf '  B机喂流 TCP：%s  UDP：%s\n' "$feed_tcp" "$feed_udp"
 }
 
+ui_print_downmask_ab_pull_target_summary() {
+    local count last_action last_actual last_planned last_error
+    count="$(downmask_ab_pull_target_count 2>/dev/null || echo 0)"
+    if [ "${count:-0}" -eq 0 ]; then
+        echo "  B机状态：暂无已配置 B机"
+    else
+        echo "  B机状态："
+        ui_table_render $'序号\tB机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$(downmask_ab_pull_targets_table_rows)" "2,7"
+    fi
+    last_action="$(jq -r '.last_action // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
+    last_actual="$(jq -r '.last_actual_bytes // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
+    last_planned="$(jq -r '.last_planned_bytes // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
+    last_error="$(jq -r '.last_error // ""' "$(downmask_state_file)" 2>/dev/null || echo "")"
+    printf '  最近拉流：动作=%s  实际=%s  计划=%s' "$last_action" "$(format_bytes "$last_actual")" "$(format_bytes "$last_planned")"
+    if [ -n "$last_error" ]; then
+        printf '  结果=%s' "$last_error"
+    fi
+    printf '\n'
+}
+
 ui_render_downmask_menu_page() {
     ui_header "下行伪装"
     ui_notice_render
@@ -4877,6 +4897,51 @@ ui_menu_downmask_public() {
     ui_maybe_pause success
 }
 
+ui_downmask_ab_target_selection_rows() {
+    local rows=$'0\t返回\n1\t所有B机'
+    local row
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        rows+=$'\n'"$(awk -F $'\t' '{print $1 + 1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8}' <<< "$row")"
+    done < <(downmask_ab_pull_targets_table_rows)
+    printf '%s\n' "$rows"
+}
+
+ui_render_downmask_ab_target_selection_page() {
+    local title="$1"
+    local rows="$2"
+    ui_header "$title"
+    ui_notice_render
+    ui_table_render $'序号\tB机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$rows" "2,7"
+}
+
+ui_select_downmask_ab_targets_multi() {
+    local title="$1"
+    local prompt="$2"
+    local count rows raw indexes selected_count
+    UI_EDIT_ABORTED=0
+    count="$(downmask_ab_pull_target_count 2>/dev/null || echo 0)"
+    if [ "${count:-0}" -eq 0 ]; then
+        ui_warn "当前没有已配置 B机"
+        return 1
+    fi
+    rows="$(ui_downmask_ab_target_selection_rows)"
+    ui_render_page ui_render_downmask_ab_target_selection_page "$title" "$rows"
+    ui_read "$prompt" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$((count + 1))" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    indexes="$UI_REPLY"
+    selected_count="$(printf '%s\n' "$indexes" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if printf '%s\n' "$indexes" | grep -qx '1'; then
+        [ "$selected_count" = "1" ] || { ui_warn "所有B机不能和其他序号混合选择"; return 1; }
+        UI_REPLY="$(seq 1 "$count")"
+        return 0
+    fi
+    UI_REPLY="$(printf '%s\n' "$indexes" | awk '$1 > 1 { print $1 - 1 }')"
+    [ -n "$UI_REPLY" ] || { ui_warn "请选择至少一个 B机"; return 1; }
+}
+
 ui_menu_downmask_ab_pull() {
     while true; do
         ui_header "A机拉流"
@@ -4886,17 +4951,19 @@ ui_menu_downmask_ab_pull() {
         printf '当前共享端口：%s\n' "$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
         printf '当前共享限速：%s\n' "$(downmask_config_get '.ab_pull.speed_limit' 2>/dev/null || echo 4M)"
         echo
+        ui_print_downmask_ab_pull_target_summary
+        echo
         ui_menu_item 1 "默认拉流参数"
-        ui_menu_item 2 "管理 B机"
-        ui_menu_item 3 "查看 B机池"
+        ui_menu_item 2 "增加 B机"
+        ui_menu_item 3 "修改 B机"
         ui_menu_item 4 "移除 B机"
-        ui_menu_item 5 "清空 B机池"
         ui_menu_item 0 "返回上级菜单"
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
                 ui_form_set "默认拉流参数" "默认双开 TCP+UDP 拉流。输入 0 返回。"
                 local protocol protocol_mode tcp_enabled udp_enabled port local_ip token speed timeout parallel_limit speed_jitter bytes_jitter
+                protocol=""
                 protocol_mode="parallel"
                 tcp_enabled="true"
                 udp_enabled="true"
@@ -4944,7 +5011,7 @@ ui_menu_downmask_ab_pull() {
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "管理 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
+                ui_form_set "增加 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
                 local host item_port item_local_ip item_token weight item_tcp item_udp
                 ui_form_edit_read "B机 IP/主机（建议直填 IPv4/IPv6）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
@@ -4974,35 +5041,101 @@ ui_menu_downmask_ab_pull() {
                 [ -z "$weight" ] || target_args+=(--weight "$weight")
                 ui_run cmd_downmask_ab_pull "${target_args[@]}"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已更新" "$UI_C_MENU_NUM"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已增加" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             3)
-                ui_header "B机池"
-                ui_notice_render
-                ui_table_render $'B机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$(downmask_ab_pull_targets_list)" "2"
-                ui_pause
+                local selected_indexes selected_index selected_host current_target current_port current_local_ip current_token current_weight current_tcp current_udp
+                ui_select_downmask_ab_targets_multi "修改 B机" "选择 B机 序号，可单/多/连续选择；1 表示所有B机" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                selected_indexes="$UI_REPLY"
+                current_target="$(downmask_ab_pull_target_by_index "$(printf '%s\n' "$selected_indexes" | head -n1)")"
+                current_port="$(jq -r '.port // ""' <<< "$current_target")"
+                current_local_ip="$(jq -r '.local_ip // ""' <<< "$current_target")"
+                current_token="$(jq -r '.token // ""' <<< "$current_target")"
+                current_weight="$(jq -r '.weight // 1' <<< "$current_target")"
+                current_tcp="$(jq -r 'if (.tcp_enabled // true) then "true" else "false" end' <<< "$current_target")"
+                current_udp="$(jq -r 'if (.udp_enabled // true) then "true" else "false" end' <<< "$current_target")"
+                ui_form_set "修改 B机" "直接回车表示保留现值。输入 0 返回。"
+                local new_port new_local_ip new_token new_weight new_tcp new_udp
+                ui_form_edit_read "B机端口（回车=保留；当前 ${current_port:--}）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                new_port="$UI_REPLY"
+                ui_form_edit_read "B机本地源 IP（回车=保留；当前 ${current_local_ip:--}）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                new_local_ip="$UI_REPLY"
+                ui_form_edit_read "B机 Token（回车=保留；当前 $( [ -n "$current_token" ] && echo set || echo - )）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                new_token="$UI_REPLY"
+                ui_form_edit_read "权重（回车=保留；当前 $current_weight）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                new_weight="$UI_REPLY"
+                ui_form_select_read "允许 TCP（当前 $current_tcp）" "0" "0) 保留" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                case "$UI_REPLY" in 0) new_tcp="" ;; 1) new_tcp="false" ;; 2) new_tcp="true" ;; esac
+                ui_form_select_read "允许 UDP（当前 $current_udp）" "0" "0) 保留" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                case "$UI_REPLY" in 0) new_udp="" ;; 1) new_udp="false" ;; 2) new_udp="true" ;; esac
+                local update_ok=0 update_fail=0 update_args
+                while IFS= read -r selected_index; do
+                    [ -n "$selected_index" ] || continue
+                    selected_host="$(downmask_ab_pull_target_field_by_index "$selected_index" "host")"
+                    [ -n "$selected_host" ] || { update_fail=$((update_fail + 1)); continue; }
+                    update_args=(targets update --host "$selected_host" --tcp-enabled "$new_tcp" --udp-enabled "$new_udp")
+                    [ -z "$new_port" ] || update_args+=(--port "$new_port")
+                    [ -z "$new_local_ip" ] || update_args+=(--local-ip "$new_local_ip")
+                    [ -z "$new_token" ] || update_args+=(--token "$new_token")
+                    [ -z "$new_weight" ] || update_args+=(--weight "$new_weight")
+                    if cmd_downmask_ab_pull "${update_args[@]}" >/dev/null 2>&1; then
+                        update_ok=$((update_ok + 1))
+                    else
+                        update_fail=$((update_fail + 1))
+                    fi
+                done <<< "$selected_indexes"
+                ui_form_reset
+                UI_STATUS=$([ "$update_fail" -eq 0 ] && echo 0 || echo 1)
+                if [ "$update_ok" -gt 0 ]; then
+                    ui_notice_set "B机修改完成：成功 $update_ok 台，失败 $update_fail 台" "$UI_C_MENU_NUM"
+                fi
+                ui_maybe_pause always
                 ;;
             4)
-                local host_to_delete=""
-                ui_form_set "移除 B机" "输入要移除的 B机 host。输入 0 返回。"
-                ui_form_edit_read "B机 host" "" || { ui_form_reset; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
-                host_to_delete="$UI_REPLY"
-                ui_run cmd_downmask_ab_pull targets delete --host "$host_to_delete"
-                ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已移除" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
-                ;;
-            5)
-                if ui_confirm_text "yes" "输入 yes 确认清空全部 B机"; then
-                    ui_run cmd_downmask_ab_pull targets clear
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机池已清空" "$UI_C_MENU_NUM"
-                    ui_maybe_pause success
-                else
+                local selected_indexes selected_index selected_host delete_ok delete_fail total_count
+                ui_select_downmask_ab_targets_multi "移除 B机" "选择 B机 序号，可单/多/连续选择；1 表示移除所有" || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                selected_indexes="$UI_REPLY"
+                total_count="$(downmask_ab_pull_target_count 2>/dev/null || echo 0)"
+                if [ "$(printf '%s\n' "$selected_indexes" | sed '/^$/d' | wc -l | tr -d ' ')" = "${total_count:-0}" ]; then
+                    if ui_confirm_text "yes" "输入 yes 确认移除全部 B机"; then
+                        ui_run cmd_downmask_ab_pull targets clear
+                        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已全部移除" "$UI_C_MENU_NUM"
+                        ui_maybe_pause success
+                    else
+                        ui_warn "已跳过"
+                        ui_pause
+                    fi
+                    continue
+                fi
+                if ! ui_confirm_text "yes" "输入 yes 确认移除选中的 B机"; then
                     ui_warn "已跳过"
                     ui_pause
+                    continue
                 fi
+                delete_ok=0
+                delete_fail=0
+                while IFS= read -r selected_index; do
+                    [ -n "$selected_index" ] || continue
+                    selected_host="$(downmask_ab_pull_target_field_by_index "$selected_index" "host")"
+                    [ -n "$selected_host" ] || { delete_fail=$((delete_fail + 1)); continue; }
+                    if cmd_downmask_ab_pull targets delete --host "$selected_host" >/dev/null 2>&1; then
+                        delete_ok=$((delete_ok + 1))
+                    else
+                        delete_fail=$((delete_fail + 1))
+                    fi
+                done <<< "$(printf '%s\n' "$selected_indexes" | sort -rn)"
+                UI_STATUS=$([ "$delete_fail" -eq 0 ] && echo 0 || echo 1)
+                if [ "$delete_ok" -gt 0 ]; then
+                    ui_notice_set "B机移除完成：成功 $delete_ok 台，失败 $delete_fail 台" "$UI_C_MENU_NUM"
+                fi
+                ui_maybe_pause always
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
