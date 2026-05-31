@@ -70,6 +70,294 @@ downmask_state_file() {
     echo "$PFWD_DOWNMASK_STATE_DIR/day_state.json"
 }
 
+downmask_ab_pull_targets_json() {
+    config_init >/dev/null
+    jq -c '
+      def bool_or($value; $fallback):
+        if $value == null then $fallback else $value end;
+      def normalize_target($shared):
+        {
+          host: (.host // .remote_host // ""),
+          port: (.port // .remote_port // ($shared.remote_port // 0)),
+          token: (.token // ""),
+          local_ip: (.local_ip // ""),
+          weight: (.weight // 1),
+          tcp_enabled: bool_or(.tcp_enabled; true),
+          udp_enabled: bool_or(.udp_enabled; true)
+        };
+      (.settings.downmask.ab_pull // {}) as $ab
+      | ($ab.targets // []) as $targets
+      | if ($targets | length) > 0 then
+          [$targets[] | normalize_target($ab)]
+        elif (($ab.remote_host // "") != "" and (($ab.remote_port // 0) | tonumber) > 0) then
+          [{
+            host: ($ab.remote_host // ""),
+            port: (($ab.remote_port // 0) | tonumber),
+            token: ($ab.token // ""),
+            local_ip: ($ab.local_ip // ""),
+            weight: 1,
+            tcp_enabled: (
+              if ($ab.protocol_mode // "single") == "parallel"
+              then bool_or($ab.tcp_enabled; true)
+              else (($ab.protocol // "tcp") != "udp")
+              end
+            ),
+            udp_enabled: (
+              if ($ab.protocol_mode // "single") == "parallel"
+              then bool_or($ab.udp_enabled; false)
+              else (($ab.protocol // "tcp") == "udp")
+              end
+            )
+          }]
+        else
+          []
+        end
+    ' "$PFWD_CONFIG_FILE"
+}
+
+downmask_ab_target_count() {
+    jq 'length' <<< "$(downmask_ab_pull_targets_json)"
+}
+
+downmask_ab_protocol_enabled() {
+    local proto="$1"
+    local mode tcp_enabled udp_enabled legacy_protocol
+    mode="$(downmask_config_get '.ab_pull.protocol_mode')"
+    tcp_enabled="$(downmask_config_get '.ab_pull.tcp_enabled')"
+    udp_enabled="$(downmask_config_get '.ab_pull.udp_enabled')"
+    legacy_protocol="$(downmask_config_get '.ab_pull.protocol')"
+    [ -n "$mode" ] || mode="single"
+    [ -n "$tcp_enabled" ] || tcp_enabled="true"
+    [ -n "$udp_enabled" ] || udp_enabled="false"
+    [ -n "$legacy_protocol" ] || legacy_protocol="tcp"
+    case "$mode:$proto" in
+        parallel:tcp) [ "$tcp_enabled" = "true" ] ;;
+        parallel:udp) [ "$udp_enabled" = "true" ] ;;
+        *:tcp) [ "$legacy_protocol" = "tcp" ] ;;
+        *:udp) [ "$legacy_protocol" = "udp" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+downmask_random_percent_factor() {
+    local percent="$1"
+    awk -v percent="$percent" -v seed="$RANDOM$$" '
+    BEGIN {
+        srand(seed)
+        if (percent <= 0) {
+            printf "1.000000"
+            exit
+        }
+        span = percent / 100.0
+        min = 1.0 - span
+        max = 1.0 + span
+        if (min < 0.05) min = 0.05
+        printf "%.6f", min + rand() * (max - min)
+    }'
+}
+
+downmask_apply_percent_jitter() {
+    local base="$1"
+    local percent="$2"
+    awk -v base="$base" -v factor="$(downmask_random_percent_factor "$percent")" '
+    BEGIN {
+        value = base * factor
+        if (value < 1) value = 1
+        printf "%.0f", value
+    }'
+}
+
+downmask_random_protocol_split() {
+    local total="$1"
+    if [ "$total" -le 1 ]; then
+        printf '1\t0\n'
+        return 0
+    fi
+    awk -v total="$total" -v seed="$RANDOM$$" '
+    BEGIN {
+        srand(seed)
+        ratio = 0.35 + rand() * 0.30
+        tcp = int(total * ratio + 0.5)
+        if (tcp < 1) tcp = 1
+        if (tcp >= total) tcp = total - 1
+        udp = total - tcp
+        printf "%d\t%d\n", tcp, udp
+    }'
+}
+
+downmask_protocol_targets_json() {
+    local proto="$1"
+    local items_json="${2:-}"
+    if [ -n "$items_json" ]; then
+        jq -rc --arg proto "$proto" '
+          def bool_or($value; $fallback):
+            if $value == null then $fallback else $value end;
+          [ .[]
+            | select((.host // "") != "" and ((.port // 0) | tonumber) > 0)
+            | select(
+                if $proto == "tcp" then bool_or(.tcp_enabled; true)
+                else bool_or(.udp_enabled; true)
+                end
+              )
+            | .weight = ((.weight // 1) | tonumber)
+            | select(.weight >= 1)
+          ]
+        ' <<< "$items_json"
+        return 0
+    fi
+    jq -rc --arg proto "$proto" '
+      def bool_or($value; $fallback):
+        if $value == null then $fallback else $value end;
+      [ .[]
+        | select((.host // "") != "" and ((.port // 0) | tonumber) > 0)
+        | select(
+            if $proto == "tcp" then bool_or(.tcp_enabled; true)
+            else bool_or(.udp_enabled; true)
+            end
+          )
+        | .weight = ((.weight // 1) | tonumber)
+        | select(.weight >= 1)
+      ]
+    ' <<< "$(downmask_ab_pull_targets_json)"
+}
+
+downmask_pick_weighted_target() {
+    local proto="$1"
+    local items_json="${2:-}"
+    local items total pick
+    items="$(downmask_protocol_targets_json "$proto" "$items_json")"
+    total="$(jq '[.[].weight] | add // 0' <<< "$items")"
+    [ "$total" -gt 0 ] || return 1
+    pick=$(( (RANDOM << 15 | RANDOM) % total ))
+    jq -rc --argjson pick "$pick" '
+      reduce .[] as $item (
+        {acc: 0, selected: null};
+        if .selected != null then .
+        else
+          .acc += ($item.weight | tonumber)
+          | if $pick < .acc then .selected = $item else . end
+        end
+      ) | .selected
+    ' <<< "$items" | head -n1
+}
+
+downmask_resolve_target_field() {
+    local target_json="$1"
+    local field="$2"
+    jq -r --arg field "$field" '.[$field] // empty' <<< "$target_json"
+}
+
+downmask_build_ab_pull_cmd() {
+    local protocol="$1"
+    local planned="$2"
+    local target_json="$3"
+
+    local shared_port shared_token shared_local_ip shared_speed shared_timeout speed_jitter bytes_jitter
+    shared_port="$(downmask_config_get '.ab_pull.remote_port')"
+    shared_token="$(downmask_config_get '.ab_pull.token')"
+    shared_local_ip="$(downmask_config_get '.ab_pull.local_ip')"
+    shared_speed="$(downmask_config_get '.ab_pull.speed_limit')"
+    shared_timeout="$(downmask_config_get '.ab_pull.timeout_seconds')"
+    speed_jitter="$(downmask_config_get '.ab_pull.speed_jitter_percent')"
+    bytes_jitter="$(downmask_config_get '.ab_pull.bytes_jitter_percent')"
+    [ -n "$shared_speed" ] || shared_speed="4M"
+    [ -n "$shared_timeout" ] && [ "$shared_timeout" -gt 0 ] || shared_timeout=1200
+    [ -n "$speed_jitter" ] || speed_jitter=0
+    [ -n "$bytes_jitter" ] || bytes_jitter=0
+
+    local remote_host remote_port token local_ip wanted_bps rate_bps wanted_bytes
+    remote_host="$(downmask_resolve_target_field "$target_json" "host")"
+    remote_port="$(downmask_resolve_target_field "$target_json" "port")"
+    token="$(downmask_resolve_target_field "$target_json" "token")"
+    local_ip="$(downmask_resolve_target_field "$target_json" "local_ip")"
+    [ -n "$remote_port" ] || remote_port="$shared_port"
+    [ -n "$token" ] || token="$shared_token"
+    [ -n "$local_ip" ] || local_ip="$shared_local_ip"
+
+    [ -n "$remote_host" ] && [ -n "$remote_port" ] && [ "$remote_port" != "0" ] || return 1
+    [ -n "$token" ] || return 1
+
+    rate_bps="$(downmask_speed_to_bps "$shared_speed")"
+    wanted_bytes="$planned"
+    if [ "$bytes_jitter" -gt 0 ]; then
+        wanted_bytes="$(downmask_apply_percent_jitter "$planned" "$bytes_jitter")"
+    fi
+    if [ "$wanted_bytes" -lt 1 ]; then
+        wanted_bytes=1
+    fi
+    if [ "$speed_jitter" -gt 0 ] && [ "$rate_bps" -gt 0 ]; then
+        wanted_bps="$(downmask_apply_percent_jitter "$rate_bps" "$speed_jitter")"
+    else
+        wanted_bps="$rate_bps"
+    fi
+
+    local -a cmd
+    cmd=(
+        "$PFWD_DOWNMASK_BIN_PATH"
+        pull
+        --protocol "$protocol"
+        --remote-host "$remote_host"
+        --remote-port "$remote_port"
+        --token "$token"
+        --wanted-bytes "$wanted_bytes"
+        --speed-limit "$wanted_bps"
+        --timeout "$shared_timeout"
+    )
+    if [ -n "$local_ip" ]; then
+        cmd+=(--local-ip "$local_ip")
+    fi
+    printf '%s\0' "${cmd[@]}"
+}
+
+downmask_run_ab_pull_once() {
+    local protocol="$1"
+    local planned="$2"
+    local target_json="$3"
+    [ -x "$PFWD_DOWNMASK_BIN_PATH" ] || { echo 0; return 0; }
+
+    local out
+    local -a cmd=()
+    while IFS= read -r -d '' arg; do
+        cmd+=("$arg")
+    done < <(downmask_build_ab_pull_cmd "$protocol" "$planned" "$target_json") || true
+    [ "${#cmd[@]}" -gt 0 ] || { echo 0; return 0; }
+
+    out="$("${cmd[@]}" 2>/dev/null || true)"
+    jq -r '.actual_bytes // 0' <<< "$out" 2>/dev/null || echo 0
+}
+
+downmask_ab_pull_attempt_protocol() {
+    local protocol="$1"
+    local planned="$2"
+    local items target_count target_json actual
+    items="$(downmask_protocol_targets_json "$protocol")"
+    target_count="$(jq 'length' <<< "$items")"
+    [ "$target_count" -gt 0 ] || { echo 0; return 0; }
+
+    actual=0
+    while [ "$target_count" -gt 0 ]; do
+        target_json="$(downmask_pick_weighted_target "$protocol" "$items")"
+        [ -n "$target_json" ] || break
+        actual="$(downmask_run_ab_pull_once "$protocol" "$planned" "$target_json")"
+        [[ "$actual" =~ ^[0-9]+$ ]] || actual=0
+        if [ "$actual" -gt 0 ]; then
+            jq -n \
+              --arg protocol "$protocol" \
+              --argjson target "$target_json" \
+              --argjson actual "$actual" '
+              {
+                protocol: $protocol,
+                actual_bytes: $actual,
+                target: $target
+              }'
+            return 0
+        fi
+        items="$(jq -c --arg host "$(jq -r '.host' <<< "$target_json")" '[.[] | select((.host // "") != $host)]' <<< "$items")"
+        target_count="$(jq 'length' <<< "$items")"
+    done
+    echo "{}"
+}
+
 downmask_load_day_state() {
     local file
     file="$(downmask_state_file)"
@@ -86,6 +374,77 @@ downmask_save_day_state() {
     file="$(downmask_state_file)"
     mkdir -p "$(dirname "$file")"
     printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$file"
+}
+
+downmask_ab_pull_target_update() {
+    local host="$1"
+    local port="$2"
+    local token="$3"
+    local local_ip="$4"
+    local weight="$5"
+    local tcp_enabled="$6"
+    local udp_enabled="$7"
+    [ -n "$host" ] || pfwd_die "必须提供 --host"
+    validate_downmask_target_host "$host"
+    [ -z "$port" ] || validate_port "$port"
+    [ -z "$token" ] || validate_downmask_token "$token"
+    [ -z "$local_ip" ] || validate_downmask_local_ip "$local_ip"
+    [ -z "$weight" ] || validate_downmask_weight "$weight"
+    [ -z "$tcp_enabled" ] || validate_bool "$tcp_enabled"
+    [ -z "$udp_enabled" ] || validate_bool "$udp_enabled"
+
+    config_update \
+      --arg host "$host" \
+      --arg port "$port" \
+      --arg token "$token" \
+      --arg local_ip "$local_ip" \
+      --arg weight "$weight" \
+      --arg tcp_enabled "$tcp_enabled" \
+      --arg udp_enabled "$udp_enabled" '
+      .settings.downmask.ab_pull.targets |= (
+        (. // [])
+        | map(select((.host // "") != $host))
+        + [
+            {
+              host: $host,
+              port: (if $port == "" then null else ($port | tonumber) end),
+              token: (if $token == "" then null else $token end),
+              local_ip: (if $local_ip == "" then null else $local_ip end),
+              weight: (if $weight == "" then 1 else ($weight | tonumber) end),
+              tcp_enabled: (if $tcp_enabled == "" then true else ($tcp_enabled == "true") end),
+              udp_enabled: (if $udp_enabled == "" then true else ($udp_enabled == "true") end)
+            }
+          ]
+      )
+    '
+}
+
+downmask_ab_pull_target_delete() {
+    local host="$1"
+    [ -n "$host" ] || pfwd_die "必须提供 --host"
+    config_update --arg host "$host" '
+      .settings.downmask.ab_pull.targets |= ((. // []) | map(select((.host // "") != $host)))
+    '
+}
+
+downmask_ab_pull_targets_clear() {
+    config_update '.settings.downmask.ab_pull.targets = []'
+}
+
+downmask_ab_pull_targets_list() {
+    jq -r '
+      (.settings.downmask.ab_pull.targets // [])[]?
+      | [
+          (.host // ""),
+          (if (.port // null) == null then "-" else (.port | tostring) end),
+          ((.weight // 1) | tostring),
+          (if (.tcp_enabled // null) == null then "true" elif .tcp_enabled then "true" else "false" end),
+          (if (.udp_enabled // null) == null then "true" elif .udp_enabled then "true" else "false" end),
+          (.local_ip // ""),
+          (if (.token // "") == "" then "-" else "set" end)
+        ]
+      | @tsv
+    ' "$PFWD_CONFIG_FILE"
 }
 
 downmask_random_ratio() {
@@ -222,46 +581,78 @@ downmask_pull_public() {
 
 downmask_pull_ab() {
     local planned="$1"
-    local protocol remote_host remote_port local_ip token speed_limit timeout
+    local mode parallel_limit tcp_enabled udp_enabled total_actual tcp_planned udp_planned
+    mode="$(downmask_config_get '.ab_pull.protocol_mode')"
+    parallel_limit="$(downmask_config_get '.ab_pull.parallel_limit')"
+    [ -n "$mode" ] || mode="single"
+    [ -n "$parallel_limit" ] && [ "$parallel_limit" -ge 1 ] || parallel_limit=2
+
+    total_actual=0
+    if [ "$mode" = "parallel" ]; then
+        downmask_ab_protocol_enabled tcp && tcp_enabled=1 || tcp_enabled=0
+        downmask_ab_protocol_enabled udp && udp_enabled=1 || udp_enabled=0
+        if [ "$tcp_enabled" -eq 0 ] && [ "$udp_enabled" -eq 0 ]; then
+            echo 0
+            return 0
+        fi
+        if [ "$tcp_enabled" -eq 1 ] && [ "$udp_enabled" -eq 1 ]; then
+            IFS=$'\t' read -r tcp_planned udp_planned <<< "$(downmask_random_protocol_split "$planned")"
+        elif [ "$tcp_enabled" -eq 1 ]; then
+            tcp_planned="$planned"
+            udp_planned=0
+        else
+            tcp_planned=0
+            udp_planned="$planned"
+        fi
+        if [ "$parallel_limit" -ge 2 ] && [ "$tcp_enabled" -eq 1 ] && [ "$udp_enabled" -eq 1 ] && [ "$udp_planned" -gt 0 ]; then
+            local tcp_tmp udp_tmp tcp_json udp_json tcp_actual udp_actual
+            tcp_tmp="$(mktemp)"
+            udp_tmp="$(mktemp)"
+            (
+                downmask_ab_pull_attempt_protocol "tcp" "$tcp_planned" >"$tcp_tmp"
+            ) &
+            local tcp_pid=$!
+            (
+                downmask_ab_pull_attempt_protocol "udp" "$udp_planned" >"$udp_tmp"
+            ) &
+            local udp_pid=$!
+            wait "$tcp_pid" || true
+            wait "$udp_pid" || true
+            tcp_json="$(cat "$tcp_tmp" 2>/dev/null || echo '{}')"
+            udp_json="$(cat "$udp_tmp" 2>/dev/null || echo '{}')"
+            rm -f "$tcp_tmp" "$udp_tmp"
+            tcp_actual="$(jq -r '.actual_bytes // 0' <<< "$tcp_json" 2>/dev/null || echo 0)"
+            udp_actual="$(jq -r '.actual_bytes // 0' <<< "$udp_json" 2>/dev/null || echo 0)"
+            [[ "$tcp_actual" =~ ^[0-9]+$ ]] || tcp_actual=0
+            [[ "$udp_actual" =~ ^[0-9]+$ ]] || udp_actual=0
+            total_actual=$((tcp_actual + udp_actual))
+        else
+            if [ "$tcp_enabled" -eq 1 ] && [ "$tcp_planned" -gt 0 ]; then
+                local tcp_json tcp_actual
+                tcp_json="$(downmask_ab_pull_attempt_protocol "tcp" "$tcp_planned")"
+                tcp_actual="$(jq -r '.actual_bytes // 0' <<< "$tcp_json" 2>/dev/null || echo 0)"
+                [[ "$tcp_actual" =~ ^[0-9]+$ ]] || tcp_actual=0
+                total_actual=$((total_actual + tcp_actual))
+            fi
+            if [ "$udp_enabled" -eq 1 ] && [ "$udp_planned" -gt 0 ]; then
+                local udp_json udp_actual
+                udp_json="$(downmask_ab_pull_attempt_protocol "udp" "$udp_planned")"
+                udp_actual="$(jq -r '.actual_bytes // 0' <<< "$udp_json" 2>/dev/null || echo 0)"
+                [[ "$udp_actual" =~ ^[0-9]+$ ]] || udp_actual=0
+                total_actual=$((total_actual + udp_actual))
+            fi
+        fi
+        echo "$total_actual"
+        return 0
+    fi
+
+    local protocol single_json single_actual
     protocol="$(downmask_config_get '.ab_pull.protocol')"
-    remote_host="$(downmask_config_get '.ab_pull.remote_host')"
-    remote_port="$(downmask_config_get '.ab_pull.remote_port')"
-    local_ip="$(downmask_config_get '.ab_pull.local_ip')"
-    token="$(downmask_config_get '.ab_pull.token')"
-    speed_limit="$(downmask_config_get '.ab_pull.speed_limit')"
-    timeout="$(downmask_config_get '.ab_pull.timeout_seconds')"
-    [ -n "$remote_host" ] && [ -n "$remote_port" ] && [ "$remote_port" != "0" ] || return 1
-    [ -n "$token" ] || return 1
-    [ -x "$PFWD_DOWNMASK_BIN_PATH" ] || { echo 0; return 0; }
-
-    local rate_bps=0
-    if [ -n "$speed_limit" ]; then
-        rate_bps="$(downmask_speed_to_bps "$speed_limit")"
-    fi
-    [ -n "$timeout" ] && [ "$timeout" -gt 0 ] || timeout=1200
-
-    local -a cmd
-    cmd=(
-        "$PFWD_DOWNMASK_BIN_PATH"
-        pull
-        --protocol "$protocol"
-        --remote-host "$remote_host"
-        --remote-port "$remote_port"
-        --token "$token"
-        --wanted-bytes "$planned"
-        --speed-limit "$rate_bps"
-        --timeout "$timeout"
-    )
-    if [ -n "$local_ip" ]; then
-        cmd+=(--local-ip "$local_ip")
-    fi
-
-    local out
-    out="$("${cmd[@]}" 2>/dev/null || true)"
-    local actual
-    actual="$(echo "$out" | jq -r '.actual_bytes // 0' 2>/dev/null || echo 0)"
-    [[ "$actual" =~ ^[0-9]+$ ]] || actual=0
-    echo "$actual"
+    [ -n "$protocol" ] || protocol="tcp"
+    single_json="$(downmask_ab_pull_attempt_protocol "$protocol" "$planned")"
+    single_actual="$(jq -r '.actual_bytes // 0' <<< "$single_json" 2>/dev/null || echo 0)"
+    [[ "$single_actual" =~ ^[0-9]+$ ]] || single_actual=0
+    echo "$single_actual"
 }
 
 downmask_speed_to_bps() {
@@ -547,9 +938,10 @@ downmask_reload_feed_service() {
 downmask_status_json() {
     config_init >/dev/null
     downmask_validate_configured_active_source
-    local cfg state feed
+    local cfg state feed ab_targets
     cfg="$(jq -c '.settings.downmask // {}' "$PFWD_CONFIG_FILE")"
     state="$(downmask_load_day_state)"
+    ab_targets="$(downmask_ab_pull_targets_json)"
     if [ -f "$PFWD_DOWNMASK_STATUS_FILE" ]; then
         feed="$(cat "$PFWD_DOWNMASK_STATUS_FILE" 2>/dev/null || echo '{}')"
     else
@@ -558,16 +950,18 @@ downmask_status_json() {
     jq -n \
         --argjson config "$cfg" \
         --argjson state "$state" \
+        --argjson ab_targets "$ab_targets" \
         --argjson feed "$feed" '
         {
             config: $config,
             day_state: $state,
+            ab_targets: $ab_targets,
             feed: $feed
         }'
 }
 
 downmask_render_status() {
-    local json pull_mode iface ratio rx tx debt action feed_tcp feed_udp
+    local json pull_mode iface ratio rx tx debt action feed_tcp feed_udp ab_targets protocol_mode
     downmask_validate_configured_active_source
     json="$(downmask_status_json)"
     pull_mode="$(jq -r '.config.pull_mode // "off"' <<< "$json")"
@@ -578,6 +972,8 @@ downmask_render_status() {
     action="$(jq -r '.day_state.last_action // "-"' <<< "$json")"
     feed_tcp="$(jq -r '.feed.tcp_listening // false' <<< "$json")"
     feed_udp="$(jq -r '.feed.udp_listening // false' <<< "$json")"
+    ab_targets="$(jq -r '.ab_targets | length' <<< "$json")"
+    protocol_mode="$(jq -r '.config.ab_pull.protocol_mode // "single"' <<< "$json")"
     debt="$(awk -v r="$ratio" -v tx="$tx" -v rx="$rx" 'BEGIN { if (r == "-") { print "-" } else { d = (r * tx) - rx; if (d < 0) d = 0; printf "%.0f", d } }')"
 
     printf 'pull_mode\t%s\n' "$pull_mode"
@@ -587,6 +983,8 @@ downmask_render_status() {
     printf 'tx_accum\t%s\n' "$tx"
     printf 'debt\t%s\n' "$debt"
     printf 'last_action\t%s\n' "$action"
+    printf 'ab_protocol_mode\t%s\n' "$protocol_mode"
+    printf 'ab_targets\t%s\n' "$ab_targets"
     printf 'feed_tcp\t%s\n' "$feed_tcp"
     printf 'feed_udp\t%s\n' "$feed_udp"
 }
@@ -612,7 +1010,8 @@ cmd_downmask() {
   pfwd downmask public custom delete --name NAME
   pfwd downmask public custom list
   pfwd downmask public custom clear
-  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)] [--timeout SEC]
+  pfwd downmask ab-pull [--protocol tcp|udp] [--protocol-mode single|parallel] [--tcp-enabled true|false] [--udp-enabled true|false] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)] [--timeout SEC] [--parallel-limit N] [--speed-jitter-percent 12] [--bytes-jitter-percent 18]
+  pfwd downmask ab-pull targets list|add|update|delete|clear ...
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
   pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
 EOF
@@ -746,40 +1145,113 @@ cmd_downmask_public_custom() {
 }
 
 cmd_downmask_ab_pull() {
-    local protocol="" remote_host="" remote_port="" local_ip="" token="" speed="" timeout=""
+    if [ "${1:-}" = "targets" ]; then
+        shift
+        local sub="${1:-list}"
+        shift || true
+        case "$sub" in
+            list)
+                downmask_ab_pull_targets_list
+                ;;
+            clear)
+                downmask_ab_pull_targets_clear
+                echo "已清空 AB 拉流 B机池"
+                ;;
+            add|update)
+                local host="" port="" local_ip="" token="" weight="" tcp_enabled="" udp_enabled=""
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --host) host="$2"; shift 2 ;;
+                        --port) port="$2"; shift 2 ;;
+                        --local-ip) local_ip="$2"; shift 2 ;;
+                        --token) token="$2"; shift 2 ;;
+                        --weight) weight="$2"; shift 2 ;;
+                        --tcp-enabled) tcp_enabled="$2"; shift 2 ;;
+                        --udp-enabled) udp_enabled="$2"; shift 2 ;;
+                        *) pfwd_die "未知选项：$1" ;;
+                    esac
+                done
+                downmask_ab_pull_target_update "$host" "$port" "$token" "$local_ip" "$weight" "$tcp_enabled" "$udp_enabled"
+                echo "已更新 AB 拉流 B机：$host"
+                ;;
+            delete)
+                local host=""
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --host) host="$2"; shift 2 ;;
+                        *) pfwd_die "未知选项：$1" ;;
+                    esac
+                done
+                downmask_ab_pull_target_delete "$host"
+                echo "已删除 AB 拉流 B机：$host"
+                ;;
+            *)
+                pfwd_die "用法：pfwd downmask ab-pull targets list|add|update|delete|clear"
+                ;;
+        esac
+        return 0
+    fi
+
+    local protocol="" protocol_mode="" tcp_enabled="" udp_enabled="" remote_host="" remote_port="" local_ip="" token="" speed="" timeout="" parallel_limit="" speed_jitter="" bytes_jitter=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --protocol) protocol="$2"; shift 2 ;;
+            --protocol-mode) protocol_mode="$2"; shift 2 ;;
+            --tcp-enabled) tcp_enabled="$2"; shift 2 ;;
+            --udp-enabled) udp_enabled="$2"; shift 2 ;;
             --remote-host) remote_host="$2"; shift 2 ;;
             --remote-port) remote_port="$2"; shift 2 ;;
             --local-ip) local_ip="$2"; shift 2 ;;
             --token) token="$2"; shift 2 ;;
             --speed-limit) speed="$2"; shift 2 ;;
             --timeout) timeout="$2"; shift 2 ;;
+            --parallel-limit) parallel_limit="$2"; shift 2 ;;
+            --speed-jitter-percent) speed_jitter="$2"; shift 2 ;;
+            --bytes-jitter-percent) bytes_jitter="$2"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
         esac
     done
     [ -z "$protocol" ] || validate_downmask_protocol "$protocol"
+    [ -z "$protocol_mode" ] || validate_downmask_protocol_mode "$protocol_mode"
+    [ -z "$tcp_enabled" ] || validate_bool "$tcp_enabled"
+    [ -z "$udp_enabled" ] || validate_bool "$udp_enabled"
+    [ -z "$remote_host" ] || validate_downmask_target_host "$remote_host"
     [ -z "$remote_port" ] || validate_port "$remote_port"
     [ -z "$local_ip" ] || validate_downmask_local_ip "$local_ip"
+    [ -z "$token" ] || validate_downmask_token "$token"
     [ -z "$speed" ] || validate_downmask_speed_limit "$speed"
     [ -z "$timeout" ] || [[ "$timeout" =~ ^[0-9]+$ ]] || pfwd_die "timeout 必须是非负整数"
+    [ -z "$parallel_limit" ] || validate_downmask_parallel_limit "$parallel_limit"
+    [ -z "$speed_jitter" ] || validate_downmask_percent "speed-jitter-percent" "$speed_jitter"
+    [ -z "$bytes_jitter" ] || validate_downmask_percent "bytes-jitter-percent" "$bytes_jitter"
     config_update \
         --arg protocol "$protocol" \
+        --arg protocol_mode "$protocol_mode" \
+        --arg tcp_enabled "$tcp_enabled" \
+        --arg udp_enabled "$udp_enabled" \
         --arg remote_host "$remote_host" \
         --arg remote_port "$remote_port" \
         --arg local_ip "$local_ip" \
         --arg token "$token" \
         --arg speed "$speed" \
-        --arg timeout "$timeout" '
+        --arg timeout "$timeout" \
+        --arg parallel_limit "$parallel_limit" \
+        --arg speed_jitter "$speed_jitter" \
+        --arg bytes_jitter "$bytes_jitter" '
         .settings.downmask.ab_pull |= (
             (if $protocol == "" then . else .protocol = $protocol end)
+            | (if $protocol_mode == "" then . else .protocol_mode = $protocol_mode end)
+            | (if $tcp_enabled == "" then . else .tcp_enabled = ($tcp_enabled == "true") end)
+            | (if $udp_enabled == "" then . else .udp_enabled = ($udp_enabled == "true") end)
             | (if $remote_host == "" then . else .remote_host = $remote_host end)
             | (if $remote_port == "" then . else .remote_port = ($remote_port | tonumber) end)
             | (if $local_ip == "" then . else .local_ip = $local_ip end)
             | (if $token == "" then . else .token = $token end)
             | (if $speed == "" then . else .speed_limit = $speed end)
             | (if $timeout == "" then . else .timeout_seconds = ($timeout | tonumber) end)
+            | (if $parallel_limit == "" then . else .parallel_limit = ($parallel_limit | tonumber) end)
+            | (if $speed_jitter == "" then . else .speed_jitter_percent = ($speed_jitter | tonumber) end)
+            | (if $bytes_jitter == "" then . else .bytes_jitter_percent = ($bytes_jitter | tonumber) end)
         )'
     echo "已更新 AB 拉流配置"
 }

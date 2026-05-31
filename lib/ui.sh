@@ -4739,10 +4739,12 @@ ui_menu_egress_whitelist() {
 }
 
 ui_print_downmask_summary() {
-    local pull_mode iface ratio
+    local pull_mode iface ratio ab_targets ab_mode
     pull_mode="$(downmask_config_get '.pull_mode' 2>/dev/null || echo off)"
     iface="$(downmask_iface 2>/dev/null || echo -)"
     ratio="$(jq -r '.target_ratio // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
+    ab_targets="$(downmask_ab_target_count 2>/dev/null || echo 0)"
+    ab_mode="$(downmask_config_get '.ab_pull.protocol_mode' 2>/dev/null || echo single)"
     local tws twe window_text
     tws="$(downmask_config_get '.time_window_start' 2>/dev/null || true)"
     twe="$(downmask_config_get '.time_window_end' 2>/dev/null || true)"
@@ -4759,6 +4761,7 @@ ui_print_downmask_summary() {
     feed_udp="$(downmask_config_get '.ab_feed.udp_enabled' 2>/dev/null || echo false)"
     printf '  拉流模式：%s  接口：%s  生效时段：%s  今日目标比例：%s\n' "$pull_mode" "$iface" "$window_text" "$ratio"
     printf '  今日入站：%s  今日出站：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
+    printf '  A机拉流：模式=%s  B机池=%s 台\n' "$ab_mode" "$ab_targets"
     printf '  B机喂流 TCP：%s  UDP：%s\n' "$feed_tcp" "$feed_udp"
 }
 
@@ -4875,45 +4878,148 @@ ui_menu_downmask_public() {
 }
 
 ui_menu_downmask_ab_pull() {
-    ui_form_set "A机拉流" "配置从 B 机拉流的连接参数。输入 0 返回上级菜单。"
-    local protocol host port local_ip token speed timeout
-    ui_form_select_read "协议" "1" "0) 返回" "1) tcp" "2) udp" || { ui_form_reset; return; }
-    [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
-    case "$UI_REPLY" in 1) protocol="tcp" ;; 2) protocol="udp" ;; esac
-    ui_form_add_kv "协议" "$protocol"
-    ui_form_edit_read "远端主机（填 B 机 IP，建议直填 IPv4/IPv6）" "$(downmask_config_get '.ab_pull.remote_host')" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    host="$UI_REPLY"
-    ui_form_add_kv "远端主机" "$host"
-    ui_form_edit_read "远端端口" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    port="$UI_REPLY"
-    ui_form_add_kv "远端端口" "$port"
-    ui_form_edit_read "A机本地源 IP（可填内网 IP）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    local_ip="$UI_REPLY"
-    [ -z "$local_ip" ] || ui_form_add_kv "A机本地源 IP" "$local_ip"
-    ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    token="$UI_REPLY"
-    ui_form_edit_read "限速（默认 $(format_downmask_speed_hint "4M")；支持 4M、4MB/s、32Mbps）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    speed="$UI_REPLY"
-    ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; return; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
-    timeout="$UI_REPLY"
+    while true; do
+        ui_header "A机拉流"
+        ui_notice_render
+        printf '当前 B机池：%s 台\n' "$(downmask_ab_target_count 2>/dev/null || echo 0)"
+        printf '当前协议模式：%s\n' "$(downmask_config_get '.ab_pull.protocol_mode' 2>/dev/null || echo single)"
+        printf '当前共享端口：%s\n' "$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
+        printf '当前共享限速：%s\n' "$(downmask_config_get '.ab_pull.speed_limit' 2>/dev/null || echo 4M)"
+        echo
+        ui_menu_item 1 "共享拉流参数"
+        ui_menu_item 2 "添加/更新 B机"
+        ui_menu_item 3 "查看 B机池"
+        ui_menu_item 4 "删除 B机"
+        ui_menu_item 5 "清空 B机池"
+        ui_menu_item 0 "返回上级菜单"
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_form_set "A机拉流共享参数" "配置并行模式、共享端口、共享 token、限速与随机化参数。输入 0 返回。"
+                local protocol protocol_mode tcp_enabled udp_enabled port local_ip token speed timeout parallel_limit speed_jitter bytes_jitter
+                ui_form_select_read "协议模式" "1" "0) 返回" "1) single（单协议）" "2) parallel（TCP/UDP 并行）" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                case "$UI_REPLY" in 1) protocol_mode="single" ;; 2) protocol_mode="parallel" ;; esac
+                if [ "$protocol_mode" = "single" ]; then
+                    ui_form_select_read "单协议选择" "1" "0) 返回" "1) tcp" "2) udp" || { ui_form_reset; continue; }
+                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                    case "$UI_REPLY" in 1) protocol="tcp" ;; 2) protocol="udp" ;; esac
+                else
+                    ui_form_select_read "TCP 并行" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                    case "$UI_REPLY" in 1) tcp_enabled="false" ;; 2) tcp_enabled="true" ;; esac
+                    ui_form_select_read "UDP 并行" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                    case "$UI_REPLY" in 1) udp_enabled="false" ;; 2) udp_enabled="true" ;; esac
+                fi
+                ui_form_edit_read "共享远端端口（条目可单独覆盖）" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                port="$UI_REPLY"
+                ui_form_edit_read "A机共享本地源 IP（可留空；条目可覆盖）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                local_ip="$UI_REPLY"
+                ui_form_edit_read "共享 Token（可留空；条目可覆盖；例如 openssl rand -hex 16）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                token="$UI_REPLY"
+                ui_form_edit_read "共享限速（默认 $(format_downmask_speed_hint "4M")）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                speed="$UI_REPLY"
+                ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                timeout="$UI_REPLY"
+                ui_form_edit_read "并行上限（建议 2）" "$(downmask_config_get '.ab_pull.parallel_limit')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                parallel_limit="$UI_REPLY"
+                ui_form_edit_read "限速抖动百分比（0-100，例如 12）" "$(downmask_config_get '.ab_pull.speed_jitter_percent')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                speed_jitter="$UI_REPLY"
+                ui_form_edit_read "单次字节抖动百分比（0-100，例如 18）" "$(downmask_config_get '.ab_pull.bytes_jitter_percent')" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                bytes_jitter="$UI_REPLY"
 
-    local args=(--protocol "$protocol")
-    [ -z "$host" ] || args+=(--remote-host "$host")
-    [ -z "$port" ] || args+=(--remote-port "$port")
-    [ -z "$local_ip" ] || args+=(--local-ip "$local_ip")
-    [ -z "$token" ] || args+=(--token "$token")
-    [ -z "$speed" ] || args+=(--speed-limit "$speed")
-    [ -z "$timeout" ] || args+=(--timeout "$timeout")
-    ui_run cmd_downmask_ab_pull "${args[@]}"
-    ui_form_reset
-    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "AB 拉流已更新" "$UI_C_MENU_NUM"
-    ui_maybe_pause success
+                local args=()
+                [ -z "$protocol_mode" ] || args+=(--protocol-mode "$protocol_mode")
+                [ -z "$protocol" ] || args+=(--protocol "$protocol")
+                [ -z "$tcp_enabled" ] || args+=(--tcp-enabled "$tcp_enabled")
+                [ -z "$udp_enabled" ] || args+=(--udp-enabled "$udp_enabled")
+                [ -z "$port" ] || args+=(--remote-port "$port")
+                [ -z "$local_ip" ] || args+=(--local-ip "$local_ip")
+                [ -z "$token" ] || args+=(--token "$token")
+                [ -z "$speed" ] || args+=(--speed-limit "$speed")
+                [ -z "$timeout" ] || args+=(--timeout "$timeout")
+                [ -z "$parallel_limit" ] || args+=(--parallel-limit "$parallel_limit")
+                [ -z "$speed_jitter" ] || args+=(--speed-jitter-percent "$speed_jitter")
+                [ -z "$bytes_jitter" ] || args+=(--bytes-jitter-percent "$bytes_jitter")
+                ui_run cmd_downmask_ab_pull "${args[@]}"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "A机拉流共享参数已更新" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_form_set "添加/更新 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
+                local host item_port item_local_ip item_token weight item_tcp item_udp
+                ui_form_edit_read "B机 IP/主机（建议直填 IPv4/IPv6）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                host="$UI_REPLY"
+                ui_form_edit_read "条目端口（留空=用共享端口）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                item_port="$UI_REPLY"
+                ui_form_edit_read "条目本地源 IP（留空=用共享值）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                item_local_ip="$UI_REPLY"
+                ui_form_edit_read "条目 Token（留空=用共享值）" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                item_token="$UI_REPLY"
+                ui_form_edit_read "权重（默认 1）" "1" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                weight="$UI_REPLY"
+                ui_form_select_read "允许 TCP" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                case "$UI_REPLY" in 1) item_tcp="false" ;; 2) item_tcp="true" ;; esac
+                ui_form_select_read "允许 UDP" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
+                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
+                case "$UI_REPLY" in 1) item_udp="false" ;; 2) item_udp="true" ;; esac
+                local target_args=(targets add --host "$host" --tcp-enabled "$item_tcp" --udp-enabled "$item_udp")
+                [ -z "$item_port" ] || target_args+=(--port "$item_port")
+                [ -z "$item_local_ip" ] || target_args+=(--local-ip "$item_local_ip")
+                [ -z "$item_token" ] || target_args+=(--token "$item_token")
+                [ -z "$weight" ] || target_args+=(--weight "$weight")
+                ui_run cmd_downmask_ab_pull "${target_args[@]}"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机条目已更新" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_header "B机池"
+                ui_notice_render
+                ui_table_render $'B机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$(downmask_ab_pull_targets_list)" "2"
+                ui_pause
+                ;;
+            4)
+                local host_to_delete=""
+                ui_form_set "删除 B机" "输入要删除的 B机 host。输入 0 返回。"
+                ui_form_edit_read "B机 host" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                host_to_delete="$UI_REPLY"
+                ui_run cmd_downmask_ab_pull targets delete --host "$host_to_delete"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机条目已删除" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            5)
+                if ui_confirm_text "yes" "输入 yes 确认清空全部 B机"; then
+                    ui_run cmd_downmask_ab_pull targets clear
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机池已清空" "$UI_C_MENU_NUM"
+                    ui_maybe_pause success
+                else
+                    ui_warn "已跳过"
+                    ui_pause
+                fi
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
 }
 
 ui_menu_downmask_ab_feed() {

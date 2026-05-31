@@ -57,12 +57,19 @@ config_default_json() {
       },
       "ab_pull": {
         "protocol": "tcp",
+        "protocol_mode": "single",
+        "tcp_enabled": true,
+        "udp_enabled": false,
         "remote_host": "",
         "remote_port": 0,
         "local_ip": "",
         "token": "",
         "speed_limit": "4M",
-        "timeout_seconds": 1200
+        "timeout_seconds": 1200,
+        "parallel_limit": 2,
+        "speed_jitter_percent": 12,
+        "bytes_jitter_percent": 18,
+        "targets": []
       },
       "ab_feed": {
         "tcp_enabled": false,

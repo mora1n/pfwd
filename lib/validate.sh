@@ -592,6 +592,39 @@ validate_downmask_protocol() {
     esac
 }
 
+validate_downmask_protocol_mode() {
+    local value="$1"
+    case "$value" in
+        single|parallel) ;;
+        *) pfwd_die "无效协议模式：$value，必须是 single 或 parallel" ;;
+    esac
+}
+
+validate_downmask_target_host() {
+    local value="$1"
+    [ -n "$value" ] || pfwd_die "B机主机不能为空"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || pfwd_die "无效 B机主机：不能包含控制字符"
+}
+
+validate_downmask_weight() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "weight 必须是正整数"
+    [ "$value" -ge 1 ] || pfwd_die "weight 必须 >= 1"
+}
+
+validate_downmask_percent() {
+    local label="$1"
+    local value="$2"
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "$label 必须是 0-100 的整数"
+    [ "$value" -ge 0 ] && [ "$value" -le 100 ] || pfwd_die "$label 必须位于 0-100"
+}
+
+validate_downmask_parallel_limit() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "parallel-limit 必须是正整数"
+    [ "$value" -ge 1 ] || pfwd_die "parallel-limit 必须 >= 1"
+}
+
 validate_downmask_local_ip() {
     local value="$1"
     [ -n "$value" ] || pfwd_die "local_ip 不能为空"

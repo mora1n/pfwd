@@ -127,10 +127,13 @@ pfwd guard status
 关键点：
 
 - `ab_pull.local_ip` 用于 A 机显式绑定拉流源 IP
+- `ab_pull.targets` 支持配置多个 B 机，A 机会按权重随机选择
+- `ab_pull.protocol_mode=parallel` 时可并行发起 TCP/UDP 拉流，并允许两路随机命中不同 B 机
 - `ab_feed.bind_ip` 用于 B 机监听并从指定 IP 返回内容
 - A/B 两端 `token` 必须完全一致；可用 `openssl rand -hex 16`
 - `seed generate` 默认生成 `1GB` 高熵种子文件，推荐大小 `256MB-4GB`
 - `public.speed_limit` / `ab-pull --speed-limit` 支持 `4M`、`4MB/s`、`32Mbps`、`1GB/s`
+- `ab_pull.speed_jitter_percent` / `bytes_jitter_percent` 用于给限速和单次拉流字节做抖动，减少固定模式特征
 - `public.active_source` 当前内置源只有：
   - `cloudflare_dynamic`
   - `linode_tokyo_100mb`
@@ -145,7 +148,9 @@ pfwd downmask policy --pull-mode public --iface eth0
 pfwd downmask public --active-source cloudflare_dynamic --speed-limit 4M
 pfwd downmask policy --pull-mode ab --iface eth0
 TOKEN="$(openssl rand -hex 16)"
-pfwd downmask ab-pull --protocol tcp --remote-host 10.0.0.2 --remote-port 5301 --local-ip 10.0.0.10 --token "$TOKEN" --speed-limit 4M
+pfwd downmask ab-pull --protocol-mode parallel --tcp-enabled true --udp-enabled true --remote-port 5301 --token "$TOKEN" --speed-limit 4M --speed-jitter-percent 12 --bytes-jitter-percent 18
+pfwd downmask ab-pull targets add --host 10.0.0.2 --weight 3 --tcp-enabled true --udp-enabled true
+pfwd downmask ab-pull targets add --host 10.0.0.3 --port 5302 --weight 1 --token "$TOKEN"
 pfwd downmask ab-feed --tcp-enabled true --udp-enabled false --bind-ip 10.0.0.2 --tcp-port 5301 --token "$TOKEN"
 pfwd downmask seed generate --size 1GB
 pfwd downmask status
