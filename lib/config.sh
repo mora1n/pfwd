@@ -57,9 +57,9 @@ config_default_json() {
       },
       "ab_pull": {
         "protocol": "tcp",
-        "protocol_mode": "single",
+        "protocol_mode": "parallel",
         "tcp_enabled": true,
-        "udp_enabled": false,
+        "udp_enabled": true,
         "remote_host": "",
         "remote_port": 0,
         "local_ip": "",

@@ -4895,23 +4895,11 @@ ui_menu_downmask_ab_pull() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_form_set "默认拉流参数" "single 和 parallel 共用这一套默认参数。输入 0 返回。"
+                ui_form_set "默认拉流参数" "默认双开 TCP+UDP 拉流。输入 0 返回。"
                 local protocol protocol_mode tcp_enabled udp_enabled port local_ip token speed timeout parallel_limit speed_jitter bytes_jitter
-                ui_form_select_read "协议模式" "1" "0) 返回" "1) single（单协议）" "2) parallel（TCP/UDP 并行）" || { ui_form_reset; continue; }
-                [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
-                case "$UI_REPLY" in 1) protocol_mode="single" ;; 2) protocol_mode="parallel" ;; esac
-                if [ "$protocol_mode" = "single" ]; then
-                    ui_form_select_read "单协议选择" "1" "0) 返回" "1) tcp" "2) udp" || { ui_form_reset; continue; }
-                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
-                    case "$UI_REPLY" in 1) protocol="tcp" ;; 2) protocol="udp" ;; esac
-                else
-                    ui_form_select_read "TCP 并行" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
-                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
-                    case "$UI_REPLY" in 1) tcp_enabled="false" ;; 2) tcp_enabled="true" ;; esac
-                    ui_form_select_read "UDP 并行" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; continue; }
-                    [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
-                    case "$UI_REPLY" in 1) udp_enabled="false" ;; 2) udp_enabled="true" ;; esac
-                fi
+                protocol_mode="parallel"
+                tcp_enabled="true"
+                udp_enabled="true"
                 ui_form_edit_read "默认远端端口（B机可单独覆盖）" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 port="$UI_REPLY"
@@ -4930,10 +4918,10 @@ ui_menu_downmask_ab_pull() {
                 ui_form_edit_read "并行上限（建议 2）" "$(downmask_config_get '.ab_pull.parallel_limit')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 parallel_limit="$UI_REPLY"
-                ui_form_read_allow_zero_value "限速抖动百分比（0-100，例如 12；0 表示关闭）" "$(downmask_config_get '.ab_pull.speed_jitter_percent')" || { ui_form_reset; continue; }
+                ui_form_read_allow_zero_value "限速抖动百分比（0-100，例如 12；默认 $(downmask_config_get '.ab_pull.speed_jitter_percent' 2>/dev/null || echo 12)）" "$(downmask_config_get '.ab_pull.speed_jitter_percent')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 speed_jitter="$UI_REPLY"
-                ui_form_read_allow_zero_value "单次字节抖动百分比（0-100，例如 18；0 表示关闭）" "$(downmask_config_get '.ab_pull.bytes_jitter_percent')" || { ui_form_reset; continue; }
+                ui_form_read_allow_zero_value "单次字节抖动百分比（0-100，例如 18；默认 $(downmask_config_get '.ab_pull.bytes_jitter_percent' 2>/dev/null || echo 18)）" "$(downmask_config_get '.ab_pull.bytes_jitter_percent')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 bytes_jitter="$UI_REPLY"
 
