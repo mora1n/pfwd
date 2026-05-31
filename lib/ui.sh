@@ -1355,6 +1355,13 @@ ui_form_edit_read() {
     ui_edit_read "$prompt" "$default"
 }
 
+ui_trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
+}
+
 ui_form_read_allow_zero_value() {
     local prompt="$1"
     local default="${2:-}"
@@ -4808,13 +4815,19 @@ ui_menu_downmask_policy() {
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     max_r="$UI_REPLY"
     ui_form_add_kv "最大比例" "$max_r"
-    ui_form_edit_read "时间窗口开始（HH:MM；留空=全天）" "$(downmask_config_get '.time_window_start')" || { ui_form_reset; return; }
+    ui_form_edit_read "时间窗口开始（HH:MM；回车保留，空格回车=全天）" "$(downmask_config_get '.time_window_start')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     tws="$UI_REPLY"
+    if [ -n "$tws" ] && [ -z "$(ui_trim_whitespace "$tws")" ]; then
+        tws=""
+    fi
     ui_form_add_kv "窗口开始" "$tws"
-    ui_form_edit_read "时间窗口结束（HH:MM；留空=全天）" "$(downmask_config_get '.time_window_end')" || { ui_form_reset; return; }
+    ui_form_edit_read "时间窗口结束（HH:MM；回车保留，空格回车=全天）" "$(downmask_config_get '.time_window_end')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     twe="$UI_REPLY"
+    if [ -n "$twe" ] && [ -z "$(ui_trim_whitespace "$twe")" ]; then
+        twe=""
+    fi
     ui_form_add_kv "窗口结束" "$twe"
     ui_form_edit_read "最大随机延迟（秒）" "$(downmask_config_get '.max_jitter_seconds')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
