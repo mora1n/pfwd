@@ -4886,16 +4886,16 @@ ui_menu_downmask_ab_pull() {
         printf '当前共享端口：%s\n' "$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
         printf '当前共享限速：%s\n' "$(downmask_config_get '.ab_pull.speed_limit' 2>/dev/null || echo 4M)"
         echo
-        ui_menu_item 1 "共享拉流参数"
-        ui_menu_item 2 "添加/更新 B机"
+        ui_menu_item 1 "默认拉流参数"
+        ui_menu_item 2 "管理 B机"
         ui_menu_item 3 "查看 B机池"
-        ui_menu_item 4 "删除 B机"
+        ui_menu_item 4 "移除 B机"
         ui_menu_item 5 "清空 B机池"
         ui_menu_item 0 "返回上级菜单"
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_form_set "A机拉流共享参数" "配置并行模式、共享端口、共享 token、限速与随机化参数。输入 0 返回。"
+                ui_form_set "默认拉流参数" "single 和 parallel 共用这一套默认参数。输入 0 返回。"
                 local protocol protocol_mode tcp_enabled udp_enabled port local_ip token speed timeout parallel_limit speed_jitter bytes_jitter
                 ui_form_select_read "协议模式" "1" "0) 返回" "1) single（单协议）" "2) parallel（TCP/UDP 并行）" || { ui_form_reset; continue; }
                 [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
@@ -4912,16 +4912,16 @@ ui_menu_downmask_ab_pull() {
                     [ "$UI_REPLY" = "0" ] && { ui_form_reset; continue; }
                     case "$UI_REPLY" in 1) udp_enabled="false" ;; 2) udp_enabled="true" ;; esac
                 fi
-                ui_form_edit_read "共享远端端口（条目可单独覆盖）" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; continue; }
+                ui_form_edit_read "默认远端端口（B机可单独覆盖）" "$(downmask_config_get '.ab_pull.remote_port')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 port="$UI_REPLY"
-                ui_form_edit_read "A机共享本地源 IP（可留空；条目可覆盖）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; continue; }
+                ui_form_edit_read "A机默认本地源 IP（可留空；B机可覆盖）" "$(downmask_config_get '.ab_pull.local_ip')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 local_ip="$UI_REPLY"
-                ui_form_edit_read "共享 Token（可留空；条目可覆盖；例如 openssl rand -hex 16）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "默认 Token（可留空；B机可覆盖；例如 openssl rand -hex 16）" "$(downmask_config_get '.ab_pull.token')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 token="$UI_REPLY"
-                ui_form_edit_read "共享限速（默认 $(format_downmask_speed_hint "4M")）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; continue; }
+                ui_form_edit_read "默认限速（默认 $(format_downmask_speed_hint "4M")）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 speed="$UI_REPLY"
                 ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; continue; }
@@ -4930,10 +4930,10 @@ ui_menu_downmask_ab_pull() {
                 ui_form_edit_read "并行上限（建议 2）" "$(downmask_config_get '.ab_pull.parallel_limit')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 parallel_limit="$UI_REPLY"
-                ui_form_edit_read "限速抖动百分比（0-100，例如 12）" "$(downmask_config_get '.ab_pull.speed_jitter_percent')" || { ui_form_reset; continue; }
+                ui_form_read_allow_zero_value "限速抖动百分比（0-100，例如 12；0 表示关闭）" "$(downmask_config_get '.ab_pull.speed_jitter_percent')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 speed_jitter="$UI_REPLY"
-                ui_form_edit_read "单次字节抖动百分比（0-100，例如 18）" "$(downmask_config_get '.ab_pull.bytes_jitter_percent')" || { ui_form_reset; continue; }
+                ui_form_read_allow_zero_value "单次字节抖动百分比（0-100，例如 18；0 表示关闭）" "$(downmask_config_get '.ab_pull.bytes_jitter_percent')" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 bytes_jitter="$UI_REPLY"
 
@@ -4952,22 +4952,22 @@ ui_menu_downmask_ab_pull() {
                 [ -z "$bytes_jitter" ] || args+=(--bytes-jitter-percent "$bytes_jitter")
                 ui_run cmd_downmask_ab_pull "${args[@]}"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "A机拉流共享参数已更新" "$UI_C_MENU_NUM"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "默认拉流参数已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)
-                ui_form_set "添加/更新 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
+                ui_form_set "管理 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
                 local host item_port item_local_ip item_token weight item_tcp item_udp
                 ui_form_edit_read "B机 IP/主机（建议直填 IPv4/IPv6）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 host="$UI_REPLY"
-                ui_form_edit_read "条目端口（留空=用共享端口）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机端口（留空=用默认端口）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_port="$UI_REPLY"
-                ui_form_edit_read "条目本地源 IP（留空=用共享值）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机本地源 IP（留空=用默认值）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_local_ip="$UI_REPLY"
-                ui_form_edit_read "条目 Token（留空=用共享值）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机 Token（留空=用默认值）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_token="$UI_REPLY"
                 ui_form_edit_read "权重（默认 1）" "1" || { ui_form_reset; continue; }
@@ -4986,7 +4986,7 @@ ui_menu_downmask_ab_pull() {
                 [ -z "$weight" ] || target_args+=(--weight "$weight")
                 ui_run cmd_downmask_ab_pull "${target_args[@]}"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机条目已更新" "$UI_C_MENU_NUM"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             3)
@@ -4997,13 +4997,13 @@ ui_menu_downmask_ab_pull() {
                 ;;
             4)
                 local host_to_delete=""
-                ui_form_set "删除 B机" "输入要删除的 B机 host。输入 0 返回。"
+                ui_form_set "移除 B机" "输入要移除的 B机 host。输入 0 返回。"
                 ui_form_edit_read "B机 host" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 host_to_delete="$UI_REPLY"
                 ui_run cmd_downmask_ab_pull targets delete --host "$host_to_delete"
                 ui_form_reset
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机条目已删除" "$UI_C_MENU_NUM"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "B机已移除" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             5)
