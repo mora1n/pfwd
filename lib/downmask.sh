@@ -247,6 +247,58 @@ downmask_resolve_target_field() {
     jq -r --arg field "$field" '.[$field] // empty' <<< "$target_json"
 }
 
+downmask_ab_pull_effective_target_json() {
+    local target_json="$1"
+    local shared_port shared_token shared_local_ip
+    shared_port="$(downmask_config_get '.ab_pull.remote_port')"
+    shared_token="$(downmask_config_get '.ab_pull.token')"
+    shared_local_ip="$(downmask_config_get '.ab_pull.local_ip')"
+    jq -c \
+        --arg shared_port "$shared_port" \
+        --arg shared_token "$shared_token" \
+        --arg shared_local_ip "$shared_local_ip" '
+        . as $item
+        | . + {
+            effective_port: (
+                if (($item.port // "") | tostring) != "" and (($item.port | tostring) != "0") then ($item.port | tostring)
+                elif $shared_port != "" and $shared_port != "0" then $shared_port
+                else ""
+                end
+            ),
+            effective_port_source: (
+                if (($item.port // "") | tostring) != "" and (($item.port | tostring) != "0") then "override"
+                elif $shared_port != "" and $shared_port != "0" then "default"
+                else "unset"
+                end
+            ),
+            effective_token: (
+                if ($item.token // "") != "" then ($item.token // "")
+                elif $shared_token != "" then $shared_token
+                else ""
+                end
+            ),
+            effective_token_source: (
+                if ($item.token // "") != "" then "override"
+                elif $shared_token != "" then "default"
+                else "unset"
+                end
+            ),
+            effective_local_ip: (
+                if ($item.local_ip // "") != "" then ($item.local_ip // "")
+                elif $shared_local_ip != "" then $shared_local_ip
+                else ""
+                end
+            ),
+            effective_local_ip_source: (
+                if ($item.local_ip // "") != "" then "override"
+                elif $shared_local_ip != "" then "default"
+                else "unset"
+                end
+            )
+        }
+    ' <<< "$target_json"
+}
+
 downmask_build_ab_pull_cmd() {
     local protocol="$1"
     local planned="$2"
@@ -265,14 +317,12 @@ downmask_build_ab_pull_cmd() {
     [ -n "$speed_jitter" ] || speed_jitter=0
     [ -n "$bytes_jitter" ] || bytes_jitter=0
 
-    local remote_host remote_port token local_ip wanted_bps rate_bps wanted_bytes
+    local resolved_target_json remote_host remote_port token local_ip wanted_bps rate_bps wanted_bytes
+    resolved_target_json="$(downmask_ab_pull_effective_target_json "$target_json")"
     remote_host="$(downmask_resolve_target_field "$target_json" "host")"
-    remote_port="$(downmask_resolve_target_field "$target_json" "port")"
-    token="$(downmask_resolve_target_field "$target_json" "token")"
-    local_ip="$(downmask_resolve_target_field "$target_json" "local_ip")"
-    [ -n "$remote_port" ] || remote_port="$shared_port"
-    [ -n "$token" ] || token="$shared_token"
-    [ -n "$local_ip" ] || local_ip="$shared_local_ip"
+    remote_port="$(downmask_resolve_target_field "$resolved_target_json" "effective_port")"
+    token="$(downmask_resolve_target_field "$resolved_target_json" "effective_token")"
+    local_ip="$(downmask_resolve_target_field "$resolved_target_json" "effective_local_ip")"
 
     [ -n "$remote_host" ] && [ -n "$remote_port" ] && [ "$remote_port" != "0" ] || return 1
     [ -n "$token" ] || return 1
@@ -451,8 +501,8 @@ downmask_ab_pull_targets_table_rows() {
           ($item.host // ""),
           (if ($item.port // null) == null then "-" else ($item.port | tostring) end),
           (($item.weight // 1) | tostring),
-          (if ($item.tcp_enabled // null) == null then "true" elif $item.tcp_enabled then "true" else "false" end),
-          (if ($item.udp_enabled // null) == null then "true" elif $item.udp_enabled then "true" else "false" end),
+          (if ($item | has("tcp_enabled")) then (if $item.tcp_enabled then "true" else "false" end) else "true" end),
+          (if ($item | has("udp_enabled")) then (if $item.udp_enabled then "true" else "false" end) else "true" end),
           ($item.local_ip // ""),
           (if ($item.token // "") == "" then "-" else "set" end)
         ]
@@ -478,8 +528,8 @@ downmask_ab_pull_targets_list() {
           (.host // ""),
           (if (.port // null) == null then "-" else (.port | tostring) end),
           ((.weight // 1) | tostring),
-          (if (.tcp_enabled // null) == null then "true" elif .tcp_enabled then "true" else "false" end),
-          (if (.udp_enabled // null) == null then "true" elif .udp_enabled then "true" else "false" end),
+          (if has("tcp_enabled") then (if .tcp_enabled then "true" else "false" end) else "true" end),
+          (if has("udp_enabled") then (if .udp_enabled then "true" else "false" end) else "true" end),
           (.local_ip // ""),
           (if (.token // "") == "" then "-" else "set" end)
         ]

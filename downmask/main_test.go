@@ -191,6 +191,40 @@ func TestServeValidationAndHelpers(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("load_seed_from_file_without_reading_whole_file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "seed.bin")
+		data := newTestSeed(4096)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write seed file: %v", err)
+		}
+
+		src, closeFn, err := loadOrGenSeed(path)
+		if err != nil {
+			t.Fatalf("loadOrGenSeed: %v", err)
+		}
+		if closeFn == nil {
+			t.Fatal("expected close function for file-backed seed")
+		}
+		defer closeFn()
+
+		fileSrc, ok := src.(*fileSeedSource)
+		if !ok {
+			t.Fatalf("seed source type = %T, want *fileSeedSource", src)
+		}
+		if fileSrc.size != int64(len(data)) {
+			t.Fatalf("file seed size = %d, want %d", fileSrc.size, len(data))
+		}
+
+		buf := make([]byte, 6000)
+		if err := src.ReadRandom(buf); err != nil {
+			t.Fatalf("ReadRandom: %v", err)
+		}
+		if bytes.Equal(buf, make([]byte, len(buf))) {
+			t.Fatal("ReadRandom returned all zeros")
+		}
+	})
 }
 
 func TestRunServePayloadValidation(t *testing.T) {
@@ -370,6 +404,10 @@ func TestUDPFlow(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pc := newRecordingPacketConn()
 			status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
+			src, err := newSeedReader(bytes.Repeat([]byte("a"), 4096))
+			if err != nil {
+				t.Fatalf("newSeedReader: %v", err)
+			}
 			var sessionID [udpSessionLen]byte
 			copy(sessionID[:], []byte("udp-flow-check01"))
 			key := udpSessionKey{Addr: "peer", SessionID: sessionID}
@@ -377,7 +415,7 @@ func TestUDPFlow(t *testing.T) {
 				t.Fatalf("failed to register UDP session")
 			}
 
-			handleUDPSession(pc, dummyAddr("peer"), sessionID, tc.wanted, 0, bytes.Repeat([]byte("a"), 4096), tc.payload, key, status)
+			handleUDPSession(pc, dummyAddr("peer"), sessionID, tc.wanted, 0, src, tc.payload, key, status)
 
 			totalPayload, maxPacketLen := pc.payloadStats()
 			if totalPayload != tc.wantBytes {
@@ -416,6 +454,11 @@ func newTestSeed(size int) []byte {
 func startPullTestServer(t *testing.T, protocol, serverToken string, seed []byte, status *serveStatus) (int, func()) {
 	t.Helper()
 
+	src, err := newSeedReader(seed)
+	if err != nil {
+		t.Fatalf("newSeedReader: %v", err)
+	}
+
 	if protocol == "tcp" {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -428,7 +471,7 @@ func startPullTestServer(t *testing.T, protocol, serverToken string, seed []byte
 			if err != nil {
 				return
 			}
-			handleTCPSession(conn, tokenDigest(serverToken), seed, 0, status)
+			handleTCPSession(conn, tokenDigest(serverToken), src, 0, status)
 		}()
 		return ln.Addr().(*net.TCPAddr).Port, func() {
 			_ = ln.Close()
@@ -444,7 +487,7 @@ func startPullTestServer(t *testing.T, protocol, serverToken string, seed []byte
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
 	}
-	go serveUDPLoop(pc, tokenDigest(serverToken), seed, 0, udpDefaultPayload, status)
+	go serveUDPLoop(pc, tokenDigest(serverToken), src, 0, udpDefaultPayload, status)
 	return pc.LocalAddr().(*net.UDPAddr).Port, func() {
 		_ = pc.Close()
 	}

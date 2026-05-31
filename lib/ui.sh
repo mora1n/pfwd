@@ -4766,13 +4766,23 @@ ui_print_downmask_summary() {
 }
 
 ui_print_downmask_ab_pull_target_summary() {
-    local count last_action last_actual last_planned last_error
+    local count last_action last_actual last_planned last_error default_port default_local_ip default_token
     count="$(downmask_ab_pull_target_count 2>/dev/null || echo 0)"
+    default_port="$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
+    default_local_ip="$(downmask_config_get '.ab_pull.local_ip' 2>/dev/null || echo "")"
+    default_token="$(downmask_config_get '.ab_pull.token' 2>/dev/null || echo "")"
+    if [ -z "$default_port" ] || [ "$default_port" = "0" ]; then
+        default_port="未设置"
+    fi
+    [ -n "$default_local_ip" ] || default_local_ip="未设置"
+    [ -n "$default_token" ] || default_token="未设置"
+    printf '  默认端口：%s  默认本地源IP：%s  默认共享Token：%s\n' "$default_port" "$default_local_ip" "$( [ "$default_token" = "未设置" ] && echo 未设置 || echo set )"
     if [ "${count:-0}" -eq 0 ]; then
         echo "  B机状态：暂无已配置 B机"
     else
         echo "  B机状态："
-        ui_table_render $'序号\tB机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$(downmask_ab_pull_targets_table_rows)" "2,7"
+        echo "  说明：以下端口/本地源IP/Token 为实际生效值；带“默认”表示当前继承默认拉流参数。"
+        ui_table_render $'序号\tB机\t端口\t权重\tTCP\tUDP\t本地源IP\tToken' "$(ui_downmask_ab_pull_target_table_rows)" "2,7"
     fi
     last_action="$(jq -r '.last_action // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
     last_actual="$(jq -r '.last_actual_bytes // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
@@ -4816,9 +4826,15 @@ ui_menu_downmask() {
 
 ui_menu_downmask_policy() {
     ui_form_set "对冲策略" "设置下行伪装的拉流模式与参数。输入 0 返回上级菜单。"
-    local pull_mode min_r max_r tws twe jitter mindef maxrun
+    local pull_mode min_r max_r tws twe jitter mindef maxrun pull_mode_default
 
-    ui_form_select_read "拉流模式" "1" "0) 返回" "1) off（关闭）" "2) public（公网）" "3) ab（A/B 拉流）" || { ui_form_reset; return; }
+    pull_mode_default="1"
+    case "$(downmask_config_get '.pull_mode' 2>/dev/null || echo off)" in
+        public) pull_mode_default="2" ;;
+        ab) pull_mode_default="3" ;;
+        *) pull_mode_default="1" ;;
+    esac
+    ui_form_select_read "拉流模式" "$pull_mode_default" "0) 返回" "1) off（关闭）" "2) public（公网）" "3) ab（A/B 拉流）" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) pull_mode="off" ;; 2) pull_mode="public" ;; 3) pull_mode="ab" ;; esac
     ui_form_add_kv "拉流模式" "$pull_mode"
@@ -4903,7 +4919,7 @@ ui_downmask_ab_target_selection_rows() {
     while IFS= read -r row; do
         [ -n "$row" ] || continue
         rows+=$'\n'"$(awk -F $'\t' '{print $1 + 1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8}' <<< "$row")"
-    done < <(downmask_ab_pull_targets_table_rows)
+    done < <(ui_downmask_ab_pull_target_table_rows)
     printf '%s\n' "$rows"
 }
 
@@ -4942,22 +4958,83 @@ ui_select_downmask_ab_targets_multi() {
     [ -n "$UI_REPLY" ] || { ui_warn "请选择至少一个 B机"; return 1; }
 }
 
+ui_downmask_ab_pull_display_port() {
+    local value="$1"
+    local source="$2"
+    case "$source" in
+        override) printf '%s' "$value" ;;
+        default) printf '%s（默认）' "$value" ;;
+        *) printf '未设置' ;;
+    esac
+}
+
+ui_downmask_ab_pull_display_local_ip() {
+    local value="$1"
+    local source="$2"
+    case "$source" in
+        override) printf '%s' "$value" ;;
+        default) printf '%s（默认）' "$value" ;;
+        *) printf '-' ;;
+    esac
+}
+
+ui_downmask_ab_pull_display_token() {
+    local source="$1"
+    case "$source" in
+        override) printf 'set（单独）' ;;
+        default) printf 'set（默认）' ;;
+        *) printf '未设置' ;;
+    esac
+}
+
+ui_downmask_ab_pull_target_table_rows() {
+    local target_json resolved_json idx host weight tcp udp effective_port effective_port_source effective_local_ip effective_local_ip_source effective_token_source
+    idx=1
+    while IFS= read -r target_json; do
+        [ -n "$target_json" ] || continue
+        resolved_json="$(downmask_ab_pull_effective_target_json "$target_json")"
+        host="$(jq -r '.host // ""' <<< "$target_json")"
+        weight="$(jq -r '.weight // 1' <<< "$target_json")"
+        tcp="$(jq -r 'if has("tcp_enabled") then (if .tcp_enabled then "true" else "false" end) else "true" end' <<< "$target_json")"
+        udp="$(jq -r 'if has("udp_enabled") then (if .udp_enabled then "true" else "false" end) else "true" end' <<< "$target_json")"
+        effective_port="$(jq -r '.effective_port // ""' <<< "$resolved_json")"
+        effective_port_source="$(jq -r '.effective_port_source // "unset"' <<< "$resolved_json")"
+        effective_local_ip="$(jq -r '.effective_local_ip // ""' <<< "$resolved_json")"
+        effective_local_ip_source="$(jq -r '.effective_local_ip_source // "unset"' <<< "$resolved_json")"
+        effective_token_source="$(jq -r '.effective_token_source // "unset"' <<< "$resolved_json")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$idx" \
+            "$host" \
+            "$(ui_downmask_ab_pull_display_port "$effective_port" "$effective_port_source")" \
+            "$weight" \
+            "$tcp" \
+            "$udp" \
+            "$(ui_downmask_ab_pull_display_local_ip "$effective_local_ip" "$effective_local_ip_source")" \
+            "$(ui_downmask_ab_pull_display_token "$effective_token_source")"
+        idx=$((idx + 1))
+    done < <(jq -c '.[]' <<< "$(downmask_ab_pull_targets_json_list)")
+}
+
+ui_render_downmask_ab_pull_menu_page() {
+    ui_header "A机拉流"
+    ui_notice_render
+    printf '当前 B机池：%s 台\n' "$(downmask_ab_target_count 2>/dev/null || echo 0)"
+    printf '当前协议模式：%s\n' "$(downmask_config_get '.ab_pull.protocol_mode' 2>/dev/null || echo single)"
+    printf '当前共享端口：%s\n' "$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
+    printf '当前共享限速：%s\n' "$(downmask_config_get '.ab_pull.speed_limit' 2>/dev/null || echo 4M)"
+    echo
+    ui_print_downmask_ab_pull_target_summary
+    echo
+    ui_menu_item 1 "默认拉流参数"
+    ui_menu_item 2 "增加 B机"
+    ui_menu_item 3 "修改 B机"
+    ui_menu_item 4 "移除 B机"
+    ui_menu_item 0 "返回上级菜单"
+}
+
 ui_menu_downmask_ab_pull() {
     while true; do
-        ui_header "A机拉流"
-        ui_notice_render
-        printf '当前 B机池：%s 台\n' "$(downmask_ab_target_count 2>/dev/null || echo 0)"
-        printf '当前协议模式：%s\n' "$(downmask_config_get '.ab_pull.protocol_mode' 2>/dev/null || echo single)"
-        printf '当前共享端口：%s\n' "$(downmask_config_get '.ab_pull.remote_port' 2>/dev/null || echo 0)"
-        printf '当前共享限速：%s\n' "$(downmask_config_get '.ab_pull.speed_limit' 2>/dev/null || echo 4M)"
-        echo
-        ui_print_downmask_ab_pull_target_summary
-        echo
-        ui_menu_item 1 "默认拉流参数"
-        ui_menu_item 2 "增加 B机"
-        ui_menu_item 3 "修改 B机"
-        ui_menu_item 4 "移除 B机"
-        ui_menu_item 0 "返回上级菜单"
+        ui_render_page ui_render_downmask_ab_pull_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
@@ -5012,17 +5089,35 @@ ui_menu_downmask_ab_pull() {
                 ;;
             2)
                 ui_form_set "增加 B机" "按 host 作为唯一键；再次添加同 host 会覆盖。输入 0 返回。"
-                local host item_port item_local_ip item_token weight item_tcp item_udp
+                local host item_port item_local_ip item_token weight item_tcp item_udp default_port default_local_ip default_token default_port_hint default_local_ip_hint default_token_hint
+                default_port="$(downmask_config_get '.ab_pull.remote_port')"
+                default_local_ip="$(downmask_config_get '.ab_pull.local_ip')"
+                default_token="$(downmask_config_get '.ab_pull.token')"
+                if [ -n "$default_port" ] && [ "$default_port" != "0" ]; then
+                    default_port_hint="留空=用默认端口 $default_port"
+                else
+                    default_port_hint="留空=当前无默认端口"
+                fi
+                if [ -n "$default_local_ip" ]; then
+                    default_local_ip_hint="留空=用默认本地源IP $default_local_ip"
+                else
+                    default_local_ip_hint="留空=当前无默认本地源IP"
+                fi
+                if [ -n "$default_token" ]; then
+                    default_token_hint="留空=用默认Token set"
+                else
+                    default_token_hint="留空=当前无默认Token"
+                fi
                 ui_form_edit_read "B机 IP/主机（建议直填 IPv4/IPv6）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 host="$UI_REPLY"
-                ui_form_edit_read "B机端口（留空=用默认端口）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机端口（$default_port_hint）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_port="$UI_REPLY"
-                ui_form_edit_read "B机本地源 IP（留空=用默认值）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机本地源 IP（$default_local_ip_hint）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_local_ip="$UI_REPLY"
-                ui_form_edit_read "B机 Token（留空=用默认值）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机 Token（$default_token_hint）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 item_token="$UI_REPLY"
                 ui_form_edit_read "权重（默认 1）" "1" || { ui_form_reset; continue; }
@@ -5045,26 +5140,32 @@ ui_menu_downmask_ab_pull() {
                 ui_maybe_pause success
                 ;;
             3)
-                local selected_indexes selected_index selected_host current_target current_port current_local_ip current_token current_weight current_tcp current_udp
+                local selected_indexes selected_index selected_host current_target effective_target current_port current_local_ip current_token current_weight current_tcp current_udp effective_port effective_port_source effective_local_ip effective_local_ip_source effective_token_source
                 ui_select_downmask_ab_targets_multi "修改 B机" "选择 B机 序号，可单/多/连续选择；1 表示所有B机" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 selected_indexes="$UI_REPLY"
                 current_target="$(downmask_ab_pull_target_by_index "$(printf '%s\n' "$selected_indexes" | head -n1)")"
+                effective_target="$(downmask_ab_pull_effective_target_json "$current_target")"
                 current_port="$(jq -r '.port // ""' <<< "$current_target")"
                 current_local_ip="$(jq -r '.local_ip // ""' <<< "$current_target")"
                 current_token="$(jq -r '.token // ""' <<< "$current_target")"
                 current_weight="$(jq -r '.weight // 1' <<< "$current_target")"
-                current_tcp="$(jq -r 'if (.tcp_enabled // true) then "true" else "false" end' <<< "$current_target")"
-                current_udp="$(jq -r 'if (.udp_enabled // true) then "true" else "false" end' <<< "$current_target")"
-                ui_form_set "修改 B机" "直接回车表示保留现值。输入 0 返回。"
+                current_tcp="$(jq -r 'if has("tcp_enabled") then (if .tcp_enabled then "true" else "false" end) else "true" end' <<< "$current_target")"
+                current_udp="$(jq -r 'if has("udp_enabled") then (if .udp_enabled then "true" else "false" end) else "true" end' <<< "$current_target")"
+                effective_port="$(jq -r '.effective_port // ""' <<< "$effective_target")"
+                effective_port_source="$(jq -r '.effective_port_source // "unset"' <<< "$effective_target")"
+                effective_local_ip="$(jq -r '.effective_local_ip // ""' <<< "$effective_target")"
+                effective_local_ip_source="$(jq -r '.effective_local_ip_source // "unset"' <<< "$effective_target")"
+                effective_token_source="$(jq -r '.effective_token_source // "unset"' <<< "$effective_target")"
+                ui_form_set "修改 B机" "回车表示保留当前覆盖配置。以下“生效”值会参与实际拉流；带“默认”表示当前继承默认拉流参数。输入 0 返回。"
                 local new_port new_local_ip new_token new_weight new_tcp new_udp
-                ui_form_edit_read "B机端口（回车=保留；当前 ${current_port:--}）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机端口（回车=保留；覆盖=${current_port:--}；生效=$(ui_downmask_ab_pull_display_port "$effective_port" "$effective_port_source")）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 new_port="$UI_REPLY"
-                ui_form_edit_read "B机本地源 IP（回车=保留；当前 ${current_local_ip:--}）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机本地源 IP（回车=保留；覆盖=${current_local_ip:--}；生效=$(ui_downmask_ab_pull_display_local_ip "$effective_local_ip" "$effective_local_ip_source")）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 new_local_ip="$UI_REPLY"
-                ui_form_edit_read "B机 Token（回车=保留；当前 $( [ -n "$current_token" ] && echo set || echo - )）" "" || { ui_form_reset; continue; }
+                ui_form_edit_read "B机 Token（回车=保留；覆盖=$( [ -n "$current_token" ] && echo set || echo - )；生效=$(ui_downmask_ab_pull_display_token "$effective_token_source")）" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 new_token="$UI_REPLY"
                 ui_form_edit_read "权重（回车=保留；当前 $current_weight）" "" || { ui_form_reset; continue; }
@@ -5144,15 +5245,15 @@ ui_menu_downmask_ab_pull() {
 }
 
 ui_menu_downmask_ab_feed() {
-    ui_form_set "B机喂流" "配置 B 机 TCP/UDP 喂流服务与返回 IP。输入 0 返回上级菜单。"
+    ui_form_set "B机喂流" "配置 B 机 TCP/UDP 喂流服务。TCP/UDP 共用一套预共享 Token 与返回 IP。输入 0 返回上级菜单。"
     local tcp udp bind tcp_port udp_port token seed_file payload
     local seed_default="/var/lib/pfwd/downmask/seed.bin"
 
-    ui_form_select_read "TCP 喂流" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
+    ui_form_select_read "TCP 喂流" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) tcp="false" ;; 2) tcp="true" ;; esac
     ui_form_add_kv "TCP" "$tcp"
-    ui_form_select_read "UDP 喂流" "1" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
+    ui_form_select_read "UDP 喂流" "2" "0) 返回" "1) 关闭" "2) 开启" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
     case "$UI_REPLY" in 1) udp="false" ;; 2) udp="true" ;; esac
     ui_form_add_kv "UDP" "$udp"
@@ -5173,7 +5274,7 @@ ui_menu_downmask_ab_feed() {
     ui_form_edit_read "UDP 端口" "$(downmask_config_get '.ab_feed.udp_port')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     udp_port="$UI_REPLY"
-    ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
+    ui_form_edit_read "预共享 Token（TCP/UDP 共用；A/B 两端一致；可用 openssl rand -hex 16 生成）" "$(downmask_config_get '.ab_feed.token')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     token="$UI_REPLY"
     seed_file="$(downmask_config_get '.ab_feed.seed_file')"
@@ -5181,7 +5282,7 @@ ui_menu_downmask_ab_feed() {
     ui_form_edit_read "种子文件路径（默认 $seed_default）" "$seed_file" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     seed_file="$UI_REPLY"
-    ui_form_edit_read "UDP 包大小（支持 1200、1.2KB；裸数字按字节）" "$(downmask_config_get '.ab_feed.udp_payload_bytes')" || { ui_form_reset; return; }
+    ui_form_edit_read "UDP 包大小（支持 1200、1.2KB；范围 17-65507 字节，过小无意义，过大超出单个 UDP 载荷上限）" "$(downmask_config_get '.ab_feed.udp_payload_bytes')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     payload="$UI_REPLY"
 

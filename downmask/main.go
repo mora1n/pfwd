@@ -79,46 +79,126 @@ func (h *requestHeader) UnmarshalBinary(buf []byte) error {
 	return nil
 }
 
-type seedReader struct {
+type seedSource interface {
+	ReadRandom(buf []byte) error
+}
+
+type memorySeedSource struct {
 	seed []byte
 }
 
-func newSeedReader(seed []byte) (*seedReader, error) {
+func newSeedReader(seed []byte) (*memorySeedSource, error) {
 	if len(seed) == 0 {
 		return nil, errors.New("seed 不能为空")
 	}
-	return &seedReader{seed: seed}, nil
+	return &memorySeedSource{seed: seed}, nil
 }
 
-func (r *seedReader) randomSlice(size int) ([]byte, error) {
-	if size < 0 {
-		return nil, fmt.Errorf("无效 slice 大小: %d", size)
-	}
+func (r *memorySeedSource) ReadRandom(buf []byte) error {
+	size := len(buf)
 	if size == 0 {
-		return []byte{}, nil
+		return nil
+	}
+	if size < 0 {
+		return fmt.Errorf("无效 slice 大小: %d", size)
 	}
 	if size >= len(r.seed) {
-		return r.randomWrappedSlice(size)
+		return r.readWrapped(buf)
 	}
 	offset, err := cryptoRandIntn(len(r.seed) - size + 1)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return append([]byte(nil), r.seed[offset:offset+size]...), nil
+	copy(buf, r.seed[offset:offset+size])
+	return nil
 }
 
-func (r *seedReader) randomWrappedSlice(size int) ([]byte, error) {
-	out := make([]byte, size)
+func (r *memorySeedSource) randomSlice(size int) ([]byte, error) {
+	buf := make([]byte, size)
+	if err := r.ReadRandom(buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (r *memorySeedSource) readWrapped(buf []byte) error {
 	pos := 0
-	for pos < size {
+	for pos < len(buf) {
 		offset, err := cryptoRandIntn(len(r.seed))
 		if err != nil {
-			return nil, err
+			return err
 		}
-		n := copy(out[pos:], r.seed[offset:])
+		n := copy(buf[pos:], r.seed[offset:])
 		pos += n
 	}
-	return out, nil
+	return nil
+}
+
+type fileSeedSource struct {
+	f    *os.File
+	size int64
+}
+
+func newFileSeedSource(path string) (*fileSeedSource, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if info.Size() <= 0 {
+		_ = f.Close()
+		return nil, errors.New("seed 不能为空")
+	}
+	return &fileSeedSource{f: f, size: info.Size()}, nil
+}
+
+func (r *fileSeedSource) Close() error {
+	if r == nil || r.f == nil {
+		return nil
+	}
+	return r.f.Close()
+}
+
+func (r *fileSeedSource) ReadRandom(buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	if r.size <= 0 {
+		return errors.New("seed 不能为空")
+	}
+	var offset int64
+	var err error
+	if int64(len(buf)) < r.size {
+		offsetLimit := int(r.size - int64(len(buf)) + 1)
+		randomOffset, offsetErr := cryptoRandIntn(offsetLimit)
+		if offsetErr != nil {
+			return offsetErr
+		}
+		offset = int64(randomOffset)
+	} else {
+		randomOffset, offsetErr := cryptoRandIntn(int(r.size))
+		if offsetErr != nil {
+			return offsetErr
+		}
+		offset = int64(randomOffset)
+	}
+	pos := 0
+	for pos < len(buf) {
+		n, readErr := r.f.ReadAt(buf[pos:], offset)
+		pos += n
+		if pos >= len(buf) {
+			return nil
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
+		}
+		offset = 0
+	}
+	return err
 }
 
 func cryptoRandIntn(limit int) (int, error) {
@@ -493,9 +573,12 @@ func runServe(args []string) error {
 		return fmt.Errorf("--udp-payload-bytes %w", err)
 	}
 
-	seed, err := loadOrGenSeed(opts.SeedFile)
+	seed, closeSeed, err := loadOrGenSeed(opts.SeedFile)
 	if err != nil {
 		return err
+	}
+	if closeSeed != nil {
+		defer closeSeed()
 	}
 
 	expected := tokenDigest(opts.Token)
@@ -645,7 +728,7 @@ func (s *serveStatus) finishUDPSession(key udpSessionKey) {
 	s.mu.Unlock()
 }
 
-func serveTCPLoop(ln net.Listener, expected [32]byte, seed []byte, maxRate uint64, status *serveStatus) {
+func serveTCPLoop(ln net.Listener, expected [32]byte, seed seedSource, maxRate uint64, status *serveStatus) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -655,7 +738,7 @@ func serveTCPLoop(ln net.Listener, expected [32]byte, seed []byte, maxRate uint6
 	}
 }
 
-func handleTCPSession(conn net.Conn, expected [32]byte, seed []byte, maxRate uint64, status *serveStatus) {
+func handleTCPSession(conn net.Conn, expected [32]byte, seed seedSource, maxRate uint64, status *serveStatus) {
 	defer conn.Close()
 	status.sessionStart()
 	defer status.sessionDone()
@@ -682,28 +765,25 @@ func handleTCPSession(conn net.Conn, expected [32]byte, seed []byte, maxRate uin
 	if wanted == 0 {
 		return
 	}
-	reader, err := newSeedReader(seed)
-	if err != nil {
-		return
-	}
 	_ = conn.SetWriteDeadline(time.Time{})
 	chunk := 32 * 1024
 	if uint64(chunk) > wanted {
 		chunk = int(wanted)
 	}
+	buf := make([]byte, chunk)
 	var sent uint64
 	for sent < wanted {
 		toSend := wanted - sent
 		if toSend > uint64(chunk) {
 			toSend = uint64(chunk)
 		}
-		buf, err := reader.randomSlice(int(toSend))
-		if err != nil {
+		slice := buf[:int(toSend)]
+		if err := seed.ReadRandom(slice); err != nil {
 			return
 		}
 		limiter.wait(int(toSend))
 		_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
-		if _, err := conn.Write(buf); err != nil {
+		if _, err := conn.Write(slice); err != nil {
 			return
 		}
 		sent += toSend
@@ -711,7 +791,7 @@ func handleTCPSession(conn net.Conn, expected [32]byte, seed []byte, maxRate uin
 	}
 }
 
-func serveUDPLoop(pc net.PacketConn, expected [32]byte, seed []byte, maxRate uint64, payload int, status *serveStatus) {
+func serveUDPLoop(pc net.PacketConn, expected [32]byte, seed seedSource, maxRate uint64, payload int, status *serveStatus) {
 	buf := make([]byte, 1<<16)
 	for {
 		n, addr, err := pc.ReadFrom(buf)
@@ -745,7 +825,7 @@ func serveUDPLoop(pc net.PacketConn, expected [32]byte, seed []byte, maxRate uin
 	}
 }
 
-func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen]byte, wanted uint64, rate uint64, seed []byte, payload int, key udpSessionKey, status *serveStatus) {
+func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen]byte, wanted uint64, rate uint64, seed seedSource, payload int, key udpSessionKey, status *serveStatus) {
 	defer status.finishUDPSession(key)
 	if wanted == 0 {
 		return
@@ -757,12 +837,10 @@ func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen
 	if err := validateUDPPayloadBytes(payload); err != nil {
 		return
 	}
-	reader, err := newSeedReader(seed)
-	if err != nil {
-		return
-	}
 	var sent uint64
 	deadline := time.Now().Add(10 * time.Minute)
+	packet := make([]byte, payload)
+	copy(packet[:udpSessionLen], sessionID[:])
 	for sent < wanted {
 		if time.Now().After(deadline) {
 			return
@@ -772,15 +850,13 @@ func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen
 		if uint64(bodySize) > remaining {
 			bodySize = int(remaining)
 		}
-		pkt := make([]byte, udpSessionLen+bodySize)
-		copy(pkt[:udpSessionLen], sessionID[:])
-		body, err := reader.randomSlice(bodySize)
-		if err != nil {
+		packetLen := udpSessionLen + bodySize
+		copy(packet[:udpSessionLen], sessionID[:])
+		if err := seed.ReadRandom(packet[udpSessionLen:packetLen]); err != nil {
 			return
 		}
-		copy(pkt[udpSessionLen:], body)
-		limiter.wait(len(pkt))
-		if _, err := pc.WriteTo(pkt, addr); err != nil {
+		limiter.wait(packetLen)
+		if _, err := pc.WriteTo(packet[:packetLen], addr); err != nil {
 			return
 		}
 		sent += uint64(bodySize)
@@ -833,17 +909,21 @@ func ipForFamily(localIP, remoteIP net.IP) (net.IP, error) {
 	return ip, nil
 }
 
-func loadOrGenSeed(path string) ([]byte, error) {
+func loadOrGenSeed(path string) (seedSource, func() error, error) {
 	if path != "" {
-		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
-			return data, nil
+		if reader, err := newFileSeedSource(path); err == nil {
+			return reader, reader.Close, nil
 		}
 	}
 	buf := make([]byte, 8*1024*1024)
 	if _, err := rand.Read(buf); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return buf, nil
+	reader, err := newSeedReader(buf)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reader, nil, nil
 }
 
 // ---- seed 子命令 ----
