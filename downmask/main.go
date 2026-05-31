@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -78,6 +77,62 @@ func (h *requestHeader) UnmarshalBinary(buf []byte) error {
 		return fmt.Errorf("不支持的协议版本: %d", h.Version)
 	}
 	return nil
+}
+
+type seedReader struct {
+	seed []byte
+}
+
+func newSeedReader(seed []byte) (*seedReader, error) {
+	if len(seed) == 0 {
+		return nil, errors.New("seed 不能为空")
+	}
+	return &seedReader{seed: seed}, nil
+}
+
+func (r *seedReader) randomSlice(size int) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("无效 slice 大小: %d", size)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	if size >= len(r.seed) {
+		return r.randomWrappedSlice(size)
+	}
+	offset, err := cryptoRandIntn(len(r.seed) - size + 1)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), r.seed[offset:offset+size]...), nil
+}
+
+func (r *seedReader) randomWrappedSlice(size int) ([]byte, error) {
+	out := make([]byte, size)
+	pos := 0
+	for pos < size {
+		offset, err := cryptoRandIntn(len(r.seed))
+		if err != nil {
+			return nil, err
+		}
+		n := copy(out[pos:], r.seed[offset:])
+		pos += n
+	}
+	return out, nil
+}
+
+func cryptoRandIntn(limit int) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("无效随机上界: %d", limit)
+	}
+	if limit == 1 {
+		return 0, nil
+	}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 0, err
+	}
+	return int(binary.BigEndian.Uint64(buf[:]) % uint64(limit)), nil
 }
 
 func tokenDigest(token string) [32]byte {
@@ -627,20 +682,25 @@ func handleTCPSession(conn net.Conn, expected [32]byte, seed []byte, maxRate uin
 	if wanted == 0 {
 		return
 	}
+	reader, err := newSeedReader(seed)
+	if err != nil {
+		return
+	}
 	_ = conn.SetWriteDeadline(time.Time{})
 	chunk := 32 * 1024
 	if uint64(chunk) > wanted {
 		chunk = int(wanted)
 	}
-	offset := mrand.Intn(len(seed))
 	var sent uint64
 	for sent < wanted {
 		toSend := wanted - sent
 		if toSend > uint64(chunk) {
 			toSend = uint64(chunk)
 		}
-		buf := readSeedSlice(seed, offset, int(toSend))
-		offset = (offset + int(toSend)) % len(seed)
+		buf, err := reader.randomSlice(int(toSend))
+		if err != nil {
+			return
+		}
 		limiter.wait(int(toSend))
 		_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 		if _, err := conn.Write(buf); err != nil {
@@ -649,20 +709,6 @@ func handleTCPSession(conn net.Conn, expected [32]byte, seed []byte, maxRate uin
 		sent += toSend
 		status.addSent(toSend)
 	}
-}
-
-func readSeedSlice(seed []byte, offset, size int) []byte {
-	if size <= len(seed)-offset {
-		return seed[offset : offset+size]
-	}
-	out := make([]byte, size)
-	pos := 0
-	for pos < size {
-		n := copy(out[pos:], seed[offset:])
-		pos += n
-		offset = 0
-	}
-	return out
 }
 
 func serveUDPLoop(pc net.PacketConn, expected [32]byte, seed []byte, maxRate uint64, payload int, status *serveStatus) {
@@ -711,7 +757,10 @@ func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen
 	if err := validateUDPPayloadBytes(payload); err != nil {
 		return
 	}
-	offset := mrand.Intn(len(seed))
+	reader, err := newSeedReader(seed)
+	if err != nil {
+		return
+	}
 	var sent uint64
 	deadline := time.Now().Add(10 * time.Minute)
 	for sent < wanted {
@@ -725,8 +774,10 @@ func handleUDPSession(pc net.PacketConn, addr net.Addr, sessionID [udpSessionLen
 		}
 		pkt := make([]byte, udpSessionLen+bodySize)
 		copy(pkt[:udpSessionLen], sessionID[:])
-		body := readSeedSlice(seed, offset, bodySize)
-		offset = (offset + bodySize) % len(seed)
+		body, err := reader.randomSlice(bodySize)
+		if err != nil {
+			return
+		}
 		copy(pkt[udpSessionLen:], body)
 		limiter.wait(len(pkt))
 		if _, err := pc.WriteTo(pkt, addr); err != nil {
@@ -806,7 +857,7 @@ func runSeed(args []string) error {
 	var path string
 	var size int64
 	fs.StringVar(&path, "path", "/var/lib/pfwd/downmask/seed.bin", "种子文件路径，默认 /var/lib/pfwd/downmask/seed.bin")
-	fs.Int64Var(&size, "size", 64*1024*1024, "种子文件字节大小")
+	fs.Int64Var(&size, "size", 1024*1024*1024, "种子文件字节大小；默认 1GB，推荐 256MB-4GB")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

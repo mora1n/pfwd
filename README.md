@@ -51,7 +51,7 @@ pfwd guard egress-whitelist status
 
 - `ab-pull --local-ip IP` / `settings.downmask.ab_pull.local_ip`：A 机拉流时绑定本地源 IP，可填额外内网 IP；TCP / UDP 都会绑定该源地址，且必须和远端地址族匹配。
 - `ab-pull --remote-host HOST`：建议直接填写 B 机的 IPv4 / IPv6 地址，避免 DNS 变化影响 A/B 拉流链路。
-- `ab_pull.speed_limit` / `ab-pull --speed-limit`：默认 `4M`，表示按字节速率限速；支持 `500K`、`4M`、`1G` 这类写法。
+- `ab_pull.speed_limit` / `ab-pull --speed-limit`：默认 `4M`，即 `4 MiB/s`，约 `33.6 Mbps`；兼容 `500K`、`4M`、`1G`，也支持显式写成 `4MB/s`、`32Mbps`、`1GB/s`。
 - `ab-feed --bind-ip IP` / `settings.downmask.ab_feed.bind_ip`：B 机监听并从该 IP 返回内容；UI 中对应文案是“B机返回/监听 IP”。
 - `--token` / `settings.downmask.ab_pull.token` / `settings.downmask.ab_feed.token`：A/B 两端必须完全一致；建议使用随机值，例如 `openssl rand -hex 16`。
 - 启用 `ab-feed` 的 TCP 或 UDP 时，必须同时配置对应端口和 `token`，否则命令会直接失败，不会生成一个看似启用但实际无法启动的服务。
@@ -59,14 +59,17 @@ pfwd guard egress-whitelist status
 - `min_deficit_bytes`、`max_bytes_per_run`、`ab_feed.udp_payload_bytes` 和 `seed generate --size` 支持 `B/KB/MB/GB/TB`；裸数字继续按字节解释，兼容现有配置。
 - `ab_feed.udp_payload_bytes` 最终必须位于 `17-65507` 字节；超出范围时命令或服务会直接报错，不会静默回退。
 - `ab_feed.seed_file` 的常规默认生成路径是 `/var/lib/pfwd/downmask/seed.bin`；B 机喂流界面会按这个路径提示默认值。
+- `pfwd downmask seed generate` 默认生成 `1GB` 高熵种子文件；推荐大小范围是 `256MB-4GB`，更小随机性收益有限，更大则更占磁盘、生成更慢。
 - `public.active_source` 可选内置源：
-  `cloudflare_dynamic` 按目标字节数动态下载，最适合精确补量；
-  `cachefly_100mb` / `digitalocean_100mb` 是固定 100MB 测速文件；
-  `aliyun_ubuntu_iso` 适合大缺口或长时间稳定补流。
+  `cloudflare_dynamic` 按目标字节数动态下载，是当前默认推荐源；
+  `linode_tokyo_100mb` 是固定 100MB 文件，适合作为亚洲地区的 range 备选；
+  `cachefly_100mb` 继续保留为兼容性备选，但建议先在本机实测可达性后再使用。
+- `digitalocean_100mb` 和 `aliyun_ubuntu_iso` 已不再是内置源；如仍需使用，请改用 `pfwd downmask public custom add ...` 自定义源。
+- `range` 型内置源现在会校验返回是否真的是完整目标区间；像 HTML 落地页、跳转失败页或只返回极小字节数这类结果，会直接记为拉流失败，不再被当成成功补流。
 - `public.custom_sources` 中：
   `query` 类型的 URL 需要使用 `{bytes}` 占位，例如 `https://example.com/file?bytes={bytes}`；
   `range` 类型需要目标源支持 HTTP Range 请求。
-- `public.speed_limit` 默认 `4M`，表示按字节速率限速；支持 `500K`、`4M`、`1G` 这类写法，建议设置为略低于机器实际可用出口带宽，避免补流把正常业务出口打满。
+- `public.speed_limit` 默认 `4M`，即 `4 MiB/s`，约 `33.6 Mbps`；兼容 `500K`、`4M`、`1G`，也支持显式写成 `4MB/s`、`32Mbps`、`1GB/s`。建议设置为略低于机器实际可用出口带宽，避免补流把正常业务出口打满。
 
 常用命令：
 
@@ -78,7 +81,7 @@ pfwd downmask policy --pull-mode ab --iface eth0
 TOKEN="$(openssl rand -hex 16)"
 pfwd downmask ab-pull --protocol tcp --remote-host 10.0.0.2 --remote-port 5301 --local-ip 10.0.0.10 --token "$TOKEN" --speed-limit 4M
 pfwd downmask ab-feed --tcp-enabled true --udp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --udp-port 5301 --udp-payload-bytes 1.2KB --token "$TOKEN"
-pfwd downmask seed generate --size 256MB
+pfwd downmask seed generate --size 1GB
 pfwd downmask status
 pfwd render downmask
 ```

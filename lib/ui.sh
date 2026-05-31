@@ -1147,16 +1147,16 @@ ui_main_title_downmask_status() {
     local pull_mode="${1:-off}"
     local feed_tcp="${2:-false}"
     local feed_udp="${3:-false}"
-    local tcp_flag="-" udp_flag="-"
+    local tcp_flag="off" udp_flag="off"
 
     case "$feed_tcp" in
-        true|1|yes|on) tcp_flag="T" ;;
+        true|1|yes|on) tcp_flag="on" ;;
     esac
     case "$feed_udp" in
-        true|1|yes|on) udp_flag="U" ;;
+        true|1|yes|on) udp_flag="on" ;;
     esac
     [ -n "$pull_mode" ] || pull_mode="off"
-    printf 'downmask: %s %s/%s' "$pull_mode" "$tcp_flag" "$udp_flag"
+    printf 'downmask: %s | feed tcp=%s udp=%s' "$pull_mode" "$tcp_flag" "$udp_flag"
 }
 
 ui_title() {
@@ -4736,14 +4736,22 @@ ui_print_downmask_summary() {
     pull_mode="$(downmask_config_get '.pull_mode' 2>/dev/null || echo off)"
     iface="$(downmask_iface 2>/dev/null || echo -)"
     ratio="$(jq -r '.target_ratio // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
+    local tws twe window_text
+    tws="$(downmask_config_get '.time_window_start' 2>/dev/null || true)"
+    twe="$(downmask_config_get '.time_window_end' 2>/dev/null || true)"
+    if [ -z "$tws" ] || [ -z "$twe" ]; then
+        window_text="全天"
+    else
+        window_text="${tws}-${twe}"
+    fi
     local rx tx
     rx="$(jq -r '.rx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
     tx="$(jq -r '.tx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
     local feed_tcp feed_udp
     feed_tcp="$(downmask_config_get '.ab_feed.tcp_enabled' 2>/dev/null || echo false)"
     feed_udp="$(downmask_config_get '.ab_feed.udp_enabled' 2>/dev/null || echo false)"
-    printf '  拉流模式：%s  接口：%s  今日比例：%s\n' "$pull_mode" "$iface" "$ratio"
-    printf '  今日 RX：%s  TX：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
+    printf '  拉流模式：%s  接口：%s  生效时段：%s  今日目标比例：%s\n' "$pull_mode" "$iface" "$window_text" "$ratio"
+    printf '  今日入站：%s  今日出站：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
     printf '  B机喂流 TCP：%s  UDP：%s\n' "$feed_tcp" "$feed_udp"
 }
 
@@ -4800,11 +4808,11 @@ ui_menu_downmask_policy() {
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     max_r="$UI_REPLY"
     ui_form_add_kv "最大比例" "$max_r"
-    ui_form_edit_read "时间窗口开始（HH:MM）" "$(downmask_config_get '.time_window_start')" || { ui_form_reset; return; }
+    ui_form_edit_read "时间窗口开始（HH:MM；留空=全天）" "$(downmask_config_get '.time_window_start')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     tws="$UI_REPLY"
     ui_form_add_kv "窗口开始" "$tws"
-    ui_form_edit_read "时间窗口结束（HH:MM）" "$(downmask_config_get '.time_window_end')" || { ui_form_reset; return; }
+    ui_form_edit_read "时间窗口结束（HH:MM；留空=全天）" "$(downmask_config_get '.time_window_end')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     twe="$UI_REPLY"
     ui_form_add_kv "窗口结束" "$twe"
@@ -4822,8 +4830,8 @@ ui_menu_downmask_policy() {
     [ -z "$pull_mode" ] || args+=(--pull-mode "$pull_mode")
     [ -z "$min_r" ] || args+=(--min-ratio "$min_r")
     [ -z "$max_r" ] || args+=(--max-ratio "$max_r")
-    [ -z "$tws" ] || args+=(--time-window-start "$tws")
-    [ -z "$twe" ] || args+=(--time-window-end "$twe")
+    args+=(--time-window-start "$tws")
+    args+=(--time-window-end "$twe")
     [ -z "$jitter" ] || args+=(--max-jitter "$jitter")
     [ -z "$mindef" ] || args+=(--min-deficit-bytes "$mindef")
     [ -z "$maxrun" ] || args+=(--max-bytes-per-run "$maxrun")
@@ -4836,13 +4844,13 @@ ui_menu_downmask_policy() {
 }
 
 ui_menu_downmask_public() {
-    ui_form_set "公网下载源" "选择活跃源并设置限速；建议优先选直连稳定、目标地区就近的下载源。输入 0 返回上级菜单。"
+    ui_form_set "公网下载源" "选择活跃源并设置限速；默认优先 cloudflare_dynamic，固定文件源请以本机实测可达性为准。输入 0 返回上级菜单。"
     local active speed
-    ui_form_select_read "选择源" "1" "0) 返回" "1) cloudflare_dynamic（按字节动态下载）" "2) cachefly_100mb（固定 100MB 文件）" "3) digitalocean_100mb（固定 100MB 文件）" "4) aliyun_ubuntu_iso（大文件镜像）" || { ui_form_reset; return; }
+    ui_form_select_read "选择源" "1" "0) 返回" "1) cloudflare_dynamic（推荐，按字节动态下载）" "2) linode_tokyo_100mb（推荐备选，固定 100MB 文件）" "3) cachefly_100mb（备选，需确认返回真实文件）" || { ui_form_reset; return; }
     [ "$UI_REPLY" = "0" ] && { ui_form_reset; return; }
-    case "$UI_REPLY" in 1) active="cloudflare_dynamic" ;; 2) active="cachefly_100mb" ;; 3) active="digitalocean_100mb" ;; 4) active="aliyun_ubuntu_iso" ;; esac
+    case "$UI_REPLY" in 1) active="cloudflare_dynamic" ;; 2) active="linode_tokyo_100mb" ;; 3) active="cachefly_100mb" ;; esac
     ui_form_add_kv "活跃源" "$active"
-    ui_form_edit_read "限速（默认 4M，如 4M、500K；按字节速率，建议略低于出口可用带宽）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
+    ui_form_edit_read "限速（默认 $(format_downmask_speed_hint "4M")；支持 4M、4MB/s、32Mbps）" "$(downmask_config_get '.public.speed_limit')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     speed="$UI_REPLY"
     local args=(--active-source "$active")
@@ -4875,7 +4883,7 @@ ui_menu_downmask_ab_pull() {
     ui_form_edit_read "预共享 Token（A/B 两端一致；可用 openssl rand -hex 16 生成）" "" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     token="$UI_REPLY"
-    ui_form_edit_read "限速（默认 4M，如 4M、500K；按字节速率）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
+    ui_form_edit_read "限速（默认 $(format_downmask_speed_hint "4M")；支持 4M、4MB/s、32Mbps）" "$(downmask_config_get '.ab_pull.speed_limit')" || { ui_form_reset; return; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return; }
     speed="$UI_REPLY"
     ui_form_edit_read "超时秒数" "$(downmask_config_get '.ab_pull.timeout_seconds')" || { ui_form_reset; return; }
@@ -4954,13 +4962,16 @@ ui_menu_downmask_ab_feed() {
 ui_render_downmask_seed_menu_page() {
     ui_header "生成随机种子文件"
     ui_notice_render
-    echo "默认生成 64MB 高熵文件到 /var/lib/pfwd/downmask/seed.bin"
+    echo "默认生成 1GB 高熵文件到 /var/lib/pfwd/downmask/seed.bin"
+    echo "推荐大小：256MB-4GB；更小随机性收益有限，更大更占磁盘且生成更慢。"
     echo
     ui_menu_item 1 "生成默认种子文件"
+    ui_menu_item 2 "自定义大小生成"
     ui_menu_item 0 "返回上级菜单"
 }
 
 ui_menu_downmask_seed() {
+    local size_input size_normalized
     while true; do
         ui_render_page ui_render_downmask_seed_menu_page
         ui_read "选择" || return 0
@@ -4969,6 +4980,22 @@ ui_menu_downmask_seed() {
                 if ui_confirm_text "yes" "输入 yes 确认生成"; then
                     ui_run cmd_downmask_seed generate
                     [ "$UI_STATUS" -eq 0 ] && ui_notice_set "默认种子文件已生成" "$UI_C_MENU_NUM"
+                    ui_maybe_pause success
+                else
+                    ui_warn "已跳过"
+                    ui_pause
+                fi
+                ;;
+            2)
+                ui_form_set "自定义大小生成" "输入 0 返回。推荐 256MB-4GB；支持 256MB、1GB、2.5GB，裸数字按字节。"
+                ui_form_edit_read "种子文件大小" "1GB" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                size_input="$UI_REPLY"
+                size_normalized="$(normalize_ui_downmask_size_input "$size_input")"
+                ui_form_reset
+                if ui_confirm_text "yes" "输入 yes 确认生成"; then
+                    ui_run cmd_downmask_seed generate --size "$size_normalized"
+                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "自定义大小种子文件已生成" "$UI_C_MENU_NUM"
                     ui_maybe_pause success
                 else
                     ui_warn "已跳过"

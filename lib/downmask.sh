@@ -1,6 +1,40 @@
 #!/usr/bin/env bash
 
-DOWNMASK_BUILTIN_SOURCES="cloudflare_dynamic cachefly_100mb digitalocean_100mb aliyun_ubuntu_iso"
+DOWNMASK_BUILTIN_SOURCES="cloudflare_dynamic linode_tokyo_100mb cachefly_100mb"
+
+downmask_is_builtin_public_source() {
+    local name="$1"
+    case "$name" in
+        cloudflare_dynamic|linode_tokyo_100mb|cachefly_100mb) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_downmask_public_source_name() {
+    local value="$1"
+    [ -n "$value" ] || pfwd_die "active_source 不能为空"
+    downmask_is_builtin_public_source "$value" && return 0
+    case "$value" in
+        digitalocean_100mb|aliyun_ubuntu_iso)
+            pfwd_die "内置公网源已移除：$value；请改用 cloudflare_dynamic、linode_tokyo_100mb、cachefly_100mb，或使用 public custom 自定义源"
+            ;;
+        *)
+            pfwd_die "未知内置公网源：$value；请改用 cloudflare_dynamic、linode_tokyo_100mb、cachefly_100mb，或使用 public custom 自定义源"
+            ;;
+    esac
+}
+
+downmask_validate_configured_active_source() {
+    local active custom
+    active="$(downmask_config_get '.public.active_source')"
+    [ -n "$active" ] || return 0
+    if downmask_is_builtin_public_source "$active"; then
+        return 0
+    fi
+    custom="$(jq -r --arg name "$active" '.settings.downmask.public.custom_sources[]? | select(.name == $name) | .name' "$PFWD_CONFIG_FILE" | head -n1)"
+    [ -n "$custom" ] && return 0
+    validate_downmask_public_source_name "$active"
+}
 
 downmask_config_get() {
     local subpath="$1"
@@ -93,14 +127,11 @@ downmask_public_source_url() {
         cloudflare_dynamic)
             printf 'query|https://speed.cloudflare.com/__down?bytes=%s\n' "$bytes"
             ;;
+        linode_tokyo_100mb)
+            printf 'range|https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin\n'
+            ;;
         cachefly_100mb)
             printf 'range|http://cachefly.cachefly.net/100mb.test\n'
-            ;;
-        digitalocean_100mb)
-            printf 'range|https://speedtest-sgp1.digitalocean.com/100mb.test\n'
-            ;;
-        aliyun_ubuntu_iso)
-            printf 'range|https://mirrors.aliyun.com/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso\n'
             ;;
         *)
             return 1
@@ -113,7 +144,7 @@ downmask_resolve_active_source() {
     active="$(downmask_config_get '.public.active_source')"
     bytes="$1"
     [ -n "$active" ] || active="cloudflare_dynamic"
-    if downmask_public_source_url "$active" "$bytes" 2>/dev/null; then
+    if downmask_is_builtin_public_source "$active" && downmask_public_source_url "$active" "$bytes" 2>/dev/null; then
         return 0
     fi
     local custom
@@ -149,11 +180,40 @@ downmask_pull_public() {
     local actual=0
     case "$kind" in
         query)
-            actual="$(curl -fsSL --max-time 1800 --limit-rate "$speed_limit" -o /dev/null -w '%{size_download}' "$url" 2>/dev/null || echo 0)"
+            local query_meta query_code
+            query_meta="$(curl -fsSL --max-time 1800 --limit-rate "$speed_limit" -o /dev/null -w '%{http_code} %{size_download}' "$url" 2>/dev/null || echo '000 0')"
+            query_code="${query_meta%% *}"
+            actual="${query_meta##* }"
+            if [ "$query_code" != "200" ] || ! [[ "$actual" =~ ^[0-9]+$ ]] || [ "$actual" -le 0 ]; then
+                actual=0
+            fi
             ;;
         range)
-            local end=$((planned - 1))
-            actual="$(curl -fsSL --max-time 1800 --limit-rate "$speed_limit" -r "0-$end" -o /dev/null -w '%{size_download}' "$url" 2>/dev/null || echo 0)"
+            local size probe_start probe_end content_length start_offset request_bytes range_meta range_code
+            size="$(curl -fsSI --max-time 30 "$url" 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {gsub("\r","",$2); print $2; exit}')"
+            request_bytes="$planned"
+            if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+                if [ "$planned" -ge "$size" ]; then
+                    request_bytes="$size"
+                fi
+            fi
+            if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ] && [ "$request_bytes" -lt "$size" ]; then
+                start_offset="$(awk -v max="$size" -v want="$request_bytes" -v seed="$RANDOM$$" 'BEGIN { srand(seed); span = max - want; if (span < 1) span = 1; printf "%.0f", rand() * span }')"
+                probe_start="$start_offset"
+                probe_end=$((start_offset + request_bytes - 1))
+            else
+                probe_start=0
+                probe_end=$((request_bytes - 1))
+            fi
+            range_meta="$(curl -fsSL --max-time 1800 --limit-rate "$speed_limit" -r "${probe_start}-${probe_end}" -o /dev/null -w '%{http_code} %{size_download}' "$url" 2>/dev/null || echo '000 0')"
+            range_code="${range_meta%% *}"
+            actual="${range_meta##* }"
+            if ! [[ "$actual" =~ ^[0-9]+$ ]]; then
+                actual=0
+            fi
+            if [ "$range_code" != "206" ] || [ "$actual" -ne "$request_bytes" ]; then
+                actual=0
+            fi
             ;;
     esac
     [[ "$actual" =~ ^[0-9]+$ ]] || actual=0
@@ -205,17 +265,7 @@ downmask_pull_ab() {
 }
 
 downmask_speed_to_bps() {
-    local raw="$1"
-    [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)([KkMmGg]?)$ ]] || { echo 0; return; }
-    local value="${BASH_REMATCH[1]}"
-    local unit="${BASH_REMATCH[3]}"
-    awk -v value="$value" -v unit="$unit" 'BEGIN {
-        scale = 1
-        if (unit == "K" || unit == "k") scale = 1024
-        else if (unit == "M" || unit == "m") scale = 1024 * 1024
-        else if (unit == "G" || unit == "g") scale = 1024 * 1024 * 1024
-        printf "%.0f\n", value * scale
-    }'
+    downmask_rate_to_bytes_per_second "$1" 2>/dev/null || echo 0
 }
 
 downmask_systemd_quote_arg() {
@@ -254,6 +304,7 @@ downmask_state_get_fields() {
 
 downmask_reconcile_pull() {
     config_init >/dev/null
+    downmask_validate_configured_active_source
     local downmask_cfg pull_mode iface today state
     downmask_cfg="$(downmask_config_section '.settings.downmask')"
     pull_mode="$(jq -r '.pull_mode // "off"' <<< "$downmask_cfg")"
@@ -495,6 +546,7 @@ downmask_reload_feed_service() {
 
 downmask_status_json() {
     config_init >/dev/null
+    downmask_validate_configured_active_source
     local cfg state feed
     cfg="$(jq -c '.settings.downmask // {}' "$PFWD_CONFIG_FILE")"
     state="$(downmask_load_day_state)"
@@ -516,6 +568,7 @@ downmask_status_json() {
 
 downmask_render_status() {
     local json pull_mode iface ratio rx tx debt action feed_tcp feed_udp
+    downmask_validate_configured_active_source
     json="$(downmask_status_json)"
     pull_mode="$(jq -r '.config.pull_mode // "off"' <<< "$json")"
     iface="$(jq -r '.day_state.iface // .config.iface // "-"' <<< "$json")"
@@ -553,15 +606,15 @@ cmd_downmask() {
             cat <<'EOF'
 用法：
   pfwd downmask status
-  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio N] [--max-ratio N] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
-  pfwd downmask public [--active-source NAME(cloudflare_dynamic|cachefly_100mb|digitalocean_100mb|aliyun_ubuntu_iso)] [--speed-limit 4M(default, bytes/s)]
+  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio N] [--max-ratio N] [--time-window-start HH:MM|empty=all-day] [--time-window-end HH:MM|empty=all-day] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
+  pfwd downmask public [--active-source NAME(cloudflare_dynamic|linode_tokyo_100mb|cachefly_100mb)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)]
   pfwd downmask public custom add --name NAME --kind query|range --url URL(query 用 {bytes} 占位；range 需支持 Range 请求)
   pfwd downmask public custom delete --name NAME
   pfwd downmask public custom list
   pfwd downmask public custom clear
-  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s)] [--timeout SEC]
+  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)] [--timeout SEC]
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
-  pfwd downmask seed generate [--path PATH] [--size 64MB]
+  pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
 EOF
             ;;
         *) pfwd_die "未知 downmask 子命令：$sub" ;;
@@ -570,13 +623,14 @@ EOF
 
 cmd_downmask_policy() {
     local pull_mode="" min_ratio="" max_ratio="" tws="" twe="" jitter="" mindef="" maxrun="" iface=""
+    local tws_set=0 twe_set=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --pull-mode) pull_mode="$2"; shift 2 ;;
             --min-ratio) min_ratio="$2"; shift 2 ;;
             --max-ratio) max_ratio="$2"; shift 2 ;;
-            --time-window-start) tws="$2"; shift 2 ;;
-            --time-window-end) twe="$2"; shift 2 ;;
+            --time-window-start) tws="$2"; tws_set=1; shift 2 ;;
+            --time-window-end) twe="$2"; twe_set=1; shift 2 ;;
             --max-jitter) jitter="$2"; shift 2 ;;
             --min-deficit-bytes) mindef="$2"; shift 2 ;;
             --max-bytes-per-run) maxrun="$2"; shift 2 ;;
@@ -592,13 +646,14 @@ cmd_downmask_policy() {
     [ -z "$jitter" ] || [[ "$jitter" =~ ^[0-9]+$ ]] || pfwd_die "max-jitter 必须是非负整数"
     [ -z "$mindef" ] || mindef="$(parse_downmask_size_bytes "$mindef")"
     [ -z "$maxrun" ] || maxrun="$(parse_downmask_size_bytes "$maxrun")"
-
     config_update \
         --arg pull_mode "$pull_mode" \
         --arg min_ratio "$min_ratio" \
         --arg max_ratio "$max_ratio" \
         --arg tws "$tws" \
         --arg twe "$twe" \
+        --argjson tws_set "$tws_set" \
+        --argjson twe_set "$twe_set" \
         --arg jitter "$jitter" \
         --arg mindef "$mindef" \
         --arg maxrun "$maxrun" \
@@ -607,8 +662,8 @@ cmd_downmask_policy() {
             (if $pull_mode == "" then . else .pull_mode = $pull_mode end)
             | (if $min_ratio == "" then . else .min_ratio = ($min_ratio | tonumber) end)
             | (if $max_ratio == "" then . else .max_ratio = ($max_ratio | tonumber) end)
-            | (if $tws == "" then . else .time_window_start = $tws end)
-            | (if $twe == "" then . else .time_window_end = $twe end)
+            | (if $tws_set == 1 then .time_window_start = $tws else . end)
+            | (if $twe_set == 1 then .time_window_end = $twe else . end)
             | (if $jitter == "" then . else .max_jitter_seconds = ($jitter | tonumber) end)
             | (if $mindef == "" then . else .min_deficit_bytes = ($mindef | tonumber) end)
             | (if $maxrun == "" then . else .max_bytes_per_run = ($maxrun | tonumber) end)
@@ -631,6 +686,7 @@ cmd_downmask_public() {
             *) pfwd_die "未知选项：$1" ;;
         esac
     done
+    [ -z "$active" ] || validate_downmask_public_source_name "$active"
     [ -z "$speed" ] || validate_downmask_speed_limit "$speed"
     config_update \
         --arg active "$active" \
@@ -805,7 +861,7 @@ cmd_downmask_ab_feed() {
 cmd_downmask_seed() {
     local sub="${1:-generate}"
     shift || true
-    [ "$sub" = "generate" ] || pfwd_die "用法：pfwd downmask seed generate [--path PATH] [--size 64MB]"
+    [ "$sub" = "generate" ] || pfwd_die "用法：pfwd downmask seed generate [--path PATH] [--size 1GB]"
     local path="" size=""
     while [ "$#" -gt 0 ]; do
         case "$1" in

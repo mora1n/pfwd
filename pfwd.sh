@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.7"
+PFWD_VERSION="0.2.8"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -283,12 +283,12 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard egress-whitelist refresh|status
   pfwd guard egress-whitelist-custom list|add|clear|delete|update ...
   pfwd downmask status
-  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio 1.5] [--max-ratio 2.8] [--time-window-start HH:MM] [--time-window-end HH:MM] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
-  pfwd downmask public [--active-source NAME(cloudflare_dynamic|cachefly_100mb|digitalocean_100mb|aliyun_ubuntu_iso)] [--speed-limit 4M(default, bytes/s)]
+  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio 1.5] [--max-ratio 2.8] [--time-window-start HH:MM|empty=all-day] [--time-window-end HH:MM|empty=all-day] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
+  pfwd downmask public [--active-source NAME(cloudflare_dynamic|linode_tokyo_100mb|cachefly_100mb)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)]
   pfwd downmask public custom list|add|delete|clear ...   # query 源 URL 用 {bytes} 占位；range 源需支持 Range
-  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s)] [--timeout SEC]
+  pfwd downmask ab-pull [--protocol tcp|udp] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)] [--timeout SEC]
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
-  pfwd downmask seed generate [--path PATH] [--size 64MB]
+  pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,62 +17,79 @@ import (
 	"time"
 )
 
-func TestRequestHeaderRoundtrip(t *testing.T) {
-	hdr := requestHeader{
-		Magic:       protoMagic,
-		Version:     protoVersion,
-		TokenSHA256: tokenDigest("hello"),
-		WantedBytes: 12345,
-		SpeedLimit:  6789,
-	}
-	buf, err := hdr.MarshalBinary()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if len(buf) != headerSize {
-		t.Fatalf("header size = %d, want %d", len(buf), headerSize)
-	}
-	var got requestHeader
-	if err := got.UnmarshalBinary(buf); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got != hdr {
-		t.Fatalf("roundtrip mismatch: %+v vs %+v", got, hdr)
-	}
-}
+func TestHeaderAndSeed(t *testing.T) {
+	t.Run("request_header_roundtrip", func(t *testing.T) {
+		hdr := requestHeader{
+			Magic:       protoMagic,
+			Version:     protoVersion,
+			TokenSHA256: tokenDigest("hello"),
+			WantedBytes: 12345,
+			SpeedLimit:  6789,
+		}
+		buf, err := hdr.MarshalBinary()
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if len(buf) != headerSize {
+			t.Fatalf("header size = %d, want %d", len(buf), headerSize)
+		}
+		var got requestHeader
+		if err := got.UnmarshalBinary(buf); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got != hdr {
+			t.Fatalf("roundtrip mismatch: %+v vs %+v", got, hdr)
+		}
+	})
 
-func TestSeedGenerate(t *testing.T) {
-	testCases := []struct {
-		name     string
-		sizeArg  string
-		wantSize int64
-	}{
-		{name: "raw_bytes", sizeArg: "65536", wantSize: 65536},
-		{name: "unit_bytes_from_shell", sizeArg: "268435456", wantSize: 268435456},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "seed.bin")
-			if err := runSeed([]string{"--path", path, "--size", tc.sizeArg}); err != nil {
-				t.Fatalf("runSeed: %v", err)
+	t.Run("seed_generate", func(t *testing.T) {
+		t.Run("default_size_is_1gb", func(t *testing.T) {
+			fs := flag.NewFlagSet("seed", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			var path string
+			var size int64
+			fs.StringVar(&path, "path", "/var/lib/pfwd/downmask/seed.bin", "种子文件路径，默认 /var/lib/pfwd/downmask/seed.bin")
+			fs.Int64Var(&size, "size", 1024*1024*1024, "种子文件字节大小；默认 1GB，推荐 256MB-4GB")
+			if err := fs.Parse(nil); err != nil {
+				t.Fatalf("parse default seed flags: %v", err)
 			}
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatalf("stat: %v", err)
-			}
-			if info.Size() != tc.wantSize {
-				t.Fatalf("size = %d, want %d", info.Size(), tc.wantSize)
-			}
-			if tc.wantSize <= 65536 {
-				data, _ := os.ReadFile(path)
-				if bytes.Equal(data, make([]byte, len(data))) {
-					t.Fatalf("seed file is all zeros")
-				}
+			if size != 1024*1024*1024 {
+				t.Fatalf("default seed size = %d, want %d", size, int64(1024*1024*1024))
 			}
 		})
-	}
+
+		testCases := []struct {
+			name     string
+			sizeArg  string
+			wantSize int64
+		}{
+			{name: "raw_bytes", sizeArg: "65536", wantSize: 65536},
+			{name: "unit_bytes_from_shell", sizeArg: "268435456", wantSize: 268435456},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "seed.bin")
+				if err := runSeed([]string{"--path", path, "--size", tc.sizeArg}); err != nil {
+					t.Fatalf("runSeed: %v", err)
+				}
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatalf("stat: %v", err)
+				}
+				if info.Size() != tc.wantSize {
+					t.Fatalf("size = %d, want %d", info.Size(), tc.wantSize)
+				}
+				if tc.wantSize <= 65536 {
+					data, _ := os.ReadFile(path)
+					if bytes.Equal(data, make([]byte, len(data))) {
+						t.Fatalf("seed file is all zeros")
+					}
+				}
+			})
+		}
+	})
 }
 
 func TestPullIntegration(t *testing.T) {
@@ -143,7 +162,7 @@ func TestPullIntegration(t *testing.T) {
 	}
 }
 
-func TestUDPPayloadValidation(t *testing.T) {
+func TestServeValidationAndHelpers(t *testing.T) {
 	t.Run("helper", func(t *testing.T) {
 		testCases := []struct {
 			name    string
@@ -172,8 +191,10 @@ func TestUDPPayloadValidation(t *testing.T) {
 			})
 		}
 	})
+}
 
-	t.Run("run_serve_rejects_invalid_payload", func(t *testing.T) {
+func TestRunServePayloadValidation(t *testing.T) {
+	t.Run("rejects_invalid_payload", func(t *testing.T) {
 		testCases := []struct {
 			name    string
 			payload int
@@ -196,7 +217,7 @@ func TestUDPPayloadValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("run_serve_accepts_valid_payload", func(t *testing.T) {
+	t.Run("accepts_valid_payload", func(t *testing.T) {
 		done := make(chan error, 1)
 		go func() {
 			done <- runServe([]string{
@@ -220,9 +241,7 @@ func TestUDPPayloadValidation(t *testing.T) {
 			t.Fatal("runServe did not stop after SIGTERM")
 		}
 	})
-}
 
-func TestServeHelpersAndUDPFlow(t *testing.T) {
 	t.Run("local_addr_helpers", func(t *testing.T) {
 		addr, err := localTCPAddr(net.ParseIP("127.0.0.2"), &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80})
 		if err != nil {
@@ -286,68 +305,92 @@ func TestServeHelpersAndUDPFlow(t *testing.T) {
 			t.Fatalf("start after finish should succeed")
 		}
 	})
+}
 
-	t.Run("handle_udp_session", func(t *testing.T) {
-		testCases := []struct {
-			name             string
-			wanted           uint64
-			payload          int
-			wantBytes        int
-			wantPackets      int
-			wantMaxPacketLen int
-		}{
-			{
-				name:             "exact_remaining_default_payload",
-				wanted:           1500,
-				payload:          udpDefaultPayload,
-				wantBytes:        1500,
-				wantPackets:      2,
-				wantMaxPacketLen: udpDefaultPayload,
-			},
-			{
-				name:             "custom_payload_respected",
-				wanted:           2000,
-				payload:          600,
-				wantBytes:        2000,
-				wantPackets:      4,
-				wantMaxPacketLen: 600,
-			},
-			{
-				name:             "invalid_payload_skips_send",
-				wanted:           1024,
-				payload:          udpMinPayload - 1,
-				wantBytes:        0,
-				wantPackets:      0,
-				wantMaxPacketLen: 0,
-			},
+func TestRandomSeedReader(t *testing.T) {
+	t.Run("random_slice_sizes", func(t *testing.T) {
+		reader, err := newSeedReader(newTestSeed(64))
+		if err != nil {
+			t.Fatalf("newSeedReader: %v", err)
 		}
-
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				pc := newRecordingPacketConn()
-				status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
-				var sessionID [udpSessionLen]byte
-				copy(sessionID[:], []byte("udp-flow-check01"))
-				key := udpSessionKey{Addr: "peer", SessionID: sessionID}
-				if !status.tryStartUDPSession(key) {
-					t.Fatalf("failed to register UDP session")
-				}
-
-				handleUDPSession(pc, dummyAddr("peer"), sessionID, tc.wanted, 0, bytes.Repeat([]byte("a"), 4096), tc.payload, key, status)
-
-				totalPayload, maxPacketLen := pc.payloadStats()
-				if totalPayload != tc.wantBytes {
-					t.Fatalf("payload = %d, want %d", totalPayload, tc.wantBytes)
-				}
-				if len(pc.packets) != tc.wantPackets {
-					t.Fatalf("packets = %d, want %d", len(pc.packets), tc.wantPackets)
-				}
-				if maxPacketLen != tc.wantMaxPacketLen {
-					t.Fatalf("max packet len = %d, want %d", maxPacketLen, tc.wantMaxPacketLen)
-				}
-			})
+		for _, size := range []int{0, 8, 32, 64, 96} {
+			buf, err := reader.randomSlice(size)
+			if err != nil {
+				t.Fatalf("randomSlice(%d): %v", size, err)
+			}
+			if len(buf) != size {
+				t.Fatalf("len(randomSlice(%d)) = %d", size, len(buf))
+			}
 		}
 	})
+
+	t.Run("empty_seed_rejected", func(t *testing.T) {
+		if _, err := newSeedReader(nil); err == nil {
+			t.Fatal("expected empty seed error")
+		}
+	})
+}
+
+func TestUDPFlow(t *testing.T) {
+	testCases := []struct {
+		name             string
+		wanted           uint64
+		payload          int
+		wantBytes        int
+		wantPackets      int
+		wantMaxPacketLen int
+	}{
+		{
+			name:             "exact_remaining_default_payload",
+			wanted:           1500,
+			payload:          udpDefaultPayload,
+			wantBytes:        1500,
+			wantPackets:      2,
+			wantMaxPacketLen: udpDefaultPayload,
+		},
+		{
+			name:             "custom_payload_respected",
+			wanted:           2000,
+			payload:          600,
+			wantBytes:        2000,
+			wantPackets:      4,
+			wantMaxPacketLen: 600,
+		},
+		{
+			name:             "invalid_payload_skips_send",
+			wanted:           1024,
+			payload:          udpMinPayload - 1,
+			wantBytes:        0,
+			wantPackets:      0,
+			wantMaxPacketLen: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := newRecordingPacketConn()
+			status := &serveStatus{udpSessions: make(map[udpSessionKey]struct{})}
+			var sessionID [udpSessionLen]byte
+			copy(sessionID[:], []byte("udp-flow-check01"))
+			key := udpSessionKey{Addr: "peer", SessionID: sessionID}
+			if !status.tryStartUDPSession(key) {
+				t.Fatalf("failed to register UDP session")
+			}
+
+			handleUDPSession(pc, dummyAddr("peer"), sessionID, tc.wanted, 0, bytes.Repeat([]byte("a"), 4096), tc.payload, key, status)
+
+			totalPayload, maxPacketLen := pc.payloadStats()
+			if totalPayload != tc.wantBytes {
+				t.Fatalf("payload = %d, want %d", totalPayload, tc.wantBytes)
+			}
+			if len(pc.packets) != tc.wantPackets {
+				t.Fatalf("packets = %d, want %d", len(pc.packets), tc.wantPackets)
+			}
+			if maxPacketLen != tc.wantMaxPacketLen {
+				t.Fatalf("max packet len = %d, want %d", maxPacketLen, tc.wantMaxPacketLen)
+			}
+		})
+	}
 }
 
 func TestRateLimiterShape(t *testing.T) {

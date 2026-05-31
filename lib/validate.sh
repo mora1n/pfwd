@@ -508,7 +508,75 @@ validate_downmask_ratio() {
 
 validate_downmask_speed_limit() {
     local value="$1"
-    [[ "$value" =~ ^[0-9]+([.][0-9]+)?[KkMmGg]?$ ]] || pfwd_die "无效限速值：$value，支持 4M、500K、1G"
+    downmask_rate_to_bytes_per_second "$value" >/dev/null
+}
+
+downmask_rate_to_bytes_per_second() {
+    local raw="$1"
+    local value unit multiplier
+    raw="$(printf '%s' "$raw" | tr -d ' ')"
+    [ -n "$raw" ] || pfwd_die "限速不能为空"
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)([KkMmGgTt])$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[3]}"
+        case "$unit" in
+            K|k) multiplier=1024 ;;
+            M|m) multiplier=$((1024 * 1024)) ;;
+            G|g) multiplier=$((1024 * 1024 * 1024)) ;;
+            T|t) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        esac
+        awk -v value="$value" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", value * multiplier }'
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(B/s|KB/s|MB/s|GB/s|TB/s|Bps|KBps|MBps|GBps|TBps)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[3]}"
+        case "$unit" in
+            B/s|Bps) multiplier=1 ;;
+            KB/s|KBps) multiplier=1024 ;;
+            MB/s|MBps) multiplier=$((1024 * 1024)) ;;
+            GB/s|GBps) multiplier=$((1024 * 1024 * 1024)) ;;
+            TB/s|TBps) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        esac
+        awk -v value="$value" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", value * multiplier }'
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)([Kk]bps|[Mm]bps|[Gg]bps|[Tt]bps|[Kk]bit/[Ss]|[Mm]bit/[Ss]|[Gg]bit/[Ss]|[Tt]bit/[Ss])$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[3]}"
+        case "$unit" in
+            Kbps|kbps|Kbit/s|kbit/s) multiplier=125 ;;
+            Mbps|mbps|Mbit/s|mbit/s) multiplier=125000 ;;
+            Gbps|gbps|Gbit/s|gbit/s) multiplier=125000000 ;;
+            Tbps|tbps|Tbit/s|tbit/s) multiplier=125000000000 ;;
+        esac
+        awk -v value="$value" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", value * multiplier }'
+        return 0
+    fi
+    pfwd_die "无效 downmask 限速：$1；支持 4M、4MB/s、32Mbps、1GB/s"
+}
+
+format_bits_per_second_decimal() {
+    local bytes_per_second="$1"
+    awk -v bps="$bytes_per_second" '
+    BEGIN {
+        bits = bps * 8
+        if (bits >= 1000000000) printf "%.1f Gbps", bits / 1000000000
+        else if (bits >= 1000000) printf "%.1f Mbps", bits / 1000000
+        else if (bits >= 1000) printf "%.1f Kbps", bits / 1000
+        else printf "%.0f bps", bits
+    }'
+}
+
+format_downmask_speed_hint() {
+    local raw="$1"
+    local bps
+    bps="$(downmask_rate_to_bytes_per_second "$raw")" || return 1
+    printf '%s（%s/s，约 %s）' "$raw" "$(format_bytes "$bps")" "$(format_bits_per_second_decimal "$bps")"
 }
 
 validate_downmask_time_window() {
