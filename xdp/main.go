@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -54,6 +55,24 @@ const connStateTCPEstablished = uint8(2)
 const statsEntryCount = 10
 const cacheVerdictAllow = uint8(1)
 const cacheVerdictDrop = uint8(2)
+
+type tcxCapabilityKey struct {
+	ifindex int
+	attach  ebpf.AttachType
+}
+
+type tcxCapabilityResult struct {
+	supported bool
+	err       error
+}
+
+var (
+	tcxAttachFunc = func(opts link.TCXOptions) (link.Link, error) {
+		return link.AttachTCX(opts)
+	}
+	tcxCapabilityCacheMu sync.Mutex
+	tcxCapabilityCache   = map[tcxCapabilityKey]tcxCapabilityResult{}
+)
 
 type bpfObjects struct {
 	PFWDXDP                    *ebpf.Program `ebpf:"pfwd_xdp"`
@@ -3066,28 +3085,76 @@ func attachPinnedTCFilter(ifaceName string, pin string, direction string) error 
 	return nil
 }
 
-func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attach ebpf.AttachType, direction string) (string, error) {
+func tcxCacheLookup(ifindex int, attach ebpf.AttachType) (tcxCapabilityResult, bool) {
+	tcxCapabilityCacheMu.Lock()
+	defer tcxCapabilityCacheMu.Unlock()
+	result, ok := tcxCapabilityCache[tcxCapabilityKey{ifindex: ifindex, attach: attach}]
+	return result, ok
+}
+
+func tcxCacheStore(ifindex int, attach ebpf.AttachType, result tcxCapabilityResult) {
+	tcxCapabilityCacheMu.Lock()
+	defer tcxCapabilityCacheMu.Unlock()
+	tcxCapabilityCache[tcxCapabilityKey{ifindex: ifindex, attach: attach}] = result
+}
+
+func resetTCXCapabilityCache() {
+	tcxCapabilityCacheMu.Lock()
+	defer tcxCapabilityCacheMu.Unlock()
+	tcxCapabilityCache = map[tcxCapabilityKey]tcxCapabilityResult{}
+}
+
+func isTCXUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, link.ErrNotSupported) || errors.Is(err, ebpf.ErrNotSupported) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not supported") ||
+		strings.Contains(msg, "operation not supported") ||
+		strings.Contains(msg, "invalid attach type") ||
+		strings.Contains(msg, "missing required feature")
+}
+
+func attachTCXOnce(iface *net.Interface, prog *ebpf.Program, attach ebpf.AttachType) (link.Link, error) {
+	if iface == nil {
+		return nil, fmt.Errorf("tc interface 为空")
+	}
 	if prog == nil {
-		return "", fmt.Errorf("tc program 未加载")
+		return nil, fmt.Errorf("tc program 未加载")
 	}
-	if err := os.MkdirAll(filepath.Dir(pin), 0o755); err != nil {
-		return "", fmt.Errorf("创建 tc pin 目录失败: %w", err)
+	if cached, ok := tcxCacheLookup(iface.Index, attach); ok && !cached.supported {
+		if cached.err != nil {
+			return nil, cached.err
+		}
+		return nil, fmt.Errorf("TCX not supported")
 	}
-	_ = removePinnedLink(pin)
-	_ = removePinnedProgram(pin)
-	attached, tcxErr := link.AttachTCX(link.TCXOptions{
+	attached, err := tcxAttachFunc(link.TCXOptions{
 		Interface: iface.Index,
 		Program:   prog,
 		Attach:    attach,
 	})
+	if err == nil {
+		tcxCacheStore(iface.Index, attach, tcxCapabilityResult{supported: true})
+		return attached, nil
+	}
+	if isTCXUnsupportedError(err) {
+		tcxCacheStore(iface.Index, attach, tcxCapabilityResult{supported: false, err: err})
+	}
+	return nil, err
+}
+
+func attachTCProgramWithTCXResult(
+	iface *net.Interface,
+	prog *ebpf.Program,
+	pin string,
+	attach ebpf.AttachType,
+	direction string,
+	tcxErr error,
+) (string, error) {
 	if tcxErr == nil {
-		defer attached.Close()
-		if err := attached.Pin(pin); err != nil {
-			return "", fmt.Errorf("pin tcx link 失败: %w", err)
-		}
-		if err := attached.Close(); err != nil {
-			return "", fmt.Errorf("关闭 tcx link fd 失败: %w", err)
-		}
 		return "tcx", nil
 	}
 	if err := runTC("qdisc", "replace", "dev", iface.Name, "clsact"); err != nil {
@@ -3104,6 +3171,29 @@ func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attac
 		return "", fmt.Errorf("TCX attach 失败 (%v)，classic TC attach 失败: %w", tcxErr, err)
 	}
 	return "tc", nil
+}
+
+func attachTCProgram(iface *net.Interface, prog *ebpf.Program, pin string, attach ebpf.AttachType, direction string) (string, error) {
+	if prog == nil {
+		return "", fmt.Errorf("tc program 未加载")
+	}
+	if err := os.MkdirAll(filepath.Dir(pin), 0o755); err != nil {
+		return "", fmt.Errorf("创建 tc pin 目录失败: %w", err)
+	}
+	_ = removePinnedLink(pin)
+	_ = removePinnedProgram(pin)
+	attached, tcxErr := attachTCXOnce(iface, prog, attach)
+	if tcxErr == nil {
+		defer attached.Close()
+		if err := attached.Pin(pin); err != nil {
+			return "", fmt.Errorf("pin tcx link 失败: %w", err)
+		}
+		if err := attached.Close(); err != nil {
+			return "", fmt.Errorf("关闭 tcx link fd 失败: %w", err)
+		}
+		return "tcx", nil
+	}
+	return attachTCProgramWithTCXResult(iface, prog, pin, attach, direction, tcxErr)
 }
 
 func attachHostEgress(ifaces []net.Interface, prog *ebpf.Program, pin string) ([]string, error) {

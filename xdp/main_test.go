@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 )
 
 func mustAddr16(t *testing.T, raw string) [16]byte {
@@ -395,5 +400,89 @@ func TestElapsedMillis(t *testing.T) {
 	elapsed := elapsedMillis(start)
 	if elapsed < 1000 {
 		t.Fatalf("elapsedMillis returned %d, want at least 1000", elapsed)
+	}
+}
+
+type fakeTCXLink struct {
+	*link.RawLink
+}
+
+func (fakeTCXLink) Update(*ebpf.Program) error { return nil }
+func (fakeTCXLink) Pin(string) error           { return nil }
+func (fakeTCXLink) Unpin() error               { return nil }
+func (fakeTCXLink) Close() error               { return nil }
+func (fakeTCXLink) Detach() error              { return nil }
+func (fakeTCXLink) Info() (*link.Info, error)  { return nil, nil }
+
+func TestAttachTCXOnceCacheBehavior(t *testing.T) {
+	orig := tcxAttachFunc
+	defer func() {
+		tcxAttachFunc = orig
+		resetTCXCapabilityCache()
+	}()
+
+	iface := &net.Interface{Index: 7, Name: "eth-test"}
+	prog := &ebpf.Program{}
+	tests := []struct {
+		name      string
+		results   []error
+		wantCalls int
+	}{
+		{
+			name:      "cache unsupported failure",
+			results:   []error{link.ErrNotSupported, link.ErrNotSupported},
+			wantCalls: 1,
+		},
+		{
+			name:      "do not cache transient failure",
+			results:   []error{errors.New("permission denied"), nil},
+			wantCalls: 2,
+		},
+		{
+			name:      "success stays retryable",
+			results:   []error{nil, nil},
+			wantCalls: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetTCXCapabilityCache()
+			callCount := 0
+			tcxAttachFunc = func(opts link.TCXOptions) (link.Link, error) {
+				if callCount >= len(tc.results) {
+					t.Fatalf("unexpected attach call %d", callCount+1)
+				}
+				err := tc.results[callCount]
+				callCount++
+				if err != nil {
+					return nil, err
+				}
+				return fakeTCXLink{}, nil
+			}
+
+			first, firstErr := attachTCXOnce(iface, prog, ebpf.AttachTCXIngress)
+			if tc.results[0] == nil {
+				if firstErr != nil || first == nil {
+					t.Fatalf("first attach = (%v, %v), want success", first, firstErr)
+				}
+			} else if firstErr == nil {
+				t.Fatalf("first attach unexpectedly succeeded")
+			}
+
+			second, secondErr := attachTCXOnce(iface, prog, ebpf.AttachTCXIngress)
+			lastErr := tc.results[len(tc.results)-1]
+			if lastErr == nil {
+				if secondErr != nil || second == nil {
+					t.Fatalf("second attach = (%v, %v), want success", second, secondErr)
+				}
+			} else if secondErr == nil {
+				t.Fatalf("second attach unexpectedly succeeded")
+			}
+
+			if callCount != tc.wantCalls {
+				t.Fatalf("attach call count = %d, want %d", callCount, tc.wantCalls)
+			}
+		})
 	}
 }
