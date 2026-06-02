@@ -148,6 +148,9 @@ cmd_update_finalize() {
 
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
+    if ! service_cleanup_legacy_install_artifacts; then
+        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "清理旧安装资产失败"
+    fi
     if ! service_write_unit_files; then
         cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "同步 systemd unit 失败"
     fi

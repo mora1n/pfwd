@@ -241,6 +241,11 @@ service_copy_bundle_from_dir() {
     done < <(service_bundle_rows)
 }
 
+service_cleanup_legacy_install_artifacts() {
+    rm -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" \
+          "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
+}
+
 service_verify_bundle_from_dir() {
     local source_root="$1"
     local _ source_rel __ ___
@@ -274,6 +279,7 @@ service_install_files() {
     service_prepare_install_dirs
     service_verify_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
+    service_cleanup_legacy_install_artifacts
     service_write_shortcuts
     service_write_unit_files
 }
@@ -569,6 +575,7 @@ service_update_apply_staged() {
 
     service_prepare_install_dirs
     service_copy_bundle_from_dir "$staged_dir"
+    service_cleanup_legacy_install_artifacts
     service_write_shortcuts
 }
 

@@ -42,6 +42,8 @@ const (
 	geoLookupLoopLimit        = 16
 	geoSegmentV4MapMaxEntries = 131072
 	geoSegmentV6MapMaxEntries = 32768
+	geoBuildTimeout           = 5 * time.Minute
+	geoDownloadTimeout        = 2 * time.Minute
 )
 
 var (
@@ -172,7 +174,7 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 		return fmt.Errorf("创建 geo 资产目录失败: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), geoBuildTimeout)
 	defer cancel()
 
 	v4XDB, err := downloadGeoXDB(ctx, 4, defaultGeoIPv4DownloadURLs)
@@ -255,6 +257,7 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 		IPv6Buckets:  v6Stats.BucketCount,
 		IPv6Segments: v6Stats.SegmentCount,
 	}
+	preserveStableGeoMetaFields(opts.AssetDir, &meta)
 	content, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化 geo 元数据失败: %w", err)
@@ -263,6 +266,44 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 		return fmt.Errorf("写入 geo 元数据失败: %w", err)
 	}
 	return nil
+}
+
+func preserveStableGeoMetaFields(assetDir string, meta *geoAssetMeta) {
+	if meta == nil {
+		return
+	}
+	content, err := os.ReadFile(filepath.Join(assetDir, geoMetaAssetFile))
+	if err != nil {
+		return
+	}
+	var existing geoAssetMeta
+	if err := json.Unmarshal(content, &existing); err != nil {
+		return
+	}
+	if !geoMetaStableFingerprintEqual(existing, *meta) {
+		return
+	}
+	meta.BuiltAt = existing.BuiltAt
+	meta.IPv4.SelectedURL = existing.IPv4.SelectedURL
+	meta.IPv6.SelectedURL = existing.IPv6.SelectedURL
+}
+
+func geoMetaStableFingerprintEqual(left geoAssetMeta, right geoAssetMeta) bool {
+	left.BuiltAt = ""
+	right.BuiltAt = ""
+	left.IPv4.SelectedURL = ""
+	right.IPv4.SelectedURL = ""
+	left.IPv6.SelectedURL = ""
+	right.IPv6.SelectedURL = ""
+	leftBytes, err := json.Marshal(left)
+	if err != nil {
+		return false
+	}
+	rightBytes, err := json.Marshal(right)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(leftBytes, rightBytes)
 }
 
 func loadGeoAssets(assetDir string) (*geoAssetRuntime, error) {
@@ -308,7 +349,7 @@ func downloadGeoXDB(ctx context.Context, ipVersion uint16, urls []string) (*down
 	if len(urls) == 0 {
 		return nil, fmt.Errorf("缺少 xdb 下载地址")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: geoDownloadTimeout}
 	errorsSeen := make([]string, 0, len(urls))
 	for _, rawURL := range urls {
 		url := strings.TrimSpace(rawURL)

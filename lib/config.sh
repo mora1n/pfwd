@@ -89,6 +89,29 @@ EOF
 
 PFWD_CONFIG_INITIALIZED=0
 
+config_cleanup_legacy_dependencies_file() {
+    local file="$1"
+    local tmp
+    [ -f "$file" ] || pfwd_die "配置文件不存在：$file"
+    tmp="$(mktemp "${file}.cleanup.XXXXXX")"
+    jq '
+      del(
+        .settings.whitelist.source_url,
+        .settings.whitelist.last_good_source,
+        .settings.whitelist.last_good_updated_at,
+        .settings.egress_whitelist.source_url,
+        .settings.egress_whitelist.last_good_source,
+        .settings.egress_whitelist.last_good_updated_at
+      )
+    ' "$file" > "$tmp"
+    config_validate_file "$tmp"
+    if cmp -s "$tmp" "$file"; then
+        rm -f "$tmp"
+    else
+        mv "$tmp" "$file"
+    fi
+}
+
 config_init() {
     [ "$PFWD_CONFIG_INITIALIZED" = "1" ] && [ -f "$PFWD_CONFIG_FILE" ] && return 0
     pfwd_require_jq
@@ -97,6 +120,7 @@ config_init() {
         config_default_json | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
     fi
     config_validate_file "$PFWD_CONFIG_FILE"
+    config_cleanup_legacy_dependencies_file "$PFWD_CONFIG_FILE"
     PFWD_CONFIG_INITIALIZED=1
 }
 
@@ -181,6 +205,7 @@ config_import_bundle() {
     defaults="$(config_default_json)"
     config_filled="$(jq --argjson defaults "$defaults" '.settings.downmask //= $defaults.settings.downmask' "$config_tmp")"
     printf '%s\n' "$config_filled" > "$config_tmp"
+    config_cleanup_legacy_dependencies_file "$config_tmp"
 
     mv "$config_tmp" "$PFWD_CONFIG_FILE"
     mv "$stats_tmp" "$PFWD_STATS_FILE"
