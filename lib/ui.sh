@@ -3038,10 +3038,10 @@ ui_resolve_listen_ports_by_forward_ids() {
 }
 
 ui_print_guard_skip_ports() {
-    local ports
-    ports="$(guard_protocol_skip_ports_tsv | paste -sd, -)"
-    if [ -n "$ports" ]; then
-        ui_print_line "当前 Guard 跳过端口：$ports" "$UI_C_ACCENT"
+    local count
+    count="$(guard_protocol_skip_ports_count)"
+    if [ "$count" -gt 0 ]; then
+        ui_print_line "当前 Guard 跳过端口：$count 个" "$UI_C_ACCENT"
     else
         ui_print_line "当前 Guard 跳过端口：-" "$UI_C_DIM"
     fi
@@ -3109,6 +3109,42 @@ ui_guard_skip_ports_apply_list() {
     [ "$UI_STATUS" -eq 0 ] || return 1
 }
 
+ui_guard_skip_ports_expand_spec() {
+    local spec="$1"
+    local expanded_port
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        while IFS= read -r expanded_port; do
+            [ -n "$expanded_port" ] || continue
+            validate_port "$expanded_port"
+            printf '%s\n' "$expanded_port"
+        done < <(expand_port_spec "$spec")
+    done <<< "$(printf '%s\n' "$spec" | tr ',' '\n')"
+}
+
+ui_guard_skip_ports_prompt_spec() {
+    local title="$1"
+    local prompt="$2"
+    local default_value="${3:-}"
+    local expanded_ports
+    ui_form_set "$title" "$prompt"
+    ui_form_read "端口规格" "$default_value" || { ui_form_reset; return 1; }
+    if [ "$UI_EDIT_ABORTED" = "1" ]; then
+        ui_form_reset
+        return 1
+    fi
+    if [ -z "$UI_REPLY" ]; then
+        ui_form_reset
+        ui_warn "必须提供端口规格"
+        return 1
+    fi
+    expanded_ports="$(ui_guard_skip_ports_expand_spec "$UI_REPLY" 2>/dev/null | awk '!seen[$0]++')"
+    ui_form_reset
+    [ -n "$expanded_ports" ] || { ui_warn "未解析到有效端口"; return 1; }
+    UI_REPLY="$expanded_ports"
+    return 0
+}
+
 ui_menu_guard_skip_ports_delete() {
     local count raw indexes delete_indexes remaining_ports port idx delete_all
     count="$(guard_protocol_skip_ports_count)"
@@ -3161,8 +3197,27 @@ ui_menu_guard_skip_ports_delete() {
     done
 }
 
+ui_menu_guard_skip_ports_add() {
+    local new_ports merged_ports
+    while true; do
+        if ! ui_guard_skip_ports_prompt_spec "增加 Guard 跳过端口" "输入端口规格，支持单端口、逗号多端口和连续范围。" ""; then
+            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+            ui_pause
+            continue
+        fi
+        new_ports="$UI_REPLY"
+        merged_ports="$(printf '%s\n%s\n' "$(guard_protocol_skip_ports_tsv)" "$new_ports" | sed '/^$/d' | awk '!seen[$0]++')"
+        ui_guard_skip_ports_apply_list "$merged_ports"
+        if [ "$UI_STATUS" -eq 0 ]; then
+            ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
+            ui_pause
+        fi
+        return 0
+    done
+}
+
 ui_menu_guard_skip_ports_update() {
-    local count selected current_port new_port updated_ports port idx
+    local count raw indexes selected_indexes selected_ports new_ports updated_ports port idx
     count="$(guard_protocol_skip_ports_count)"
     if [ "$count" -eq 0 ]; then
         ui_warn "当前没有 Guard 跳过端口"
@@ -3171,38 +3226,36 @@ ui_menu_guard_skip_ports_update() {
     fi
     while true; do
         ui_render_page ui_render_guard_skip_ports_update_page
-        ui_read "选择要修改的端口序号" || return 1
-        [ "$UI_REPLY" = "0" ] && return 0
-        [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; continue; }
-        selected="$UI_REPLY"
-        [ "$selected" -ge 1 ] && [ "$selected" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; continue; }
-        current_port="$(guard_protocol_skip_ports_tsv | sed -n "${selected}p")"
-        [ -n "$current_port" ] || { ui_warn "端口序号不存在"; ui_pause; continue; }
-        ui_form_set "修改 Guard 跳过端口" "输入新的监听端口；该端口将绕过入口 Guard。"
-        ui_form_add_kv "当前端口" "$current_port"
-        ui_form_read "新端口" "$current_port" || { ui_form_reset; return 0; }
-        new_port="$UI_REPLY"
-        [ -n "$new_port" ] || { ui_form_reset; ui_warn "必须提供端口"; ui_pause; continue; }
-        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-            ui_form_reset
-            ui_warn "无效端口：$new_port"
+        ui_read "选择要修改的端口序号，可单/多/连续选择" || return 1
+        raw="$UI_REPLY"
+        ui_multiselect_parse_indexes "$raw" "$count" true || return 1
+        [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+        selected_indexes="$UI_REPLY"
+        [ -n "$selected_indexes" ] || { ui_warn "请选择要修改的端口"; ui_pause; continue; }
+        selected_ports=""
+        while IFS= read -r idx; do
+            [ -n "$idx" ] || continue
+            port="$(guard_protocol_skip_ports_tsv | sed -n "${idx}p")"
+            [ -n "$port" ] || continue
+            selected_ports="${selected_ports}${selected_ports:+,}$port"
+        done <<< "$selected_indexes"
+        if ! ui_guard_skip_ports_prompt_spec "修改 Guard 跳过端口" "输入新的端口规格；会替换所选端口。" "$selected_ports"; then
+            [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             ui_pause
             continue
         fi
+        new_ports="$UI_REPLY"
         updated_ports=""
         idx=1
         while IFS= read -r port; do
             [ -n "$port" ] || continue
-            if [ "$idx" -eq "$selected" ]; then
-                port="$new_port"
-            fi
-            if ! printf '%s\n' "$updated_ports" | sed '/^$/d' | grep -qx "$port"; then
+            if ! printf '%s\n' "$selected_indexes" | grep -qx "$idx"; then
                 updated_ports="${updated_ports}${updated_ports:+$'\n'}$port"
             fi
             idx=$((idx + 1))
         done < <(guard_protocol_skip_ports_tsv)
+        updated_ports="$(printf '%s\n%s\n' "$updated_ports" "$new_ports" | sed '/^$/d' | awk '!seen[$0]++')"
         ui_guard_skip_ports_apply_list "$updated_ports"
-        ui_form_reset
         if [ "$UI_STATUS" -eq 0 ]; then
             ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
             ui_pause
@@ -3212,25 +3265,11 @@ ui_menu_guard_skip_ports_update() {
 }
 
 ui_menu_guard_skip_ports() {
-    local forward_ids ports
     while true; do
         ui_render_page ui_render_guard_skip_ports_menu_page
         ui_read "选择" || return 0
         case "$UI_REPLY" in
-            1)
-                ui_select_forwards_multi_scoped true "选择需要跳过入口 Guard 的转发范围" || { ui_pause; continue; }
-                [ "$UI_EDIT_ABORTED" = "1" ] && continue
-                forward_ids="$UI_REPLY"
-                ports="$(ui_resolve_listen_ports_by_forward_ids "$forward_ids")"
-                [ -n "$ports" ] || { ui_warn "未解析到监听端口"; ui_pause; continue; }
-                while IFS= read -r port; do
-                    [ -n "$port" ] || continue
-                    ui_run cmd_guard protocols --skip-port "$port"
-                    [ "$UI_STATUS" -eq 0 ] || break
-                done <<< "$ports"
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
-                ;;
+            1) ui_menu_guard_skip_ports_add; ui_maybe_pause success ;;
             2)
                 ui_menu_guard_skip_ports_delete
                 ui_maybe_pause success
