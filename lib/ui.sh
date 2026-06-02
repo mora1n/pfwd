@@ -3483,7 +3483,7 @@ ui_menu_add_forward() {
     local preset_user_id="${1:-}"
     local user_id remote_host remote_port remote listen_ip listen_port random_range stop_at protocol traffic_mode traffic_ratio comment args=()
     local user_defaults="" default_rate="" default_stop_at="" default_traffic_mode="" stop_prompt=""
-    ui_form_set "添加转发" "支持单端口、多端口：443,553 或 连续段：1000-1005；监听端口和目标端口数量需一致。输入 0 返回上级菜单。"
+    ui_form_set "添加转发" "端口支持单端口、逗号分隔多端口如 443,553，或连续范围如 1000-1005；监听端口和目标端口数量需一致。输入 0 返回上级菜单。"
     if [ -n "$preset_user_id" ]; then
         user_id="$preset_user_id"
     else
@@ -3501,7 +3501,7 @@ ui_menu_add_forward() {
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     remote_host="$UI_REPLY"
     ui_form_add_kv "目标 IP/域名" "$remote_host"
-    ui_form_read "目标端口" || { ui_form_reset; return 0; }
+    ui_form_read "目标端口，支持 443,553 或 1000-1005" || { ui_form_reset; return 0; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     remote_port="$UI_REPLY"
     remote="$(ui_join_remote "$remote_host" "$remote_port")"
@@ -3510,7 +3510,7 @@ ui_menu_add_forward() {
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     listen_ip="$UI_REPLY"
     ui_form_add_kv "监听 IP" "$listen_ip"
-    ui_form_read "固定监听端口，留空则使用随机端口" || { ui_form_reset; return 0; }
+    ui_form_read "固定监听端口，支持 443,553 或 1000-1005；留空则使用随机端口" || { ui_form_reset; return 0; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     listen_port="$UI_REPLY"
     if [ -z "$listen_port" ]; then
@@ -3636,7 +3636,7 @@ ui_menu_forwards() {
                     current_snat_mode="$(jq -r '.net.snat_mode // "masquerade"' <<< "$current")"
                     current_snat_source="$(jq -r '.net.snat_source // ""' <<< "$current")"
 
-                    ui_form_set "修改转发" "回车保留当前值，0 返回上级，转发到期日输入 - 清空为不限期，备注输入 - 清空。"
+                    ui_form_set "修改转发" "回车保留当前值，0 返回上级；端口支持单端口、逗号分隔多端口如 443,553，或连续范围如 1000-1005；监听端口和目标端口数量需一致；转发到期日输入 - 清空为不限期，备注输入 - 清空。"
                     ui_form_add_kv "用户" "$user_id"
                     ui_form_add_kv "转发 ID" "$forward_id"
                     ui_form_add_kv "当前监听 IP" "$current_listen_ip"
@@ -3654,7 +3654,7 @@ ui_menu_forwards() {
                     listen_ip="$UI_REPLY"
                     ui_form_add_kv "新监听 IP" "$listen_ip"
 
-                    ui_form_edit_read "监听端口" "$current_listen_port" || { ui_pause; continue; }
+                    ui_form_edit_read "监听端口，支持 443,553 或 1000-1005" "$current_listen_port" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                     listen_port="$UI_REPLY"
                     ui_form_add_kv "新监听端口" "$listen_port"
@@ -3664,7 +3664,7 @@ ui_menu_forwards() {
                     remote_host="$UI_REPLY"
                     ui_form_add_kv "新目标 IP/域名" "$remote_host"
 
-                    ui_form_edit_read "目标端口" "$current_remote_port" || { ui_pause; continue; }
+                    ui_form_edit_read "目标端口，支持 443,553 或 1000-1005" "$current_remote_port" || { ui_pause; continue; }
                     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                     remote_port="$UI_REPLY"
                     ui_form_add_kv "新目标端口" "$remote_port"
@@ -4502,6 +4502,7 @@ ui_render_cn_selection_page() {
     ui_header "$title"
     ui_notice_render
     printf '当前策略：%s\n' "$current"
+    printf '说明：这里按序号选择国内IP/省份，支持单个、逗号分隔多个序号和连续范围；端口输入场景的多端口请用 , 分隔，连续范围用 - 。\n'
     printf '\n'
     ui_table_render $'序号\t国内范围' "$(ui_cn_selection_rows)" "2"
 }
@@ -4565,7 +4566,6 @@ ui_render_ingress_whitelist_menu_page() {
     ui_menu_item 2 "关闭入口白名单"
     ui_menu_item 3 "国内IP/省份"
     ui_menu_item 4 "入口自定义 CIDR"
-    ui_menu_item 5 "刷新入口白名单"
     ui_menu_item 0 "返回"
 }
 
@@ -4590,11 +4590,6 @@ ui_menu_ingress_whitelist() {
                 ;;
             4)
                 ui_menu_whitelist_cidrs
-                ;;
-            5)
-                ui_run cmd_guard_whitelist refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单数据已刷新" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -4780,7 +4775,6 @@ ui_render_egress_whitelist_menu_page() {
     ui_menu_item 2 "关闭出口白名单"
     ui_menu_item 3 "国内IP/省份"
     ui_menu_item 4 "出口自定义 CIDR"
-    ui_menu_item 5 "刷新出口白名单"
     ui_menu_item 0 "返回"
 }
 
@@ -4805,11 +4799,6 @@ ui_menu_egress_whitelist() {
                 ;;
             4)
                 ui_menu_egress_whitelist_cidrs
-                ;;
-            5)
-                ui_run cmd_guard_egress_whitelist refresh
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口白名单数据已刷新" "$UI_C_MENU_NUM"
-                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
