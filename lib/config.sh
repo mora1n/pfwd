@@ -25,6 +25,8 @@ config_default_json() {
     "whitelist": {
       "enabled": false,
       "include_cn": true,
+      "cn_mode": "all",
+      "cn_provinces": [],
       "custom_cidrs": [],
       "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
       "last_good_source": "",
@@ -34,6 +36,8 @@ config_default_json() {
     "egress_whitelist": {
       "enabled": false,
       "include_cn": true,
+      "cn_mode": "all",
+      "cn_provinces": [],
       "custom_cidrs": [],
       "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone",
       "last_good_source": "",

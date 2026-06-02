@@ -113,6 +113,9 @@ service_bundle_rows() {
     printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
     printf '0644\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\n'
     printf '0644\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\n'
+    printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
+    printf '0644\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\n'
+    printf '0644\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
         printf '0644\tlib/%s.sh\tlib/%s.sh\tlib/%s.sh\n' "$lib" "$lib" "$lib"
     done
@@ -423,6 +426,8 @@ service_verify_removed() {
         "$PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH" \
         "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH" \
         "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH" "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
+        "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" \
+        "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
         "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" \
         "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
         "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \

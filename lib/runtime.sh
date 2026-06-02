@@ -40,6 +40,22 @@ runtime_protocol_skip_ports_json() {
     forwarder_protocol_skip_ports_json
 }
 
+runtime_whitelist_cn_mode() {
+    whitelist_cn_mode
+}
+
+runtime_whitelist_cn_provinces_json() {
+    whitelist_cn_provinces_json
+}
+
+runtime_egress_whitelist_cn_mode() {
+    egress_whitelist_cn_mode
+}
+
+runtime_egress_whitelist_cn_provinces_json() {
+    egress_whitelist_cn_provinces_json
+}
+
 runtime_rule_execution_class() {
     local resolved_target="$1"
     case "$resolved_target" in
@@ -416,6 +432,11 @@ runtime_compiled_json() {
     settings_json="$(jq -n \
       --arg iface "$(runtime_iface)" \
       --arg guard_ingress_mode "$(runtime_guard_ingress_mode)" \
+      --arg geo_asset_dir "$PFWD_ASSETS_DIR" \
+      --arg ingress_cn_mode "$(runtime_whitelist_cn_mode)" \
+      --argjson ingress_cn_provinces "$(runtime_whitelist_cn_provinces_json)" \
+      --arg egress_cn_mode "$(runtime_egress_whitelist_cn_mode)" \
+      --argjson egress_cn_provinces "$(runtime_egress_whitelist_cn_provinces_json)" \
       --argjson guard_enabled "$guard_enabled" \
       --argjson whitelist_enabled "$whitelist_state" \
       --argjson egress_whitelist_enabled "$egress_whitelist_state" \
@@ -435,6 +456,11 @@ runtime_compiled_json() {
         whitelist_enabled: $whitelist_enabled,
         egress_whitelist_enabled: $egress_whitelist_enabled,
         host_egress_enabled: $host_egress_enabled,
+        geo_asset_dir: $geo_asset_dir,
+        ingress_cn_mode: $ingress_cn_mode,
+        ingress_cn_provinces: $ingress_cn_provinces,
+        egress_cn_mode: $egress_cn_mode,
+        egress_cn_provinces: $egress_cn_provinces,
         block_http: $block_http,
         block_tls: $block_tls,
         block_socks: $block_socks,
@@ -470,7 +496,7 @@ runtime_attach_metadata() {
     local config_hash
     runtime_json="$(jq '
       .dataplane_version = 2
-      | .map_abi_version = 7
+      | .map_abi_version = 8
       | .rules = [
           .rules[]? as $rule
           | (
@@ -635,6 +661,9 @@ runtime_remove_pinned_state() {
           "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH" \
           "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH" \
           "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
+          "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" \
+          "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" \
+          "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
           "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" || true
 }
 

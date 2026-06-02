@@ -53,6 +53,47 @@ egress_whitelist_include_cn() {
     jq -r 'if (.settings.egress_whitelist.include_cn? | type) == "boolean" then .settings.egress_whitelist.include_cn else true end' "$config_file"
 }
 
+egress_whitelist_cn_mode() {
+    local config_file="${1:-$PFWD_CONFIG_FILE}"
+    jq -r '
+      if ((.settings.egress_whitelist.cn_mode // "") | type) == "string" and (.settings.egress_whitelist.cn_mode | length) > 0 then
+        .settings.egress_whitelist.cn_mode
+      elif ((.settings.egress_whitelist.include_cn? | type) == "boolean") then
+        (if .settings.egress_whitelist.include_cn then "all" else "off" end)
+      else
+        "all"
+      end
+    ' "$config_file"
+}
+
+egress_whitelist_cn_provinces_json() {
+    local config_file="${1:-$PFWD_CONFIG_FILE}"
+    jq -c '.settings.egress_whitelist.cn_provinces // []' "$config_file"
+}
+
+egress_whitelist_cn_provinces_tsv() {
+    local config_file="${1:-$PFWD_CONFIG_FILE}"
+    jq -r '.settings.egress_whitelist.cn_provinces // [] | .[]' "$config_file"
+}
+
+egress_whitelist_cn_selection_summary() {
+    local config_file="${1:-$PFWD_CONFIG_FILE}"
+    local mode
+    mode="$(egress_whitelist_cn_mode "$config_file")"
+    case "$mode" in
+        all) printf '国内IP' ;;
+        provinces)
+            local provinces
+            provinces="$(egress_whitelist_cn_provinces_tsv "$config_file" | pfwd_join_lines '、')"
+            [ -n "$provinces" ] || provinces="未选择"
+            printf '省份：%s' "$provinces"
+            ;;
+        *)
+            printf '关闭'
+            ;;
+    esac
+}
+
 egress_whitelist_source_url() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     jq -r --arg url "$(egress_whitelist_default_source_url)" '.settings.egress_whitelist.source_url // $url' "$config_file"
@@ -81,6 +122,78 @@ egress_whitelist_custom_cidrs_count() {
 egress_whitelist_runtime_hash() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     jq -r '.settings.egress_whitelist.runtime_hash // ""' "$config_file"
+}
+
+egress_whitelist_require_geo_assets() {
+    [ "$(egress_whitelist_cn_mode "${1:-$PFWD_CONFIG_FILE}")" = "off" ] && return 0
+    [ -f "$PFWD_ASSETS_DIR/pfwd-geo-meta.json" ] || pfwd_die "缺少 geo 资产：$PFWD_ASSETS_DIR/pfwd-geo-meta.json"
+    [ -f "$PFWD_ASSETS_DIR/pfwd-geo-cn-v4.bin" ] || pfwd_die "缺少 geo 资产：$PFWD_ASSETS_DIR/pfwd-geo-cn-v4.bin"
+    [ -f "$PFWD_ASSETS_DIR/pfwd-geo-cn-v6.bin" ] || pfwd_die "缺少 geo 资产：$PFWD_ASSETS_DIR/pfwd-geo-cn-v6.bin"
+}
+
+egress_whitelist_validate_cn_mode() {
+    local mode="$1"
+    case "$mode" in
+        off|all|provinces) ;;
+        *) pfwd_die "无效出口白名单国内模式：$mode" ;;
+    esac
+}
+
+egress_whitelist_config_set_cn_mode() {
+    local mode="$1"
+    egress_whitelist_validate_cn_mode "$mode"
+    config_update --arg mode "$mode" '
+      (.settings.egress_whitelist //= {})
+      | .settings.egress_whitelist.cn_mode = $mode
+      | .settings.egress_whitelist.include_cn = ($mode != "off")
+    '
+}
+
+egress_whitelist_config_set_cn_provinces() {
+    local provinces_file="$1"
+    [ -f "$provinces_file" ] || pfwd_die "出口省份临时文件不存在：$provinces_file"
+    whitelist_validate_cn_provinces_file "$provinces_file"
+    config_update --rawfile provinces "$provinces_file" '
+      (.settings.egress_whitelist //= {})
+      | .settings.egress_whitelist.cn_provinces =
+          (($provinces
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | unique))
+    '
+}
+
+egress_whitelist_config_apply_cn_selection() {
+    local mode="$1"
+    local provinces_file="${2:-}"
+    egress_whitelist_validate_cn_mode "$mode"
+    case "$mode" in
+        off|all)
+            config_update --arg mode "$mode" '
+              (.settings.egress_whitelist //= {})
+              | .settings.egress_whitelist.cn_mode = $mode
+              | .settings.egress_whitelist.cn_provinces = []
+              | .settings.egress_whitelist.include_cn = ($mode != "off")
+            '
+            ;;
+        provinces)
+            [ -n "$provinces_file" ] || pfwd_die "缺少出口省份列表"
+            [ -f "$provinces_file" ] || pfwd_die "出口省份临时文件不存在：$provinces_file"
+            whitelist_validate_cn_provinces_file "$provinces_file"
+            config_update --arg mode "$mode" --rawfile provinces "$provinces_file" '
+              (.settings.egress_whitelist //= {})
+              | .settings.egress_whitelist.cn_mode = $mode
+              | .settings.egress_whitelist.cn_provinces =
+                  (($provinces
+                    | split("\n")
+                    | map(gsub("^\\s+|\\s+$"; ""))
+                    | map(select(length > 0))
+                    | unique))
+              | .settings.egress_whitelist.include_cn = true
+            '
+            ;;
+    esac
 }
 
 egress_whitelist_entry_count() {
@@ -259,18 +372,20 @@ egress_whitelist_validate_custom_cidrs() {
 
 egress_whitelist_config_set_state() {
     local enabled="$1"
-    local include_cn="$2"
+    local cn_mode="$2"
     local source_url="$3"
     validate_bool "$enabled"
-    validate_bool "$include_cn"
+    egress_whitelist_validate_cn_mode "$cn_mode"
     [ -n "$source_url" ] || source_url="$(egress_whitelist_default_source_url)"
     config_update \
       --argjson enabled "$enabled" \
-      --argjson include_cn "$include_cn" \
+      --arg cn_mode "$cn_mode" \
       --arg source_url "$source_url" '
       (.settings.egress_whitelist //= {})
       | .settings.egress_whitelist.enabled = $enabled
-      | .settings.egress_whitelist.include_cn = $include_cn
+      | .settings.egress_whitelist.cn_mode = $cn_mode
+      | .settings.egress_whitelist.include_cn = ($cn_mode != "off")
+      | if $cn_mode != "provinces" then .settings.egress_whitelist.cn_provinces = [] else . end
       | .settings.egress_whitelist.source_url = $source_url
     '
 }
@@ -355,7 +470,7 @@ egress_whitelist_custom_cidr_by_index() {
 egress_whitelist_prepare_runtime() {
     local config_file="${1:-$PFWD_CONFIG_FILE}"
     local state_dir="${2:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
-    local ipv4_file ipv6_file host_ipv4_file host_ipv6_file cn_tmp tmp_v4 tmp_v6
+    local ipv4_file ipv6_file host_ipv4_file host_ipv6_file tmp_v4 tmp_v6
     ipv4_file="$(egress_whitelist_allow_ipv4_file "$state_dir")"
     ipv6_file="$(egress_whitelist_allow_ipv6_file "$state_dir")"
     host_ipv4_file="$(egress_whitelist_host_allow_ipv4_file "$state_dir")"
@@ -367,42 +482,15 @@ egress_whitelist_prepare_runtime() {
         return 0
     fi
 
-    if [ "$(egress_whitelist_include_cn "$config_file")" = "true" ]; then
-        cn_tmp="$(mktemp)"
-        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" ]; then
-            egress_whitelist_write_allow_ipv4_file "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" "$cn_tmp"
-            [ "$config_file" = "$PFWD_CONFIG_FILE" ] && egress_whitelist_mark_last_good "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" "$(pfwd_now_iso)"
-        else
-            pfwd_bootstrap_download "$(egress_whitelist_source_url "$config_file")" "$cn_tmp"
-            egress_whitelist_write_allow_ipv4_file "$cn_tmp" "$cn_tmp.filtered"
-            mv "$cn_tmp.filtered" "$cn_tmp"
-            [ "$config_file" = "$PFWD_CONFIG_FILE" ] && egress_whitelist_mark_last_good "$(egress_whitelist_source_url "$config_file")" "$(pfwd_now_iso)"
-        fi
-        mv "$cn_tmp" "${ipv4_file}.cn"
-
-        cn_tmp="$(mktemp)"
-        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" ]; then
-            egress_whitelist_write_allow_ipv6_file "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" "$cn_tmp"
-        else
-            pfwd_bootstrap_download "$(egress_whitelist_default_ipv6_source_url)" "$cn_tmp"
-            egress_whitelist_write_allow_ipv6_file "$cn_tmp" "$cn_tmp.filtered"
-            mv "$cn_tmp.filtered" "$cn_tmp"
-        fi
-        mv "$cn_tmp" "${ipv6_file}.cn"
+    if [ "$(egress_whitelist_cn_mode "$config_file")" != "off" ]; then
+        egress_whitelist_require_geo_assets "$config_file"
+        [ "$config_file" = "$PFWD_CONFIG_FILE" ] && egress_whitelist_mark_last_good "$PFWD_ASSETS_DIR/pfwd-geo-meta.json" "$(pfwd_now_iso)"
     else
         rm -f "${ipv4_file}.cn" "${ipv6_file}.cn" 2>/dev/null || true
     fi
 
     tmp_v4="$(mktemp)"
     tmp_v6="$(mktemp)"
-    if [ -s "${ipv4_file}.cn" ]; then
-        cat "${ipv4_file}.cn" >> "$tmp_v4"
-        printf '\n' >> "$tmp_v4"
-    fi
-    if [ -s "${ipv6_file}.cn" ]; then
-        cat "${ipv6_file}.cn" >> "$tmp_v6"
-        printf '\n' >> "$tmp_v6"
-    fi
     egress_whitelist_custom_cidrs_tsv "$config_file" | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
     egress_whitelist_custom_cidrs_tsv "$config_file" | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
 
@@ -430,7 +518,8 @@ egress_whitelist_runtime_hash_compute() {
     host_ipv6_file="$(egress_whitelist_host_allow_ipv6_file "$state_dir")"
     payload="$(cat <<EOF
 enabled=$(egress_whitelist_enabled "$config_file")
-include_cn=$(egress_whitelist_include_cn "$config_file")
+cn_mode=$(egress_whitelist_cn_mode "$config_file")
+cn_provinces=$(egress_whitelist_cn_provinces_tsv "$config_file" | paste -sd ',' -)
 source=$(egress_whitelist_source_url "$config_file")
 last_good_source=$(egress_whitelist_last_good_source "$config_file")
 custom:
@@ -467,7 +556,8 @@ egress_whitelist_apply_runtime() {
 egress_whitelist_status_json() {
     jq -n \
       --argjson enabled "$(egress_whitelist_enabled)" \
-      --argjson include_cn "$(egress_whitelist_include_cn)" \
+      --arg cn_mode "$(egress_whitelist_cn_mode)" \
+      --argjson cn_provinces "$(egress_whitelist_cn_provinces_json)" \
       --arg source_url "$(egress_whitelist_source_url)" \
       --arg allow_ipv4_file "$(egress_whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(egress_whitelist_allow_ipv6_file)" \
@@ -480,7 +570,8 @@ egress_whitelist_status_json() {
       --argjson custom_cidrs_count "$(egress_whitelist_custom_cidrs_count)" \
       '{
         enabled: $enabled,
-        include_cn: $include_cn,
+        cn_mode: $cn_mode,
+        cn_provinces: $cn_provinces,
         source_url: $source_url,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
@@ -500,7 +591,7 @@ egress_whitelist_render_status() {
     jq -r '
       [
         ["启用出口白名单", (if .enabled then "开" else "关" end)],
-        ["出口包含国内 IP", (if .enabled then (if .include_cn then "开" else "关" end) else "-" end)],
+        ["出口国内 IP 策略", (if .enabled then (if .cn_mode == "all" then "国内IP" elif .cn_mode == "provinces" then ("省份：" + ((.cn_provinces // []) | join("、"))) else "关闭" end) else "-" end)],
         ["出口自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["出口白名单条目", (.entries | tostring)],
         ["宿主机出口白名单条目", (.host_entries | tostring)],
@@ -519,63 +610,24 @@ egress_whitelist_assert_target_rows_allowed() {
     local remote_input="$1"
     local target_rows="$2"
     local state_dir="${3:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
-    local tmp_ips blocked_ip ipv4_file ipv6_file
-    tmp_ips="$(mktemp)"
-    ipv4_file="$(egress_whitelist_allow_ipv4_file "$state_dir")"
-    ipv6_file="$(egress_whitelist_allow_ipv6_file "$state_dir")"
+    local config_file="${4:-$PFWD_CONFIG_FILE}"
+    local resolved_ip geo_mode provinces_csv asset_dir whitelist_files
+    geo_mode="$(egress_whitelist_cn_mode "$config_file")"
+    provinces_csv="$(egress_whitelist_cn_provinces_tsv "$config_file" | paste -sd ',' -)"
+    asset_dir="$PFWD_ASSETS_DIR"
+    whitelist_files="$(egress_whitelist_allow_ipv4_file "$state_dir"):$(egress_whitelist_allow_ipv6_file "$state_dir")"
     while IFS='|' read -r _ _ resolved_ip; do
         [ -n "$resolved_ip" ] || continue
-        printf '%s\n' "$resolved_ip" >> "$tmp_ips"
+        if ! "$(forwarder_bin_path)" geo-check \
+            --asset-dir "$asset_dir" \
+            --address "$resolved_ip" \
+            --mode "$geo_mode" \
+            --provinces "$provinces_csv" \
+            --egress-whitelist-file "$whitelist_files" >/dev/null 2>&1; then
+            EGRESS_WHITELIST_LAST_ERROR="resolved_ip=${resolved_ip}"
+            return 1
+        fi
     done <<< "$target_rows"
-
-    local status=0
-    if blocked_ip="$(python3 - "$tmp_ips" "$ipv4_file" "$ipv6_file" <<'PY'
-import ipaddress
-import pathlib
-import sys
-
-addr_file = pathlib.Path(sys.argv[1])
-ipv4_file = pathlib.Path(sys.argv[2])
-ipv6_file = pathlib.Path(sys.argv[3])
-
-def load_networks(path):
-    if not path.exists():
-        return []
-    items = []
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        items.append(ipaddress.ip_network(line, strict=False))
-    return items
-
-ipv4_networks = load_networks(ipv4_file)
-ipv6_networks = load_networks(ipv6_file)
-
-for raw in addr_file.read_text().splitlines():
-    value = raw.strip()
-    if not value:
-        continue
-    addr = ipaddress.ip_address(value)
-    networks = ipv4_networks if addr.version == 4 else ipv6_networks
-    if not any(addr in network for network in networks):
-        sys.stdout.write(value)
-        sys.exit(1)
-PY
-    )"; then
-        status=0
-    else
-        status=$?
-    fi
-    rm -f "$tmp_ips"
-    if [ "$status" -ne 0 ] && [ -n "$blocked_ip" ]; then
-        EGRESS_WHITELIST_LAST_ERROR="resolved_ip=${blocked_ip}"
-        return 1
-    fi
-    if [ "$status" -ne 0 ]; then
-        EGRESS_WHITELIST_LAST_ERROR="remote=${remote_input} 校验失败"
-        return 1
-    fi
     return 0
 }
 
@@ -607,7 +659,7 @@ egress_whitelist_validate_remote_host() {
             fi
             continue
         fi
-        if ! egress_whitelist_assert_target_rows_allowed "$remote_host" "$target_rows" "$state_dir"; then
+        if ! egress_whitelist_assert_target_rows_allowed "$remote_host" "$target_rows" "$state_dir" "$config_file"; then
             EGRESS_WHITELIST_LAST_ERROR="${prefix} ${EGRESS_WHITELIST_LAST_ERROR}"
             return 1
         fi

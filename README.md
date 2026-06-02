@@ -62,6 +62,9 @@ tar -czf pfwd.tar.gz \
   lib/ \
   assets/pfwd-xdp-linux-amd64 \
   assets/pfwd-downmask-linux-amd64 \
+  assets/pfwd-geo-cn-v4.bin \
+  assets/pfwd-geo-cn-v6.bin \
+  assets/pfwd-geo-meta.json \
   assets/cn-aggregated.zone \
   assets/cn-aggregated-v6.zone
 ```
@@ -101,8 +104,8 @@ pfwd add \
 
 `pfwd guard` 负责三类能力：
 
-- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，可直接启用国内 IP 白名单，也可追加自定义 CIDR 或单个 IP
-- 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量
+- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，支持关闭国内段、允许全部国内 IP，或按省份批量允许；也可追加自定义 CIDR 或单个 IP
+- 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量；国内 IP / 省份策略与目标校验、宿主机出口共用一套配置
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`
 
 常用命令：
@@ -110,9 +113,13 @@ pfwd add \
 ```bash
 pfwd guard enable
 pfwd guard protocols --https true --socks true
-pfwd guard whitelist --enabled true --include-cn true
+pfwd guard whitelist --enabled true
+pfwd guard whitelist-cn all
+pfwd guard whitelist-cn select 广东省 江苏省
 pfwd guard whitelist-custom add 203.0.113.5
-pfwd guard egress-whitelist --enabled true --include-cn true
+pfwd guard egress-whitelist --enabled true
+pfwd guard egress-whitelist-cn all
+pfwd guard egress-whitelist-cn select 浙江省 上海市
 pfwd guard egress-whitelist-custom add 203.0.113.0/24
 pfwd guard status
 ```
@@ -134,12 +141,6 @@ pfwd guard status
 - `seed generate` 默认生成 `1GB` 高熵种子文件，推荐大小 `256MB-4GB`
 - `public.speed_limit` / `ab-pull --speed-limit` 支持 `4M`、`4MB/s`、`32Mbps`、`1GB/s`
 - `ab_pull.speed_jitter_percent` / `bytes_jitter_percent` 用于给限速和单次拉流字节做抖动，减少固定模式特征
-- `public.active_source` 当前内置源只有：
-  - `cloudflare_dynamic`
-  - `linode_tokyo_100mb`
-  - `cachefly_100mb`
-- `digitalocean_100mb` 和 `aliyun_ubuntu_iso` 不再是内置源；如仍需使用，请改成 `public custom`
-- 时间窗口为空即全天生效
 
 常用命令：
 
@@ -216,6 +217,9 @@ install -m 755 bbr.sh /usr/local/lib/pfwd/bbr.sh
 install -m 644 lib/*.sh /usr/local/lib/pfwd/lib/
 install -m 755 assets/pfwd-xdp-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-xdp
 install -m 755 assets/pfwd-downmask-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-downmask
+install -m 644 assets/pfwd-geo-cn-v4.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v4.bin
+install -m 644 assets/pfwd-geo-cn-v6.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v6.bin
+install -m 644 assets/pfwd-geo-meta.json /usr/local/lib/pfwd/assets/pfwd-geo-meta.json
 install -m 644 assets/cn-aggregated.zone /usr/local/lib/pfwd/assets/cn-aggregated.zone
 install -m 644 assets/cn-aggregated-v6.zone /usr/local/lib/pfwd/assets/cn-aggregated-v6.zone
 

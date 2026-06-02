@@ -1041,7 +1041,7 @@ ui_guard_summary_state() {
                 已停用|停用|关闭|关|false|paused|■) printf 'paused' ;;
             esac
             ;;
-        "启用入口白名单"|"入口包含国内 IP"|"启用出口白名单"|"出口包含国内 IP"|"封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
+        "启用入口白名单"|"启用出口白名单"|"封锁 HTTP"|"封锁 TLS"|"封锁 SOCKS")
             case "$value" in
                 开|开启|启用|已启用|true|active|●) printf 'active' ;;
                 关|关闭|停用|已停用|false|paused|■) printf 'paused' ;;
@@ -1070,7 +1070,7 @@ ui_whitelist_summary_rows() {
         [ -n "$item" ] || continue
         case "$item" in
             "启用白名单") item="启用入口白名单" ;;
-            "包含国内 IP") item="入口包含国内 IP" ;;
+            "国内 IP 策略") item="入口国内 IP 策略" ;;
             "自定义 CIDR") item="入口自定义 CIDR" ;;
             "白名单条目") item="入口白名单条目" ;;
             "来源地址") item="入口来源地址" ;;
@@ -4447,28 +4447,91 @@ ui_menu_whitelist_cidrs_delete() {
     fi
 }
 
-ui_render_ingress_whitelist_menu_page() {
-    local include_cn action_label
-    include_cn="$(whitelist_include_cn)"
-    if [ "$include_cn" = "true" ]; then
-        action_label="排除国内 IP"
+ui_cn_selection_rows() {
+    local idx=2 row
+    printf '0\t返回\n'
+    printf '1\t国内IP\n'
+    while IFS=$'\t' read -r _ row; do
+        [ -n "$row" ] || continue
+        printf '%s\t%s\n' "$idx" "$row"
+        idx=$((idx + 1))
+    done < <(whitelist_geo_province_rows)
+}
+
+ui_render_cn_selection_page() {
+    local title="$1"
+    local current="$2"
+    ui_header "$title"
+    ui_notice_render
+    printf '当前策略：%s\n' "$current"
+    printf '\n'
+    ui_table_render $'序号\t国内范围' "$(ui_cn_selection_rows)" "2"
+}
+
+ui_menu_guard_cn_selection() {
+    local kind="$1"
+    local current title raw parsed selected_count tmp province_indexes names mode
+    if [ "$kind" = "ingress" ]; then
+        current="$(whitelist_cn_selection_summary)"
+        title="入口国内 IP 策略"
     else
-        action_label="包含国内 IP"
+        current="$(egress_whitelist_cn_selection_summary)"
+        title="出口国内 IP 策略"
     fi
+    ui_render_page ui_render_cn_selection_page "$title" "$current"
+    ui_read "选择序号，可单/多/连续；1 为国内IP，0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$(($(whitelist_geo_province_rows | wc -l | tr -d ' ') + 1))" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$UI_REPLY"
+    selected_count="$(printf '%s\n' "$parsed" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if printf '%s\n' "$parsed" | grep -qx '1'; then
+        [ "$selected_count" = "1" ] || { ui_warn "国内IP 不能和省份混合选择"; return 1; }
+        if [ "$kind" = "ingress" ]; then
+            ui_run cmd_guard_whitelist_cn all
+            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口国内 IP 策略已设为国内IP" "$UI_C_MENU_NUM"
+        else
+            ui_run cmd_guard_egress_whitelist_cn all
+            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口国内 IP 策略已设为国内IP" "$UI_C_MENU_NUM"
+        fi
+        return 0
+    fi
+    province_indexes="$(printf '%s\n' "$parsed" | awk '$1 > 1 { print $1 - 1 }')"
+    [ -n "$province_indexes" ] || { ui_warn "请选择国内IP或至少一个省份"; return 1; }
+    tmp="$(mktemp)"
+    while IFS= read -r mode; do
+        [ -n "$mode" ] || continue
+        sed -n "${mode}p" < <(whitelist_geo_province_rows | cut -f2) >> "$tmp"
+    done <<< "$province_indexes"
+    mapfile -t names < "$tmp"
+    rm -f "$tmp"
+    if [ "${#names[@]}" -eq 0 ]; then
+        ui_warn "未解析到省份"
+        return 1
+    fi
+    if [ "$kind" = "ingress" ]; then
+        ui_run cmd_guard_whitelist_cn select "${names[@]}"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口国内 IP 策略已更新为省份选择" "$UI_C_MENU_NUM"
+    else
+        ui_run cmd_guard_egress_whitelist_cn select "${names[@]}"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口国内 IP 策略已更新为省份选择" "$UI_C_MENU_NUM"
+    fi
+}
+
+ui_render_ingress_whitelist_menu_page() {
     ui_header "入口白名单"
     ui_notice_render
     ui_print_whitelist_summary
     echo
     ui_menu_item 1 "启用入口白名单"
     ui_menu_item 2 "关闭入口白名单"
-    ui_menu_item 3 "$action_label"
+    ui_menu_item 3 "国内IP/省份"
     ui_menu_item 4 "入口自定义 CIDR"
     ui_menu_item 5 "刷新入口白名单"
     ui_menu_item 0 "返回"
 }
 
 ui_menu_ingress_whitelist() {
-    local include_cn
     while true; do
         ui_render_page ui_render_ingress_whitelist_menu_page
         ui_read "选择" || return 0
@@ -4484,14 +4547,7 @@ ui_menu_ingress_whitelist() {
                 ui_maybe_pause success
                 ;;
             3)
-                include_cn="$(whitelist_include_cn)"
-                if [ "$include_cn" = "true" ]; then
-                    ui_run cmd_guard_whitelist --include-cn false
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从入口白名单移出国内 IP 段" "$UI_C_MENU_NUM"
-                else
-                    ui_run cmd_guard_whitelist --include-cn true
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入入口白名单" "$UI_C_MENU_NUM"
-                fi
+                ui_menu_guard_cn_selection ingress
                 ui_maybe_pause success
                 ;;
             4)
@@ -4678,27 +4734,19 @@ ui_menu_egress_whitelist_cidrs() {
 }
 
 ui_render_egress_whitelist_menu_page() {
-    local include_cn action_label
-    include_cn="$(egress_whitelist_include_cn)"
-    if [ "$include_cn" = "true" ]; then
-        action_label="排除国内 IP"
-    else
-        action_label="包含国内 IP"
-    fi
     ui_header "出口白名单"
     ui_notice_render
     ui_print_egress_whitelist_summary
     echo
     ui_menu_item 1 "启用出口白名单"
     ui_menu_item 2 "关闭出口白名单"
-    ui_menu_item 3 "$action_label"
+    ui_menu_item 3 "国内IP/省份"
     ui_menu_item 4 "出口自定义 CIDR"
     ui_menu_item 5 "刷新出口白名单"
     ui_menu_item 0 "返回"
 }
 
 ui_menu_egress_whitelist() {
-    local include_cn
     while true; do
         ui_render_page ui_render_egress_whitelist_menu_page
         ui_read "选择" || return 0
@@ -4714,14 +4762,7 @@ ui_menu_egress_whitelist() {
                 ui_maybe_pause success
                 ;;
             3)
-                include_cn="$(egress_whitelist_include_cn)"
-                if [ "$include_cn" = "true" ]; then
-                    ui_run cmd_guard_egress_whitelist --include-cn false
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已从出口白名单移出国内 IP 段" "$UI_C_MENU_NUM"
-                else
-                    ui_run cmd_guard_egress_whitelist --include-cn true
-                    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "已把国内 IP 段加入出口白名单" "$UI_C_MENU_NUM"
-                fi
+                ui_menu_guard_cn_selection egress
                 ui_maybe_pause success
                 ;;
             4)

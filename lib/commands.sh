@@ -1288,17 +1288,23 @@ cmd_guard() {
         whitelist)
             cmd_guard_whitelist "$@"
             ;;
+        whitelist-cn)
+            cmd_guard_whitelist_cn "$@"
+            ;;
         whitelist-custom)
             cmd_guard_whitelist_custom "$@"
             ;;
         egress-whitelist)
             cmd_guard_egress_whitelist "$@"
             ;;
+        egress-whitelist-cn)
+            cmd_guard_egress_whitelist_cn "$@"
+            ;;
         egress-whitelist-custom)
             cmd_guard_egress_whitelist_custom "$@"
             ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-custom|egress-whitelist|egress-whitelist-custom"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-cn|whitelist-custom|egress-whitelist|egress-whitelist-cn|egress-whitelist-custom"
             ;;
     esac
 }
@@ -1306,6 +1312,7 @@ cmd_guard() {
 cmd_guard_whitelist() {
     config_init >/dev/null
     local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local cn_mode="__KEEP__"
     local refresh_requested="false" status_requested="false"
     local tmp_cidrs current_cidrs
 
@@ -1313,6 +1320,7 @@ cmd_guard_whitelist() {
         case "$1" in
             --enabled) enabled="${2:-}"; shift 2 ;;
             --include-cn) include_cn="${2:-}"; shift 2 ;;
+            --cn-mode) cn_mode="${2:-}"; shift 2 ;;
             --source-url) source_url="${2:-}"; shift 2 ;;
             --cidr) cidr="${2:-}"; shift 2 ;;
             --replace-custom) replace_custom="true"; shift ;;
@@ -1323,12 +1331,12 @@ cmd_guard_whitelist() {
         esac
     done
 
-    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         whitelist_render_status
         return 0
     fi
 
-    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         whitelist_apply_runtime
         cmd_apply_guard_runtime
         echo "入口白名单数据已刷新"
@@ -1337,6 +1345,9 @@ cmd_guard_whitelist() {
 
     [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
     [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
+    if [ "$cn_mode" != "__KEEP__" ]; then
+        whitelist_validate_cn_mode "$cn_mode"
+    fi
     if [ -n "$cidr" ]; then
         cidr="$(normalize_ip_or_cidr "$cidr")"
     fi
@@ -1345,11 +1356,20 @@ cmd_guard_whitelist() {
         enabled="$(whitelist_enabled)"
     fi
     if [ "$include_cn" = "__KEEP__" ]; then
-        include_cn="$(whitelist_include_cn)"
+        :
+    elif [ "$cn_mode" = "__KEEP__" ]; then
+        if [ "$include_cn" = "true" ]; then
+            cn_mode="all"
+        else
+            cn_mode="off"
+        fi
+    fi
+    if [ "$cn_mode" = "__KEEP__" ]; then
+        cn_mode="$(whitelist_cn_mode)"
     fi
     [ -n "$source_url" ] || source_url="$(whitelist_source_url)"
 
-    whitelist_config_set_state "$enabled" "$include_cn" "$source_url"
+    whitelist_config_set_state "$enabled" "$cn_mode" "$source_url"
 
     tmp_cidrs="$(mktemp)"
     if [ "$clear_custom" != "true" ]; then
@@ -1418,6 +1438,7 @@ cmd_guard_whitelist_custom() {
 cmd_guard_egress_whitelist() {
     config_init >/dev/null
     local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local cn_mode="__KEEP__"
     local refresh_requested="false" status_requested="false"
     local tmp_cidrs
 
@@ -1425,6 +1446,7 @@ cmd_guard_egress_whitelist() {
         case "$1" in
             --enabled) enabled="${2:-}"; shift 2 ;;
             --include-cn) include_cn="${2:-}"; shift 2 ;;
+            --cn-mode) cn_mode="${2:-}"; shift 2 ;;
             --source-url) source_url="${2:-}"; shift 2 ;;
             --cidr) cidr="${2:-}"; shift 2 ;;
             --replace-custom) replace_custom="true"; shift ;;
@@ -1435,12 +1457,12 @@ cmd_guard_egress_whitelist() {
         esac
     done
 
-    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         egress_whitelist_render_status
         return 0
     fi
 
-    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         egress_whitelist_apply_runtime
         if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
             pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
@@ -1452,6 +1474,9 @@ cmd_guard_egress_whitelist() {
 
     [ "$enabled" = "__KEEP__" ] || validate_bool "$enabled"
     [ "$include_cn" = "__KEEP__" ] || validate_bool "$include_cn"
+    if [ "$cn_mode" != "__KEEP__" ]; then
+        egress_whitelist_validate_cn_mode "$cn_mode"
+    fi
     if [ -n "$cidr" ]; then
         cidr="$(normalize_ip_or_cidr "$cidr")"
     fi
@@ -1460,11 +1485,20 @@ cmd_guard_egress_whitelist() {
         enabled="$(egress_whitelist_enabled)"
     fi
     if [ "$include_cn" = "__KEEP__" ]; then
-        include_cn="$(egress_whitelist_include_cn)"
+        :
+    elif [ "$cn_mode" = "__KEEP__" ]; then
+        if [ "$include_cn" = "true" ]; then
+            cn_mode="all"
+        else
+            cn_mode="off"
+        fi
+    fi
+    if [ "$cn_mode" = "__KEEP__" ]; then
+        cn_mode="$(egress_whitelist_cn_mode)"
     fi
     [ -n "$source_url" ] || source_url="$(egress_whitelist_source_url)"
 
-    egress_whitelist_config_set_state "$enabled" "$include_cn" "$source_url"
+    egress_whitelist_config_set_state "$enabled" "$cn_mode" "$source_url"
 
     tmp_cidrs="$(mktemp)"
     if [ "$clear_custom" != "true" ]; then
@@ -1484,6 +1518,105 @@ cmd_guard_egress_whitelist() {
     fi
     cmd_apply_guard_runtime
     echo "出口白名单已更新"
+}
+
+cmd_guard_whitelist_cn() {
+    config_init >/dev/null
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        list)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn list"
+            whitelist_geo_province_rows
+            ;;
+        status)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn status"
+            printf 'mode=%s\n' "$(whitelist_cn_mode)"
+            printf 'selection=%s\n' "$(whitelist_cn_selection_summary)"
+            ;;
+        all)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn all"
+            whitelist_config_apply_cn_selection all
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口白名单国内策略已更新为：国内IP"
+            ;;
+        off)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn off"
+            whitelist_config_apply_cn_selection off
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口白名单国内策略已关闭"
+            ;;
+        select)
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-cn select <省份...>"
+            local tmp
+            tmp="$(mktemp)"
+            printf '%s\n' "$@" > "$tmp"
+            whitelist_config_apply_cn_selection provinces "$tmp"
+            rm -f "$tmp"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口白名单国内策略已更新为省份选择"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard whitelist-cn list|status|all|off|select"
+            ;;
+    esac
+}
+
+cmd_guard_egress_whitelist_cn() {
+    config_init >/dev/null
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        list)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn list"
+            whitelist_geo_province_rows
+            ;;
+        status)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn status"
+            printf 'mode=%s\n' "$(egress_whitelist_cn_mode)"
+            printf 'selection=%s\n' "$(egress_whitelist_cn_selection_summary)"
+            ;;
+        all)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn all"
+            egress_whitelist_config_apply_cn_selection all
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单国内策略已更新为：国内IP"
+            ;;
+        off)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn off"
+            egress_whitelist_config_apply_cn_selection off
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单国内策略已关闭"
+            ;;
+        select)
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn select <省份...>"
+            local tmp
+            tmp="$(mktemp)"
+            printf '%s\n' "$@" > "$tmp"
+            egress_whitelist_config_apply_cn_selection provinces "$tmp"
+            rm -f "$tmp"
+            egress_whitelist_apply_runtime
+            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
+                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
+            fi
+            cmd_apply_guard_runtime
+            echo "出口白名单国内策略已更新为省份选择"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard egress-whitelist-cn list|status|all|off|select"
+            ;;
+    esac
 }
 
 cmd_guard_egress_whitelist_custom() {

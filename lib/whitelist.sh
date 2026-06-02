@@ -32,6 +32,52 @@ whitelist_include_cn() {
     jq -r 'if (.settings.whitelist.include_cn? | type) == "boolean" then .settings.whitelist.include_cn else true end' "$PFWD_CONFIG_FILE"
 }
 
+whitelist_cn_mode() {
+    jq -r '
+      if ((.settings.whitelist.cn_mode // "") | type) == "string" and (.settings.whitelist.cn_mode | length) > 0 then
+        .settings.whitelist.cn_mode
+      elif ((.settings.whitelist.include_cn? | type) == "boolean") then
+        (if .settings.whitelist.include_cn then "all" else "off" end)
+      else
+        "all"
+      end
+    ' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_cn_provinces_json() {
+    jq -c '.settings.whitelist.cn_provinces // []' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_cn_provinces_tsv() {
+    jq -r '.settings.whitelist.cn_provinces // [] | .[]' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_cn_mode_label() {
+    local mode="${1:-$(whitelist_cn_mode)}"
+    case "$mode" in
+        all) printf '国内IP' ;;
+        provinces) printf '省份' ;;
+        off) printf '关闭' ;;
+        *) printf '%s' "$mode" ;;
+    esac
+}
+
+whitelist_cn_selection_summary() {
+    local mode="${1:-$(whitelist_cn_mode)}"
+    case "$mode" in
+        all) printf '国内IP' ;;
+        provinces)
+            local provinces
+            provinces="$(whitelist_cn_provinces_tsv | pfwd_join_lines '、')"
+            [ -n "$provinces" ] || provinces="未选择"
+            printf '省份：%s' "$provinces"
+            ;;
+        *)
+            printf '关闭'
+            ;;
+    esac
+}
+
 whitelist_source_url() {
     jq -r --arg url "$(whitelist_default_source_url)" '.settings.whitelist.source_url // $url' "$PFWD_CONFIG_FILE"
 }
@@ -69,6 +115,116 @@ whitelist_custom_cidrs_count() {
 
 whitelist_runtime_hash() {
     jq -r '.settings.whitelist.runtime_hash // ""' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_geo_asset_dir() {
+    printf '%s\n' "$PFWD_ASSETS_DIR"
+}
+
+whitelist_geo_meta_file() {
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-geo-meta.json"
+}
+
+whitelist_geo_ipv4_asset_file() {
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-geo-cn-v4.bin"
+}
+
+whitelist_geo_ipv6_asset_file() {
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-geo-cn-v6.bin"
+}
+
+whitelist_require_geo_assets() {
+    [ "$(whitelist_cn_mode)" = "off" ] && return 0
+    [ -f "$(whitelist_geo_meta_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_meta_file)"
+    [ -f "$(whitelist_geo_ipv4_asset_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_ipv4_asset_file)"
+    [ -f "$(whitelist_geo_ipv6_asset_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_ipv6_asset_file)"
+}
+
+whitelist_geo_province_rows() {
+    local meta_file
+    meta_file="$(whitelist_geo_meta_file)"
+    [ -f "$meta_file" ] || pfwd_die "缺少 geo 省份资产：$meta_file，请先执行 ./xdp/build.sh 或使用完整安装包"
+    jq -r '.provinces[]? | [.id, .name] | @tsv' "$meta_file"
+}
+
+whitelist_validate_cn_provinces_file() {
+    local provinces_file="$1"
+    [ -f "$provinces_file" ] || pfwd_die "省份临时文件不存在：$provinces_file"
+    whitelist_require_geo_assets
+    local known tmp province
+    tmp="$(mktemp)"
+    whitelist_geo_province_rows | cut -f2 > "$tmp"
+    while IFS= read -r province; do
+        province="$(printf '%s' "$province" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$province" ] || continue
+        grep -Fxq "$province" "$tmp" || { rm -f "$tmp"; pfwd_die "未知省份：$province"; }
+    done < "$provinces_file"
+    rm -f "$tmp"
+}
+
+whitelist_validate_cn_mode() {
+    local mode="$1"
+    case "$mode" in
+        off|all|provinces) ;;
+        *) pfwd_die "无效入口白名单国内模式：$mode" ;;
+    esac
+}
+
+whitelist_config_set_cn_mode() {
+    local mode="$1"
+    whitelist_validate_cn_mode "$mode"
+    config_update --arg mode "$mode" '
+      (.settings.whitelist //= {})
+      | .settings.whitelist.cn_mode = $mode
+      | .settings.whitelist.include_cn = ($mode != "off")
+    '
+}
+
+whitelist_config_set_cn_provinces() {
+    local provinces_file="$1"
+    [ -f "$provinces_file" ] || pfwd_die "入口省份临时文件不存在：$provinces_file"
+    whitelist_validate_cn_provinces_file "$provinces_file"
+    config_update --rawfile provinces "$provinces_file" '
+      (.settings.whitelist //= {})
+      | .settings.whitelist.cn_provinces =
+          (($provinces
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | unique))
+    '
+}
+
+whitelist_config_apply_cn_selection() {
+    local mode="$1"
+    local provinces_file="${2:-}"
+    whitelist_validate_cn_mode "$mode"
+    case "$mode" in
+        off|all)
+            config_update --arg mode "$mode" '
+              (.settings.whitelist //= {})
+              | .settings.whitelist.cn_mode = $mode
+              | .settings.whitelist.cn_provinces = []
+              | .settings.whitelist.include_cn = ($mode != "off")
+            '
+            ;;
+        provinces)
+            [ -n "$provinces_file" ] || pfwd_die "缺少入口省份列表"
+            [ -f "$provinces_file" ] || pfwd_die "入口省份临时文件不存在：$provinces_file"
+            whitelist_validate_cn_provinces_file "$provinces_file"
+            config_update --arg mode "$mode" --rawfile provinces "$provinces_file" '
+              (.settings.whitelist //= {})
+              | .settings.whitelist.cn_mode = $mode
+              | .settings.whitelist.cn_provinces =
+                  (($provinces
+                    | split("\n")
+                    | map(gsub("^\\s+|\\s+$"; ""))
+                    | map(select(length > 0))
+                    | unique))
+              | .settings.whitelist.include_cn = true
+            '
+            ;;
+    esac
 }
 
 whitelist_filter_ipv4_cidrs() {
@@ -163,18 +319,20 @@ whitelist_validate_custom_cidrs() {
 
 whitelist_config_set_state() {
     local enabled="$1"
-    local include_cn="$2"
+    local cn_mode="$2"
     local source_url="$3"
     validate_bool "$enabled"
-    validate_bool "$include_cn"
+    whitelist_validate_cn_mode "$cn_mode"
     [ -n "$source_url" ] || source_url="$(whitelist_default_source_url)"
     config_update \
       --argjson enabled "$enabled" \
-      --argjson include_cn "$include_cn" \
+      --arg cn_mode "$cn_mode" \
       --arg source_url "$source_url" '
       (.settings.whitelist //= {})
       | .settings.whitelist.enabled = $enabled
-      | .settings.whitelist.include_cn = $include_cn
+      | .settings.whitelist.cn_mode = $cn_mode
+      | .settings.whitelist.include_cn = ($cn_mode != "off")
+      | if $cn_mode != "provinces" then .settings.whitelist.cn_provinces = [] else . end
       | .settings.whitelist.source_url = $source_url
     '
 }
@@ -257,60 +415,29 @@ whitelist_custom_cidr_by_index() {
 }
 
 whitelist_refresh_cn() {
-    local url tmp
-    url="$(whitelist_source_url)"
-    tmp="$(mktemp)"
-    pfwd_bootstrap_download "$url" "$tmp"
-    whitelist_write_allow_file "$tmp"
-    rm -f "$tmp"
-    whitelist_mark_last_good "$url" "$(pfwd_now_iso)"
+    whitelist_require_geo_assets
+    whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
 }
 
 whitelist_refresh_cn_ipv6() {
-    local url tmp
-    url="$(whitelist_default_ipv6_source_url)"
-    tmp="$(mktemp)"
-    pfwd_bootstrap_download "$url" "$tmp"
-    whitelist_write_allow_ipv6_file "$tmp"
-    rm -f "$tmp"
+    whitelist_require_geo_assets
 }
 
 whitelist_import_local_cn_seed() {
-    local file_path="$PFWD_INSTALL_DIR/assets/cn-aggregated.zone"
-    [ -f "$file_path" ] || return 1
-    whitelist_write_allow_file "$file_path"
-    whitelist_mark_last_good "$file_path" "$(pfwd_now_iso)"
-}
-
-whitelist_import_local_cn_seed_ipv6() {
-    local file_path="$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
-    [ -f "$file_path" ] || return 1
-    whitelist_write_allow_ipv6_file "$file_path"
+    whitelist_require_geo_assets
+    whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
 }
 
 whitelist_sync_cn() {
-    if ! whitelist_import_local_cn_seed; then
-        whitelist_refresh_cn
-    fi
-    if ! whitelist_import_local_cn_seed_ipv6; then
-        whitelist_refresh_cn_ipv6
-    fi
+    [ "$(whitelist_cn_mode)" != "off" ] || return 0
+    whitelist_import_local_cn_seed
+    whitelist_refresh_cn_ipv6
 }
 
 whitelist_merge_runtime() {
     local tmp_v4 tmp_v6
     tmp_v4="$(mktemp)"
     tmp_v6="$(mktemp)"
-    if [ "$(whitelist_include_cn)" = "true" ]; then
-        if [ -s "$(whitelist_allow_ipv4_file).cn" ]; then
-            cat "$(whitelist_allow_ipv4_file).cn" >> "$tmp_v4"
-            printf '\n' >> "$tmp_v4"
-        fi
-        if [ -s "$(whitelist_allow_ipv6_file).cn" ]; then
-            cat "$(whitelist_allow_ipv6_file).cn" >> "$tmp_v6"
-            printf '\n' >> "$tmp_v6"
-        fi
-    fi
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
 
@@ -328,35 +455,15 @@ whitelist_merge_runtime() {
 }
 
 whitelist_prepare_runtime() {
-    local cn_tmp
     if [ "$(whitelist_enabled)" != "true" ]; then
         rm -f "$(whitelist_allow_ipv4_file)" "$(whitelist_allow_ipv6_file)" 2>/dev/null || true
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
         return 0
     fi
 
-    if [ "$(whitelist_include_cn)" = "true" ]; then
-        cn_tmp="$(mktemp)"
-        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" ]; then
-            whitelist_filter_ipv4_cidrs < "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" | pfwd_write_atomic "$cn_tmp"
-            whitelist_mark_last_good "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" "$(pfwd_now_iso)"
-        else
-            pfwd_bootstrap_download "$(whitelist_source_url)" "$cn_tmp"
-            whitelist_filter_ipv4_cidrs < "$cn_tmp" | pfwd_write_atomic "$cn_tmp.filtered"
-            mv "$cn_tmp.filtered" "$cn_tmp"
-            whitelist_mark_last_good "$(whitelist_source_url)" "$(pfwd_now_iso)"
-        fi
-        mv "$cn_tmp" "$(whitelist_allow_ipv4_file).cn"
-
-        cn_tmp="$(mktemp)"
-        if [ -f "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" ]; then
-            whitelist_filter_ipv6_cidrs < "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone" | pfwd_write_atomic "$cn_tmp"
-        else
-            pfwd_bootstrap_download "$(whitelist_default_ipv6_source_url)" "$cn_tmp"
-            whitelist_filter_ipv6_cidrs < "$cn_tmp" | pfwd_write_atomic "$cn_tmp.filtered"
-            mv "$cn_tmp.filtered" "$cn_tmp"
-        fi
-        mv "$cn_tmp" "$(whitelist_allow_ipv6_file).cn"
+    if [ "$(whitelist_cn_mode)" != "off" ]; then
+        whitelist_require_geo_assets
+        whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
     else
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
     fi
@@ -372,7 +479,8 @@ whitelist_runtime_hash_compute() {
     local payload
     payload="$(cat <<EOF
 enabled=$(whitelist_enabled)
-include_cn=$(whitelist_include_cn)
+cn_mode=$(whitelist_cn_mode)
+cn_provinces=$(whitelist_cn_provinces_tsv | paste -sd ',' -)
 source=$(whitelist_source_url)
 last_good_source=$(whitelist_last_good_source)
 custom:
@@ -408,7 +516,8 @@ whitelist_apply_runtime() {
 whitelist_status_json() {
     jq -n \
       --argjson enabled "$(whitelist_enabled)" \
-      --argjson include_cn "$(whitelist_include_cn)" \
+      --arg cn_mode "$(whitelist_cn_mode)" \
+      --argjson cn_provinces "$(whitelist_cn_provinces_json)" \
       --arg source_url "$(whitelist_source_url)" \
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
@@ -418,7 +527,8 @@ whitelist_status_json() {
       --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
       '{
         enabled: $enabled,
-        include_cn: $include_cn,
+        cn_mode: $cn_mode,
+        cn_provinces: $cn_provinces,
         source_url: $source_url,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
@@ -435,7 +545,7 @@ whitelist_render_status() {
     jq -r '
       [
         ["启用白名单", (if .enabled then "开" else "关" end)],
-        ["包含国内 IP", (if .enabled then (if .include_cn then "开" else "关" end) else "-" end)],
+        ["国内 IP 策略", (if .enabled then (if .cn_mode == "all" then "国内IP" elif .cn_mode == "provinces" then ("省份：" + ((.cn_provinces // []) | join("、"))) else "关闭" end) else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],

@@ -201,6 +201,30 @@ struct pfwd_whitelist_key_v6 {
     __u8 addr[16];
 };
 
+struct pfwd_geo_bucket {
+    __u32 start;
+    __u32 count;
+};
+
+struct pfwd_geo_segment_v4 {
+    __u32 start;
+    __u32 end;
+    __u16 province_id;
+    __u16 pad;
+};
+
+struct pfwd_geo_segment_v6 {
+    __u8 start[16];
+    __u8 end[16];
+    __u16 province_id;
+    __u16 pad;
+};
+
+struct pfwd_geo_province_policy {
+    __u8 flags;
+    __u8 pad[3];
+};
+
 struct pfwd_flow_key {
     __u8 family;
     __u8 protocol;
@@ -347,6 +371,41 @@ struct {
     __type(key, struct pfwd_whitelist_cache_key_v6);
     __type(value, __u8);
 } pfwd_egress_whitelist_cache_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct pfwd_geo_bucket);
+} pfwd_geo_bucket_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct pfwd_geo_bucket);
+} pfwd_geo_bucket_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 131072);
+    __type(key, __u32);
+    __type(value, struct pfwd_geo_segment_v4);
+} pfwd_geo_segments_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 32768);
+    __type(key, __u32);
+    __type(value, struct pfwd_geo_segment_v6);
+} pfwd_geo_segments_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, struct pfwd_geo_province_policy);
+} pfwd_geo_province_policy SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -821,13 +880,140 @@ static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 v
     bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
+static __always_inline __u32 ipv6_word_be(const __u8 addr[16], int offset) {
+    return ((__u32)addr[offset] << 24) | ((__u32)addr[offset + 1] << 16) |
+           ((__u32)addr[offset + 2] << 8) | (__u32)addr[offset + 3];
+}
+
+static __always_inline int ipv6_addr_cmp(const __u8 left[16], const __u8 right[16]) {
+    __u32 left_word, right_word;
+    left_word = ipv6_word_be(left, 0);
+    right_word = ipv6_word_be(right, 0);
+    if (left_word != right_word) return left_word < right_word ? -1 : 1;
+    left_word = ipv6_word_be(left, 4);
+    right_word = ipv6_word_be(right, 4);
+    if (left_word != right_word) return left_word < right_word ? -1 : 1;
+    left_word = ipv6_word_be(left, 8);
+    right_word = ipv6_word_be(right, 8);
+    if (left_word != right_word) return left_word < right_word ? -1 : 1;
+    left_word = ipv6_word_be(left, 12);
+    right_word = ipv6_word_be(right, 12);
+    if (left_word != right_word) return left_word < right_word ? -1 : 1;
+    return 0;
+}
+
+static __always_inline int ipv6_addr_lt(const __u8 left[16], const __u8 right[16]) {
+    return ipv6_addr_cmp(left, right) < 0;
+}
+
+static __always_inline int ipv6_addr_gt(const __u8 left[16], const __u8 right[16]) {
+    return ipv6_addr_cmp(left, right) > 0;
+}
+
+static __always_inline __u8 geo_lookup_flags(__u16 province_id) {
+    __u32 key = province_id;
+    struct pfwd_geo_province_policy *policy;
+
+    if (province_id == 0) {
+        return 0;
+    }
+    policy = bpf_map_lookup_elem(&pfwd_geo_province_policy, &key);
+    if (!policy) {
+        return 0;
+    }
+    return policy->flags;
+}
+
+static __always_inline int geo_match_v4(__be32 addr, __u8 policy_flag) {
+    __u32 host_addr = bpf_ntohl(addr);
+    __u32 bucket_key = ((host_addr >> 24) & 0xffU) << 8 | ((host_addr >> 16) & 0xffU);
+    struct pfwd_geo_bucket *bucket = bpf_map_lookup_elem(&pfwd_geo_bucket_v4, &bucket_key);
+    __u32 low, high, loops = 0;
+
+    if (!bucket || bucket->count == 0) {
+        return 0;
+    }
+    low = bucket->start;
+    high = bucket->start + bucket->count - 1;
+#pragma unroll
+    for (loops = 0; loops < 16; loops++) {
+        __u32 mid;
+        struct pfwd_geo_segment_v4 *segment;
+        __u8 flags;
+
+        if (low > high) {
+            break;
+        }
+        mid = low + ((high - low) >> 1);
+        segment = bpf_map_lookup_elem(&pfwd_geo_segments_v4, &mid);
+        if (!segment) {
+            return 0;
+        }
+        if (host_addr < segment->start) {
+            if (mid == 0) {
+                break;
+            }
+            high = mid - 1;
+            continue;
+        }
+        if (host_addr > segment->end) {
+            low = mid + 1;
+            continue;
+        }
+        flags = geo_lookup_flags(segment->province_id);
+        return (flags & policy_flag) != 0;
+    }
+    return 0;
+}
+
+static __always_inline int geo_match_v6(const __u8 addr[16], __u8 policy_flag) {
+    __u32 bucket_key = ((__u32)addr[0] << 8) | (__u32)addr[1];
+    struct pfwd_geo_bucket *bucket = bpf_map_lookup_elem(&pfwd_geo_bucket_v6, &bucket_key);
+    __u32 low, high, loops = 0;
+
+    if (!bucket || bucket->count == 0) {
+        return 0;
+    }
+    low = bucket->start;
+    high = bucket->start + bucket->count - 1;
+#pragma unroll
+    for (loops = 0; loops < 16; loops++) {
+        __u32 mid;
+        struct pfwd_geo_segment_v6 *segment;
+        __u8 flags;
+
+        if (low > high) {
+            break;
+        }
+        mid = low + ((high - low) >> 1);
+        segment = bpf_map_lookup_elem(&pfwd_geo_segments_v6, &mid);
+        if (!segment) {
+            return 0;
+        }
+        if (ipv6_addr_lt(addr, segment->start)) {
+            if (mid == 0) {
+                break;
+            }
+            high = mid - 1;
+            continue;
+        }
+        if (ipv6_addr_gt(addr, segment->end)) {
+            low = mid + 1;
+            continue;
+        }
+        flags = geo_lookup_flags(segment->province_id);
+        return (flags & policy_flag) != 0;
+    }
+    return 0;
+}
+
 static __always_inline int whitelist_allowed_v4(__be32 addr) {
     int verdict = whitelist_cache_hit_v4(addr);
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = (whitelist_match_v4(addr) || geo_match_v4(addr, 1)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -838,7 +1024,7 @@ static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = (whitelist_match_v6(addr) || geo_match_v6(addr, 1)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -899,7 +1085,7 @@ static __always_inline int egress_whitelist_allowed_v4(__be32 addr) {
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = egress_whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = (egress_whitelist_match_v4(addr) || geo_match_v4(addr, 2)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -910,7 +1096,7 @@ static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16]) {
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = egress_whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = (egress_whitelist_match_v6(addr) || geo_match_v6(addr, 2)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }

@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$SCRIPT_DIR"
 
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go run -tags geobuild . --asset-dir "$ROOT_DIR/assets"
+
 clang -O2 -g -Wall -Werror -target bpfel -c xdp.bpf.c -o xdp_bpfel.o
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$ROOT_DIR/assets/pfwd-xdp-linux-amd64" .

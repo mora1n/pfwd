@@ -49,7 +49,11 @@ guard_config_file() {
 }
 
 guard_bin_path() {
-    printf '%s\n' "$PFWD_XDP_BIN_PATH"
+    if command -v forwarder_bin_path >/dev/null 2>&1; then
+        forwarder_bin_path
+    else
+        printf '%s\n' "$PFWD_XDP_BIN_PATH"
+    fi
 }
 
 guard_status_file() {
@@ -388,17 +392,17 @@ guard_status_json() {
     skip_ports="$(guard_protocol_skip_ports_display)"
     skip_count="$(guard_protocol_skip_ports_count)"
 
-    local wl_enabled="false" wl_include_cn="false" wl_entries=0 wl_custom_count=0
-    local ewl_enabled="false" ewl_include_cn="false" ewl_entries=0 ewl_custom_count=0
+    local wl_enabled="false" wl_cn_summary="关闭" wl_entries=0 wl_custom_count=0
+    local ewl_enabled="false" ewl_cn_summary="关闭" ewl_entries=0 ewl_custom_count=0
     if command -v whitelist_enabled >/dev/null 2>&1; then
         wl_enabled="$(whitelist_enabled)"
-        wl_include_cn="$(whitelist_include_cn)"
+        wl_cn_summary="$(whitelist_cn_selection_summary)"
         wl_entries="$(whitelist_entry_count)"
         wl_custom_count="$(whitelist_custom_cidrs_count)"
     fi
     if command -v egress_whitelist_enabled >/dev/null 2>&1; then
         ewl_enabled="$(egress_whitelist_enabled)"
-        ewl_include_cn="$(egress_whitelist_include_cn)"
+        ewl_cn_summary="$(egress_whitelist_cn_selection_summary)"
         ewl_entries="$(egress_whitelist_entry_count)"
         ewl_custom_count="$(egress_whitelist_custom_cidrs_count)"
     fi
@@ -423,11 +427,11 @@ guard_status_json() {
       --arg protocol_skip_ports "$skip_ports" \
       --argjson protocol_skip_ports_count "$skip_count" \
       --argjson wl_enabled "$wl_enabled" \
-      --argjson wl_include_cn "$wl_include_cn" \
+      --arg wl_cn_summary "$wl_cn_summary" \
       --argjson wl_entries "$wl_entries" \
       --argjson wl_custom_count "$wl_custom_count" \
       --argjson ewl_enabled "$ewl_enabled" \
-      --argjson ewl_include_cn "$ewl_include_cn" \
+      --arg ewl_cn_summary "$ewl_cn_summary" \
       --argjson ewl_entries "$ewl_entries" \
       --argjson ewl_custom_count "$ewl_custom_count" \
       '{
@@ -446,11 +450,11 @@ guard_status_json() {
         protocol_skip_ports: $protocol_skip_ports,
         protocol_skip_ports_count: $protocol_skip_ports_count,
         wl_enabled: $wl_enabled,
-        wl_include_cn: $wl_include_cn,
+        wl_cn_summary: $wl_cn_summary,
         wl_entries: $wl_entries,
         wl_custom_count: $wl_custom_count,
         ewl_enabled: $ewl_enabled,
-        ewl_include_cn: $ewl_include_cn,
+        ewl_cn_summary: $ewl_cn_summary,
         ewl_entries: $ewl_entries,
         ewl_custom_count: $ewl_custom_count,
         guard_binary: $bin,
@@ -476,11 +480,11 @@ guard_render_status() {
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
         ["跳过端口", .protocol_skip_ports],
         ["启用入口白名单", (if .wl_enabled then "开" else "关" end)],
-        ["入口包含国内 IP", (if .wl_enabled then (if .wl_include_cn then "开" else "关" end) else "-" end)],
+        ["入口国内 IP 策略", (if .wl_enabled then .wl_cn_summary else "-" end)],
         ["入口自定义 CIDR", (.wl_custom_count | tostring)],
         ["入口白名单条目", (.wl_entries | tostring)],
         ["启用出口白名单", (if .ewl_enabled then "开" else "关" end)],
-        ["出口包含国内 IP", (if .ewl_enabled then (if .ewl_include_cn then "开" else "关" end) else "-" end)],
+        ["出口国内 IP 策略", (if .ewl_enabled then .ewl_cn_summary else "-" end)],
         ["出口自定义 CIDR", (.ewl_custom_count | tostring)],
         ["出口白名单条目", (.ewl_entries | tostring)],
         ["XDP Pin", .xdp_pin],

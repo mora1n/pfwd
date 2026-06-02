@@ -43,6 +43,13 @@ PFWD_XDP_BIN_PATH="${PFWD_XDP_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-xdp}"
 PFWD_DOWNMASK_STATE_DIR="${PFWD_DOWNMASK_STATE_DIR:-$PFWD_STATE_DIR/downmask}"
 PFWD_DOWNMASK_STATUS_FILE="${PFWD_DOWNMASK_STATUS_FILE:-$PFWD_DOWNMASK_STATE_DIR/status.json}"
 PFWD_DOWNMASK_BIN_PATH="${PFWD_DOWNMASK_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-downmask}"
+if [ -z "${PFWD_ASSETS_DIR:-}" ]; then
+    if [ -n "${PFWD_SCRIPT_DIR:-}" ] && [ -d "$PFWD_SCRIPT_DIR/assets" ]; then
+        PFWD_ASSETS_DIR="$PFWD_SCRIPT_DIR/assets"
+    else
+        PFWD_ASSETS_DIR="$PFWD_INSTALL_DIR/assets"
+    fi
+fi
 PFWD_GUARD_STATE_DIR="${PFWD_GUARD_STATE_DIR:-$PFWD_STATE_DIR/guard}"
 PFWD_GUARD_STATUS_FILE="${PFWD_GUARD_STATUS_FILE:-$PFWD_GUARD_STATE_DIR/status.json}"
 PFWD_XDP_LINK_PIN_PATH="${PFWD_XDP_LINK_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_link}"
@@ -73,6 +80,11 @@ PFWD_XDP_ALLOWED_FLOWS_PIN_PATH="${PFWD_XDP_ALLOWED_FLOWS_PIN_PATH:-/sys/fs/bpf/
 PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH="${PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH:-/sys/fs/bpf/pfwd_host_egress_flows}"
 PFWD_XDP_GUARD_PREFIXES_PIN_PATH="${PFWD_XDP_GUARD_PREFIXES_PIN_PATH:-/sys/fs/bpf/pfwd_guard_prefixes}"
 PFWD_XDP_SKIP_PORTS_PIN_PATH="${PFWD_XDP_SKIP_PORTS_PIN_PATH:-/sys/fs/bpf/pfwd_protocol_skip_ports}"
+PFWD_XDP_GEO_BUCKET_V4_PIN_PATH="${PFWD_XDP_GEO_BUCKET_V4_PIN_PATH:-/sys/fs/bpf/pfwd_geo_bucket_v4}"
+PFWD_XDP_GEO_BUCKET_V6_PIN_PATH="${PFWD_XDP_GEO_BUCKET_V6_PIN_PATH:-/sys/fs/bpf/pfwd_geo_bucket_v6}"
+PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH="${PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH:-/sys/fs/bpf/pfwd_geo_segments_v4}"
+PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH="${PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH:-/sys/fs/bpf/pfwd_geo_segments_v6}"
+PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH="${PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH:-/sys/fs/bpf/pfwd_geo_province_policy}"
 PFWD_GUARD_XDP_PIN_PATH="${PFWD_GUARD_XDP_PIN_PATH:-$PFWD_XDP_LINK_PIN_PATH}"
 PFWD_GUARD_LINK_INGRESS_PATH="${PFWD_GUARD_LINK_INGRESS_PATH:-$PFWD_XDP_INGRESS_PIN_PATH}"
 PFWD_WHITELIST_STATE_DIR="${PFWD_WHITELIST_STATE_DIR:-$PFWD_STATE_DIR/whitelist}"
@@ -111,6 +123,24 @@ pfwd_today() {
 
 pfwd_now_minute() {
     date '+%Y-%m-%d %H:%M'
+}
+
+pfwd_join_lines() {
+    local delimiter="${1:-}"
+    awk -v delimiter="$delimiter" '
+      NF {
+        if (seen) {
+          printf "%s", delimiter
+        }
+        printf "%s", $0
+        seen = 1
+      }
+      END {
+        if (seen) {
+          printf "\n"
+        }
+      }
+    '
 }
 
 pfwd_normalize_minute_value() {
@@ -155,6 +185,19 @@ pfwd_mkdirs() {
 }
 
 forwarder_bin_path() {
+    if [ -x "$PFWD_XDP_BIN_PATH" ]; then
+        printf '%s\n' "$PFWD_XDP_BIN_PATH"
+        return 0
+    fi
+    local local_asset=""
+    case "$(uname -m)" in
+        x86_64|amd64) local_asset="$PFWD_ASSETS_DIR/pfwd-xdp-linux-amd64" ;;
+        aarch64|arm64) local_asset="$PFWD_ASSETS_DIR/pfwd-xdp-linux-arm64" ;;
+    esac
+    if [ -n "$local_asset" ] && [ -x "$local_asset" ]; then
+        printf '%s\n' "$local_asset"
+        return 0
+    fi
     printf '%s\n' "$PFWD_XDP_BIN_PATH"
 }
 
