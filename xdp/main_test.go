@@ -675,6 +675,50 @@ func TestWhitelistHashHelpers(t *testing.T) {
 	}
 }
 
+func TestGeoPolicyChangeHelpers(t *testing.T) {
+	base := runtimeAuxState{
+		IngressCNMode:      "provinces",
+		IngressCNProvinces: []string{"广东省", "浙江省"},
+		EgressCNMode:       "all",
+		EgressCNProvinces:  nil,
+	}
+	tests := []struct {
+		name        string
+		next        runtimeAuxState
+		wantIngress bool
+		wantEgress  bool
+	}{
+		{
+			name:        "same policy ignores province order",
+			next:        runtimeAuxState{IngressCNMode: "provinces", IngressCNProvinces: []string{"浙江省", "广东省"}, EgressCNMode: "all"},
+			wantIngress: false,
+			wantEgress:  false,
+		},
+		{
+			name:        "ingress province change",
+			next:        runtimeAuxState{IngressCNMode: "provinces", IngressCNProvinces: []string{"广东省"}, EgressCNMode: "all"},
+			wantIngress: true,
+			wantEgress:  false,
+		},
+		{
+			name:        "egress mode change",
+			next:        runtimeAuxState{IngressCNMode: "provinces", IngressCNProvinces: []string{"广东省", "浙江省"}, EgressCNMode: "provinces", EgressCNProvinces: []string{"广东省"}},
+			wantIngress: false,
+			wantEgress:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ingressGeoPolicyChanged(base, tc.next); got != tc.wantIngress {
+				t.Fatalf("ingressGeoPolicyChanged()=%v, want %v", got, tc.wantIngress)
+			}
+			if got := egressGeoPolicyChanged(base, tc.next); got != tc.wantEgress {
+				t.Fatalf("egressGeoPolicyChanged()=%v, want %v", got, tc.wantEgress)
+			}
+		})
+	}
+}
+
 func TestAuxStateValid(t *testing.T) {
 	tests := []struct {
 		name    string

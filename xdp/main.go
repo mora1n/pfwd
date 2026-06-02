@@ -226,19 +226,19 @@ type attachTiming struct {
 }
 
 type runtimeSemanticSettings struct {
-	Interface         string   `json:"interface"`
-	GuardEnabled      bool     `json:"guard_enabled"`
-	WhitelistEnabled  bool     `json:"whitelist_enabled"`
-	HostEgressEnabled bool     `json:"host_egress_enabled"`
-	BlockHTTP         bool     `json:"block_http"`
-	BlockTLS          bool     `json:"block_tls"`
-	BlockSOCKS        bool     `json:"block_socks"`
-	ProtocolSkipPorts []uint16 `json:"protocol_skip_ports,omitempty"`
-	GuardIngressMode  string   `json:"guard_ingress_mode,omitempty"`
-	IngressCNMode     string   `json:"ingress_cn_mode,omitempty"`
-	EgressCNMode      string   `json:"egress_cn_mode,omitempty"`
+	Interface          string   `json:"interface"`
+	GuardEnabled       bool     `json:"guard_enabled"`
+	WhitelistEnabled   bool     `json:"whitelist_enabled"`
+	HostEgressEnabled  bool     `json:"host_egress_enabled"`
+	BlockHTTP          bool     `json:"block_http"`
+	BlockTLS           bool     `json:"block_tls"`
+	BlockSOCKS         bool     `json:"block_socks"`
+	ProtocolSkipPorts  []uint16 `json:"protocol_skip_ports,omitempty"`
+	GuardIngressMode   string   `json:"guard_ingress_mode,omitempty"`
+	IngressCNMode      string   `json:"ingress_cn_mode,omitempty"`
+	EgressCNMode       string   `json:"egress_cn_mode,omitempty"`
 	IngressCNProvinces []string `json:"ingress_cn_provinces,omitempty"`
-	EgressCNProvinces []string `json:"egress_cn_provinces,omitempty"`
+	EgressCNProvinces  []string `json:"egress_cn_provinces,omitempty"`
 }
 
 type runtimeSemanticRule struct {
@@ -1467,6 +1467,13 @@ func clearWhitelistMaps(mapV4 *ebpf.Map, mapV6 *ebpf.Map, cacheV4 *ebpf.Map, cac
 	if err := clearMap[whitelistKeyV6, uint8](mapV6); err != nil {
 		return err
 	}
+	if err := clearWhitelistCacheMaps(cacheV4, cacheV6); err != nil {
+		return err
+	}
+	return nil
+}
+
+func clearWhitelistCacheMaps(cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
 	if err := clearMap[uint32, uint8](cacheV4); err != nil {
 		return err
 	}
@@ -1626,6 +1633,16 @@ func effectiveWhitelistFiles(runtimeData *runtimeFile, opts applyOptions) []stri
 	return files
 }
 
+func ingressGeoPolicyChanged(current, next runtimeAuxState) bool {
+	return current.IngressCNMode != next.IngressCNMode ||
+		!stringSlicesEqual(normalizeProvinceNames(current.IngressCNProvinces), normalizeProvinceNames(next.IngressCNProvinces))
+}
+
+func egressGeoPolicyChanged(current, next runtimeAuxState) bool {
+	return current.EgressCNMode != next.EgressCNMode ||
+		!stringSlicesEqual(normalizeProvinceNames(current.EgressCNProvinces), normalizeProvinceNames(next.EgressCNProvinces))
+}
+
 func applyIncrementalAuxState(
 	objs *bpfObjects,
 	runtimeData *runtimeFile,
@@ -1714,8 +1731,23 @@ func applyIncrementalAuxState(
 		!stringSlicesEqual(normalizeProvinceNames(current.IngressCNProvinces), normalizeProvinceNames(nextState.IngressCNProvinces)) ||
 		!stringSlicesEqual(normalizeProvinceNames(current.EgressCNProvinces), normalizeProvinceNames(nextState.EgressCNProvinces))
 	if geoStateChanged {
+		geoAssetsChanged := !currentValid || !whitelistHashesEqual(current.GeoAssetHashes, nextState.GeoAssetHashes)
+		ingressPolicyChanged := geoAssetsChanged || ingressGeoPolicyChanged(current, nextState)
+		egressPolicyChanged := geoAssetsChanged || egressGeoPolicyChanged(current, nextState)
 		if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
 			return runtimeAuxState{}, nil, err
+		}
+		if ingressPolicyChanged {
+			if err := clearWhitelistCacheMaps(objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
+				return runtimeAuxState{}, nil, fmt.Errorf("清理入口白名单 geo cache 失败: %w", err)
+			}
+			recordAuxAction(&actions, "whitelist_geo_cache", "reload", 0)
+		}
+		if egressPolicyChanged {
+			if err := clearWhitelistCacheMaps(objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
+				return runtimeAuxState{}, nil, fmt.Errorf("清理出口白名单 geo cache 失败: %w", err)
+			}
+			recordAuxAction(&actions, "egress_whitelist_geo_cache", "reload", 0)
 		}
 		if geoModeEnabled(nextState.IngressCNMode) || geoModeEnabled(nextState.EgressCNMode) {
 			assets, err := loadGeoAssets(runtimeData.Settings.GeoAssetDir)
