@@ -5027,26 +5027,30 @@ ui_menu_egress_whitelist() {
 }
 
 ui_print_downmask_summary() {
-    local pull_mode iface ratio ab_targets ab_mode
-    pull_mode="$(downmask_config_get '.pull_mode' 2>/dev/null || echo off)"
-    iface="$(downmask_iface 2>/dev/null || echo -)"
-    ratio="$(jq -r '.target_ratio // "-"' "$(downmask_state_file)" 2>/dev/null || echo -)"
-    ab_targets="$(downmask_ab_target_count 2>/dev/null || echo 0)"
-    ab_mode="$(downmask_config_get '.ab_pull.protocol_mode' 2>/dev/null || echo single)"
+    local json pull_mode iface ratio ab_targets ab_mode
+    if ! json="$(downmask_status_json 2>&1)"; then
+        printf '  下行伪装状态读取失败：%s\n' "$json"
+        return 0
+    fi
+    pull_mode="$(jq -r '.config.pull_mode // "off"' <<< "$json" 2>/dev/null || echo off)"
+    iface="$(jq -r '.day_state.iface // .config.iface // "-"' <<< "$json" 2>/dev/null || echo -)"
+    ratio="$(jq -r '.day_state.target_ratio // "-"' <<< "$json" 2>/dev/null || echo -)"
+    ab_targets="$(jq -r '.ab_targets | length' <<< "$json" 2>/dev/null || echo 0)"
+    ab_mode="$(jq -r '.config.ab_pull.protocol_mode // "single"' <<< "$json" 2>/dev/null || echo single)"
     local tws twe window_text
-    tws="$(downmask_config_get '.time_window_start' 2>/dev/null || true)"
-    twe="$(downmask_config_get '.time_window_end' 2>/dev/null || true)"
+    tws="$(jq -r '.config.time_window_start // ""' <<< "$json" 2>/dev/null || true)"
+    twe="$(jq -r '.config.time_window_end // ""' <<< "$json" 2>/dev/null || true)"
     if [ -z "$tws" ] || [ -z "$twe" ]; then
         window_text="全天"
     else
         window_text="${tws}-${twe}"
     fi
     local rx tx
-    rx="$(jq -r '.rx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
-    tx="$(jq -r '.tx_accum // 0' "$(downmask_state_file)" 2>/dev/null || echo 0)"
+    rx="$(jq -r '.day_state.rx_accum // 0' <<< "$json" 2>/dev/null || echo 0)"
+    tx="$(jq -r '.day_state.tx_accum // 0' <<< "$json" 2>/dev/null || echo 0)"
     local feed_tcp feed_udp
-    feed_tcp="$(downmask_config_get '.ab_feed.tcp_enabled' 2>/dev/null || echo false)"
-    feed_udp="$(downmask_config_get '.ab_feed.udp_enabled' 2>/dev/null || echo false)"
+    feed_tcp="$(jq -r '.config.ab_feed.tcp_enabled // false' <<< "$json" 2>/dev/null || echo false)"
+    feed_udp="$(jq -r '.config.ab_feed.udp_enabled // false' <<< "$json" 2>/dev/null || echo false)"
     printf '  拉流模式：%s  接口：%s  生效时段：%s  今日目标比例：%s\n' "$pull_mode" "$iface" "$window_text" "$ratio"
     printf '  今日入站：%s  今日出站：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
     printf '  A机拉流：模式=%s  B机池=%s 台\n' "$ab_mode" "$ab_targets"

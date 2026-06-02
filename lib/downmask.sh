@@ -415,7 +415,7 @@ downmask_load_day_state() {
     local file
     file="$(downmask_state_file)"
     if [ -f "$file" ]; then
-        cat "$file"
+        jq -c '.' "$file" || pfwd_die "无效 downmask 日状态文件：$file"
     else
         echo '{}'
     fi
@@ -853,29 +853,37 @@ downmask_state_get_fields() {
     ] | @tsv' <<< "$state_json"
 }
 
-downmask_reconcile_pull() {
+downmask_prepare_day_state() {
     config_init >/dev/null
     downmask_validate_configured_active_source
     local downmask_cfg pull_mode iface today state
     downmask_cfg="$(downmask_config_section '.settings.downmask')"
     pull_mode="$(jq -r '.pull_mode // "off"' <<< "$downmask_cfg")"
-    [ -n "$pull_mode" ] && [ "$pull_mode" != "off" ] || return 0
+    [ -n "$pull_mode" ] && [ "$pull_mode" != "off" ] || return 1
     iface="$(downmask_iface)"
-    [ -n "$iface" ] || return 0
-    [ -d "/sys/class/net/$iface" ] || return 0
+    [ -n "$iface" ] || return 1
+    [ -d "/sys/class/net/$iface" ] || return 1
 
     today="$(pfwd_today)"
-    state="$(downmask_load_day_state)"
+    state="$(downmask_load_day_state)" || return 1
 
     local raw_rx_tx raw_rx raw_tx
     raw_rx_tx="$(downmask_read_iface_bytes "$iface")"
     raw_rx="${raw_rx_tx%%$'\t'*}"
     raw_tx="${raw_rx_tx##*$'\t'}"
+    [[ "$raw_rx" =~ ^[0-9]+$ ]] || raw_rx=0
+    [[ "$raw_tx" =~ ^[0-9]+$ ]] || raw_tx=0
 
     local state_fields state_date target_ratio rx_accum tx_accum last_rx last_tx next_eligible
-    state_fields="$(downmask_state_get_fields "$state")"
+    state_fields="$(downmask_state_get_fields "$state")" || return 1
     IFS=$'\t' read -r state_date target_ratio rx_accum tx_accum last_rx last_tx next_eligible <<< "$state_fields"
+    [[ "$rx_accum" =~ ^[0-9]+$ ]] || rx_accum=0
+    [[ "$tx_accum" =~ ^[0-9]+$ ]] || tx_accum=0
+    [[ "$last_rx" =~ ^[0-9]+$ ]] || last_rx=0
+    [[ "$last_tx" =~ ^[0-9]+$ ]] || last_tx=0
+    [[ "$next_eligible" =~ ^[0-9]+$ ]] || next_eligible=0
 
+    local payload
     if [ "$state_date" != "$today" ] || [ -z "$target_ratio" ]; then
         local min_r max_r
         min_r="$(jq -r '.min_ratio // 1.5' <<< "$downmask_cfg")"
@@ -887,6 +895,31 @@ downmask_reconcile_pull() {
         last_tx="$raw_tx"
         next_eligible=0
         state_date="$today"
+        payload="$(jq -n \
+            --arg date "$state_date" \
+            --arg iface "$iface" \
+            --arg target_ratio "$target_ratio" \
+            --argjson rx_accum "$rx_accum" \
+            --argjson tx_accum "$tx_accum" \
+            --argjson last_rx_raw "$last_rx" \
+            --argjson last_tx_raw "$last_tx" \
+            --argjson next_eligible_at "$next_eligible" \
+            --arg updated_at "$(pfwd_now_iso)" '
+            {
+                date: $date,
+                iface: $iface,
+                target_ratio: ($target_ratio | tonumber),
+                rx_accum: $rx_accum,
+                tx_accum: $tx_accum,
+                last_rx_raw: $last_rx_raw,
+                last_tx_raw: $last_tx_raw,
+                next_eligible_at: $next_eligible_at,
+                last_action: "new_day",
+                last_actual_bytes: 0,
+                last_planned_bytes: 0,
+                last_error: "",
+                updated_at: $updated_at
+            }')" || return 1
     else
         local delta_rx delta_tx
         if [ "$raw_rx" -ge "$last_rx" ]; then
@@ -903,7 +936,56 @@ downmask_reconcile_pull() {
         tx_accum=$((tx_accum + delta_tx))
         last_rx="$raw_rx"
         last_tx="$raw_tx"
+        payload="$(jq -n \
+            --argjson previous "$state" \
+            --arg date "$state_date" \
+            --arg iface "$iface" \
+            --arg target_ratio "$target_ratio" \
+            --argjson rx_accum "$rx_accum" \
+            --argjson tx_accum "$tx_accum" \
+            --argjson last_rx_raw "$last_rx" \
+            --argjson last_tx_raw "$last_tx" \
+            --argjson next_eligible_at "$next_eligible" \
+            --arg updated_at "$(pfwd_now_iso)" '
+            ($previous // {})
+            + {
+                date: $date,
+                iface: $iface,
+                target_ratio: ($target_ratio | tonumber),
+                rx_accum: $rx_accum,
+                tx_accum: $tx_accum,
+                last_rx_raw: $last_rx_raw,
+                last_tx_raw: $last_tx_raw,
+                next_eligible_at: $next_eligible_at,
+                updated_at: $updated_at
+            }
+            | .last_action //= "skip"
+            | .last_actual_bytes //= 0
+            | .last_planned_bytes //= 0
+            | .last_error //= ""')" || return 1
     fi
+    downmask_save_day_state "$payload"
+    printf '%s\n' "$payload"
+}
+
+downmask_reconcile_pull() {
+    config_init >/dev/null
+    downmask_validate_configured_active_source
+    local downmask_cfg pull_mode iface state
+    downmask_cfg="$(downmask_config_section '.settings.downmask')"
+    pull_mode="$(jq -r '.pull_mode // "off"' <<< "$downmask_cfg")"
+    [ -n "$pull_mode" ] && [ "$pull_mode" != "off" ] || return 0
+    iface="$(downmask_iface)"
+    [ -n "$iface" ] || return 0
+    [ -d "/sys/class/net/$iface" ] || return 0
+
+    state="$(downmask_prepare_day_state)" || return 1
+    iface="$(jq -r '.iface // ""' <<< "$state")"
+    [ -n "$iface" ] || return 0
+
+    local state_fields state_date target_ratio rx_accum tx_accum last_rx last_tx next_eligible
+    state_fields="$(downmask_state_get_fields "$state")" || return 1
+    IFS=$'\t' read -r state_date target_ratio rx_accum tx_accum last_rx last_tx next_eligible <<< "$state_fields"
 
     local now_epoch action="skip" reason="" actual=0 planned=0
     now_epoch="$(downmask_now_epoch)"
@@ -943,7 +1025,7 @@ downmask_reconcile_pull() {
                 last_planned_bytes: $last_planned,
                 last_error: $last_error,
                 updated_at: $updated_at
-            }')"
+            }')" || return 1
         downmask_save_day_state "$payload"
     }
 
@@ -1098,9 +1180,19 @@ downmask_reload_feed_service() {
 downmask_status_json() {
     config_init >/dev/null
     downmask_validate_configured_active_source
-    local cfg state feed ab_targets
+    local cfg state feed ab_targets pull_mode iface
     cfg="$(jq -c '.settings.downmask // {}' "$PFWD_CONFIG_FILE")"
-    state="$(downmask_load_day_state)"
+    pull_mode="$(jq -r '.pull_mode // "off"' <<< "$cfg")"
+    if [ -n "$pull_mode" ] && [ "$pull_mode" != "off" ]; then
+        iface="$(downmask_iface)"
+        if [ -n "$iface" ] && [ -d "/sys/class/net/$iface" ]; then
+            state="$(downmask_prepare_day_state)" || return 1
+        else
+            state='{}'
+        fi
+    else
+        state='{}'
+    fi
     ab_targets="$(downmask_ab_pull_targets_json)"
     if [ -f "$PFWD_DOWNMASK_STATUS_FILE" ]; then
         feed="$(cat "$PFWD_DOWNMASK_STATUS_FILE" 2>/dev/null || echo '{}')"
