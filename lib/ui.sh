@@ -3038,10 +3038,10 @@ ui_resolve_listen_ports_by_forward_ids() {
 }
 
 ui_print_guard_skip_ports() {
-    local count
-    count="$(guard_protocol_skip_ports_count)"
-    if [ "$count" -gt 0 ]; then
-        ui_print_line "当前 Guard 跳过端口：$count 个" "$UI_C_ACCENT"
+    local ports
+    ports="$(guard_protocol_skip_ports_display)"
+    if [ "$ports" != "-" ]; then
+        ui_print_line "当前 Guard 跳过端口：$ports" "$UI_C_ACCENT"
     else
         ui_print_line "当前 Guard 跳过端口：-" "$UI_C_DIM"
     fi
@@ -3155,7 +3155,7 @@ ui_menu_guard_skip_ports_delete() {
     fi
     while true; do
         ui_render_page ui_render_guard_skip_ports_delete_page
-        ui_read "选择端口序号，可单/多/连续选择；1 表示删除全部" || return 1
+        ui_read "选择端口序号，可单/多/连续选择；0) 返回，1) 删除全部" || return 1
         raw="$UI_REPLY"
         ui_multiselect_parse_indexes "$raw" "$((count + 1))" true || return 1
         [ "$UI_EDIT_ABORTED" = "1" ] && return 0
@@ -3200,7 +3200,7 @@ ui_menu_guard_skip_ports_delete() {
 ui_menu_guard_skip_ports_add() {
     local new_ports merged_ports
     while true; do
-        if ! ui_guard_skip_ports_prompt_spec "增加 Guard 跳过端口" "输入端口规格，支持单端口、逗号多端口和连续范围。" ""; then
+        if ! ui_guard_skip_ports_prompt_spec "增加 Guard 跳过端口" "输入端口规格，支持单端口、逗号多端口和连续范围。0) 返回。" ""; then
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             ui_pause
             continue
@@ -3226,7 +3226,7 @@ ui_menu_guard_skip_ports_update() {
     fi
     while true; do
         ui_render_page ui_render_guard_skip_ports_update_page
-        ui_read "选择要修改的端口序号，可单/多/连续选择" || return 1
+        ui_read "选择要修改的端口序号，可单/多/连续选择；0) 返回" || return 1
         raw="$UI_REPLY"
         ui_multiselect_parse_indexes "$raw" "$count" true || return 1
         [ "$UI_EDIT_ABORTED" = "1" ] && return 0
@@ -3239,7 +3239,7 @@ ui_menu_guard_skip_ports_update() {
             [ -n "$port" ] || continue
             selected_ports="${selected_ports}${selected_ports:+,}$port"
         done <<< "$selected_indexes"
-        if ! ui_guard_skip_ports_prompt_spec "修改 Guard 跳过端口" "输入新的端口规格；会替换所选端口。" "$selected_ports"; then
+        if ! ui_guard_skip_ports_prompt_spec "修改 Guard 跳过端口" "输入新的端口规格；会替换所选端口。0) 返回。" "$selected_ports"; then
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             ui_pause
             continue
