@@ -2,14 +2,6 @@
 
 EGRESS_WHITELIST_LAST_ERROR=""
 
-egress_whitelist_default_source_url() {
-    printf '%s\n' "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone"
-}
-
-egress_whitelist_default_ipv6_source_url() {
-    printf '%s\n' "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone"
-}
-
 egress_whitelist_state_dir() {
     local state_dir="${1:-$PFWD_EGRESS_WHITELIST_STATE_DIR}"
     printf '%s\n' "$state_dir"
@@ -92,21 +84,6 @@ egress_whitelist_cn_selection_summary() {
             printf '关闭'
             ;;
     esac
-}
-
-egress_whitelist_source_url() {
-    local config_file="${1:-$PFWD_CONFIG_FILE}"
-    jq -r --arg url "$(egress_whitelist_default_source_url)" '.settings.egress_whitelist.source_url // $url' "$config_file"
-}
-
-egress_whitelist_last_good_source() {
-    local config_file="${1:-$PFWD_CONFIG_FILE}"
-    jq -r '.settings.egress_whitelist.last_good_source // ""' "$config_file"
-}
-
-egress_whitelist_last_good_updated_at() {
-    local config_file="${1:-$PFWD_CONFIG_FILE}"
-    jq -r '.settings.egress_whitelist.last_good_updated_at // empty' "$config_file"
 }
 
 egress_whitelist_custom_cidrs_tsv() {
@@ -351,16 +328,6 @@ egress_whitelist_prepare_host_runtime() {
     rm -f "$tmp_v4" "$tmp_v6"
 }
 
-egress_whitelist_mark_last_good() {
-    local source="$1"
-    local updated_at="$2"
-    config_update --arg source "$source" --arg updated_at "$updated_at" '
-      (.settings.egress_whitelist //= {})
-      | .settings.egress_whitelist.last_good_source = $source
-      | .settings.egress_whitelist.last_good_updated_at = $updated_at
-    '
-}
-
 egress_whitelist_validate_custom_cidrs() {
     local cidr
     while IFS= read -r cidr; do
@@ -373,20 +340,16 @@ egress_whitelist_validate_custom_cidrs() {
 egress_whitelist_config_set_state() {
     local enabled="$1"
     local cn_mode="$2"
-    local source_url="$3"
     validate_bool "$enabled"
     egress_whitelist_validate_cn_mode "$cn_mode"
-    [ -n "$source_url" ] || source_url="$(egress_whitelist_default_source_url)"
     config_update \
       --argjson enabled "$enabled" \
-      --arg cn_mode "$cn_mode" \
-      --arg source_url "$source_url" '
+      --arg cn_mode "$cn_mode" '
       (.settings.egress_whitelist //= {})
       | .settings.egress_whitelist.enabled = $enabled
       | .settings.egress_whitelist.cn_mode = $cn_mode
       | .settings.egress_whitelist.include_cn = ($cn_mode != "off")
       | if $cn_mode != "provinces" then .settings.egress_whitelist.cn_provinces = [] else . end
-      | .settings.egress_whitelist.source_url = $source_url
     '
 }
 
@@ -484,7 +447,6 @@ egress_whitelist_prepare_runtime() {
 
     if [ "$(egress_whitelist_cn_mode "$config_file")" != "off" ]; then
         egress_whitelist_require_geo_assets "$config_file"
-        [ "$config_file" = "$PFWD_CONFIG_FILE" ] && egress_whitelist_mark_last_good "$PFWD_ASSETS_DIR/pfwd-geo-meta.json" "$(pfwd_now_iso)"
     else
         rm -f "${ipv4_file}.cn" "${ipv6_file}.cn" 2>/dev/null || true
     fi
@@ -520,8 +482,6 @@ egress_whitelist_runtime_hash_compute() {
 enabled=$(egress_whitelist_enabled "$config_file")
 cn_mode=$(egress_whitelist_cn_mode "$config_file")
 cn_provinces=$(egress_whitelist_cn_provinces_tsv "$config_file" | paste -sd ',' -)
-source=$(egress_whitelist_source_url "$config_file")
-last_good_source=$(egress_whitelist_last_good_source "$config_file")
 custom:
 $(egress_whitelist_custom_cidrs_tsv "$config_file")
 ipv4:
@@ -558,13 +518,10 @@ egress_whitelist_status_json() {
       --argjson enabled "$(egress_whitelist_enabled)" \
       --arg cn_mode "$(egress_whitelist_cn_mode)" \
       --argjson cn_provinces "$(egress_whitelist_cn_provinces_json)" \
-      --arg source_url "$(egress_whitelist_source_url)" \
       --arg allow_ipv4_file "$(egress_whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(egress_whitelist_allow_ipv6_file)" \
       --arg host_allow_ipv4_file "$(egress_whitelist_host_allow_ipv4_file)" \
       --arg host_allow_ipv6_file "$(egress_whitelist_host_allow_ipv6_file)" \
-      --arg last_good_source "$(egress_whitelist_last_good_source)" \
-      --arg last_good_updated_at "$(egress_whitelist_last_good_updated_at)" \
       --argjson entries "$(egress_whitelist_entry_count)" \
       --argjson host_entries "$(egress_whitelist_host_entry_count)" \
       --argjson custom_cidrs_count "$(egress_whitelist_custom_cidrs_count)" \
@@ -572,13 +529,10 @@ egress_whitelist_status_json() {
         enabled: $enabled,
         cn_mode: $cn_mode,
         cn_provinces: $cn_provinces,
-        source_url: $source_url,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
         host_allow_ipv4_file: $host_allow_ipv4_file,
         host_allow_ipv6_file: $host_allow_ipv6_file,
-        last_good_source: $last_good_source,
-        last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
         entries: $entries,
         host_entries: $host_entries,
         custom_cidrs_count: $custom_cidrs_count
@@ -595,7 +549,6 @@ egress_whitelist_render_status() {
         ["出口自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["出口白名单条目", (.entries | tostring)],
         ["宿主机出口白名单条目", (.host_entries | tostring)],
-        ["出口来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],
         ["出口 IPv4 文件", .allow_ipv4_file],
         ["出口 IPv6 文件", .allow_ipv6_file],
         ["宿主机出口 IPv4 文件", .host_allow_ipv4_file],

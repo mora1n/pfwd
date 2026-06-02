@@ -130,8 +130,6 @@ pfwd_bootstrap_install() {
         fi
         chmod +x "$install_dir/assets/$downmask_asset"
     fi
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated.zone" "$install_dir/assets/cn-aggregated.zone"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/cn-aggregated-v6.zone" "$install_dir/assets/cn-aggregated-v6.zone"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v4.bin" "$install_dir/assets/pfwd-geo-cn-v4.bin"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v6.bin" "$install_dir/assets/pfwd-geo-cn-v6.bin"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-meta.json" "$install_dir/assets/pfwd-geo-meta.json"
@@ -278,13 +276,13 @@ pfwd - XDP 端口转发管理脚本
   pfwd notify-disable --user-id ID
   pfwd notify-delete --user-id ID
   pfwd guard enable|disable|status|apply|remove
-  pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off]
-  pfwd guard whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom] [--source-url URL]
-  pfwd guard whitelist refresh|status
+  pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off] [--skip-port PORT[,PORT]|START-END] [--replace-skip-ports] [--clear-skip-ports]
+  pfwd guard whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
+  pfwd guard whitelist status
   pfwd guard whitelist-cn list|status|all|off|select <省份...>
   pfwd guard whitelist-custom list|add|clear|delete|update ...
-  pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom] [--source-url URL]
-  pfwd guard egress-whitelist refresh|status
+  pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
+  pfwd guard egress-whitelist status
   pfwd guard egress-whitelist-cn list|status|all|off|select <省份...>
   pfwd guard egress-whitelist-custom list|add|clear|delete|update ...
   pfwd downmask status

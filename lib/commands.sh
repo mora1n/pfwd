@@ -1283,7 +1283,7 @@ cmd_guard() {
             guard_config_set_protocol_skip_ports "$tmp_ports"
             rm -f "$tmp_ports"
             cmd_apply_guard_runtime
-            echo "guard 协议封锁已更新"
+            echo "guard 配置已更新"
             ;;
         whitelist)
             cmd_guard_whitelist "$@"
@@ -1311,9 +1311,9 @@ cmd_guard() {
 
 cmd_guard_whitelist() {
     config_init >/dev/null
-    local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local enabled="__KEEP__" include_cn="__KEEP__" cidr="" replace_custom="false" clear_custom="false"
     local cn_mode="__KEEP__"
-    local refresh_requested="false" status_requested="false"
+    local status_requested="false"
     local tmp_cidrs current_cidrs
 
     while [ "$#" -gt 0 ]; do
@@ -1321,25 +1321,16 @@ cmd_guard_whitelist() {
             --enabled) enabled="${2:-}"; shift 2 ;;
             --include-cn) include_cn="${2:-}"; shift 2 ;;
             --cn-mode) cn_mode="${2:-}"; shift 2 ;;
-            --source-url) source_url="${2:-}"; shift 2 ;;
             --cidr) cidr="${2:-}"; shift 2 ;;
             --replace-custom) replace_custom="true"; shift ;;
             --clear-custom) clear_custom="true"; shift ;;
-            refresh) refresh_requested="true"; shift ;;
             status) status_requested="true"; shift ;;
             *) pfwd_die "未知选项：$1" ;;
         esac
     done
 
-    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$status_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         whitelist_render_status
-        return 0
-    fi
-
-    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
-        whitelist_apply_runtime
-        cmd_apply_guard_runtime
-        echo "入口白名单数据已刷新"
         return 0
     fi
 
@@ -1367,9 +1358,7 @@ cmd_guard_whitelist() {
     if [ "$cn_mode" = "__KEEP__" ]; then
         cn_mode="$(whitelist_cn_mode)"
     fi
-    [ -n "$source_url" ] || source_url="$(whitelist_source_url)"
-
-    whitelist_config_set_state "$enabled" "$cn_mode" "$source_url"
+    whitelist_config_set_state "$enabled" "$cn_mode"
 
     tmp_cidrs="$(mktemp)"
     if [ "$clear_custom" != "true" ]; then
@@ -1437,9 +1426,9 @@ cmd_guard_whitelist_custom() {
 
 cmd_guard_egress_whitelist() {
     config_init >/dev/null
-    local enabled="__KEEP__" include_cn="__KEEP__" source_url="" cidr="" replace_custom="false" clear_custom="false"
+    local enabled="__KEEP__" include_cn="__KEEP__" cidr="" replace_custom="false" clear_custom="false"
     local cn_mode="__KEEP__"
-    local refresh_requested="false" status_requested="false"
+    local status_requested="false"
     local tmp_cidrs
 
     while [ "$#" -gt 0 ]; do
@@ -1447,28 +1436,16 @@ cmd_guard_egress_whitelist() {
             --enabled) enabled="${2:-}"; shift 2 ;;
             --include-cn) include_cn="${2:-}"; shift 2 ;;
             --cn-mode) cn_mode="${2:-}"; shift 2 ;;
-            --source-url) source_url="${2:-}"; shift 2 ;;
             --cidr) cidr="${2:-}"; shift 2 ;;
             --replace-custom) replace_custom="true"; shift ;;
             --clear-custom) clear_custom="true"; shift ;;
-            refresh) refresh_requested="true"; shift ;;
             status) status_requested="true"; shift ;;
             *) pfwd_die "未知选项：$1" ;;
         esac
     done
 
-    if [ "$status_requested" = "true" ] && [ "$refresh_requested" = "false" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
+    if [ "$status_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
         egress_whitelist_render_status
-        return 0
-    fi
-
-    if [ "$refresh_requested" = "true" ] && [ "$enabled" = "__KEEP__" ] && [ "$include_cn" = "__KEEP__" ] && [ "$cn_mode" = "__KEEP__" ] && [ -z "$source_url" ] && [ -z "$cidr" ] && [ "$clear_custom" = "false" ]; then
-        egress_whitelist_apply_runtime
-        if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-            pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-        fi
-        cmd_apply_guard_runtime
-        echo "出口白名单数据已刷新"
         return 0
     fi
 
@@ -1496,9 +1473,7 @@ cmd_guard_egress_whitelist() {
     if [ "$cn_mode" = "__KEEP__" ]; then
         cn_mode="$(egress_whitelist_cn_mode)"
     fi
-    [ -n "$source_url" ] || source_url="$(egress_whitelist_source_url)"
-
-    egress_whitelist_config_set_state "$enabled" "$cn_mode" "$source_url"
+    egress_whitelist_config_set_state "$enabled" "$cn_mode"
 
     tmp_cidrs="$(mktemp)"
     if [ "$clear_custom" != "true" ]; then

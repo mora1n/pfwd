@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 
-whitelist_default_source_url() {
-    printf '%s\n' "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone"
-}
-
-whitelist_default_ipv6_source_url() {
-    printf '%s\n' "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/cn-aggregated.zone"
-}
-
 whitelist_state_dir() {
     printf '%s\n' "$PFWD_WHITELIST_STATE_DIR"
 }
@@ -76,18 +68,6 @@ whitelist_cn_selection_summary() {
             printf '关闭'
             ;;
     esac
-}
-
-whitelist_source_url() {
-    jq -r --arg url "$(whitelist_default_source_url)" '.settings.whitelist.source_url // $url' "$PFWD_CONFIG_FILE"
-}
-
-whitelist_last_good_source() {
-    jq -r '.settings.whitelist.last_good_source // ""' "$PFWD_CONFIG_FILE"
-}
-
-whitelist_last_good_updated_at() {
-    jq -r '.settings.whitelist.last_good_updated_at // empty' "$PFWD_CONFIG_FILE"
 }
 
 whitelist_custom_cidrs_tsv() {
@@ -298,16 +278,6 @@ whitelist_write_allow_ipv6_file() {
     [ -s "$target_file" ] || pfwd_die "白名单来源 IPv6 集合为空：$source_file"
 }
 
-whitelist_mark_last_good() {
-    local source="$1"
-    local updated_at="$2"
-    config_update --arg source "$source" --arg updated_at "$updated_at" '
-      (.settings.whitelist //= {})
-      | .settings.whitelist.last_good_source = $source
-      | .settings.whitelist.last_good_updated_at = $updated_at
-    '
-}
-
 whitelist_validate_custom_cidrs() {
     local cidr
     while IFS= read -r cidr; do
@@ -320,20 +290,16 @@ whitelist_validate_custom_cidrs() {
 whitelist_config_set_state() {
     local enabled="$1"
     local cn_mode="$2"
-    local source_url="$3"
     validate_bool "$enabled"
     whitelist_validate_cn_mode "$cn_mode"
-    [ -n "$source_url" ] || source_url="$(whitelist_default_source_url)"
     config_update \
       --argjson enabled "$enabled" \
-      --arg cn_mode "$cn_mode" \
-      --arg source_url "$source_url" '
+      --arg cn_mode "$cn_mode" '
       (.settings.whitelist //= {})
       | .settings.whitelist.enabled = $enabled
       | .settings.whitelist.cn_mode = $cn_mode
       | .settings.whitelist.include_cn = ($cn_mode != "off")
       | if $cn_mode != "provinces" then .settings.whitelist.cn_provinces = [] else . end
-      | .settings.whitelist.source_url = $source_url
     '
 }
 
@@ -414,26 +380,6 @@ whitelist_custom_cidr_by_index() {
     ' "$PFWD_CONFIG_FILE"
 }
 
-whitelist_refresh_cn() {
-    whitelist_require_geo_assets
-    whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
-}
-
-whitelist_refresh_cn_ipv6() {
-    whitelist_require_geo_assets
-}
-
-whitelist_import_local_cn_seed() {
-    whitelist_require_geo_assets
-    whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
-}
-
-whitelist_sync_cn() {
-    [ "$(whitelist_cn_mode)" != "off" ] || return 0
-    whitelist_import_local_cn_seed
-    whitelist_refresh_cn_ipv6
-}
-
 whitelist_merge_runtime() {
     local tmp_v4 tmp_v6
     tmp_v4="$(mktemp)"
@@ -463,7 +409,6 @@ whitelist_prepare_runtime() {
 
     if [ "$(whitelist_cn_mode)" != "off" ]; then
         whitelist_require_geo_assets
-        whitelist_mark_last_good "$(whitelist_geo_meta_file)" "$(pfwd_now_iso)"
     else
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
     fi
@@ -481,8 +426,6 @@ whitelist_runtime_hash_compute() {
 enabled=$(whitelist_enabled)
 cn_mode=$(whitelist_cn_mode)
 cn_provinces=$(whitelist_cn_provinces_tsv | paste -sd ',' -)
-source=$(whitelist_source_url)
-last_good_source=$(whitelist_last_good_source)
 custom:
 $(whitelist_custom_cidrs_tsv)
 ipv4:
@@ -518,22 +461,16 @@ whitelist_status_json() {
       --argjson enabled "$(whitelist_enabled)" \
       --arg cn_mode "$(whitelist_cn_mode)" \
       --argjson cn_provinces "$(whitelist_cn_provinces_json)" \
-      --arg source_url "$(whitelist_source_url)" \
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
-      --arg last_good_source "$(whitelist_last_good_source)" \
-      --arg last_good_updated_at "$(whitelist_last_good_updated_at)" \
       --argjson entries "$(whitelist_entry_count)" \
       --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
       '{
         enabled: $enabled,
         cn_mode: $cn_mode,
         cn_provinces: $cn_provinces,
-        source_url: $source_url,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
-        last_good_source: $last_good_source,
-        last_good_updated_at: (if $last_good_updated_at == "" then null else $last_good_updated_at end),
         entries: $entries,
         custom_cidrs_count: $custom_cidrs_count
       }'
@@ -548,7 +485,6 @@ whitelist_render_status() {
         ["国内 IP 策略", (if .enabled then (if .cn_mode == "all" then "国内IP" elif .cn_mode == "provinces" then ("省份：" + ((.cn_provinces // []) | join("、"))) else "关闭" end) else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
-        ["来源地址", (if .last_good_source == "" then .source_url else .last_good_source end)],
         ["IPv4 文件", .allow_ipv4_file],
         ["IPv6 文件", .allow_ipv6_file]
       ]

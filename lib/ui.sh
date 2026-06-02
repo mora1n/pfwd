@@ -1073,7 +1073,6 @@ ui_whitelist_summary_rows() {
             "国内 IP 策略") item="入口国内 IP 策略" ;;
             "自定义 CIDR") item="入口自定义 CIDR" ;;
             "白名单条目") item="入口白名单条目" ;;
-            "来源地址") item="入口来源地址" ;;
             "IPv4 文件") item="入口 IPv4 文件" ;;
             "IPv6 文件") item="入口 IPv6 文件" ;;
         esac
@@ -3042,9 +3041,9 @@ ui_print_guard_skip_ports() {
     local ports
     ports="$(guard_protocol_skip_ports_tsv | paste -sd, -)"
     if [ -n "$ports" ]; then
-        ui_print_line "当前跳过端口：$ports" "$UI_C_ACCENT"
+        ui_print_line "当前 Guard 跳过端口：$ports" "$UI_C_ACCENT"
     else
-        ui_print_line "当前跳过端口：-" "$UI_C_DIM"
+        ui_print_line "当前 Guard 跳过端口：-" "$UI_C_DIM"
     fi
 }
 
@@ -3064,7 +3063,7 @@ ui_print_guard_skip_port_list() {
 }
 
 ui_render_guard_skip_ports_menu_page() {
-    ui_header "跳过端口"
+    ui_header "Guard 跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3075,7 +3074,7 @@ ui_render_guard_skip_ports_menu_page() {
 }
 
 ui_render_guard_skip_ports_delete_page() {
-    ui_header "删除跳过端口"
+    ui_header "删除 Guard 跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3085,7 +3084,7 @@ ui_render_guard_skip_ports_delete_page() {
 }
 
 ui_render_guard_skip_ports_update_page() {
-    ui_header "修改跳过端口"
+    ui_header "修改 Guard 跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3114,7 +3113,7 @@ ui_menu_guard_skip_ports_delete() {
     local count raw indexes delete_indexes remaining_ports port idx delete_all
     count="$(guard_protocol_skip_ports_count)"
     if [ "$count" -eq 0 ]; then
-        ui_warn "当前没有跳过端口"
+        ui_warn "当前没有 Guard 跳过端口"
         ui_pause
         return 0
     fi
@@ -3137,7 +3136,7 @@ ui_menu_guard_skip_ports_delete() {
         if [ "$delete_all" -eq 1 ]; then
             ui_run cmd_guard protocols --clear-skip-ports
             if [ "$UI_STATUS" -eq 0 ]; then
-                ui_notice_set "协议封锁跳过端口已清空" "$UI_C_MENU_NUM"
+                ui_notice_set "Guard 跳过端口已清空" "$UI_C_MENU_NUM"
                 ui_pause
             fi
             return 0
@@ -3155,7 +3154,7 @@ ui_menu_guard_skip_ports_delete() {
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$remaining_ports"
         if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "协议封锁跳过端口已删除" "$UI_C_MENU_NUM"
+            ui_notice_set "Guard 跳过端口已删除" "$UI_C_MENU_NUM"
             ui_pause
         fi
         return 0
@@ -3166,7 +3165,7 @@ ui_menu_guard_skip_ports_update() {
     local count selected current_port new_port updated_ports port idx
     count="$(guard_protocol_skip_ports_count)"
     if [ "$count" -eq 0 ]; then
-        ui_warn "当前没有跳过端口"
+        ui_warn "当前没有 Guard 跳过端口"
         ui_pause
         return 0
     fi
@@ -3179,7 +3178,7 @@ ui_menu_guard_skip_ports_update() {
         [ "$selected" -ge 1 ] && [ "$selected" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; continue; }
         current_port="$(guard_protocol_skip_ports_tsv | sed -n "${selected}p")"
         [ -n "$current_port" ] || { ui_warn "端口序号不存在"; ui_pause; continue; }
-        ui_form_set "修改跳过端口" "输入新的监听端口；仅用于跳过协议封锁。"
+        ui_form_set "修改 Guard 跳过端口" "输入新的监听端口；该端口将绕过入口 Guard。"
         ui_form_add_kv "当前端口" "$current_port"
         ui_form_read "新端口" "$current_port" || { ui_form_reset; return 0; }
         new_port="$UI_REPLY"
@@ -3205,7 +3204,7 @@ ui_menu_guard_skip_ports_update() {
         ui_guard_skip_ports_apply_list "$updated_ports"
         ui_form_reset
         if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
+            ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
             ui_pause
         fi
         return 0
@@ -3219,7 +3218,7 @@ ui_menu_guard_skip_ports() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_select_forwards_multi_scoped true "选择需要跳过协议封锁的转发范围" || { ui_pause; continue; }
+                ui_select_forwards_multi_scoped true "选择需要跳过入口 Guard 的转发范围" || { ui_pause; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && continue
                 forward_ids="$UI_REPLY"
                 ports="$(ui_resolve_listen_ports_by_forward_ids "$forward_ids")"
@@ -3229,7 +3228,7 @@ ui_menu_guard_skip_ports() {
                     ui_run cmd_guard protocols --skip-port "$port"
                     [ "$UI_STATUS" -eq 0 ] || break
                 done <<< "$ports"
-                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "协议封锁跳过端口已更新" "$UI_C_MENU_NUM"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
                 ui_maybe_pause success
                 ;;
             2)

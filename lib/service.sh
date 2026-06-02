@@ -111,8 +111,6 @@ service_bundle_rows() {
     printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
     printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
     printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
-    printf '0644\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\tassets/cn-aggregated.zone\n'
-    printf '0644\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\tassets/cn-aggregated-v6.zone\n'
     printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
     printf '0644\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\n'
     printf '0644\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\n'

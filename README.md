@@ -64,9 +64,7 @@ tar -czf pfwd.tar.gz \
   assets/pfwd-downmask-linux-amd64 \
   assets/pfwd-geo-cn-v4.bin \
   assets/pfwd-geo-cn-v6.bin \
-  assets/pfwd-geo-meta.json \
-  assets/cn-aggregated.zone \
-  assets/cn-aggregated-v6.zone
+  assets/pfwd-geo-meta.json
 ```
 
 目标机器上解压并安装：
@@ -107,12 +105,13 @@ pfwd add \
 - 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，支持关闭国内段、允许全部国内 IP，或按省份批量允许；也可追加自定义 CIDR 或单个 IP
 - 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量；国内 IP / 省份策略与目标校验、宿主机出口共用一套配置
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`
+- Guard 跳过端口：指定监听端口可绕过入口 Guard，包括入口白名单和协议封锁；不影响出口白名单
 
 常用命令：
 
 ```bash
 pfwd guard enable
-pfwd guard protocols --https true --socks true
+pfwd guard protocols --https true --socks true --skip-port 25001
 pfwd guard whitelist --enabled true
 pfwd guard whitelist-cn all
 pfwd guard whitelist-cn select 广东省 江苏省
@@ -220,8 +219,6 @@ install -m 755 assets/pfwd-downmask-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-dow
 install -m 644 assets/pfwd-geo-cn-v4.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v4.bin
 install -m 644 assets/pfwd-geo-cn-v6.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v6.bin
 install -m 644 assets/pfwd-geo-meta.json /usr/local/lib/pfwd/assets/pfwd-geo-meta.json
-install -m 644 assets/cn-aggregated.zone /usr/local/lib/pfwd/assets/cn-aggregated.zone
-install -m 644 assets/cn-aggregated-v6.zone /usr/local/lib/pfwd/assets/cn-aggregated-v6.zone
 
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr
