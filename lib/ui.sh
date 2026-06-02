@@ -1070,7 +1070,10 @@ ui_whitelist_summary_rows() {
         [ -n "$item" ] || continue
         case "$item" in
             "启用白名单") item="启用入口白名单" ;;
-            "国内 IP 策略") item="入口国内 IP 策略" ;;
+            "国内 IP 策略")
+                item="入口国内 IP 策略"
+                [ "$value" != "-" ] && value="$(ui_guard_cn_compact_summary ingress)"
+                ;;
             "自定义 CIDR") item="入口自定义 CIDR" ;;
             "白名单条目") item="入口白名单条目" ;;
             "IPv4 文件") item="入口 IPv4 文件" ;;
@@ -1081,7 +1084,17 @@ ui_whitelist_summary_rows() {
 }
 
 ui_egress_whitelist_summary_rows() {
-    egress_whitelist_render_status
+    local rows item value
+    rows="$(egress_whitelist_render_status)"
+    while IFS=$'\t' read -r item value; do
+        [ -n "$item" ] || continue
+        case "$item" in
+            "出口国内 IP 策略")
+                [ "$value" != "-" ] && value="$(ui_guard_cn_compact_summary egress)"
+                ;;
+        esac
+        printf '%s\t%s\n' "$item" "$value"
+    done <<< "$rows"
 }
 
 ui_forward_line() {
@@ -4485,76 +4498,283 @@ ui_menu_whitelist_cidrs_delete() {
     fi
 }
 
-ui_cn_selection_rows() {
-    local idx=2 row
-    printf '0\t返回\n'
-    printf '1\t国内IP\n'
-    while IFS=$'\t' read -r _ row; do
-        [ -n "$row" ] || continue
-        printf '%s\t%s\n' "$idx" "$row"
-        idx=$((idx + 1))
-    done < <(whitelist_geo_province_rows)
+ui_guard_cn_kind_title() {
+    case "$1" in
+        ingress) printf '入口国内 IP/省份' ;;
+        egress) printf '出口国内 IP/省份' ;;
+        *) printf '国内 IP/省份' ;;
+    esac
 }
 
-ui_render_cn_selection_page() {
-    local title="$1"
-    local current="$2"
-    ui_header "$title"
-    ui_notice_render
-    printf '当前策略：%s\n' "$current"
-    printf '说明：这里按序号选择国内IP/省份，支持单个、逗号分隔多个序号和连续范围；端口输入场景的多端口请用 , 分隔，连续范围用 - 。\n'
-    printf '\n'
-    ui_table_render $'序号\t国内范围' "$(ui_cn_selection_rows)" "2"
+ui_guard_cn_kind_prefix() {
+    case "$1" in
+        ingress) printf '入口' ;;
+        egress) printf '出口' ;;
+        *) printf '' ;;
+    esac
 }
 
-ui_menu_guard_cn_selection() {
+ui_guard_cn_current_mode() {
+    case "$1" in
+        ingress) whitelist_cn_mode ;;
+        egress) egress_whitelist_cn_mode ;;
+    esac
+}
+
+ui_guard_cn_current_provinces() {
+    case "$1" in
+        ingress) whitelist_cn_provinces_tsv ;;
+        egress) egress_whitelist_cn_provinces_tsv ;;
+    esac
+}
+
+ui_guard_cn_compact_summary() {
     local kind="$1"
-    local current title raw parsed selected_count tmp province_indexes names mode
+    local mode count preview suffix
+    local -a provinces=() shown=()
+    mode="$(ui_guard_cn_current_mode "$kind")"
+    case "$mode" in
+        all)
+            printf '国内IP'
+            ;;
+        provinces)
+            mapfile -t provinces < <(ui_guard_cn_current_provinces "$kind")
+            count="${#provinces[@]}"
+            if [ "$count" -eq 0 ]; then
+                printf '省份：未选择'
+                return 0
+            fi
+            if [ "$count" -le 2 ]; then
+                printf '省份：%s' "$(printf '%s\n' "${provinces[@]}" | pfwd_join_lines '、')"
+                return 0
+            fi
+            shown=("${provinces[@]:0:3}")
+            suffix=""
+            [ "$count" -gt 3 ] && suffix="..."
+            preview="$(printf '%s\n' "${shown[@]}" | pfwd_join_lines '、')"
+            printf '省份：%s 个（%s%s）' "$count" "$preview" "$suffix"
+            ;;
+        *)
+            printf '关闭'
+            ;;
+    esac
+}
+
+ui_guard_cn_all_provinces() {
+    whitelist_geo_province_rows | cut -f2
+}
+
+ui_guard_cn_all_province_count() {
+    ui_guard_cn_all_provinces | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+ui_guard_cn_all_province_rows() {
+    local kind="$1"
+    local idx=1 province
+    local -A selected=()
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        selected["$province"]=1
+    done < <(ui_guard_cn_current_provinces "$kind")
+
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        if [ -n "${selected[$province]:-}" ]; then
+            printf '%s\t%s\t已选\n' "$idx" "$province"
+        else
+            printf '%s\t%s\t\n' "$idx" "$province"
+        fi
+        idx=$((idx + 1))
+    done < <(ui_guard_cn_all_provinces)
+}
+
+ui_guard_cn_selected_province_rows() {
+    local kind="$1"
+    local idx=1 province
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        printf '%s\t%s\n' "$idx" "$province"
+        idx=$((idx + 1))
+    done < <(ui_guard_cn_current_provinces "$kind")
+}
+
+ui_guard_cn_apply_all() {
+    case "$1" in
+        ingress) ui_run cmd_guard_whitelist_cn all ;;
+        egress) ui_run cmd_guard_egress_whitelist_cn all ;;
+    esac
+}
+
+ui_guard_cn_apply_off() {
+    case "$1" in
+        ingress) ui_run cmd_guard_whitelist_cn off ;;
+        egress) ui_run cmd_guard_egress_whitelist_cn off ;;
+    esac
+}
+
+ui_guard_cn_apply_provinces() {
+    local kind="$1"
+    shift
     if [ "$kind" = "ingress" ]; then
-        current="$(whitelist_cn_selection_summary)"
-        title="入口国内 IP 策略"
+        ui_run cmd_guard_whitelist_cn select "$@"
     else
-        current="$(egress_whitelist_cn_selection_summary)"
-        title="出口国内 IP 策略"
+        ui_run cmd_guard_egress_whitelist_cn select "$@"
     fi
-    ui_render_page ui_render_cn_selection_page "$title" "$current"
-    ui_read "选择序号，可单/多/连续；1 为国内IP，0 返回" || return 1
+}
+
+ui_guard_cn_provinces_from_indexes() {
+    local indexes="$1"
+    local -a all=() names=()
+    local idx
+    mapfile -t all < <(ui_guard_cn_all_provinces)
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        names+=("${all[$((idx - 1))]:-}")
+    done <<< "$indexes"
+    printf '%s\n' "${names[@]}" | sed '/^$/d'
+}
+
+ui_guard_cn_merge_with_current() {
+    local kind="$1"
+    local added="$2"
+    local province
+    local -A selected=()
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        selected["$province"]=1
+    done < <(ui_guard_cn_current_provinces "$kind")
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        selected["$province"]=1
+    done <<< "$added"
+
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        [ -n "${selected[$province]:-}" ] || continue
+        printf '%s\n' "$province"
+    done < <(ui_guard_cn_all_provinces)
+}
+
+ui_render_guard_cn_menu_page() {
+    local kind="$1"
+    ui_header "$(ui_guard_cn_kind_title "$kind")"
+    ui_notice_render
+    printf '当前策略：%s\n' "$(ui_guard_cn_compact_summary "$kind")"
+    printf '说明：添加/删除省份支持单序号、多序号和连续范围，例如 3、3,5、3-6。\n'
+    printf '\n'
+    ui_menu_item 1 "允许全部国内IP"
+    ui_menu_item 2 "关闭国内IP/省份"
+    ui_menu_item 3 "添加省份"
+    ui_menu_item 4 "删除省份"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_guard_cn_add_page() {
+    local kind="$1"
+    ui_header "$(ui_guard_cn_kind_title "$kind") - 添加省份"
+    ui_notice_render
+    printf '当前策略：%s\n' "$(ui_guard_cn_compact_summary "$kind")"
+    printf '说明：选择要加入白名单的省份；已选省份会保留。\n'
+    printf '\n'
+    ui_table_render $'序号\t省份\t当前' "$(ui_guard_cn_all_province_rows "$kind")" "2"
+}
+
+ui_render_guard_cn_delete_page() {
+    local kind="$1"
+    ui_header "$(ui_guard_cn_kind_title "$kind") - 删除省份"
+    ui_notice_render
+    printf '当前策略：%s\n' "$(ui_guard_cn_compact_summary "$kind")"
+    printf '说明：删除后如果没有剩余省份，将切换为关闭国内IP/省份。\n'
+    printf '\n'
+    ui_table_render $'序号\t省份' "$(ui_guard_cn_selected_province_rows "$kind")" "2"
+}
+
+ui_menu_guard_cn_add_provinces() {
+    local kind="$1"
+    local raw parsed total added merged prefix
+    local -a names=()
+    total="$(ui_guard_cn_all_province_count)"
+    [ "$total" -gt 0 ] || { ui_warn "暂无省份资产"; return 1; }
+    ui_render_page ui_render_guard_cn_add_page "$kind"
+    ui_read "选择省份序号，可单/多/连续；0 返回" || return 1
     raw="$UI_REPLY"
-    ui_multiselect_parse_indexes "$raw" "$(($(whitelist_geo_province_rows | wc -l | tr -d ' ') + 1))" true || return 1
+    ui_multiselect_parse_indexes "$raw" "$total" true || return 1
     [ "$UI_EDIT_ABORTED" = "1" ] && return 0
     parsed="$UI_REPLY"
-    selected_count="$(printf '%s\n' "$parsed" | sed '/^$/d' | wc -l | tr -d ' ')"
-    if printf '%s\n' "$parsed" | grep -qx '1'; then
-        [ "$selected_count" = "1" ] || { ui_warn "国内IP 不能和省份混合选择"; return 1; }
-        if [ "$kind" = "ingress" ]; then
-            ui_run cmd_guard_whitelist_cn all
-            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口国内 IP 策略已设为国内IP" "$UI_C_MENU_NUM"
-        else
-            ui_run cmd_guard_egress_whitelist_cn all
-            [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口国内 IP 策略已设为国内IP" "$UI_C_MENU_NUM"
-        fi
-        return 0
-    fi
-    province_indexes="$(printf '%s\n' "$parsed" | awk '$1 > 1 { print $1 - 1 }')"
-    [ -n "$province_indexes" ] || { ui_warn "请选择国内IP或至少一个省份"; return 1; }
-    tmp="$(mktemp)"
-    while IFS= read -r mode; do
-        [ -n "$mode" ] || continue
-        sed -n "${mode}p" < <(whitelist_geo_province_rows | cut -f2) >> "$tmp"
-    done <<< "$province_indexes"
-    mapfile -t names < "$tmp"
-    rm -f "$tmp"
+    added="$(ui_guard_cn_provinces_from_indexes "$parsed")"
+    merged="$(ui_guard_cn_merge_with_current "$kind" "$added")"
+    mapfile -t names < <(printf '%s\n' "$merged" | sed '/^$/d')
     if [ "${#names[@]}" -eq 0 ]; then
         ui_warn "未解析到省份"
         return 1
     fi
-    if [ "$kind" = "ingress" ]; then
-        ui_run cmd_guard_whitelist_cn select "${names[@]}"
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口国内 IP 策略已更新为省份选择" "$UI_C_MENU_NUM"
-    else
-        ui_run cmd_guard_egress_whitelist_cn select "${names[@]}"
-        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "出口国内 IP 策略已更新为省份选择" "$UI_C_MENU_NUM"
+    ui_guard_cn_apply_provinces "$kind" "${names[@]}"
+    prefix="$(ui_guard_cn_kind_prefix "$kind")"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "${prefix}国内 IP/省份已添加省份" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_cn_delete_provinces() {
+    local kind="$1"
+    local count raw parsed idx prefix
+    local -a current=() remaining=()
+    mapfile -t current < <(ui_guard_cn_current_provinces "$kind")
+    count="${#current[@]}"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "当前没有已选省份"
+        return 1
     fi
+    ui_render_page ui_render_guard_cn_delete_page "$kind"
+    ui_read "选择要删除的省份序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$UI_REPLY"
+    for idx in "${!current[@]}"; do
+        if printf '%s\n' "$parsed" | grep -qx "$((idx + 1))"; then
+            continue
+        fi
+        remaining+=("${current[$idx]}")
+    done
+    prefix="$(ui_guard_cn_kind_prefix "$kind")"
+    if [ "${#remaining[@]}" -eq 0 ]; then
+        ui_guard_cn_apply_off "$kind"
+        [ "$UI_STATUS" -eq 0 ] && ui_notice_set "${prefix}国内 IP/省份已关闭" "$UI_C_MENU_NUM"
+        return 0
+    fi
+    ui_guard_cn_apply_provinces "$kind" "${remaining[@]}"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "${prefix}国内 IP/省份已删除省份" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_cn_selection() {
+    local kind="$1"
+    local prefix
+    while true; do
+        ui_render_page ui_render_guard_cn_menu_page "$kind"
+        ui_read "选择" || return 0
+        prefix="$(ui_guard_cn_kind_prefix "$kind")"
+        case "$UI_REPLY" in
+            1)
+                ui_guard_cn_apply_all "$kind"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "${prefix}国内 IP/省份已设为国内IP" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_guard_cn_apply_off "$kind"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "${prefix}国内 IP/省份已关闭" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_menu_guard_cn_add_provinces "$kind"
+                ui_maybe_pause success
+                ;;
+            4)
+                ui_menu_guard_cn_delete_provinces "$kind"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
 }
 
 ui_render_ingress_whitelist_menu_page() {

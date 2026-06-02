@@ -137,7 +137,7 @@ egress_whitelist_config_set_cn_provinces() {
             | split("\n")
             | map(gsub("^\\s+|\\s+$"; ""))
             | map(select(length > 0))
-            | unique))
+            | reduce .[] as $province ([]; if index($province) then . else . + [$province] end)))
     '
 }
 
@@ -166,7 +166,7 @@ egress_whitelist_config_apply_cn_selection() {
                     | split("\n")
                     | map(gsub("^\\s+|\\s+$"; ""))
                     | map(select(length > 0))
-                    | unique))
+                    | reduce .[] as $province ([]; if index($province) then . else . + [$province] end)))
               | .settings.egress_whitelist.include_cn = true
             '
             ;;

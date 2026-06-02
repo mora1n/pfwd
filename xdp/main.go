@@ -35,7 +35,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
-const mapABIVersion = 8
+const mapABIVersion = 9
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -49,6 +49,10 @@ const (
 	ruleFlagNeedsAllow   = uint16(1 << 4)
 	ruleFlagSNATFixed    = uint16(1 << 5)
 	ruleFlagMSSEnabled   = uint16(1 << 6)
+	ruleFlagHasSkipPorts = uint16(1 << 7)
+	ruleFlagBlockHTTP    = uint16(1 << 8)
+	ruleFlagBlockTLS     = uint16(1 << 9)
+	ruleFlagBlockSOCKS   = uint16(1 << 10)
 	geoPolicyIngress     = uint8(1 << 0)
 	geoPolicyEgress      = uint8(1 << 1)
 )
@@ -607,17 +611,19 @@ type guardPrefixVal struct {
 }
 
 type geoSegmentMapV4 struct {
-	Start      uint32
-	End        uint32
-	ProvinceID uint16
-	Pad        uint16
+	Start       uint32
+	End         uint32
+	ProvinceID  uint16
+	PolicyFlags uint8
+	Pad         uint8
 }
 
 type geoSegmentMapV6 struct {
-	Start      [16]byte
-	End        [16]byte
-	ProvinceID uint16
-	Pad        uint16
+	Start       [16]byte
+	End         [16]byte
+	ProvinceID  uint16
+	PolicyFlags uint8
+	Pad         uint8
 }
 
 func main() {
@@ -902,14 +908,7 @@ func applyRuntime(opts applyOptions) error {
 	if err != nil {
 		return err
 	}
-	if currentStatus.Applied &&
-		currentStatus.BinaryVersion == binaryVersion &&
-		currentStatus.ConfigHash == runtimeSemanticConfigHash &&
-		currentStatus.GuardMode == opts.GuardMode &&
-		currentStatus.Interface == iface.Name &&
-		currentStatus.HostEgressEnabled == runtimeData.Settings.HostEgressEnabled &&
-		(!runtimeData.Settings.HostEgressEnabled || stringSlicesEqual(currentStatus.HostEgressInterfaces, hostEgressNames)) &&
-		(!runtimeData.Settings.HostEgressEnabled || pinnedPathExists(firstNonEmpty(opts.HostEgressPin, currentStatus.HostEgressPin))) &&
+	if runtimeStatusReusable(currentStatus, runtimeData.Settings, opts, iface.Name, hostEgressNames, runtimeSemanticConfigHash) &&
 		pinnedRuntimeMapsCompatible(opts) {
 		return nil
 	}
@@ -1154,6 +1153,44 @@ func loadRuntime(path string) (*runtimeFile, error) {
 		return nil, fmt.Errorf("不支持的 map_abi_version：%d", runtimeData.MapABIVersion)
 	}
 	return &runtimeData, nil
+}
+
+func runtimeStatusReusable(
+	currentStatus statusPayload,
+	settings runtimeSettings,
+	opts applyOptions,
+	ifaceName string,
+	hostEgressNames []string,
+	runtimeSemanticConfigHash string,
+) bool {
+	if !currentStatus.Applied {
+		return false
+	}
+	if currentStatus.BinaryVersion != binaryVersion {
+		return false
+	}
+	if currentStatus.MapABIVersion != mapABIVersion {
+		return false
+	}
+	if currentStatus.ConfigHash != runtimeSemanticConfigHash {
+		return false
+	}
+	if currentStatus.GuardMode != opts.GuardMode {
+		return false
+	}
+	if currentStatus.Interface != ifaceName {
+		return false
+	}
+	if currentStatus.HostEgressEnabled != settings.HostEgressEnabled {
+		return false
+	}
+	if settings.HostEgressEnabled && !stringSlicesEqual(currentStatus.HostEgressInterfaces, hostEgressNames) {
+		return false
+	}
+	if settings.HostEgressEnabled && !pinnedPathExists(firstNonEmpty(opts.HostEgressPin, currentStatus.HostEgressPin)) {
+		return false
+	}
+	return true
 }
 
 func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
@@ -1535,6 +1572,10 @@ func loadGeoMaps(
 	if bucketV4 == nil || bucketV6 == nil || segmentsV4 == nil || segmentsV6 == nil || provincePolicy == nil {
 		return fmt.Errorf("geo BPF map 未加载")
 	}
+	flagsByProvince, err := geoPolicyFlagsByProvince(assets, ingressMode, ingressProvinces, egressMode, egressProvinces)
+	if err != nil {
+		return err
+	}
 	for i, bucket := range assets.BucketsV4 {
 		key := uint32(i)
 		value := bucket
@@ -1551,18 +1592,45 @@ func loadGeoMaps(
 	}
 	for i, segment := range assets.SegmentsV4 {
 		key := uint32(i)
-		value := geoSegmentMapV4(segment)
+		value := geoSegmentMapV4{
+			Start:       segment.Start,
+			End:         segment.End,
+			ProvinceID:  segment.ProvinceID,
+			PolicyFlags: flagsByProvince[segment.ProvinceID],
+		}
 		if err := segmentsV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("写入 geo segment v4 失败 (key=%d): %w", i, err)
 		}
 	}
 	for i, segment := range assets.SegmentsV6 {
 		key := uint32(i)
-		value := geoSegmentMapV6(segment)
+		value := geoSegmentMapV6{
+			Start:       segment.Start,
+			End:         segment.End,
+			ProvinceID:  segment.ProvinceID,
+			PolicyFlags: flagsByProvince[segment.ProvinceID],
+		}
 		if err := segmentsV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("写入 geo segment v6 失败 (key=%d): %w", i, err)
 		}
 	}
+	for provinceID, flags := range flagsByProvince {
+		key := uint32(provinceID)
+		value := geoProvincePolicyVal{Flags: flags}
+		if err := provincePolicy.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入 geo province policy 失败 (province=%d): %w", provinceID, err)
+		}
+	}
+	return nil
+}
+
+func geoPolicyFlagsByProvince(
+	assets *geoAssetRuntime,
+	ingressMode string,
+	ingressProvinces []string,
+	egressMode string,
+	egressProvinces []string,
+) (map[uint16]uint8, error) {
 	flagsByProvince := make(map[uint16]uint8)
 	if geoModeEnabled(ingressMode) {
 		if ingressMode == "all" {
@@ -1573,7 +1641,7 @@ func loadGeoMaps(
 			for _, province := range normalizeProvinceNames(ingressProvinces) {
 				id, ok := assets.ProvinceIDs[province]
 				if !ok {
-					return fmt.Errorf("未知入口省份：%s", province)
+					return nil, fmt.Errorf("未知入口省份：%s", province)
 				}
 				flagsByProvince[id] |= geoPolicyIngress
 			}
@@ -1588,20 +1656,13 @@ func loadGeoMaps(
 			for _, province := range normalizeProvinceNames(egressProvinces) {
 				id, ok := assets.ProvinceIDs[province]
 				if !ok {
-					return fmt.Errorf("未知出口省份：%s", province)
+					return nil, fmt.Errorf("未知出口省份：%s", province)
 				}
 				flagsByProvince[id] |= geoPolicyEgress
 			}
 		}
 	}
-	for provinceID, flags := range flagsByProvince {
-		key := uint32(provinceID)
-		value := geoProvincePolicyVal{Flags: flags}
-		if err := provincePolicy.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo province policy 失败 (province=%d): %w", provinceID, err)
-		}
-	}
-	return nil
+	return flagsByProvince, nil
 }
 
 func normalizeProvinceNames(values []string) []string {
@@ -3389,8 +3450,22 @@ func makeRuleVal(rule runtimeRule, settings runtimeSettings) (ruleVal, error) {
 	if rule.RuleLimit > 0 || rule.UserLimit > 0 {
 		value.Flags |= ruleFlagNeedsQuota
 	}
-	if settings.GuardEnabled && (settings.BlockHTTP || settings.BlockTLS || settings.BlockSOCKS) && strings.Contains(rule.Protocol, "tcp") {
-		value.Flags |= ruleFlagNeedsGuard
+	if settings.GuardEnabled && len(settings.ProtocolSkipPorts) > 0 {
+		value.Flags |= ruleFlagHasSkipPorts
+	}
+	if settings.GuardEnabled && rule.Protocol == "tcp" {
+		if settings.BlockHTTP {
+			value.Flags |= ruleFlagBlockHTTP
+		}
+		if settings.BlockTLS {
+			value.Flags |= ruleFlagBlockTLS
+		}
+		if settings.BlockSOCKS {
+			value.Flags |= ruleFlagBlockSOCKS
+		}
+		if settings.BlockHTTP || settings.BlockTLS || settings.BlockSOCKS {
+			value.Flags |= ruleFlagNeedsGuard
+		}
 	}
 	if settings.WhitelistEnabled {
 		value.Flags |= ruleFlagNeedsAllow

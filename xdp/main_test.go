@@ -719,6 +719,174 @@ func TestGeoPolicyChangeHelpers(t *testing.T) {
 	}
 }
 
+func TestGeoPolicyFlagsByProvince(t *testing.T) {
+	assets := &geoAssetRuntime{
+		Meta: geoAssetMeta{
+			Provinces: []geoProvinceEntry{
+				{ID: 1, Name: "广东省"},
+				{ID: 2, Name: "浙江省"},
+				{ID: 3, Name: "北京市"},
+			},
+		},
+		ProvinceIDs: map[string]uint16{
+			"广东省": 1,
+			"浙江省": 2,
+			"北京市": 3,
+		},
+	}
+
+	tests := []struct {
+		name             string
+		ingressMode      string
+		ingressProvinces []string
+		egressMode       string
+		egressProvinces  []string
+		want             map[uint16]uint8
+		wantErr          string
+	}{
+		{
+			name:             "ingress provinces and egress all merge flags",
+			ingressMode:      "provinces",
+			ingressProvinces: []string{"浙江省", "广东省"},
+			egressMode:       "all",
+			want: map[uint16]uint8{
+				1: geoPolicyIngress | geoPolicyEgress,
+				2: geoPolicyIngress | geoPolicyEgress,
+				3: geoPolicyEgress,
+			},
+		},
+		{
+			name:        "disabled modes produce empty flags",
+			want:        map[uint16]uint8{},
+			ingressMode: "off",
+			egressMode:  "off",
+		},
+		{
+			name:             "unknown ingress province returns explicit error",
+			ingressMode:      "provinces",
+			ingressProvinces: []string{"不存在省"},
+			wantErr:          "未知入口省份：不存在省",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := geoPolicyFlagsByProvince(assets, tc.ingressMode, tc.ingressProvinces, tc.egressMode, tc.egressProvinces)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("geoPolicyFlagsByProvince error=%v, want contains %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("geoPolicyFlagsByProvince: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("flags len=%d, want %d: got=%v", len(got), len(tc.want), got)
+			}
+			for provinceID, wantFlags := range tc.want {
+				if got[provinceID] != wantFlags {
+					t.Fatalf("province %d flags=%d, want %d", provinceID, got[provinceID], wantFlags)
+				}
+			}
+		})
+	}
+}
+
+func TestMakeRuleValGuardFlags(t *testing.T) {
+	baseRule := runtimeRule{
+		Index:          1,
+		UserIndex:      2,
+		Protocol:       "tcp",
+		ResolvedTarget: "192.0.2.10",
+		RemotePort:     443,
+		TrafficRatio:   1,
+	}
+	tests := []struct {
+		name      string
+		rule      runtimeRule
+		settings  runtimeSettings
+		wantFlags uint16
+		denyFlags uint16
+	}{
+		{
+			name: "tcp guard encodes protocol filters and skip ports",
+			rule: baseRule,
+			settings: runtimeSettings{
+				GuardEnabled:      true,
+				BlockHTTP:         true,
+				BlockTLS:          true,
+				ProtocolSkipPorts: []uint16{443},
+			},
+			wantFlags: ruleFlagNeedsGuard | ruleFlagHasSkipPorts | ruleFlagBlockHTTP | ruleFlagBlockTLS,
+			denyFlags: ruleFlagBlockSOCKS,
+		},
+		{
+			name: "tcp skip ports without protocol filters only encode bypass",
+			rule: baseRule,
+			settings: runtimeSettings{
+				GuardEnabled:      true,
+				ProtocolSkipPorts: []uint16{443},
+			},
+			wantFlags: ruleFlagHasSkipPorts,
+			denyFlags: ruleFlagNeedsGuard | ruleFlagBlockHTTP | ruleFlagBlockTLS | ruleFlagBlockSOCKS,
+		},
+		{
+			name: "udp guard settings encode skip ports but not tcp-only filters",
+			rule: func() runtimeRule {
+				rule := baseRule
+				rule.Protocol = "udp"
+				return rule
+			}(),
+			settings: runtimeSettings{
+				GuardEnabled:      true,
+				BlockHTTP:         true,
+				BlockTLS:          true,
+				BlockSOCKS:        true,
+				ProtocolSkipPorts: []uint16{443},
+			},
+			wantFlags: ruleFlagHasSkipPorts,
+			denyFlags: ruleFlagNeedsGuard | ruleFlagBlockHTTP | ruleFlagBlockTLS | ruleFlagBlockSOCKS,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := makeRuleVal(tc.rule, tc.settings)
+			if err != nil {
+				t.Fatalf("makeRuleVal: %v", err)
+			}
+			if got.Flags&tc.wantFlags != tc.wantFlags {
+				t.Fatalf("flags=%#x, want bits %#x", got.Flags, tc.wantFlags)
+			}
+			if got.Flags&tc.denyFlags != 0 {
+				t.Fatalf("flags=%#x, denied bits %#x present", got.Flags, got.Flags&tc.denyFlags)
+			}
+		})
+	}
+}
+
+func TestRuntimeStatusReusableRequiresCurrentMapABI(t *testing.T) {
+	opts := applyOptions{GuardMode: "full"}
+	settings := runtimeSettings{}
+	status := statusPayload{
+		Applied:       true,
+		BinaryVersion: binaryVersion,
+		MapABIVersion: mapABIVersion,
+		ConfigHash:    "hash",
+		GuardMode:     "full",
+		Interface:     "eth0",
+	}
+	if !runtimeStatusReusable(status, settings, opts, "eth0", nil, "hash") {
+		t.Fatalf("runtimeStatusReusable()=false, want true")
+	}
+
+	status.MapABIVersion = mapABIVersion - 1
+	if runtimeStatusReusable(status, settings, opts, "eth0", nil, "hash") {
+		t.Fatalf("runtimeStatusReusable()=true for stale ABI, want false")
+	}
+}
+
 func TestAuxStateValid(t *testing.T) {
 	tests := []struct {
 		name    string
