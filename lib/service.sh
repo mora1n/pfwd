@@ -172,7 +172,7 @@ service_backup_shortcuts() {
     mkdir -p "$backup_dir"
     while IFS=$'\t' read -r _ link_path backup_name; do
         if [ -L "$link_path" ] || [ -e "$link_path" ]; then
-            cp -a "$link_path" "$backup_dir/$backup_name"
+            cp -a "$link_path" "$backup_dir/$backup_name" || return 1
         fi
     done < <(service_shortcut_rows)
 }
@@ -198,7 +198,7 @@ service_backup_unit_files() {
     while IFS= read -r unit; do
         [ -n "$unit" ] || continue
         if [ -e "$PFWD_SYSTEMD_DIR/$unit" ]; then
-            cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/$unit"
+            cp -a "$PFWD_SYSTEMD_DIR/$unit" "$backup_dir/$unit" || return 1
         fi
     done < <(service_unit_names)
 }
@@ -469,7 +469,21 @@ service_installed_version() {
 
 service_update_create_workdir() {
     pfwd_mkdirs
-    mktemp -d "${PFWD_RUN_DIR}/update.XXXXXX"
+    mktemp -d "${PFWD_STATE_DIR}/update.XXXXXX"
+}
+
+service_update_path_size_kb() {
+    local path="$1"
+    if [ ! -e "$path" ]; then
+        echo 0
+        return 0
+    fi
+    du -sk "$path" | awk 'NR == 1 {print $1}'
+}
+
+service_update_available_kb() {
+    local path="$1"
+    df -Pk "$path" | awk 'NR == 2 {print $4}'
 }
 
 service_update_download_bundle() {
@@ -564,9 +578,30 @@ service_update_backup_current() {
     local backup_dir="$work_dir/backup"
 
     mkdir -p "$backup_dir/install" "$backup_dir/systemd" "$backup_dir/bin"
-    cp -a "$PFWD_INSTALL_DIR/." "$backup_dir/install/"
-    service_backup_shortcuts "$backup_dir/bin"
-    service_backup_unit_files "$backup_dir/systemd"
+    cp -a "$PFWD_INSTALL_DIR/." "$backup_dir/install/" || return 1
+    service_backup_shortcuts "$backup_dir/bin" || return 1
+    service_backup_unit_files "$backup_dir/systemd" || return 1
+}
+
+service_update_preflight_space() {
+    local work_dir="$1"
+    local staged_dir="$work_dir/staged"
+    local installed_kb staged_kb available_kb required_kb safety_kb
+
+    installed_kb="$(service_update_path_size_kb "$PFWD_INSTALL_DIR")" || return 1
+    staged_kb="$(service_update_path_size_kb "$staged_dir")" || return 1
+    available_kb="$(service_update_available_kb "$work_dir")" || return 1
+    safety_kb=16384
+    required_kb=$((installed_kb + staged_kb + safety_kb))
+
+    if [ "$available_kb" -lt "$required_kb" ]; then
+        {
+            printf '更新工作目录空间不足：%s\n' "$work_dir"
+            printf '可用空间：%sKB；预计需要：%sKB（当前安装：%sKB，更新包：%sKB，安全余量：%sKB）\n' \
+                "$available_kb" "$required_kb" "$installed_kb" "$staged_kb" "$safety_kb"
+        } >&2
+        return 1
+    fi
 }
 
 service_update_apply_staged() {

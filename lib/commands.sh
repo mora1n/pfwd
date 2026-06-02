@@ -204,6 +204,10 @@ cmd_update() {
         return 0
     fi
 
+    if ! service_update_preflight_space "$work_dir"; then
+        pfwd_die "更新工作目录空间不足；未应用更新；临时目录保留：$work_dir"
+    fi
+
     if [ "$auto_yes" != "true" ]; then
         if [ ! -t 0 ]; then
             pfwd_die "非交互环境请使用 pfwd update --yes"
@@ -221,7 +225,9 @@ cmd_update() {
     timer_enabled="$(service_update_capture_enabled_state "$(service_timer_unit_name)")"
     guard_enabled="$(service_update_capture_enabled_state "$(service_guard_unit_name)")"
 
-    service_update_backup_current "$work_dir"
+    if ! service_update_backup_current "$work_dir"; then
+        pfwd_die "备份当前安装失败；未应用更新；临时目录保留：$work_dir"
+    fi
     if ! service_update_apply_staged "$work_dir"; then
         service_update_rollback "$work_dir" || true
         pfwd_die "更新失败，已回滚；临时目录保留：$work_dir"
