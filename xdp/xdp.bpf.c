@@ -41,6 +41,8 @@ enum pfwd_rule_flags {
     PFWD_RULE_F_BLOCK_HTTP = 1U << 8,
     PFWD_RULE_F_BLOCK_TLS = 1U << 9,
     PFWD_RULE_F_BLOCK_SOCKS = 1U << 10,
+    PFWD_RULE_F_ALLOW_CUSTOM = 1U << 11,
+    PFWD_RULE_F_ALLOW_GEO = 1U << 12,
 };
 
 enum pfwd_rule_flag_groups {
@@ -75,7 +77,9 @@ struct pfwd_settings {
     __u8 block_socks;
     __u8 guard_enabled;
     __u8 has_skip_ports;
-    __u8 pad[2];
+    __u8 egress_whitelist_custom;
+    __u8 egress_whitelist_geo;
+    __u8 pad[4];
     __u32 external_ifindex;
     __u32 loopback_ifindex;
 };
@@ -995,24 +999,46 @@ static __always_inline int geo_match_v6(const __u8 addr[16], __u8 policy_flag) {
     return 0;
 }
 
-static __always_inline int whitelist_allowed_v4(__be32 addr) {
+static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_rule_val *rule) {
     int verdict = whitelist_cache_hit_v4(addr);
+    int custom;
+    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = (whitelist_match_v4(addr) || geo_match_v4(addr, 1)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    if (!rule) {
+        return 0;
+    }
+    custom = rule->flags & PFWD_RULE_F_ALLOW_CUSTOM;
+    geo = rule->flags & PFWD_RULE_F_ALLOW_GEO;
+    if (geo) {
+        verdict = (geo_match_v4(addr, 1) || (custom && whitelist_match_v4(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    } else {
+        verdict = (custom && whitelist_match_v4(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    }
     whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
-static __always_inline int whitelist_allowed_v6(const __u8 addr[16]) {
+static __always_inline int whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_rule_val *rule) {
     int verdict = whitelist_cache_hit_v6(addr);
+    int custom;
+    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = (whitelist_match_v6(addr) || geo_match_v6(addr, 1)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    if (!rule) {
+        return 0;
+    }
+    custom = rule->flags & PFWD_RULE_F_ALLOW_CUSTOM;
+    geo = rule->flags & PFWD_RULE_F_ALLOW_GEO;
+    if (geo) {
+        verdict = (geo_match_v6(addr, 1) || (custom && whitelist_match_v6(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    } else {
+        verdict = (custom && whitelist_match_v6(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    }
     whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -1067,24 +1093,46 @@ static __always_inline void egress_whitelist_cache_store_v6(const __u8 addr[16],
     bpf_map_update_elem(&pfwd_egress_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
-static __always_inline int egress_whitelist_allowed_v4(__be32 addr) {
+static __always_inline int egress_whitelist_allowed_v4(__be32 addr, const struct pfwd_settings *settings) {
     int verdict = egress_whitelist_cache_hit_v4(addr);
+    int custom;
+    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = (egress_whitelist_match_v4(addr) || geo_match_v4(addr, 2)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    if (!settings) {
+        return 0;
+    }
+    custom = settings->egress_whitelist_custom;
+    geo = settings->egress_whitelist_geo;
+    if (geo) {
+        verdict = (geo_match_v4(addr, 2) || (custom && egress_whitelist_match_v4(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    } else {
+        verdict = (custom && egress_whitelist_match_v4(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    }
     egress_whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
-static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16]) {
+static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_settings *settings) {
     int verdict = egress_whitelist_cache_hit_v6(addr);
+    int custom;
+    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = (egress_whitelist_match_v6(addr) || geo_match_v6(addr, 2)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    if (!settings) {
+        return 0;
+    }
+    custom = settings->egress_whitelist_custom;
+    geo = settings->egress_whitelist_geo;
+    if (geo) {
+        verdict = (geo_match_v6(addr, 2) || (custom && egress_whitelist_match_v6(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    } else {
+        verdict = (custom && egress_whitelist_match_v6(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    }
     egress_whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -2083,7 +2131,7 @@ static __always_inline int tc_local_forward_v4(
     init_counter_plan(rule, &counters);
     if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
         if (counter_plan_needs_allow(&counters)) {
-            if (!whitelist_allowed_v4(ip4->saddr)) {
+            if (!whitelist_allowed_v4(ip4->saddr, rule)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop_with_plan(rule, packet_len, &counters);
                 return TC_ACT_SHOT;
@@ -2152,7 +2200,7 @@ static __always_inline int tc_local_forward_v6(
     init_counter_plan(rule, &counters);
     if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
         if (counter_plan_needs_allow(&counters)) {
-            if (!whitelist_allowed_v6(ip6->saddr)) {
+            if (!whitelist_allowed_v6(ip6->saddr, rule)) {
                 stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                 count_drop_with_plan(rule, packet_len, &counters);
                 return TC_ACT_SHOT;
@@ -2205,7 +2253,8 @@ static __always_inline int tc_local_forward_v6(
 
 static __always_inline int host_egress_allow_v4_tcp(
     struct ipv4hdr_min *ip4,
-    const struct tcphdr_min *tcp
+    const struct tcphdr_min *tcp,
+    struct pfwd_settings *settings
 ) {
     struct pfwd_flow_key flow = {};
     int verdict;
@@ -2224,7 +2273,14 @@ static __always_inline int host_egress_allow_v4_tcp(
         count_host_egress_drop();
         return TC_ACT_SHOT;
     }
-    if (egress_whitelist_allowed_v4(ip4->daddr)) {
+    if (!settings) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+    }
+    if (egress_whitelist_allowed_v4(ip4->daddr, settings)) {
         host_egress_flow_store_allow(&flow);
         return TC_ACT_OK;
     }
@@ -2239,7 +2295,8 @@ static __always_inline int host_egress_allow_v4_tcp(
 
 static __always_inline int host_egress_allow_v4_udp(
     struct ipv4hdr_min *ip4,
-    const struct udphdr_min *udp
+    const struct udphdr_min *udp,
+    struct pfwd_settings *settings
 ) {
     struct pfwd_flow_key flow = {};
     int verdict;
@@ -2258,7 +2315,14 @@ static __always_inline int host_egress_allow_v4_udp(
         count_host_egress_drop();
         return TC_ACT_SHOT;
     }
-    if (egress_whitelist_allowed_v4(ip4->daddr)) {
+    if (!settings) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+    }
+    if (egress_whitelist_allowed_v4(ip4->daddr, settings)) {
         host_egress_flow_store_allow(&flow);
         return TC_ACT_OK;
     }
@@ -2269,7 +2333,8 @@ static __always_inline int host_egress_allow_v4_udp(
 
 static __always_inline int host_egress_allow_v6_tcp(
     struct ipv6hdr_min *ip6,
-    const struct tcphdr_min *tcp
+    const struct tcphdr_min *tcp,
+    struct pfwd_settings *settings
 ) {
     struct pfwd_flow_key flow = {};
     int verdict;
@@ -2288,7 +2353,14 @@ static __always_inline int host_egress_allow_v6_tcp(
         count_host_egress_drop();
         return TC_ACT_SHOT;
     }
-    if (egress_whitelist_allowed_v6(ip6->daddr)) {
+    if (!settings) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+    }
+    if (egress_whitelist_allowed_v6(ip6->daddr, settings)) {
         host_egress_flow_store_allow(&flow);
         return TC_ACT_OK;
     }
@@ -2303,7 +2375,8 @@ static __always_inline int host_egress_allow_v6_tcp(
 
 static __always_inline int host_egress_allow_v6_udp(
     struct ipv6hdr_min *ip6,
-    const struct udphdr_min *udp
+    const struct udphdr_min *udp,
+    struct pfwd_settings *settings
 ) {
     struct pfwd_flow_key flow = {};
     int verdict;
@@ -2322,7 +2395,14 @@ static __always_inline int host_egress_allow_v6_udp(
         count_host_egress_drop();
         return TC_ACT_SHOT;
     }
-    if (egress_whitelist_allowed_v6(ip6->daddr)) {
+    if (!settings) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+    }
+    if (egress_whitelist_allowed_v6(ip6->daddr, settings)) {
         host_egress_flow_store_allow(&flow);
         return TC_ACT_OK;
     }
@@ -2336,6 +2416,7 @@ int pfwd_host_egress(struct __sk_buff *skb) {
     void *data;
     void *data_end;
     struct ethhdr *eth;
+    struct pfwd_settings *settings = 0;
 
     if (tc_pull_data_min(skb, ETH_HLEN + sizeof(struct ipv4hdr_min)) < 0) {
         stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -2372,7 +2453,7 @@ int pfwd_host_egress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            return host_egress_allow_v4_tcp(ip4, &tcp);
+            return host_egress_allow_v4_tcp(ip4, &tcp, settings);
         }
         if (protocol == IPPROTO_UDP) {
             struct udphdr_min udp = {};
@@ -2381,9 +2462,14 @@ int pfwd_host_egress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            return host_egress_allow_v4_udp(ip4, &udp);
+            return host_egress_allow_v4_udp(ip4, &udp, settings);
         }
-        if (egress_whitelist_allowed_v4(ip4->daddr)) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+        if (egress_whitelist_allowed_v4(ip4->daddr, settings)) {
             return TC_ACT_OK;
         }
         count_host_egress_drop();
@@ -2420,7 +2506,7 @@ int pfwd_host_egress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            return host_egress_allow_v6_tcp(ip6, &tcp);
+            return host_egress_allow_v6_tcp(ip6, &tcp, settings);
         }
         if (protocol == IPPROTO_UDP) {
             struct udphdr_min udp = {};
@@ -2429,9 +2515,14 @@ int pfwd_host_egress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            return host_egress_allow_v6_udp(ip6, &udp);
+            return host_egress_allow_v6_udp(ip6, &udp, settings);
         }
-        if (egress_whitelist_allowed_v6(ip6->daddr)) {
+        settings = lookup_settings();
+        if (!settings) {
+            count_host_egress_drop();
+            return TC_ACT_SHOT;
+        }
+        if (egress_whitelist_allowed_v6(ip6->daddr, settings)) {
             return TC_ACT_OK;
         }
         count_host_egress_drop();
@@ -2514,7 +2605,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             int guard_bypassed = ingress_guard_bypassed(rule, dport);
             init_counter_plan(rule, &counters);
             if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v4(ip4->saddr)) {
+                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v4(ip4->saddr, rule)) {
                     stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                     count_drop_with_plan(rule, packet_len, &counters);
                     return XDP_DROP;
@@ -2695,7 +2786,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             int guard_bypassed = ingress_guard_bypassed(rule, dport);
             init_counter_plan(rule, &counters);
             if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v6(ip6->saddr)) {
+                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v6(ip6->saddr, rule)) {
                     stat_inc(PFWD_STAT_WHITELIST_DROPPED);
                     count_drop_with_plan(rule, packet_len, &counters);
                     return XDP_DROP;
@@ -2878,9 +2969,8 @@ int pfwd_ingress(struct __sk_buff *skb) {
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
             rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
-            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
-                needs_pull = 1;
-            } else if (rule && rule_needs_guard(rule)) {
+            if (rule && !rule_xdp_disabled(rule) &&
+                (rule_target_is_loopback(4, rule) || rule_needs_guard(rule))) {
                 needs_pull = 1;
             }
             if (!needs_pull) {
@@ -2900,13 +2990,6 @@ int pfwd_ingress(struct __sk_buff *skb) {
             ip4 = (void *)(eth + 1);
             if ((void *)(ip4 + 1) > data_end || (void *)ip4 + ihl > data_end) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
-            if (!rule) {
-                return TC_ACT_OK;
-            }
-            if (rule_xdp_disabled(rule)) {
                 return TC_ACT_OK;
             }
             {
@@ -2999,9 +3082,8 @@ int pfwd_ingress(struct __sk_buff *skb) {
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
             rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
-            if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
-                needs_pull = 1;
-            } else if (rule && rule_needs_guard(rule)) {
+            if (rule && !rule_xdp_disabled(rule) &&
+                (rule_target_is_loopback(6, rule) || rule_needs_guard(rule))) {
                 needs_pull = 1;
             }
             if (!needs_pull) {
@@ -3021,13 +3103,6 @@ int pfwd_ingress(struct __sk_buff *skb) {
             ip6 = (void *)(eth + 1);
             if ((void *)(ip6 + 1) > data_end) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
-                return TC_ACT_OK;
-            }
-            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
-            if (!rule) {
-                return TC_ACT_OK;
-            }
-            if (rule_xdp_disabled(rule)) {
                 return TC_ACT_OK;
             }
             {
@@ -3165,10 +3240,6 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
-        if (!conn) {
-            return TC_ACT_OK;
-        }
         if (!settings) {
             settings = lookup_settings();
             if (!settings) {
@@ -3269,10 +3340,6 @@ int pfwd_loopback_egress(struct __sk_buff *skb) {
         ip6 = (void *)(eth + 1);
         if ((void *)(ip6 + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
-            return TC_ACT_OK;
-        }
-        conn = bpf_map_lookup_elem(&pfwd_reverse, &reverse_key);
-        if (!conn) {
             return TC_ACT_OK;
         }
         if (!settings) {

@@ -495,8 +495,8 @@ runtime_attach_metadata() {
     runtime_json="$(cat)"
     local config_hash
     runtime_json="$(jq '
-      .dataplane_version = 2
-      | .map_abi_version = 9
+      .dataplane_version = ($dataplane_version | tonumber)
+      | .map_abi_version = ($map_abi_version | tonumber)
       | .rules = [
           .rules[]? as $rule
           | (
@@ -527,7 +527,7 @@ runtime_attach_metadata() {
           | .profile_counts[$rule.feature_profile] = ((.profile_counts[$rule.feature_profile] // 0) + 1)
         )
       )
-    ' <<< "$runtime_json")"
+    ' --arg dataplane_version "$PFWD_XDP_DATAPLANE_VERSION" --arg map_abi_version "$PFWD_XDP_MAP_ABI_VERSION" <<< "$runtime_json")"
     config_hash="$(printf '%s' "$runtime_json" | pfwd_stdin_checksum)"
     jq --arg config_hash "$config_hash" '
       .config_hash = $config_hash

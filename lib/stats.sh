@@ -409,25 +409,32 @@ stats_current_snapshot() {
     nft_snapshot='[]'
 
     if [ "$(jq -r '.xdp_applied // false' <<< "$forwarder_status")" = "true" ] && [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_FORWARDER_XDP_RUNTIME_FILE" ]; then
-        local snapshot_error snapshot_status=0
-        snapshot_error="$(mktemp "${PFWD_RUN_DIR}/snapshot.err.XXXXXX")"
-        xdp_snapshot="$("$(forwarder_bin_path)" snapshot \
-          --runtime-file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" \
-          --state-file "$PFWD_STATS_FILE" \
-          --status-file "$PFWD_XDP_STATUS_FILE" \
-          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" 2>"$snapshot_error")" || snapshot_status=$?
-        if [ -n "$xdp_snapshot" ] && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$xdp_snapshot"; then
-            :
+        local pinned_map_abi
+        pinned_map_abi="$(jq -r '.xdp_status.map_abi_version // .map_abi_version // empty' <<< "$forwarder_status")"
+        if [ -n "$pinned_map_abi" ] && [ "$pinned_map_abi" != "$PFWD_XDP_MAP_ABI_VERSION" ]; then
+            PFWD_STATS_LAST_SNAPSHOT_ERROR="skipped stale XDP map ABI $pinned_map_abi while target ABI is $PFWD_XDP_MAP_ABI_VERSION"
+            pfwd_debug "$PFWD_STATS_LAST_SNAPSHOT_ERROR"
         else
-            xdp_snapshot='[]'
-        fi
-        PFWD_STATS_LAST_SNAPSHOT_ERROR="$(tr '\n' ' ' < "$snapshot_error" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-        rm -f "$snapshot_error"
-        if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
-            if [[ "$PFWD_STATS_LAST_SNAPSHOT_ERROR" == *"doesn't consume all data"* ]]; then
-                pfwd_die "读取 XDP 计数失败：pfwd-xdp 与当前 pinned counter map ABI 不匹配，请使用包含 assets/$(guard_asset_name) 的完整安装包重新安装后再执行 restart"
+            local snapshot_error snapshot_status=0
+            snapshot_error="$(mktemp "${PFWD_RUN_DIR}/snapshot.err.XXXXXX")"
+            xdp_snapshot="$("$(forwarder_bin_path)" snapshot \
+              --runtime-file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" \
+              --state-file "$PFWD_STATS_FILE" \
+              --status-file "$PFWD_XDP_STATUS_FILE" \
+              --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" 2>"$snapshot_error")" || snapshot_status=$?
+            if [ -n "$xdp_snapshot" ] && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$xdp_snapshot"; then
+                :
+            else
+                xdp_snapshot='[]'
             fi
-            pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
+            PFWD_STATS_LAST_SNAPSHOT_ERROR="$(tr '\n' ' ' < "$snapshot_error" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+            rm -f "$snapshot_error"
+            if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
+                if [[ "$PFWD_STATS_LAST_SNAPSHOT_ERROR" == *"doesn't consume all data"* ]]; then
+                    pfwd_die "读取 XDP 计数失败：pfwd-xdp 与当前 pinned counter map ABI 不匹配，请使用包含 assets/$(guard_asset_name) 的完整安装包重新安装后再执行 restart"
+                fi
+                pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
+            fi
         fi
     fi
 

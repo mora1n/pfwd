@@ -866,6 +866,135 @@ func TestMakeRuleValGuardFlags(t *testing.T) {
 	}
 }
 
+func TestMakeRuleValWhitelistFlags(t *testing.T) {
+	baseRule := runtimeRule{
+		Index:          1,
+		UserIndex:      2,
+		Protocol:       "tcp",
+		ResolvedTarget: "192.0.2.10",
+		RemotePort:     443,
+		TrafficRatio:   1,
+	}
+	tests := []struct {
+		name      string
+		settings  runtimeSettings
+		wantFlags uint16
+		denyFlags uint16
+	}{
+		{
+			name: "whitelist off leaves allow strategy empty",
+			settings: runtimeSettings{
+				WhitelistFiles: []string{"/tmp/custom.txt"},
+				IngressCNMode:  "all",
+			},
+			denyFlags: ruleFlagNeedsAllow | ruleFlagAllowCustom | ruleFlagAllowGeo,
+		},
+		{
+			name: "custom only uses LPM strategy",
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				WhitelistFiles:   []string{"/tmp/custom.txt"},
+			},
+			wantFlags: ruleFlagNeedsAllow | ruleFlagAllowCustom,
+			denyFlags: ruleFlagAllowGeo,
+		},
+		{
+			name: "geo only skips custom LPM",
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				IngressCNMode:    "provinces",
+			},
+			wantFlags: ruleFlagNeedsAllow | ruleFlagAllowGeo,
+			denyFlags: ruleFlagAllowCustom,
+		},
+		{
+			name: "custom and geo enable both strategies",
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				WhitelistFiles:   []string{"/tmp/custom.txt"},
+				IngressCNMode:    "all",
+			},
+			wantFlags: ruleFlagNeedsAllow | ruleFlagAllowCustom | ruleFlagAllowGeo,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := makeRuleVal(baseRule, tc.settings)
+			if err != nil {
+				t.Fatalf("makeRuleVal: %v", err)
+			}
+			if got.Flags&tc.wantFlags != tc.wantFlags {
+				t.Fatalf("flags=%#x, want bits %#x", got.Flags, tc.wantFlags)
+			}
+			if got.Flags&tc.denyFlags != 0 {
+				t.Fatalf("flags=%#x, denied bits %#x present", got.Flags, got.Flags&tc.denyFlags)
+			}
+		})
+	}
+}
+
+func TestMakeXDPSettingsEgressWhitelistStrategy(t *testing.T) {
+	tests := []struct {
+		name       string
+		settings   runtimeSettings
+		wantCustom uint8
+		wantGeo    uint8
+	}{
+		{
+			name: "egress custom only",
+			settings: runtimeSettings{
+				EgressWhitelistFiles: []string{"/tmp/egress.txt"},
+			},
+			wantCustom: 1,
+		},
+		{
+			name: "egress geo only",
+			settings: runtimeSettings{
+				EgressCNMode: "all",
+			},
+			wantGeo: 1,
+		},
+		{
+			name: "egress custom and geo enable both strategies",
+			settings: runtimeSettings{
+				EgressWhitelistFiles: []string{"/tmp/egress.txt"},
+				EgressCNMode:         "provinces",
+			},
+			wantCustom: 1,
+			wantGeo:    1,
+		},
+		{
+			name: "blank custom paths are ignored",
+			settings: runtimeSettings{
+				EgressWhitelistFiles: []string{"", " "},
+				EgressCNMode:         "off",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := makeXDPSettings(tc.settings, 7)
+			if got.EgressWhitelistCustom != tc.wantCustom ||
+				got.EgressWhitelistGeo != tc.wantGeo {
+				t.Fatalf("egress strategy custom=%d geo=%d, want %d/%d",
+					got.EgressWhitelistCustom, got.EgressWhitelistGeo,
+					tc.wantCustom, tc.wantGeo)
+			}
+			if got.ExternalIfindex != 7 {
+				t.Fatalf("ExternalIfindex=%d, want 7", got.ExternalIfindex)
+			}
+		})
+	}
+}
+
+func TestXDPSettingsABISize(t *testing.T) {
+	if got, want := binary.Size(xdpSettings{}), 20; got != want {
+		t.Fatalf("xdpSettings binary size=%d, want %d", got, want)
+	}
+}
+
 func TestRuntimeStatusReusableRequiresCurrentMapABI(t *testing.T) {
 	opts := applyOptions{GuardMode: "full"}
 	settings := runtimeSettings{}

@@ -35,7 +35,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.3"
 const dataplaneVersion = 2
-const mapABIVersion = 9
+const mapABIVersion = 10
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -53,6 +53,8 @@ const (
 	ruleFlagBlockHTTP    = uint16(1 << 8)
 	ruleFlagBlockTLS     = uint16(1 << 9)
 	ruleFlagBlockSOCKS   = uint16(1 << 10)
+	ruleFlagAllowCustom  = uint16(1 << 11)
+	ruleFlagAllowGeo     = uint16(1 << 12)
 	geoPolicyIngress     = uint8(1 << 0)
 	geoPolicyEgress      = uint8(1 << 1)
 )
@@ -432,15 +434,17 @@ type runtimeMapPins struct {
 }
 
 type xdpSettings struct {
-	WhitelistEnabled uint8
-	BlockHTTP        uint8
-	BlockTLS         uint8
-	BlockSOCKS       uint8
-	GuardEnabled     uint8
-	HasSkipPorts     uint8
-	Pad              [2]uint8
-	ExternalIfindex  uint32
-	LoopbackIfindex  uint32
+	WhitelistEnabled      uint8
+	BlockHTTP             uint8
+	BlockTLS              uint8
+	BlockSOCKS            uint8
+	GuardEnabled          uint8
+	HasSkipPorts          uint8
+	EgressWhitelistCustom uint8
+	EgressWhitelistGeo    uint8
+	Pad                   [4]uint8
+	ExternalIfindex       uint32
+	LoopbackIfindex       uint32
 }
 
 type ruleKey struct {
@@ -1972,6 +1976,38 @@ func zeroPerCPUDropCounterValues() ([]dropCounterVal, error) {
 	return make([]dropCounterVal, cpus), nil
 }
 
+func hasWhitelistFiles(files []string) bool {
+	for _, filePath := range files {
+		if strings.TrimSpace(filePath) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveDataplaneSettings(runtimeData *runtimeFile, opts applyOptions) runtimeSettings {
+	settings := runtimeData.Settings
+	settings.WhitelistFiles = effectiveWhitelistFiles(runtimeData, opts)
+	return settings
+}
+
+func makeXDPSettings(settings runtimeSettings, externalIfindex uint32) xdpSettings {
+	egressCustom := hasWhitelistFiles(settings.EgressWhitelistFiles)
+	egressGeo := geoModeEnabled(settings.EgressCNMode)
+	return xdpSettings{
+		WhitelistEnabled:      boolToUint8(settings.WhitelistEnabled),
+		BlockHTTP:             boolToUint8(settings.BlockHTTP),
+		BlockTLS:              boolToUint8(settings.BlockTLS),
+		BlockSOCKS:            boolToUint8(settings.BlockSOCKS),
+		GuardEnabled:          boolToUint8(settings.GuardEnabled),
+		HasSkipPorts:          boolToUint8(len(settings.ProtocolSkipPorts) > 0),
+		EgressWhitelistCustom: boolToUint8(egressCustom),
+		EgressWhitelistGeo:    boolToUint8(egressGeo),
+		ExternalIfindex:       externalIfindex,
+		LoopbackIfindex:       0,
+	}
+}
+
 func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) error {
 	if objs.PFWDSettings == nil || objs.PFWDRules == nil || objs.PFWDRuleCounter == nil || objs.PFWDRuleReplyCounter == nil || objs.PFWDRuleDropCounter == nil || objs.PFWDUserCounter == nil {
 		return fmt.Errorf("关键 BPF map 未加载")
@@ -1984,16 +2020,8 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		}
 		externalIfindex = uint32(iface.Index)
 	}
-	settings := xdpSettings{
-		WhitelistEnabled: boolToUint8(runtimeData.Settings.WhitelistEnabled),
-		BlockHTTP:        boolToUint8(runtimeData.Settings.BlockHTTP),
-		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
-		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
-		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
-		HasSkipPorts:     boolToUint8(len(runtimeData.Settings.ProtocolSkipPorts) > 0),
-		ExternalIfindex:  externalIfindex,
-		LoopbackIfindex:  0,
-	}
+	dataplaneSettings := effectiveDataplaneSettings(runtimeData, opts)
+	settings := makeXDPSettings(dataplaneSettings, externalIfindex)
 	key := uint32(0)
 	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("写入 settings 失败: %w", err)
@@ -2001,12 +2029,8 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 	if err := loadProtocolSkipPorts(objs.PFWDSkipPorts, runtimeData.Settings.ProtocolSkipPorts); err != nil {
 		return err
 	}
-	files := runtimeData.Settings.WhitelistFiles
-	if opts.WhitelistFile != "" {
-		files = splitFiles(opts.WhitelistFile)
-	}
 	if runtimeData.Settings.WhitelistEnabled {
-		if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, files); err != nil {
+		if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, dataplaneSettings.WhitelistFiles); err != nil {
 			return err
 		}
 	}
@@ -2063,7 +2087,7 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		}
 	}
 	for _, rule := range runtimeData.Rules {
-		if err := putRule(objs, rule, runtimeData.Settings, zeroCounter, zeroReplyCounter, zeroDropCounter); err != nil {
+		if err := putRule(objs, rule, dataplaneSettings, zeroCounter, zeroReplyCounter, zeroDropCounter); err != nil {
 			return err
 		}
 	}
@@ -2871,14 +2895,14 @@ func connectionAllowedByRuntime(key connKey, value connVal, allowed map[ruleKey]
 	return ok && connectionMatchesRule(key, value, expected)
 }
 
-func runtimeRuleEntries(runtimeData *runtimeFile) (map[ruleKey]ruleVal, error) {
+func runtimeRuleEntries(runtimeData *runtimeFile, settings runtimeSettings) (map[ruleKey]ruleVal, error) {
 	entries := make(map[ruleKey]ruleVal, len(runtimeData.Rules))
 	for _, rule := range runtimeData.Rules {
 		key, err := makeRuleKey(rule)
 		if err != nil {
 			return nil, fmt.Errorf("生成规则 key 失败 (%s): %w", rule.ID, err)
 		}
-		value, err := makeRuleVal(rule, runtimeData.Settings)
+		value, err := makeRuleVal(rule, settings)
 		if err != nil {
 			return nil, fmt.Errorf("生成规则 value 失败 (%s): %w", rule.ID, err)
 		}
@@ -3098,16 +3122,8 @@ func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts apply
 		}
 		externalIfindex = uint32(iface.Index)
 	}
-	settings := xdpSettings{
-		WhitelistEnabled: boolToUint8(runtimeData.Settings.WhitelistEnabled),
-		BlockHTTP:        boolToUint8(runtimeData.Settings.BlockHTTP),
-		BlockTLS:         boolToUint8(runtimeData.Settings.BlockTLS),
-		BlockSOCKS:       boolToUint8(runtimeData.Settings.BlockSOCKS),
-		GuardEnabled:     boolToUint8(runtimeData.Settings.GuardEnabled),
-		HasSkipPorts:     boolToUint8(len(runtimeData.Settings.ProtocolSkipPorts) > 0),
-		ExternalIfindex:  externalIfindex,
-		LoopbackIfindex:  0,
-	}
+	dataplaneSettings := effectiveDataplaneSettings(runtimeData, opts)
+	settings := makeXDPSettings(dataplaneSettings, externalIfindex)
 	key := uint32(0)
 	if err := objs.PFWDSettings.Update(&key, &settings, ebpf.UpdateAny); err != nil {
 		return mapReconcileReport{}, runtimeAuxState{}, fmt.Errorf("写入 settings 失败: %w", err)
@@ -3119,7 +3135,7 @@ func reconcileRuntimeMaps(objs *bpfObjects, runtimeData *runtimeFile, opts apply
 	if err != nil {
 		return mapReconcileReport{}, runtimeAuxState{}, err
 	}
-	rules, err := runtimeRuleEntries(runtimeData)
+	rules, err := runtimeRuleEntries(runtimeData, dataplaneSettings)
 	if err != nil {
 		return mapReconcileReport{}, runtimeAuxState{}, err
 	}
@@ -3469,6 +3485,12 @@ func makeRuleVal(rule runtimeRule, settings runtimeSettings) (ruleVal, error) {
 	}
 	if settings.WhitelistEnabled {
 		value.Flags |= ruleFlagNeedsAllow
+		if hasWhitelistFiles(settings.WhitelistFiles) {
+			value.Flags |= ruleFlagAllowCustom
+		}
+		if geoModeEnabled(settings.IngressCNMode) {
+			value.Flags |= ruleFlagAllowGeo
+		}
 	}
 	if rule.XDPDisabled {
 		value.Flags |= ruleFlagXDPDisabled
