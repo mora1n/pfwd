@@ -1449,13 +1449,38 @@ ui_run() {
     return 0
 }
 
+ui_try_cmd() {
+    local output="" status=0
+    if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
+        ui_dry_run_reset
+    fi
+    UI_REPLY=""
+    output="$( ( "$@" ) 2>&1 )" || status=$?
+    UI_REPLY="$output"
+    if [ "$status" -eq 0 ]; then
+        UI_STATUS=0
+        return 0
+    fi
+    UI_STATUS=1
+    return "$status"
+}
+
+ui_error_from_reply() {
+    local message="$1"
+    if [ -n "$UI_REPLY" ]; then
+        ui_error "$message：$UI_REPLY"
+    else
+        ui_error "$message"
+    fi
+}
+
 ui_run_capture() {
     local output="" status=0
     if [ "${PFWD_DRY_RUN:-0}" = "1" ] && [ "$UI_ALT_SCREEN_ACTIVE" = "1" ]; then
         ui_dry_run_reset
     fi
     UI_REPLY=""
-    output="$("$@" 2>&1)" || status=$?
+    output="$( ( "$@" ) 2>&1 )" || status=$?
     UI_REPLY="$output"
     if [ "$status" -eq 0 ]; then
         UI_STATUS=0
@@ -1658,9 +1683,16 @@ ui_select_mss_mode() {
             else
                 ui_form_read "固定 MSS 值" "$fixed_default" || return 1
             fi
-            [ -n "$UI_REPLY" ] || pfwd_die "固定 MSS 模式必须提供 MSS 值"
-            validate_mss_value "$UI_REPLY"
-            UI_MSS_VALUE="$UI_REPLY"
+            local mss_value="$UI_REPLY"
+            if [ -z "$mss_value" ]; then
+                ui_warn "固定 MSS 模式必须提供 MSS 值"
+                return 1
+            fi
+            if ! ui_try_cmd validate_mss_value "$mss_value"; then
+                ui_error_from_reply "固定 MSS 值无效"
+                return 1
+            fi
+            UI_MSS_VALUE="$mss_value"
             ;;
         *)
             ui_warn "无效选择，已使用不设置"
@@ -1731,9 +1763,16 @@ ui_select_snat_mode() {
             else
                 ui_form_read "固定 SNAT 源地址（必须是显式 IP，例如内网 IP）" || return 1
             fi
-            [ -n "$UI_REPLY" ] || pfwd_die "固定 SNAT 模式必须提供源地址"
-            validate_ip_literal "$UI_REPLY"
-            UI_SNAT_SOURCE="$UI_REPLY"
+            local snat_source="$UI_REPLY"
+            if [ -z "$snat_source" ]; then
+                ui_warn "固定 SNAT 模式必须提供源地址"
+                return 1
+            fi
+            if ! ui_try_cmd validate_ip_literal "$snat_source"; then
+                ui_error_from_reply "固定 SNAT 源地址无效"
+                return 1
+            fi
+            UI_SNAT_SOURCE="$snat_source"
             ;;
         *)
             ui_warn "无效选择，已使用 masquerade"
@@ -3124,22 +3163,15 @@ ui_guard_skip_ports_apply_list() {
 
 ui_guard_skip_ports_expand_spec() {
     local spec="$1"
-    local expanded_port
-    while IFS= read -r spec; do
-        [ -n "$spec" ] || continue
-        while IFS= read -r expanded_port; do
-            [ -n "$expanded_port" ] || continue
-            validate_port "$expanded_port"
-            printf '%s\n' "$expanded_port"
-        done < <(expand_port_spec "$spec")
-    done <<< "$(printf '%s\n' "$spec" | tr ',' '\n')"
+    ui_try_cmd expand_port_spec "$spec" || return 1
+    printf '%s\n' "$UI_REPLY"
 }
 
 ui_guard_skip_ports_prompt_spec() {
     local title="$1"
     local prompt="$2"
     local default_value="${3:-}"
-    local expanded_ports
+    local raw_spec expanded_ports
     ui_form_set "$title" "$prompt"
     ui_form_read "端口规格" "$default_value" || { ui_form_reset; return 1; }
     if [ "$UI_EDIT_ABORTED" = "1" ]; then
@@ -3151,7 +3183,13 @@ ui_guard_skip_ports_prompt_spec() {
         ui_warn "必须提供端口规格"
         return 1
     fi
-    expanded_ports="$(ui_guard_skip_ports_expand_spec "$UI_REPLY" 2>/dev/null | awk '!seen[$0]++')"
+    raw_spec="$UI_REPLY"
+    if ! ui_try_cmd expand_port_spec "$raw_spec"; then
+        ui_form_reset
+        ui_error_from_reply "端口规格无效"
+        return 1
+    fi
+    expanded_ports="$(printf '%s\n' "$UI_REPLY" | awk '!seen[$0]++')"
     ui_form_reset
     [ -n "$expanded_ports" ] || { ui_warn "未解析到有效端口"; return 1; }
     UI_REPLY="$expanded_ports"
@@ -3785,11 +3823,11 @@ ui_menu_forwards() {
                     local stop_ids="$UI_REPLY" ok=0 fail=0
                     while IFS= read -r forward_id; do
                         [ -n "$forward_id" ] || continue
-                        if cmd_toggle_forward false "$forward_id"; then
+                        if ui_try_cmd cmd_toggle_forward false "$forward_id"; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "暂停失败：$forward_id"
+                            ui_error_from_reply "暂停失败：$forward_id"
                         fi
                     done <<< "$stop_ids"
                     ui_batch_print_result "$ok" "$fail"
@@ -3801,11 +3839,11 @@ ui_menu_forwards() {
                     local start_ids="$UI_REPLY" ok=0 fail=0
                     while IFS= read -r forward_id; do
                         [ -n "$forward_id" ] || continue
-                        if cmd_toggle_forward true "$forward_id"; then
+                        if ui_try_cmd cmd_toggle_forward true "$forward_id"; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "恢复失败：$forward_id"
+                            ui_error_from_reply "恢复失败：$forward_id"
                         fi
                     done <<< "$start_ids"
                     ui_batch_print_result "$ok" "$fail"
@@ -3831,11 +3869,11 @@ ui_menu_forwards() {
                         local ok=0 fail=0
                         while IFS= read -r forward_id; do
                             [ -n "$forward_id" ] || continue
-                            if cmd_delete "$forward_id"; then
+                            if ui_try_cmd cmd_delete "$forward_id"; then
                                 ok=$((ok + 1))
                             else
                                 fail=$((fail + 1))
-                                ui_error "删除失败：$forward_id"
+                                ui_error_from_reply "删除失败：$forward_id"
                             fi
                         done <<< "$delete_ids"
                         ui_batch_print_result "$ok" "$fail"
@@ -3917,18 +3955,18 @@ ui_menu_expire_limit() {
                                 if [ "$stop_value" = "$current_stop_at" ]; then
                                     continue
                                 elif [ "$stop_value" = "-" ]; then
-                                    if cmd_expire clear "$forward_id"; then
+                                    if ui_try_cmd cmd_expire clear "$forward_id"; then
                                         ok=$((ok + 1))
                                     else
                                         fail=$((fail + 1))
-                                        ui_error "清除到期失败：$forward_id"
+                                        ui_error_from_reply "清除到期失败：$forward_id"
                                     fi
                                 else
-                                    if cmd_expire set "$forward_id" --stop-at "$stop_value"; then
+                                    if ui_try_cmd cmd_expire set "$forward_id" --stop-at "$stop_value"; then
                                         ok=$((ok + 1))
                                     else
                                         fail=$((fail + 1))
-                                        ui_error "设置到期失败：$forward_id"
+                                        ui_error_from_reply "设置到期失败：$forward_id"
                                     fi
                                 fi
                             done <<< "${scope#forward-list:}"
@@ -4012,11 +4050,11 @@ ui_menu_expire_limit() {
                                 [ -z "$traffic" ] || args+=(--traffic "$traffic")
                                 [ -z "$rate" ] || args+=(--rate "$rate")
                                 [ -z "$traffic_mode" ] || args+=(--traffic-mode "$traffic_mode")
-                                if cmd_limit "${args[@]}"; then
+                                if ui_try_cmd cmd_limit "${args[@]}"; then
                                     ok=$((ok + 1))
                                 else
                                     fail=$((fail + 1))
-                                    ui_error "端口设置失败：$forward_id"
+                                    ui_error_from_reply "端口设置失败：$forward_id"
                                 fi
                             done <<< "${scope#forward-list:}"
                             ui_batch_print_result "$ok" "$fail"
@@ -4043,11 +4081,11 @@ ui_menu_expire_limit() {
                                 local ok=0 fail=0
                                 while IFS= read -r forward_id; do
                                     [ -n "$forward_id" ] || continue
-                                    if cmd_traffic reset-now --forward-id "$forward_id"; then
+                                    if ui_try_cmd cmd_traffic reset-now --forward-id "$forward_id"; then
                                         ok=$((ok + 1))
                                     else
                                         fail=$((fail + 1))
-                                        ui_error "立即重置失败：$forward_id"
+                                        ui_error_from_reply "立即重置失败：$forward_id"
                                     fi
                                 done <<< "${scope#forward-list:}"
                                 ui_batch_print_result "$ok" "$fail"
@@ -4076,11 +4114,11 @@ ui_menu_expire_limit() {
                                 local ok=0 fail=0
                                 while IFS= read -r forward_id; do
                                     [ -n "$forward_id" ] || continue
-                                    if cmd_traffic reset-day set --forward-id "$forward_id" --day "$day"; then
+                                    if ui_try_cmd cmd_traffic reset-day set --forward-id "$forward_id" --day "$day"; then
                                         ok=$((ok + 1))
                                     else
                                         fail=$((fail + 1))
-                                        ui_error "设置重置日失败：$forward_id"
+                                        ui_error_from_reply "设置重置日失败：$forward_id"
                                     fi
                                 done <<< "${scope#forward-list:}"
                                 ui_batch_print_result "$ok" "$fail"
@@ -4123,11 +4161,11 @@ ui_menu_expire_limit() {
                         local ok=0 fail=0
                         while IFS= read -r forward_id; do
                             [ -n "$forward_id" ] || continue
-                            if cmd_traffic used set --forward-id "$forward_id" --used "$used"; then
+                            if ui_try_cmd cmd_traffic used set --forward-id "$forward_id" --used "$used"; then
                                 ok=$((ok + 1))
                             else
                                 fail=$((fail + 1))
-                                ui_error "设置已用流量失败：$forward_id"
+                                ui_error_from_reply "设置已用流量失败：$forward_id"
                             fi
                         done <<< "${scope#forward-list:}"
                         ui_batch_print_result "$ok" "$fail"
@@ -4188,27 +4226,39 @@ ui_menu_telegram() {
                 ui_form_read "Bot Token，例如 123456789:AA..." "$token_default" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 token="$UI_REPLY"
+                if [ -z "$token" ]; then
+                    ui_form_reset
+                    ui_notice_set "Bot Token 不能为空，请填写或输入 0 返回。" "$UI_C_WARN"
+                    continue
+                fi
                 ui_form_add_kv "Bot Token" "$token"
                 ui_form_read "Chat ID，例如 123456789 或 -1001234567890" "$chat_id_default" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 chat_id="$UI_REPLY"
+                if [ -z "$chat_id" ]; then
+                    ui_form_reset
+                    ui_notice_set "Chat ID 不能为空，请填写或输入 0 返回。" "$UI_C_WARN"
+                    continue
+                fi
                 ui_form_add_kv "Chat ID" "$chat_id"
                 ui_form_read "服务器名称" "$server_name_default" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 server_name="$UI_REPLY"
                 ui_form_add_kv "服务器名称" "$server_name"
                 if [ "$user_id" = "__ALL_USERS__" ]; then
-                    ui_run cmd_user telegram --all --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name"
+                    if ! ui_try_cmd cmd_user telegram --all --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name"; then
+                        ui_error_from_reply "更新 Telegram 配置失败：全部用户"
+                    fi
                 else
                     while IFS= read -r target_user; do
                         [ -n "$target_user" ] || continue
                         tg="$(ui_user_telegram_config "$target_user")"
                         enabled="$(jq -r '.enabled // false' <<< "$tg")"
-                        if cmd_user telegram "$target_user" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"; then
+                        if ui_try_cmd cmd_user telegram "$target_user" --bot-token "$token" --chat-id "$chat_id" --server-name "$server_name" --enabled "$enabled"; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "更新 Telegram 配置失败：$target_user"
+                            ui_error_from_reply "更新 Telegram 配置失败：$target_user"
                         fi
                     done <<< "$selected_users"
                     UI_STATUS=0
@@ -4258,11 +4308,11 @@ ui_menu_telegram() {
                 local test_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r user_id; do
                     [ -n "$user_id" ] || continue
-                    if cmd_notify_test --user-id "$user_id"; then
+                    if ui_try_cmd cmd_notify_test --user-id "$user_id"; then
                         ok=$((ok + 1))
                     else
                         fail=$((fail + 1))
-                        ui_error "测试通知失败：$user_id"
+                        ui_error_from_reply "测试通知失败：$user_id"
                     fi
                 done <<< "$test_ids"
                 ui_batch_print_result "$ok" "$fail"
@@ -4275,11 +4325,11 @@ ui_menu_telegram() {
                 local enable_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r user_id; do
                     [ -n "$user_id" ] || continue
-                    if cmd_notify_enable --user-id "$user_id"; then
+                    if ui_try_cmd cmd_notify_enable --user-id "$user_id"; then
                         ok=$((ok + 1))
                     else
                         fail=$((fail + 1))
-                        ui_error "恢复通知失败：$user_id"
+                        ui_error_from_reply "恢复通知失败：$user_id"
                     fi
                 done <<< "$enable_ids"
                 ui_batch_print_result "$ok" "$fail"
@@ -4292,11 +4342,11 @@ ui_menu_telegram() {
                 local disable_ids="$UI_REPLY" ok=0 fail=0
                 while IFS= read -r user_id; do
                     [ -n "$user_id" ] || continue
-                    if cmd_notify_disable --user-id "$user_id"; then
+                    if ui_try_cmd cmd_notify_disable --user-id "$user_id"; then
                         ok=$((ok + 1))
                     else
                         fail=$((fail + 1))
-                        ui_error "暂停通知失败：$user_id"
+                        ui_error_from_reply "暂停通知失败：$user_id"
                     fi
                 done <<< "$disable_ids"
                 ui_batch_print_result "$ok" "$fail"
@@ -4313,11 +4363,11 @@ ui_menu_telegram() {
                     local ok=0 fail=0
                     while IFS= read -r user_id; do
                         [ -n "$user_id" ] || continue
-                        if cmd_notify_delete --user-id "$user_id"; then
+                        if ui_try_cmd cmd_notify_delete --user-id "$user_id"; then
                             ok=$((ok + 1))
                         else
                             fail=$((fail + 1))
-                            ui_error "删除通知失败：$user_id"
+                            ui_error_from_reply "删除通知失败：$user_id"
                         fi
                     done <<< "$delete_ids"
                     ui_batch_print_result "$ok" "$fail"
@@ -5477,10 +5527,11 @@ ui_menu_downmask_ab_pull() {
                     [ -z "$new_local_ip" ] || update_args+=(--local-ip "$new_local_ip")
                     [ -z "$new_token" ] || update_args+=(--token "$new_token")
                     [ -z "$new_weight" ] || update_args+=(--weight "$new_weight")
-                    if cmd_downmask_ab_pull "${update_args[@]}" >/dev/null 2>&1; then
+                    if ui_try_cmd cmd_downmask_ab_pull "${update_args[@]}"; then
                         update_ok=$((update_ok + 1))
                     else
                         update_fail=$((update_fail + 1))
+                        ui_error_from_reply "修改 B机失败：$selected_host"
                     fi
                 done <<< "$selected_indexes"
                 ui_form_reset
@@ -5518,10 +5569,11 @@ ui_menu_downmask_ab_pull() {
                     [ -n "$selected_index" ] || continue
                     selected_host="$(downmask_ab_pull_target_field_by_index "$selected_index" "host")"
                     [ -n "$selected_host" ] || { delete_fail=$((delete_fail + 1)); continue; }
-                    if cmd_downmask_ab_pull targets delete --host "$selected_host" >/dev/null 2>&1; then
+                    if ui_try_cmd cmd_downmask_ab_pull targets delete --host "$selected_host"; then
                         delete_ok=$((delete_ok + 1))
                     else
                         delete_fail=$((delete_fail + 1))
+                        ui_error_from_reply "移除 B机失败：$selected_host"
                     fi
                 done <<< "$(printf '%s\n' "$selected_indexes" | sort -rn)"
                 UI_STATUS=$([ "$delete_fail" -eq 0 ] && echo 0 || echo 1)
