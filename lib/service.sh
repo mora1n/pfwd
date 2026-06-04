@@ -130,6 +130,9 @@ service_missing_bundle_hint() {
         */assets/pfwd-xdp-linux-*)
             printf '请先执行 ./xdp/build.sh 生成预编译资产，或使用包含 pfwd-xdp 资产的完整源码/发布包。\n'
             ;;
+        */assets/pfwd-city-cn-*)
+            printf '请使用包含 city 资产的完整安装包，或使用已更新 bootstrap 的版本重新安装。\n'
+            ;;
         *)
             return 0
             ;;

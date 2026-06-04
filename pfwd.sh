@@ -133,6 +133,17 @@ pfwd_bootstrap_install() {
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v4.bin" "$install_dir/assets/pfwd-geo-cn-v4.bin"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v6.bin" "$install_dir/assets/pfwd-geo-cn-v6.bin"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-meta.json" "$install_dir/assets/pfwd-geo-meta.json"
+    local city_asset
+    for city_asset in pfwd-city-cn-meta.json pfwd-city-cn-v4.bin; do
+        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$city_asset" "$install_dir/assets/$city_asset"; then
+            echo "错误：缺少必需的 city 资产：assets/$city_asset" >&2
+            echo "请补齐发布源中的 city 资产，或使用已更新 bootstrap 的版本重新安装。" >&2
+            status=1
+            echo "bootstrap 安装失败，正在回滚临时安装文件" >&2
+            pfwd_bootstrap_cleanup_partial_install || true
+            exit "$status"
+        fi
+    done
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
