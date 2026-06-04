@@ -114,6 +114,8 @@ service_bundle_rows() {
     printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
     printf '0644\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\n'
     printf '0644\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\n'
+    printf '0644\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\n'
+    printf '0644\tassets/pfwd-city-cn-v4.tsv\tassets/pfwd-city-cn-v4.tsv\tassets/pfwd-city-cn-v4.tsv\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
         printf '0644\tlib/%s.sh\tlib/%s.sh\tlib/%s.sh\n' "$lib" "$lib" "$lib"
     done
@@ -433,7 +435,7 @@ service_verify_removed() {
         "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" \
         "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
         "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" \
-        "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
+        "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" "$PFWD_WHITELIST_CITY_IPV4_FILE" \
         "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
         "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"; do
         [ ! -e "$path" ] || leftovers+=("$path")

@@ -27,6 +27,7 @@ config_default_json() {
       "include_cn": true,
       "cn_mode": "all",
       "cn_provinces": [],
+      "cn_city_codes": [],
       "custom_cidrs": [],
       "runtime_hash": ""
     },

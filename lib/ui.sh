@@ -1074,9 +1074,11 @@ ui_whitelist_summary_rows() {
                 item="入口国内 IP 策略"
                 [ "$value" != "-" ] && value="$(ui_guard_cn_compact_summary ingress)"
                 ;;
+            "市白名单") item="入口市白名单" ;;
             "自定义 CIDR") item="入口自定义 CIDR" ;;
             "白名单条目") item="入口白名单条目" ;;
             "IPv4 文件") item="入口 IPv4 文件" ;;
+            "市级 IPv4 文件") item="入口市级 IPv4 文件" ;;
             "IPv6 文件") item="入口 IPv6 文件" ;;
         esac
         printf '%s\t%s\n' "$item" "$value"
@@ -4551,7 +4553,7 @@ ui_menu_whitelist_cidrs_delete() {
 
 ui_guard_cn_kind_title() {
     case "$1" in
-        ingress) printf '入口国内 IP/省份' ;;
+        ingress) printf '入口省白名单' ;;
         egress) printf '出口国内 IP/省份' ;;
         *) printf '国内 IP/省份' ;;
     esac
@@ -4828,6 +4830,177 @@ ui_menu_guard_cn_selection() {
     done
 }
 
+ui_guard_city_compact_summary() {
+    whitelist_city_selection_summary
+}
+
+ui_guard_city_province_count() {
+    whitelist_city_available_province_rows | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+ui_guard_city_province_rows() {
+    whitelist_city_available_province_rows | awk -F '\t' '{printf "%s\t%s\t%s\n", $1, $3, $4}'
+}
+
+ui_guard_city_province_code_by_index() {
+    local index="$1"
+    whitelist_city_available_province_rows | awk -F '\t' -v idx="$index" '$1 == idx {print $2; exit}'
+}
+
+ui_guard_city_city_count() {
+    local province_code="$1"
+    whitelist_city_rows_by_province_code "$province_code" | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+ui_guard_city_rows() {
+    local province_code="$1"
+    local idx code city
+    local -A selected=()
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        selected["$code"]=1
+    done < <(whitelist_cn_city_codes_tsv)
+
+    while IFS=$'\t' read -r idx code city; do
+        [ -n "$idx" ] || continue
+        if [ -n "${selected[$code]:-}" ]; then
+            printf '%s\t%s\t%s\t已选\n' "$idx" "$code" "$city"
+        else
+            printf '%s\t%s\t%s\t\n' "$idx" "$code" "$city"
+        fi
+    done < <(whitelist_city_rows_by_province_code "$province_code")
+}
+
+ui_guard_city_codes_from_indexes() {
+    local province_code="$1"
+    local indexes="$2"
+    local -a cities=()
+    local idx
+    mapfile -t cities < <(whitelist_city_rows_by_province_code "$province_code" | cut -f2)
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        printf '%s\n' "${cities[$((idx - 1))]:-}"
+    done <<< "$indexes" | sed '/^$/d'
+}
+
+ui_guard_city_selected_rows() {
+    local idx=1 code province city
+    while IFS=$'\t' read -r code province city; do
+        [ -n "$code" ] || continue
+        printf '%s\t%s\t%s\t%s\n' "$idx" "$code" "$province" "$city"
+        idx=$((idx + 1))
+    done < <(whitelist_city_selected_rows)
+}
+
+ui_render_guard_city_menu_page() {
+    ui_header "入口市白名单"
+    ui_notice_render
+    printf '当前市白名单：%s\n' "$(ui_guard_city_compact_summary)"
+    printf '说明：市白名单当前仅覆盖 IPv4；和省白名单不互斥，最终取并集。\n'
+    printf '\n'
+    ui_menu_item 1 "添加城市"
+    ui_menu_item 2 "删除城市"
+    ui_menu_item 3 "清空城市"
+    ui_menu_item 0 "返回"
+}
+
+ui_render_guard_city_province_page() {
+    ui_header "入口市白名单 - 选择省份"
+    ui_notice_render
+    printf '当前市白名单：%s\n' "$(ui_guard_city_compact_summary)"
+    printf '说明：先选择省份，再选择城市；输入 0 返回。\n'
+    printf '\n'
+    ui_table_render $'序号\t省份\t城市数' "$(ui_guard_city_province_rows)" "2"
+}
+
+ui_render_guard_city_add_page() {
+    local province_code="$1"
+    ui_header "入口市白名单 - 添加城市"
+    ui_notice_render
+    printf '当前市白名单：%s\n' "$(ui_guard_city_compact_summary)"
+    printf '说明：支持单序号、多序号和连续范围，多个选择用 , 分隔，例如 1,3,5-8；输入 0 返回。\n'
+    printf '\n'
+    ui_table_render $'序号\tcode\t城市\t当前' "$(ui_guard_city_rows "$province_code")" "2"
+}
+
+ui_render_guard_city_delete_page() {
+    ui_header "入口市白名单 - 删除城市"
+    ui_notice_render
+    printf '当前市白名单：%s\n' "$(ui_guard_city_compact_summary)"
+    printf '说明：支持单序号、多序号和连续范围，多个选择用 , 分隔，例如 1,3,5-8；输入 0 返回。\n'
+    printf '\n'
+    ui_table_render $'序号\tcode\t省份\t城市' "$(ui_guard_city_selected_rows)" "2"
+}
+
+ui_menu_guard_city_add() {
+    local province_count raw parsed province_code city_count codes
+    local -a city_codes=()
+    province_count="$(ui_guard_city_province_count)"
+    [ "$province_count" -gt 0 ] || { ui_warn "暂无市级白名单资产"; return 1; }
+    ui_render_page ui_render_guard_city_province_page
+    ui_read "选择省份序号；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$province_count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$(printf '%s\n' "$UI_REPLY" | head -n1)"
+    province_code="$(ui_guard_city_province_code_by_index "$parsed")"
+    [ -n "$province_code" ] || { ui_warn "省份序号不存在"; return 1; }
+
+    city_count="$(ui_guard_city_city_count "$province_code")"
+    [ "$city_count" -gt 0 ] || { ui_warn "该省份暂无市级细分"; return 1; }
+    ui_render_page ui_render_guard_city_add_page "$province_code"
+    ui_read "选择城市序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$city_count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    codes="$(ui_guard_city_codes_from_indexes "$province_code" "$UI_REPLY")"
+    mapfile -t city_codes < <(printf '%s\n' "$codes" | sed '/^$/d')
+    [ "${#city_codes[@]}" -gt 0 ] || { ui_warn "未解析到城市"; return 1; }
+    ui_run cmd_guard_whitelist_city add "$province_code" "${city_codes[@]}"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口市白名单已添加城市" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_city_delete() {
+    local count raw parsed
+    count="$(whitelist_city_codes_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "当前没有已选城市"
+        return 1
+    fi
+    ui_render_page ui_render_guard_city_delete_page
+    ui_read "选择要删除的城市序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$UI_REPLY"
+    ui_run cmd_guard_whitelist_city delete $parsed
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口市白名单已删除城市" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_city_selection() {
+    while true; do
+        ui_render_page ui_render_guard_city_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_menu_guard_city_add
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_menu_guard_city_delete
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_run cmd_guard_whitelist_city clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口市白名单已清空" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
 ui_render_ingress_whitelist_menu_page() {
     ui_header "入口白名单"
     ui_notice_render
@@ -4835,8 +5008,9 @@ ui_render_ingress_whitelist_menu_page() {
     echo
     ui_menu_item 1 "启用入口白名单"
     ui_menu_item 2 "关闭入口白名单"
-    ui_menu_item 3 "国内IP/省份"
-    ui_menu_item 4 "入口自定义 CIDR"
+    ui_menu_item 3 "省白名单"
+    ui_menu_item 4 "市白名单"
+    ui_menu_item 5 "入口自定义 CIDR"
     ui_menu_item 0 "返回"
 }
 
@@ -4860,6 +5034,10 @@ ui_menu_ingress_whitelist() {
                 ui_maybe_pause success
                 ;;
             4)
+                ui_menu_guard_city_selection
+                ui_maybe_pause success
+                ;;
+            5)
                 ui_menu_whitelist_cidrs
                 ;;
             0) return 0 ;;

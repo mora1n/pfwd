@@ -1300,6 +1300,9 @@ cmd_guard() {
         whitelist-cn)
             cmd_guard_whitelist_cn "$@"
             ;;
+        whitelist-city)
+            cmd_guard_whitelist_city "$@"
+            ;;
         whitelist-custom)
             cmd_guard_whitelist_custom "$@"
             ;;
@@ -1313,7 +1316,7 @@ cmd_guard() {
             cmd_guard_egress_whitelist_custom "$@"
             ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-cn|whitelist-custom|egress-whitelist|egress-whitelist-cn|egress-whitelist-custom"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-cn|whitelist-city|whitelist-custom|egress-whitelist|egress-whitelist-cn|egress-whitelist-custom"
             ;;
     esac
 }
@@ -1420,10 +1423,11 @@ cmd_guard_whitelist_check() {
         *) pfwd_die "无效协议：$protocol，必须是 tcp 或 udp" ;;
     esac
 
-    local mode provinces files bin output geo_status geo_error_file geo_error
+    local mode provinces files city_file bin output geo_status geo_error_file geo_error
     mode="$(whitelist_cn_mode)"
     provinces="$(whitelist_cn_provinces_tsv | paste -sd, -)"
     files="$(whitelist_allow_ipv4_file):$(whitelist_allow_ipv6_file)"
+    city_file="$(whitelist_city_runtime_ipv4_file)"
     bin="$(guard_bin_path)"
     [ -x "$bin" ] || pfwd_die "缺少 XDP 预编译二进制：$bin"
 
@@ -1434,6 +1438,7 @@ cmd_guard_whitelist_check() {
         --address "$address" \
         --mode "$mode" \
         --provinces "$provinces" \
+        --city-file "$city_file" \
         --whitelist-file "$files" 2>"$geo_error_file")"; then
         geo_status=0
     else
@@ -1473,12 +1478,14 @@ cmd_guard_whitelist_check() {
         fi
     fi
 
-    local geo_allowed custom_allowed allowed province matched_source
+    local geo_allowed custom_allowed city_allowed allowed province matched_source city_label
     geo_allowed="$(jq -r '.geo_allowed' <<< "$output")"
     custom_allowed="$(jq -r '.custom_allowed' <<< "$output")"
+    city_allowed="$(jq -r '.city_allowed // false' <<< "$output")"
     allowed="$(jq -r '.allowed' <<< "$output")"
     province="$(jq -r '.province // "-"' <<< "$output")"
     matched_source="$(jq -r '.matched_source' <<< "$output")"
+    city_label="$(jq -r 'if ((.city_province // "") != "") and ((.city // "") != "") then (.city_province + "/" + .city) else "-" end' <<< "$output")"
 
     if [ "$skip_hit" = "true" ]; then
         conclusion="放行"
@@ -1488,7 +1495,9 @@ cmd_guard_whitelist_check() {
         reason="入口白名单未启用"
     elif [ "$allowed" = "true" ]; then
         conclusion="放行"
-        if [ "$custom_allowed" = "true" ]; then
+        if [ "$city_allowed" = "true" ]; then
+            reason="命中入口市白名单：$city_label"
+        elif [ "$custom_allowed" = "true" ]; then
             reason="命中入口自定义 CIDR"
         else
             reason="命中国内 IP 策略"
@@ -1510,8 +1519,10 @@ cmd_guard_whitelist_check() {
 
     printf '地址\t%s\n' "$address"
     printf '省份\t%s\n' "$province"
+    printf '城市\t%s\n' "$city_label"
     printf '入口白名单\t%s\n' "$(if [ "$wl_enabled" = "true" ]; then printf '开'; else printf '关'; fi)"
     printf '国内 IP 策略\t%s\n' "$(whitelist_cn_selection_summary)"
+    printf '市白名单\t%s\n' "$(whitelist_city_selection_summary)"
     if [ -n "$listen_port" ]; then
         printf '监听端口\t%s%s\n' "$listen_port" "$(if [ -n "$protocol" ]; then printf '/%s' "$protocol"; fi)"
         printf '入口防护跳过\t%s\n' "$(if [ "$skip_hit" = "true" ]; then printf '是'; else printf '否'; fi)"
@@ -1521,6 +1532,66 @@ cmd_guard_whitelist_check() {
     printf 'geo-check\t%s\n' "$(if [ "$geo_status" -eq 0 ]; then printf 'allow'; else printf 'deny'; fi)"
     printf '结论\t%s\n' "$conclusion"
     printf '原因\t%s\n' "$reason"
+}
+
+cmd_guard_whitelist_city() {
+    config_init >/dev/null
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        list)
+            case "$#" in
+                0)
+                    whitelist_city_available_province_rows
+                    ;;
+                1)
+                    local province_code
+                    province_code="$(whitelist_city_province_code_by_selector "$1")"
+                    whitelist_city_rows_by_province_code "$province_code"
+                    ;;
+                *)
+                    pfwd_die "用法：pfwd guard whitelist-city list [省份序号|省份名|省份code]"
+                    ;;
+            esac
+            ;;
+        status)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-city status"
+            whitelist_city_selected_rows
+            ;;
+        add)
+            [ "$#" -ge 2 ] || pfwd_die "用法：pfwd guard whitelist-city add <省份序号|省份名|省份code> <城市序号|城市名|城市code...>"
+            local province_selector="$1" city_selector code tmp
+            shift
+            tmp="$(mktemp)"
+            whitelist_cn_city_codes_tsv > "$tmp"
+            for city_selector in "$@"; do
+                code="$(whitelist_city_code_by_selector "$province_selector" "$city_selector")"
+                printf '%s\n' "$code" >> "$tmp"
+            done
+            whitelist_config_set_city_codes "$tmp"
+            rm -f "$tmp"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口市白名单已更新"
+            ;;
+        delete)
+            [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-city delete <index...>"
+            whitelist_delete_city_codes_by_indexes "$(printf '%s\n' "$@")"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口市白名单已删除"
+            ;;
+        clear)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-city clear"
+            whitelist_clear_city_codes
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口市白名单已清空"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard whitelist-city list|status|add|delete|clear"
+            ;;
+    esac
 }
 
 cmd_guard_whitelist_custom() {

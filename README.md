@@ -64,7 +64,9 @@ tar -czf pfwd.tar.gz \
   assets/pfwd-downmask-linux-amd64 \
   assets/pfwd-geo-cn-v4.bin \
   assets/pfwd-geo-cn-v6.bin \
-  assets/pfwd-geo-meta.json
+  assets/pfwd-geo-meta.json \
+  assets/pfwd-city-cn-meta.json \
+  assets/pfwd-city-cn-v4.tsv
 ```
 
 目标机器上解压并安装：
@@ -102,7 +104,7 @@ pfwd add \
 
 `pfwd guard` 负责三类能力：
 
-- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，支持关闭国内段、允许全部国内 IP，或按省份批量允许；也可追加自定义 CIDR 或单个 IP
+- 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，支持关闭国内段、允许全部国内 IP、按省份或按市允许 IPv4；
 - 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量；国内 IP / 省份策略与目标校验、宿主机出口共用一套配置
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`
 - 入口防护跳过端口：指定公网监听端口可绕过入口白名单和协议封锁；不影响出口白名单
@@ -115,6 +117,8 @@ pfwd guard protocols --https true --socks true --skip-port 25001
 pfwd guard whitelist --enabled true
 pfwd guard whitelist-cn all
 pfwd guard whitelist-cn select 广东省 江苏省
+pfwd guard whitelist-city list 湖南省
+pfwd guard whitelist-city add 湖南省 长沙市
 pfwd guard whitelist-custom add 203.0.113.5
 pfwd guard whitelist check --address 61.187.9.117 --listen-port 41422 --protocol tcp
 pfwd guard egress-whitelist --enabled true
@@ -220,6 +224,8 @@ install -m 755 assets/pfwd-downmask-linux-amd64 /usr/local/lib/pfwd/bin/pfwd-dow
 install -m 644 assets/pfwd-geo-cn-v4.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v4.bin
 install -m 644 assets/pfwd-geo-cn-v6.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v6.bin
 install -m 644 assets/pfwd-geo-meta.json /usr/local/lib/pfwd/assets/pfwd-geo-meta.json
+install -m 644 assets/pfwd-city-cn-meta.json /usr/local/lib/pfwd/assets/pfwd-city-cn-meta.json
+install -m 644 assets/pfwd-city-cn-v4.tsv /usr/local/lib/pfwd/assets/pfwd-city-cn-v4.tsv
 
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr

@@ -120,6 +120,10 @@ static __always_inline int rule_needs_guard(const struct pfwd_rule_val *rule) {
     return rule && (rule->flags & PFWD_RULE_F_NEEDS_GUARD);
 }
 
+static __always_inline int rule_needs_allow(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & PFWD_RULE_F_NEEDS_ALLOW);
+}
+
 static __always_inline int rule_snat_fixed(const struct pfwd_rule_val *rule) {
     return rule && (rule->flags & PFWD_RULE_F_SNAT_FIXED);
 }
@@ -1151,14 +1155,6 @@ static __always_inline int counter_plan_needs_quota(const struct pfwd_counter_pl
     return plan->flags & PFWD_RULE_F_NEEDS_QUOTA;
 }
 
-static __always_inline int counter_plan_needs_guard(const struct pfwd_counter_plan *plan) {
-    return plan->flags & PFWD_RULE_F_NEEDS_GUARD;
-}
-
-static __always_inline int counter_plan_needs_allow(const struct pfwd_counter_plan *plan) {
-    return plan->flags & PFWD_RULE_F_NEEDS_ALLOW;
-}
-
 static __always_inline void load_input_counter_plan(
     const struct pfwd_rule_val *rule,
     __u64 input_delta,
@@ -1550,7 +1546,7 @@ static __always_inline void load_guard_payload_prefix(
 static __always_inline int port_skipped(__be16 port) {
     __u32 key = bpf_ntohs(port);
     __u8 *value = bpf_map_lookup_elem(&pfwd_protocol_skip_ports, &key);
-    return value != 0;
+    return value && *value != 0;
 }
 
 static __always_inline int ingress_guard_bypassed(const struct pfwd_rule_val *rule, __be16 port) {
@@ -2041,14 +2037,10 @@ static __always_inline int tc_local_forward_v4(
     int guard_bypassed = ingress_guard_bypassed(rule, dport);
 
     init_counter_plan(rule, &counters);
-    if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-        if (counter_plan_needs_allow(&counters)) {
-            if (!whitelist_allowed_v4(ip4->saddr, rule)) {
-                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                count_drop_with_plan(rule, packet_len, &counters);
-                return TC_ACT_SHOT;
-            }
-        }
+    if (!guard_bypassed && rule_needs_allow(rule) && !whitelist_allowed_v4(ip4->saddr, rule)) {
+        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+        count_drop_with_plan(rule, packet_len, &counters);
+        return TC_ACT_SHOT;
     }
     if (protocol == IPPROTO_TCP) {
         struct tcphdr_min *tcp = (void *)ip4 + ihl;
@@ -2058,11 +2050,9 @@ static __always_inline int tc_local_forward_v4(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-            if (counter_plan_needs_guard(&counters)) {
-                if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-                    return TC_ACT_SHOT;
-                }
+        if (!guard_bypassed && rule_needs_guard(rule)) {
+            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
             }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -2110,14 +2100,10 @@ static __always_inline int tc_local_forward_v6(
     int guard_bypassed = ingress_guard_bypassed(rule, dport);
 
     init_counter_plan(rule, &counters);
-    if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-        if (counter_plan_needs_allow(&counters)) {
-            if (!whitelist_allowed_v6(ip6->saddr, rule)) {
-                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                count_drop_with_plan(rule, packet_len, &counters);
-                return TC_ACT_SHOT;
-            }
-        }
+    if (!guard_bypassed && rule_needs_allow(rule) && !whitelist_allowed_v6(ip6->saddr, rule)) {
+        stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+        count_drop_with_plan(rule, packet_len, &counters);
+        return TC_ACT_SHOT;
     }
     if (protocol == IPPROTO_TCP) {
         struct tcphdr_min *tcp = (void *)(ip6 + 1);
@@ -2127,11 +2113,9 @@ static __always_inline int tc_local_forward_v6(
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-            if (counter_plan_needs_guard(&counters)) {
-                if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-                    return TC_ACT_SHOT;
-                }
+        if (!guard_bypassed && rule_needs_guard(rule)) {
+            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                return TC_ACT_SHOT;
             }
         }
         conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -2161,6 +2145,46 @@ static __always_inline int tc_local_forward_v6(
     count_input_with_plan(rule, packet_len, 1, &counters);
     stat_inc(PFWD_STAT_FORWARDED);
     return TC_ACT_OK;
+}
+
+static __always_inline int tc_ingress_allowed_v4(
+    struct ipv4hdr_min *ip4,
+    struct pfwd_rule_val *rule,
+    __be16 dport,
+    __u64 packet_len
+) {
+    if (!rule) {
+        return 1;
+    }
+    if (ingress_guard_bypassed(rule, dport) || !rule_needs_allow(rule)) {
+        return 1;
+    }
+    if (whitelist_allowed_v4(ip4->saddr, rule)) {
+        return 1;
+    }
+    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+    count_drop(rule, packet_len);
+    return 0;
+}
+
+static __always_inline int tc_ingress_allowed_v6(
+    struct ipv6hdr_min *ip6,
+    struct pfwd_rule_val *rule,
+    __be16 dport,
+    __u64 packet_len
+) {
+    if (!rule) {
+        return 1;
+    }
+    if (ingress_guard_bypassed(rule, dport) || !rule_needs_allow(rule)) {
+        return 1;
+    }
+    if (whitelist_allowed_v6(ip6->saddr, rule)) {
+        return 1;
+    }
+    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+    count_drop(rule, packet_len);
+    return 0;
 }
 
 static __always_inline int host_egress_allow_v4_tcp(
@@ -2516,12 +2540,10 @@ int pfwd_xdp(struct xdp_md *ctx) {
             struct pfwd_conn_key conn_key;
             int guard_bypassed = ingress_guard_bypassed(rule, dport);
             init_counter_plan(rule, &counters);
-            if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v4(ip4->saddr, rule)) {
-                    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                    count_drop_with_plan(rule, packet_len, &counters);
-                    return XDP_DROP;
-                }
+            if (!guard_bypassed && rule_needs_allow(rule) && !whitelist_allowed_v4(ip4->saddr, rule)) {
+                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                count_drop_with_plan(rule, packet_len, &counters);
+                return XDP_DROP;
             }
             if (protocol == IPPROTO_TCP) {
                 struct tcphdr_min *tcp = (void *)ip4 + ihl;
@@ -2531,11 +2553,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                    if (counter_plan_needs_guard(&counters)) {
-                        if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
-                            return XDP_DROP;
-                        }
+                if (!guard_bypassed && rule_needs_guard(rule)) {
+                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                        return XDP_DROP;
                     }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -2697,12 +2717,10 @@ int pfwd_xdp(struct xdp_md *ctx) {
             struct pfwd_conn_key conn_key;
             int guard_bypassed = ingress_guard_bypassed(rule, dport);
             init_counter_plan(rule, &counters);
-            if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                if (counter_plan_needs_allow(&counters) && !whitelist_allowed_v6(ip6->saddr, rule)) {
-                    stat_inc(PFWD_STAT_WHITELIST_DROPPED);
-                    count_drop_with_plan(rule, packet_len, &counters);
-                    return XDP_DROP;
-                }
+            if (!guard_bypassed && rule_needs_allow(rule) && !whitelist_allowed_v6(ip6->saddr, rule)) {
+                stat_inc(PFWD_STAT_WHITELIST_DROPPED);
+                count_drop_with_plan(rule, packet_len, &counters);
+                return XDP_DROP;
             }
             if (protocol == IPPROTO_TCP) {
                 struct tcphdr_min *tcp = (void *)(ip6 + 1);
@@ -2712,11 +2730,9 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (!guard_bypassed && counter_plan_needs_policy(&counters)) {
-                    if (counter_plan_needs_guard(&counters)) {
-                        if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
-                            return XDP_DROP;
-                        }
+                if (!guard_bypassed && rule_needs_guard(rule)) {
+                    if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                        return XDP_DROP;
                     }
                 }
                 tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
@@ -2881,9 +2897,17 @@ int pfwd_ingress(struct __sk_buff *skb) {
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
             rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
-            if (rule && !rule_xdp_disabled(rule) &&
-                (rule_target_is_loopback(4, rule) || rule_needs_guard(rule))) {
-                needs_pull = 1;
+            if (rule && !rule_xdp_disabled(rule)) {
+                if (rule_target_is_loopback(4, rule)) {
+                    needs_pull = 1;
+                } else {
+                    if (!tc_ingress_allowed_v4(ip4, rule, dport, packet_len)) {
+                        return TC_ACT_SHOT;
+                    }
+                    if (rule_needs_guard(rule)) {
+                        needs_pull = 1;
+                    }
+                }
             }
             if (!needs_pull) {
                 return TC_ACT_OK;
@@ -2951,6 +2975,10 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, rule, packet_len);
             }
+            if (rule && !rule_xdp_disabled(rule) &&
+                !tc_ingress_allowed_v4(ip4, rule, dport, packet_len)) {
+                return TC_ACT_SHOT;
+            }
             return TC_ACT_OK;
         }
     }
@@ -2994,9 +3022,17 @@ int pfwd_ingress(struct __sk_buff *skb) {
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
             rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
-            if (rule && !rule_xdp_disabled(rule) &&
-                (rule_target_is_loopback(6, rule) || rule_needs_guard(rule))) {
-                needs_pull = 1;
+            if (rule && !rule_xdp_disabled(rule)) {
+                if (rule_target_is_loopback(6, rule)) {
+                    needs_pull = 1;
+                } else {
+                    if (!tc_ingress_allowed_v6(ip6, rule, dport, packet_len)) {
+                        return TC_ACT_SHOT;
+                    }
+                    if (rule_needs_guard(rule)) {
+                        needs_pull = 1;
+                    }
+                }
             }
             if (!needs_pull) {
                 return TC_ACT_OK;
@@ -3062,6 +3098,10 @@ int pfwd_ingress(struct __sk_buff *skb) {
             rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, rule, packet_len);
+            }
+            if (rule && !rule_xdp_disabled(rule) &&
+                !tc_ingress_allowed_v6(ip6, rule, dport, packet_len)) {
+                return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
         }

@@ -1,0 +1,2266 @@
+{
+  "source": "https://github.com/metowolf/iplist/blob/master/docs/cncity.md",
+  "generated_by": "tools/prepare_data.py",
+  "provinces": [
+    {
+      "name": "北京市",
+      "code": "110000",
+      "file": "regions/110000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/110000.txt",
+      "cities": []
+    },
+    {
+      "name": "天津市",
+      "code": "120000",
+      "file": "regions/120000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/120000.txt",
+      "cities": []
+    },
+    {
+      "name": "河北省",
+      "code": "130000",
+      "file": "regions/130000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/130000.txt",
+      "cities": [
+        {
+          "name": "石家庄市",
+          "code": "130100",
+          "file": "regions/130100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130100.txt"
+        },
+        {
+          "name": "唐山市",
+          "code": "130200",
+          "file": "regions/130200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130200.txt"
+        },
+        {
+          "name": "秦皇岛市",
+          "code": "130300",
+          "file": "regions/130300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130300.txt"
+        },
+        {
+          "name": "邯郸市",
+          "code": "130400",
+          "file": "regions/130400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130400.txt"
+        },
+        {
+          "name": "邢台市",
+          "code": "130500",
+          "file": "regions/130500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130500.txt"
+        },
+        {
+          "name": "保定市",
+          "code": "130600",
+          "file": "regions/130600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130600.txt"
+        },
+        {
+          "name": "张家口市",
+          "code": "130700",
+          "file": "regions/130700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130700.txt"
+        },
+        {
+          "name": "承德市",
+          "code": "130800",
+          "file": "regions/130800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130800.txt"
+        },
+        {
+          "name": "沧州市",
+          "code": "130900",
+          "file": "regions/130900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/130900.txt"
+        },
+        {
+          "name": "廊坊市",
+          "code": "131000",
+          "file": "regions/131000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/131000.txt"
+        },
+        {
+          "name": "衡水市",
+          "code": "131100",
+          "file": "regions/131100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/131100.txt"
+        }
+      ]
+    },
+    {
+      "name": "山西省",
+      "code": "140000",
+      "file": "regions/140000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/140000.txt",
+      "cities": [
+        {
+          "name": "太原市",
+          "code": "140100",
+          "file": "regions/140100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140100.txt"
+        },
+        {
+          "name": "大同市",
+          "code": "140200",
+          "file": "regions/140200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140200.txt"
+        },
+        {
+          "name": "阳泉市",
+          "code": "140300",
+          "file": "regions/140300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140300.txt"
+        },
+        {
+          "name": "长治市",
+          "code": "140400",
+          "file": "regions/140400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140400.txt"
+        },
+        {
+          "name": "晋城市",
+          "code": "140500",
+          "file": "regions/140500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140500.txt"
+        },
+        {
+          "name": "朔州市",
+          "code": "140600",
+          "file": "regions/140600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140600.txt"
+        },
+        {
+          "name": "晋中市",
+          "code": "140700",
+          "file": "regions/140700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140700.txt"
+        },
+        {
+          "name": "运城市",
+          "code": "140800",
+          "file": "regions/140800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140800.txt"
+        },
+        {
+          "name": "忻州市",
+          "code": "140900",
+          "file": "regions/140900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/140900.txt"
+        },
+        {
+          "name": "临汾市",
+          "code": "141000",
+          "file": "regions/141000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/141000.txt"
+        },
+        {
+          "name": "吕梁市",
+          "code": "141100",
+          "file": "regions/141100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/141100.txt"
+        }
+      ]
+    },
+    {
+      "name": "内蒙古自治区",
+      "code": "150000",
+      "file": "regions/150000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/150000.txt",
+      "cities": [
+        {
+          "name": "呼和浩特市",
+          "code": "150100",
+          "file": "regions/150100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150100.txt"
+        },
+        {
+          "name": "包头市",
+          "code": "150200",
+          "file": "regions/150200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150200.txt"
+        },
+        {
+          "name": "乌海市",
+          "code": "150300",
+          "file": "regions/150300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150300.txt"
+        },
+        {
+          "name": "赤峰市",
+          "code": "150400",
+          "file": "regions/150400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150400.txt"
+        },
+        {
+          "name": "通辽市",
+          "code": "150500",
+          "file": "regions/150500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150500.txt"
+        },
+        {
+          "name": "鄂尔多斯市",
+          "code": "150600",
+          "file": "regions/150600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150600.txt"
+        },
+        {
+          "name": "呼伦贝尔市",
+          "code": "150700",
+          "file": "regions/150700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150700.txt"
+        },
+        {
+          "name": "巴彦淖尔市",
+          "code": "150800",
+          "file": "regions/150800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150800.txt"
+        },
+        {
+          "name": "乌兰察布市",
+          "code": "150900",
+          "file": "regions/150900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/150900.txt"
+        },
+        {
+          "name": "兴安盟",
+          "code": "152200",
+          "file": "regions/152200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/152200.txt"
+        },
+        {
+          "name": "锡林郭勒盟",
+          "code": "152500",
+          "file": "regions/152500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/152500.txt"
+        },
+        {
+          "name": "阿拉善盟",
+          "code": "152900",
+          "file": "regions/152900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/152900.txt"
+        }
+      ]
+    },
+    {
+      "name": "辽宁省",
+      "code": "210000",
+      "file": "regions/210000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/210000.txt",
+      "cities": [
+        {
+          "name": "沈阳市",
+          "code": "210100",
+          "file": "regions/210100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210100.txt"
+        },
+        {
+          "name": "大连市",
+          "code": "210200",
+          "file": "regions/210200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210200.txt"
+        },
+        {
+          "name": "鞍山市",
+          "code": "210300",
+          "file": "regions/210300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210300.txt"
+        },
+        {
+          "name": "抚顺市",
+          "code": "210400",
+          "file": "regions/210400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210400.txt"
+        },
+        {
+          "name": "本溪市",
+          "code": "210500",
+          "file": "regions/210500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210500.txt"
+        },
+        {
+          "name": "丹东市",
+          "code": "210600",
+          "file": "regions/210600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210600.txt"
+        },
+        {
+          "name": "锦州市",
+          "code": "210700",
+          "file": "regions/210700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210700.txt"
+        },
+        {
+          "name": "营口市",
+          "code": "210800",
+          "file": "regions/210800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210800.txt"
+        },
+        {
+          "name": "阜新市",
+          "code": "210900",
+          "file": "regions/210900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/210900.txt"
+        },
+        {
+          "name": "辽阳市",
+          "code": "211000",
+          "file": "regions/211000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/211000.txt"
+        },
+        {
+          "name": "盘锦市",
+          "code": "211100",
+          "file": "regions/211100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/211100.txt"
+        },
+        {
+          "name": "铁岭市",
+          "code": "211200",
+          "file": "regions/211200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/211200.txt"
+        },
+        {
+          "name": "朝阳市",
+          "code": "211300",
+          "file": "regions/211300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/211300.txt"
+        },
+        {
+          "name": "葫芦岛市",
+          "code": "211400",
+          "file": "regions/211400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/211400.txt"
+        }
+      ]
+    },
+    {
+      "name": "吉林省",
+      "code": "220000",
+      "file": "regions/220000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/220000.txt",
+      "cities": [
+        {
+          "name": "长春市",
+          "code": "220100",
+          "file": "regions/220100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220100.txt"
+        },
+        {
+          "name": "吉林市",
+          "code": "220200",
+          "file": "regions/220200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220200.txt"
+        },
+        {
+          "name": "四平市",
+          "code": "220300",
+          "file": "regions/220300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220300.txt"
+        },
+        {
+          "name": "辽源市",
+          "code": "220400",
+          "file": "regions/220400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220400.txt"
+        },
+        {
+          "name": "通化市",
+          "code": "220500",
+          "file": "regions/220500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220500.txt"
+        },
+        {
+          "name": "白山市",
+          "code": "220600",
+          "file": "regions/220600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220600.txt"
+        },
+        {
+          "name": "松原市",
+          "code": "220700",
+          "file": "regions/220700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220700.txt"
+        },
+        {
+          "name": "白城市",
+          "code": "220800",
+          "file": "regions/220800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/220800.txt"
+        },
+        {
+          "name": "延边朝鲜族自治州",
+          "code": "222400",
+          "file": "regions/222400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/222400.txt"
+        }
+      ]
+    },
+    {
+      "name": "黑龙江省",
+      "code": "230000",
+      "file": "regions/230000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/230000.txt",
+      "cities": [
+        {
+          "name": "哈尔滨市",
+          "code": "230100",
+          "file": "regions/230100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230100.txt"
+        },
+        {
+          "name": "齐齐哈尔市",
+          "code": "230200",
+          "file": "regions/230200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230200.txt"
+        },
+        {
+          "name": "鸡西市",
+          "code": "230300",
+          "file": "regions/230300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230300.txt"
+        },
+        {
+          "name": "鹤岗市",
+          "code": "230400",
+          "file": "regions/230400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230400.txt"
+        },
+        {
+          "name": "双鸭山市",
+          "code": "230500",
+          "file": "regions/230500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230500.txt"
+        },
+        {
+          "name": "大庆市",
+          "code": "230600",
+          "file": "regions/230600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230600.txt"
+        },
+        {
+          "name": "伊春市",
+          "code": "230700",
+          "file": "regions/230700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230700.txt"
+        },
+        {
+          "name": "佳木斯市",
+          "code": "230800",
+          "file": "regions/230800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230800.txt"
+        },
+        {
+          "name": "七台河市",
+          "code": "230900",
+          "file": "regions/230900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/230900.txt"
+        },
+        {
+          "name": "牡丹江市",
+          "code": "231000",
+          "file": "regions/231000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/231000.txt"
+        },
+        {
+          "name": "黑河市",
+          "code": "231100",
+          "file": "regions/231100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/231100.txt"
+        },
+        {
+          "name": "绥化市",
+          "code": "231200",
+          "file": "regions/231200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/231200.txt"
+        },
+        {
+          "name": "大兴安岭地区",
+          "code": "232700",
+          "file": "regions/232700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/232700.txt"
+        }
+      ]
+    },
+    {
+      "name": "上海市",
+      "code": "310000",
+      "file": "regions/310000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/310000.txt",
+      "cities": []
+    },
+    {
+      "name": "江苏省",
+      "code": "320000",
+      "file": "regions/320000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/320000.txt",
+      "cities": [
+        {
+          "name": "南京市",
+          "code": "320100",
+          "file": "regions/320100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320100.txt"
+        },
+        {
+          "name": "无锡市",
+          "code": "320200",
+          "file": "regions/320200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320200.txt"
+        },
+        {
+          "name": "徐州市",
+          "code": "320300",
+          "file": "regions/320300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320300.txt"
+        },
+        {
+          "name": "常州市",
+          "code": "320400",
+          "file": "regions/320400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320400.txt"
+        },
+        {
+          "name": "苏州市",
+          "code": "320500",
+          "file": "regions/320500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320500.txt"
+        },
+        {
+          "name": "南通市",
+          "code": "320600",
+          "file": "regions/320600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320600.txt"
+        },
+        {
+          "name": "连云港市",
+          "code": "320700",
+          "file": "regions/320700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320700.txt"
+        },
+        {
+          "name": "淮安市",
+          "code": "320800",
+          "file": "regions/320800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320800.txt"
+        },
+        {
+          "name": "盐城市",
+          "code": "320900",
+          "file": "regions/320900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/320900.txt"
+        },
+        {
+          "name": "扬州市",
+          "code": "321000",
+          "file": "regions/321000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/321000.txt"
+        },
+        {
+          "name": "镇江市",
+          "code": "321100",
+          "file": "regions/321100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/321100.txt"
+        },
+        {
+          "name": "泰州市",
+          "code": "321200",
+          "file": "regions/321200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/321200.txt"
+        },
+        {
+          "name": "宿迁市",
+          "code": "321300",
+          "file": "regions/321300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/321300.txt"
+        }
+      ]
+    },
+    {
+      "name": "浙江省",
+      "code": "330000",
+      "file": "regions/330000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/330000.txt",
+      "cities": [
+        {
+          "name": "杭州市",
+          "code": "330100",
+          "file": "regions/330100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330100.txt"
+        },
+        {
+          "name": "宁波市",
+          "code": "330200",
+          "file": "regions/330200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330200.txt"
+        },
+        {
+          "name": "温州市",
+          "code": "330300",
+          "file": "regions/330300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330300.txt"
+        },
+        {
+          "name": "嘉兴市",
+          "code": "330400",
+          "file": "regions/330400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330400.txt"
+        },
+        {
+          "name": "湖州市",
+          "code": "330500",
+          "file": "regions/330500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330500.txt"
+        },
+        {
+          "name": "绍兴市",
+          "code": "330600",
+          "file": "regions/330600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330600.txt"
+        },
+        {
+          "name": "金华市",
+          "code": "330700",
+          "file": "regions/330700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330700.txt"
+        },
+        {
+          "name": "衢州市",
+          "code": "330800",
+          "file": "regions/330800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330800.txt"
+        },
+        {
+          "name": "舟山市",
+          "code": "330900",
+          "file": "regions/330900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/330900.txt"
+        },
+        {
+          "name": "台州市",
+          "code": "331000",
+          "file": "regions/331000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/331000.txt"
+        },
+        {
+          "name": "丽水市",
+          "code": "331100",
+          "file": "regions/331100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/331100.txt"
+        }
+      ]
+    },
+    {
+      "name": "安徽省",
+      "code": "340000",
+      "file": "regions/340000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/340000.txt",
+      "cities": [
+        {
+          "name": "合肥市",
+          "code": "340100",
+          "file": "regions/340100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340100.txt"
+        },
+        {
+          "name": "芜湖市",
+          "code": "340200",
+          "file": "regions/340200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340200.txt"
+        },
+        {
+          "name": "蚌埠市",
+          "code": "340300",
+          "file": "regions/340300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340300.txt"
+        },
+        {
+          "name": "淮南市",
+          "code": "340400",
+          "file": "regions/340400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340400.txt"
+        },
+        {
+          "name": "马鞍山市",
+          "code": "340500",
+          "file": "regions/340500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340500.txt"
+        },
+        {
+          "name": "淮北市",
+          "code": "340600",
+          "file": "regions/340600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340600.txt"
+        },
+        {
+          "name": "铜陵市",
+          "code": "340700",
+          "file": "regions/340700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340700.txt"
+        },
+        {
+          "name": "安庆市",
+          "code": "340800",
+          "file": "regions/340800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/340800.txt"
+        },
+        {
+          "name": "黄山市",
+          "code": "341000",
+          "file": "regions/341000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341000.txt"
+        },
+        {
+          "name": "滁州市",
+          "code": "341100",
+          "file": "regions/341100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341100.txt"
+        },
+        {
+          "name": "阜阳市",
+          "code": "341200",
+          "file": "regions/341200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341200.txt"
+        },
+        {
+          "name": "宿州市",
+          "code": "341300",
+          "file": "regions/341300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341300.txt"
+        },
+        {
+          "name": "六安市",
+          "code": "341500",
+          "file": "regions/341500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341500.txt"
+        },
+        {
+          "name": "亳州市",
+          "code": "341600",
+          "file": "regions/341600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341600.txt"
+        },
+        {
+          "name": "池州市",
+          "code": "341700",
+          "file": "regions/341700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341700.txt"
+        },
+        {
+          "name": "宣城市",
+          "code": "341800",
+          "file": "regions/341800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/341800.txt"
+        }
+      ]
+    },
+    {
+      "name": "福建省",
+      "code": "350000",
+      "file": "regions/350000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/350000.txt",
+      "cities": [
+        {
+          "name": "福州市",
+          "code": "350100",
+          "file": "regions/350100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350100.txt"
+        },
+        {
+          "name": "厦门市",
+          "code": "350200",
+          "file": "regions/350200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350200.txt"
+        },
+        {
+          "name": "莆田市",
+          "code": "350300",
+          "file": "regions/350300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350300.txt"
+        },
+        {
+          "name": "三明市",
+          "code": "350400",
+          "file": "regions/350400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350400.txt"
+        },
+        {
+          "name": "泉州市",
+          "code": "350500",
+          "file": "regions/350500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350500.txt"
+        },
+        {
+          "name": "漳州市",
+          "code": "350600",
+          "file": "regions/350600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350600.txt"
+        },
+        {
+          "name": "南平市",
+          "code": "350700",
+          "file": "regions/350700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350700.txt"
+        },
+        {
+          "name": "龙岩市",
+          "code": "350800",
+          "file": "regions/350800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350800.txt"
+        },
+        {
+          "name": "宁德市",
+          "code": "350900",
+          "file": "regions/350900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/350900.txt"
+        }
+      ]
+    },
+    {
+      "name": "江西省",
+      "code": "360000",
+      "file": "regions/360000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/360000.txt",
+      "cities": [
+        {
+          "name": "南昌市",
+          "code": "360100",
+          "file": "regions/360100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360100.txt"
+        },
+        {
+          "name": "景德镇市",
+          "code": "360200",
+          "file": "regions/360200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360200.txt"
+        },
+        {
+          "name": "萍乡市",
+          "code": "360300",
+          "file": "regions/360300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360300.txt"
+        },
+        {
+          "name": "九江市",
+          "code": "360400",
+          "file": "regions/360400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360400.txt"
+        },
+        {
+          "name": "新余市",
+          "code": "360500",
+          "file": "regions/360500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360500.txt"
+        },
+        {
+          "name": "鹰潭市",
+          "code": "360600",
+          "file": "regions/360600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360600.txt"
+        },
+        {
+          "name": "赣州市",
+          "code": "360700",
+          "file": "regions/360700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360700.txt"
+        },
+        {
+          "name": "吉安市",
+          "code": "360800",
+          "file": "regions/360800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360800.txt"
+        },
+        {
+          "name": "宜春市",
+          "code": "360900",
+          "file": "regions/360900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/360900.txt"
+        },
+        {
+          "name": "抚州市",
+          "code": "361000",
+          "file": "regions/361000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/361000.txt"
+        },
+        {
+          "name": "上饶市",
+          "code": "361100",
+          "file": "regions/361100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/361100.txt"
+        }
+      ]
+    },
+    {
+      "name": "山东省",
+      "code": "370000",
+      "file": "regions/370000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/370000.txt",
+      "cities": [
+        {
+          "name": "济南市",
+          "code": "370100",
+          "file": "regions/370100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370100.txt"
+        },
+        {
+          "name": "青岛市",
+          "code": "370200",
+          "file": "regions/370200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370200.txt"
+        },
+        {
+          "name": "淄博市",
+          "code": "370300",
+          "file": "regions/370300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370300.txt"
+        },
+        {
+          "name": "枣庄市",
+          "code": "370400",
+          "file": "regions/370400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370400.txt"
+        },
+        {
+          "name": "东营市",
+          "code": "370500",
+          "file": "regions/370500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370500.txt"
+        },
+        {
+          "name": "烟台市",
+          "code": "370600",
+          "file": "regions/370600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370600.txt"
+        },
+        {
+          "name": "潍坊市",
+          "code": "370700",
+          "file": "regions/370700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370700.txt"
+        },
+        {
+          "name": "济宁市",
+          "code": "370800",
+          "file": "regions/370800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370800.txt"
+        },
+        {
+          "name": "泰安市",
+          "code": "370900",
+          "file": "regions/370900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/370900.txt"
+        },
+        {
+          "name": "威海市",
+          "code": "371000",
+          "file": "regions/371000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371000.txt"
+        },
+        {
+          "name": "日照市",
+          "code": "371100",
+          "file": "regions/371100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371100.txt"
+        },
+        {
+          "name": "临沂市",
+          "code": "371300",
+          "file": "regions/371300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371300.txt"
+        },
+        {
+          "name": "德州市",
+          "code": "371400",
+          "file": "regions/371400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371400.txt"
+        },
+        {
+          "name": "聊城市",
+          "code": "371500",
+          "file": "regions/371500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371500.txt"
+        },
+        {
+          "name": "滨州市",
+          "code": "371600",
+          "file": "regions/371600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371600.txt"
+        },
+        {
+          "name": "菏泽市",
+          "code": "371700",
+          "file": "regions/371700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/371700.txt"
+        }
+      ]
+    },
+    {
+      "name": "河南省",
+      "code": "410000",
+      "file": "regions/410000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/410000.txt",
+      "cities": [
+        {
+          "name": "郑州市",
+          "code": "410100",
+          "file": "regions/410100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410100.txt"
+        },
+        {
+          "name": "开封市",
+          "code": "410200",
+          "file": "regions/410200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410200.txt"
+        },
+        {
+          "name": "洛阳市",
+          "code": "410300",
+          "file": "regions/410300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410300.txt"
+        },
+        {
+          "name": "平顶山市",
+          "code": "410400",
+          "file": "regions/410400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410400.txt"
+        },
+        {
+          "name": "安阳市",
+          "code": "410500",
+          "file": "regions/410500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410500.txt"
+        },
+        {
+          "name": "鹤壁市",
+          "code": "410600",
+          "file": "regions/410600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410600.txt"
+        },
+        {
+          "name": "新乡市",
+          "code": "410700",
+          "file": "regions/410700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410700.txt"
+        },
+        {
+          "name": "焦作市",
+          "code": "410800",
+          "file": "regions/410800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410800.txt"
+        },
+        {
+          "name": "濮阳市",
+          "code": "410900",
+          "file": "regions/410900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/410900.txt"
+        },
+        {
+          "name": "许昌市",
+          "code": "411000",
+          "file": "regions/411000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411000.txt"
+        },
+        {
+          "name": "漯河市",
+          "code": "411100",
+          "file": "regions/411100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411100.txt"
+        },
+        {
+          "name": "三门峡市",
+          "code": "411200",
+          "file": "regions/411200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411200.txt"
+        },
+        {
+          "name": "南阳市",
+          "code": "411300",
+          "file": "regions/411300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411300.txt"
+        },
+        {
+          "name": "商丘市",
+          "code": "411400",
+          "file": "regions/411400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411400.txt"
+        },
+        {
+          "name": "信阳市",
+          "code": "411500",
+          "file": "regions/411500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411500.txt"
+        },
+        {
+          "name": "周口市",
+          "code": "411600",
+          "file": "regions/411600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411600.txt"
+        },
+        {
+          "name": "驻马店市",
+          "code": "411700",
+          "file": "regions/411700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/411700.txt"
+        },
+        {
+          "name": "省直辖县(*)",
+          "code": "419000",
+          "file": "regions/419000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/419000.txt"
+        }
+      ]
+    },
+    {
+      "name": "湖北省",
+      "code": "420000",
+      "file": "regions/420000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/420000.txt",
+      "cities": [
+        {
+          "name": "武汉市",
+          "code": "420100",
+          "file": "regions/420100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420100.txt"
+        },
+        {
+          "name": "黄石市",
+          "code": "420200",
+          "file": "regions/420200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420200.txt"
+        },
+        {
+          "name": "十堰市",
+          "code": "420300",
+          "file": "regions/420300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420300.txt"
+        },
+        {
+          "name": "宜昌市",
+          "code": "420500",
+          "file": "regions/420500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420500.txt"
+        },
+        {
+          "name": "襄阳市",
+          "code": "420600",
+          "file": "regions/420600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420600.txt"
+        },
+        {
+          "name": "鄂州市",
+          "code": "420700",
+          "file": "regions/420700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420700.txt"
+        },
+        {
+          "name": "荆门市",
+          "code": "420800",
+          "file": "regions/420800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420800.txt"
+        },
+        {
+          "name": "孝感市",
+          "code": "420900",
+          "file": "regions/420900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/420900.txt"
+        },
+        {
+          "name": "荆州市",
+          "code": "421000",
+          "file": "regions/421000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/421000.txt"
+        },
+        {
+          "name": "黄冈市",
+          "code": "421100",
+          "file": "regions/421100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/421100.txt"
+        },
+        {
+          "name": "咸宁市",
+          "code": "421200",
+          "file": "regions/421200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/421200.txt"
+        },
+        {
+          "name": "随州市",
+          "code": "421300",
+          "file": "regions/421300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/421300.txt"
+        },
+        {
+          "name": "恩施土家族苗族自治州",
+          "code": "422800",
+          "file": "regions/422800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/422800.txt"
+        },
+        {
+          "name": "省直辖县(*)",
+          "code": "429000",
+          "file": "regions/429000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/429000.txt"
+        }
+      ]
+    },
+    {
+      "name": "湖南省",
+      "code": "430000",
+      "file": "regions/430000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/430000.txt",
+      "cities": [
+        {
+          "name": "长沙市",
+          "code": "430100",
+          "file": "regions/430100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430100.txt"
+        },
+        {
+          "name": "株洲市",
+          "code": "430200",
+          "file": "regions/430200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430200.txt"
+        },
+        {
+          "name": "湘潭市",
+          "code": "430300",
+          "file": "regions/430300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430300.txt"
+        },
+        {
+          "name": "衡阳市",
+          "code": "430400",
+          "file": "regions/430400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430400.txt"
+        },
+        {
+          "name": "邵阳市",
+          "code": "430500",
+          "file": "regions/430500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430500.txt"
+        },
+        {
+          "name": "岳阳市",
+          "code": "430600",
+          "file": "regions/430600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430600.txt"
+        },
+        {
+          "name": "常德市",
+          "code": "430700",
+          "file": "regions/430700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430700.txt"
+        },
+        {
+          "name": "张家界市",
+          "code": "430800",
+          "file": "regions/430800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430800.txt"
+        },
+        {
+          "name": "益阳市",
+          "code": "430900",
+          "file": "regions/430900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/430900.txt"
+        },
+        {
+          "name": "郴州市",
+          "code": "431000",
+          "file": "regions/431000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/431000.txt"
+        },
+        {
+          "name": "永州市",
+          "code": "431100",
+          "file": "regions/431100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/431100.txt"
+        },
+        {
+          "name": "怀化市",
+          "code": "431200",
+          "file": "regions/431200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/431200.txt"
+        },
+        {
+          "name": "娄底市",
+          "code": "431300",
+          "file": "regions/431300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/431300.txt"
+        },
+        {
+          "name": "湘西土家族苗族自治州",
+          "code": "433100",
+          "file": "regions/433100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/433100.txt"
+        }
+      ]
+    },
+    {
+      "name": "广东省",
+      "code": "440000",
+      "file": "regions/440000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/440000.txt",
+      "cities": [
+        {
+          "name": "广州市",
+          "code": "440100",
+          "file": "regions/440100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440100.txt"
+        },
+        {
+          "name": "韶关市",
+          "code": "440200",
+          "file": "regions/440200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440200.txt"
+        },
+        {
+          "name": "深圳市",
+          "code": "440300",
+          "file": "regions/440300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440300.txt"
+        },
+        {
+          "name": "珠海市",
+          "code": "440400",
+          "file": "regions/440400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440400.txt"
+        },
+        {
+          "name": "汕头市",
+          "code": "440500",
+          "file": "regions/440500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440500.txt"
+        },
+        {
+          "name": "佛山市",
+          "code": "440600",
+          "file": "regions/440600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440600.txt"
+        },
+        {
+          "name": "江门市",
+          "code": "440700",
+          "file": "regions/440700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440700.txt"
+        },
+        {
+          "name": "湛江市",
+          "code": "440800",
+          "file": "regions/440800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440800.txt"
+        },
+        {
+          "name": "茂名市",
+          "code": "440900",
+          "file": "regions/440900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/440900.txt"
+        },
+        {
+          "name": "肇庆市",
+          "code": "441200",
+          "file": "regions/441200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441200.txt"
+        },
+        {
+          "name": "惠州市",
+          "code": "441300",
+          "file": "regions/441300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441300.txt"
+        },
+        {
+          "name": "梅州市",
+          "code": "441400",
+          "file": "regions/441400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441400.txt"
+        },
+        {
+          "name": "汕尾市",
+          "code": "441500",
+          "file": "regions/441500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441500.txt"
+        },
+        {
+          "name": "河源市",
+          "code": "441600",
+          "file": "regions/441600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441600.txt"
+        },
+        {
+          "name": "阳江市",
+          "code": "441700",
+          "file": "regions/441700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441700.txt"
+        },
+        {
+          "name": "清远市",
+          "code": "441800",
+          "file": "regions/441800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441800.txt"
+        },
+        {
+          "name": "东莞市",
+          "code": "441900",
+          "file": "regions/441900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/441900.txt"
+        },
+        {
+          "name": "中山市",
+          "code": "442000",
+          "file": "regions/442000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/442000.txt"
+        },
+        {
+          "name": "潮州市",
+          "code": "445100",
+          "file": "regions/445100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/445100.txt"
+        },
+        {
+          "name": "揭阳市",
+          "code": "445200",
+          "file": "regions/445200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/445200.txt"
+        },
+        {
+          "name": "云浮市",
+          "code": "445300",
+          "file": "regions/445300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/445300.txt"
+        }
+      ]
+    },
+    {
+      "name": "广西壮族自治区",
+      "code": "450000",
+      "file": "regions/450000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/450000.txt",
+      "cities": [
+        {
+          "name": "南宁市",
+          "code": "450100",
+          "file": "regions/450100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450100.txt"
+        },
+        {
+          "name": "柳州市",
+          "code": "450200",
+          "file": "regions/450200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450200.txt"
+        },
+        {
+          "name": "桂林市",
+          "code": "450300",
+          "file": "regions/450300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450300.txt"
+        },
+        {
+          "name": "梧州市",
+          "code": "450400",
+          "file": "regions/450400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450400.txt"
+        },
+        {
+          "name": "北海市",
+          "code": "450500",
+          "file": "regions/450500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450500.txt"
+        },
+        {
+          "name": "防城港市",
+          "code": "450600",
+          "file": "regions/450600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450600.txt"
+        },
+        {
+          "name": "钦州市",
+          "code": "450700",
+          "file": "regions/450700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450700.txt"
+        },
+        {
+          "name": "贵港市",
+          "code": "450800",
+          "file": "regions/450800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450800.txt"
+        },
+        {
+          "name": "玉林市",
+          "code": "450900",
+          "file": "regions/450900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/450900.txt"
+        },
+        {
+          "name": "百色市",
+          "code": "451000",
+          "file": "regions/451000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/451000.txt"
+        },
+        {
+          "name": "贺州市",
+          "code": "451100",
+          "file": "regions/451100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/451100.txt"
+        },
+        {
+          "name": "河池市",
+          "code": "451200",
+          "file": "regions/451200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/451200.txt"
+        },
+        {
+          "name": "来宾市",
+          "code": "451300",
+          "file": "regions/451300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/451300.txt"
+        },
+        {
+          "name": "崇左市",
+          "code": "451400",
+          "file": "regions/451400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/451400.txt"
+        }
+      ]
+    },
+    {
+      "name": "海南省",
+      "code": "460000",
+      "file": "regions/460000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/460000.txt",
+      "cities": [
+        {
+          "name": "海口市",
+          "code": "460100",
+          "file": "regions/460100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/460100.txt"
+        },
+        {
+          "name": "三亚市",
+          "code": "460200",
+          "file": "regions/460200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/460200.txt"
+        },
+        {
+          "name": "儋州市",
+          "code": "460400",
+          "file": "regions/460400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/460400.txt"
+        },
+        {
+          "name": "省直辖县(*)",
+          "code": "469000",
+          "file": "regions/469000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/469000.txt"
+        }
+      ]
+    },
+    {
+      "name": "重庆市",
+      "code": "500000",
+      "file": "regions/500000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/500000.txt",
+      "cities": []
+    },
+    {
+      "name": "四川省",
+      "code": "510000",
+      "file": "regions/510000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/510000.txt",
+      "cities": [
+        {
+          "name": "成都市",
+          "code": "510100",
+          "file": "regions/510100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510100.txt"
+        },
+        {
+          "name": "自贡市",
+          "code": "510300",
+          "file": "regions/510300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510300.txt"
+        },
+        {
+          "name": "攀枝花市",
+          "code": "510400",
+          "file": "regions/510400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510400.txt"
+        },
+        {
+          "name": "泸州市",
+          "code": "510500",
+          "file": "regions/510500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510500.txt"
+        },
+        {
+          "name": "德阳市",
+          "code": "510600",
+          "file": "regions/510600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510600.txt"
+        },
+        {
+          "name": "绵阳市",
+          "code": "510700",
+          "file": "regions/510700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510700.txt"
+        },
+        {
+          "name": "广元市",
+          "code": "510800",
+          "file": "regions/510800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510800.txt"
+        },
+        {
+          "name": "遂宁市",
+          "code": "510900",
+          "file": "regions/510900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/510900.txt"
+        },
+        {
+          "name": "内江市",
+          "code": "511000",
+          "file": "regions/511000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511000.txt"
+        },
+        {
+          "name": "乐山市",
+          "code": "511100",
+          "file": "regions/511100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511100.txt"
+        },
+        {
+          "name": "南充市",
+          "code": "511300",
+          "file": "regions/511300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511300.txt"
+        },
+        {
+          "name": "眉山市",
+          "code": "511400",
+          "file": "regions/511400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511400.txt"
+        },
+        {
+          "name": "宜宾市",
+          "code": "511500",
+          "file": "regions/511500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511500.txt"
+        },
+        {
+          "name": "广安市",
+          "code": "511600",
+          "file": "regions/511600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511600.txt"
+        },
+        {
+          "name": "达州市",
+          "code": "511700",
+          "file": "regions/511700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511700.txt"
+        },
+        {
+          "name": "雅安市",
+          "code": "511800",
+          "file": "regions/511800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511800.txt"
+        },
+        {
+          "name": "巴中市",
+          "code": "511900",
+          "file": "regions/511900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/511900.txt"
+        },
+        {
+          "name": "资阳市",
+          "code": "512000",
+          "file": "regions/512000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/512000.txt"
+        },
+        {
+          "name": "阿坝藏族羌族自治州",
+          "code": "513200",
+          "file": "regions/513200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/513200.txt"
+        },
+        {
+          "name": "甘孜藏族自治州",
+          "code": "513300",
+          "file": "regions/513300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/513300.txt"
+        },
+        {
+          "name": "凉山彝族自治州",
+          "code": "513400",
+          "file": "regions/513400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/513400.txt"
+        }
+      ]
+    },
+    {
+      "name": "贵州省",
+      "code": "520000",
+      "file": "regions/520000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/520000.txt",
+      "cities": [
+        {
+          "name": "贵阳市",
+          "code": "520100",
+          "file": "regions/520100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520100.txt"
+        },
+        {
+          "name": "六盘水市",
+          "code": "520200",
+          "file": "regions/520200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520200.txt"
+        },
+        {
+          "name": "遵义市",
+          "code": "520300",
+          "file": "regions/520300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520300.txt"
+        },
+        {
+          "name": "安顺市",
+          "code": "520400",
+          "file": "regions/520400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520400.txt"
+        },
+        {
+          "name": "毕节市",
+          "code": "520500",
+          "file": "regions/520500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520500.txt"
+        },
+        {
+          "name": "铜仁市",
+          "code": "520600",
+          "file": "regions/520600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/520600.txt"
+        },
+        {
+          "name": "黔西南布依族苗族自治州",
+          "code": "522300",
+          "file": "regions/522300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/522300.txt"
+        },
+        {
+          "name": "黔东南苗族侗族自治州",
+          "code": "522600",
+          "file": "regions/522600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/522600.txt"
+        },
+        {
+          "name": "黔南布依族苗族自治州",
+          "code": "522700",
+          "file": "regions/522700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/522700.txt"
+        }
+      ]
+    },
+    {
+      "name": "云南省",
+      "code": "530000",
+      "file": "regions/530000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/530000.txt",
+      "cities": [
+        {
+          "name": "昆明市",
+          "code": "530100",
+          "file": "regions/530100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530100.txt"
+        },
+        {
+          "name": "曲靖市",
+          "code": "530300",
+          "file": "regions/530300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530300.txt"
+        },
+        {
+          "name": "玉溪市",
+          "code": "530400",
+          "file": "regions/530400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530400.txt"
+        },
+        {
+          "name": "保山市",
+          "code": "530500",
+          "file": "regions/530500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530500.txt"
+        },
+        {
+          "name": "昭通市",
+          "code": "530600",
+          "file": "regions/530600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530600.txt"
+        },
+        {
+          "name": "丽江市",
+          "code": "530700",
+          "file": "regions/530700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530700.txt"
+        },
+        {
+          "name": "普洱市",
+          "code": "530800",
+          "file": "regions/530800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530800.txt"
+        },
+        {
+          "name": "临沧市",
+          "code": "530900",
+          "file": "regions/530900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/530900.txt"
+        },
+        {
+          "name": "楚雄彝族自治州",
+          "code": "532300",
+          "file": "regions/532300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/532300.txt"
+        },
+        {
+          "name": "红河哈尼族彝族自治州",
+          "code": "532500",
+          "file": "regions/532500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/532500.txt"
+        },
+        {
+          "name": "文山壮族苗族自治州",
+          "code": "532600",
+          "file": "regions/532600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/532600.txt"
+        },
+        {
+          "name": "西双版纳傣族自治州",
+          "code": "532800",
+          "file": "regions/532800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/532800.txt"
+        },
+        {
+          "name": "大理白族自治州",
+          "code": "532900",
+          "file": "regions/532900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/532900.txt"
+        },
+        {
+          "name": "德宏傣族景颇族自治州",
+          "code": "533100",
+          "file": "regions/533100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/533100.txt"
+        },
+        {
+          "name": "怒江傈僳族自治州",
+          "code": "533300",
+          "file": "regions/533300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/533300.txt"
+        },
+        {
+          "name": "迪庆藏族自治州",
+          "code": "533400",
+          "file": "regions/533400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/533400.txt"
+        }
+      ]
+    },
+    {
+      "name": "西藏自治区",
+      "code": "540000",
+      "file": "regions/540000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/540000.txt",
+      "cities": [
+        {
+          "name": "拉萨市",
+          "code": "540100",
+          "file": "regions/540100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540100.txt"
+        },
+        {
+          "name": "日喀则市",
+          "code": "540200",
+          "file": "regions/540200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540200.txt"
+        },
+        {
+          "name": "昌都市",
+          "code": "540300",
+          "file": "regions/540300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540300.txt"
+        },
+        {
+          "name": "林芝市",
+          "code": "540400",
+          "file": "regions/540400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540400.txt"
+        },
+        {
+          "name": "山南市",
+          "code": "540500",
+          "file": "regions/540500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540500.txt"
+        },
+        {
+          "name": "那曲市",
+          "code": "540600",
+          "file": "regions/540600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/540600.txt"
+        },
+        {
+          "name": "阿里地区",
+          "code": "542500",
+          "file": "regions/542500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/542500.txt"
+        }
+      ]
+    },
+    {
+      "name": "陕西省",
+      "code": "610000",
+      "file": "regions/610000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/610000.txt",
+      "cities": [
+        {
+          "name": "西安市",
+          "code": "610100",
+          "file": "regions/610100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610100.txt"
+        },
+        {
+          "name": "铜川市",
+          "code": "610200",
+          "file": "regions/610200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610200.txt"
+        },
+        {
+          "name": "宝鸡市",
+          "code": "610300",
+          "file": "regions/610300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610300.txt"
+        },
+        {
+          "name": "咸阳市",
+          "code": "610400",
+          "file": "regions/610400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610400.txt"
+        },
+        {
+          "name": "渭南市",
+          "code": "610500",
+          "file": "regions/610500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610500.txt"
+        },
+        {
+          "name": "延安市",
+          "code": "610600",
+          "file": "regions/610600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610600.txt"
+        },
+        {
+          "name": "汉中市",
+          "code": "610700",
+          "file": "regions/610700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610700.txt"
+        },
+        {
+          "name": "榆林市",
+          "code": "610800",
+          "file": "regions/610800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610800.txt"
+        },
+        {
+          "name": "安康市",
+          "code": "610900",
+          "file": "regions/610900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/610900.txt"
+        },
+        {
+          "name": "商洛市",
+          "code": "611000",
+          "file": "regions/611000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/611000.txt"
+        }
+      ]
+    },
+    {
+      "name": "甘肃省",
+      "code": "620000",
+      "file": "regions/620000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/620000.txt",
+      "cities": [
+        {
+          "name": "兰州市",
+          "code": "620100",
+          "file": "regions/620100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620100.txt"
+        },
+        {
+          "name": "嘉峪关市",
+          "code": "620200",
+          "file": "regions/620200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620200.txt"
+        },
+        {
+          "name": "金昌市",
+          "code": "620300",
+          "file": "regions/620300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620300.txt"
+        },
+        {
+          "name": "白银市",
+          "code": "620400",
+          "file": "regions/620400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620400.txt"
+        },
+        {
+          "name": "天水市",
+          "code": "620500",
+          "file": "regions/620500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620500.txt"
+        },
+        {
+          "name": "武威市",
+          "code": "620600",
+          "file": "regions/620600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620600.txt"
+        },
+        {
+          "name": "张掖市",
+          "code": "620700",
+          "file": "regions/620700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620700.txt"
+        },
+        {
+          "name": "平凉市",
+          "code": "620800",
+          "file": "regions/620800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620800.txt"
+        },
+        {
+          "name": "酒泉市",
+          "code": "620900",
+          "file": "regions/620900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/620900.txt"
+        },
+        {
+          "name": "庆阳市",
+          "code": "621000",
+          "file": "regions/621000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/621000.txt"
+        },
+        {
+          "name": "定西市",
+          "code": "621100",
+          "file": "regions/621100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/621100.txt"
+        },
+        {
+          "name": "陇南市",
+          "code": "621200",
+          "file": "regions/621200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/621200.txt"
+        },
+        {
+          "name": "临夏回族自治州",
+          "code": "622900",
+          "file": "regions/622900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/622900.txt"
+        },
+        {
+          "name": "甘南藏族自治州",
+          "code": "623000",
+          "file": "regions/623000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/623000.txt"
+        }
+      ]
+    },
+    {
+      "name": "青海省",
+      "code": "630000",
+      "file": "regions/630000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/630000.txt",
+      "cities": [
+        {
+          "name": "西宁市",
+          "code": "630100",
+          "file": "regions/630100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/630100.txt"
+        },
+        {
+          "name": "海东市",
+          "code": "630200",
+          "file": "regions/630200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/630200.txt"
+        },
+        {
+          "name": "海北藏族自治州",
+          "code": "632200",
+          "file": "regions/632200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632200.txt"
+        },
+        {
+          "name": "黄南藏族自治州",
+          "code": "632300",
+          "file": "regions/632300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632300.txt"
+        },
+        {
+          "name": "海南藏族自治州",
+          "code": "632500",
+          "file": "regions/632500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632500.txt"
+        },
+        {
+          "name": "果洛藏族自治州",
+          "code": "632600",
+          "file": "regions/632600.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632600.txt"
+        },
+        {
+          "name": "玉树藏族自治州",
+          "code": "632700",
+          "file": "regions/632700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632700.txt"
+        },
+        {
+          "name": "海西蒙古族藏族自治州",
+          "code": "632800",
+          "file": "regions/632800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/632800.txt"
+        }
+      ]
+    },
+    {
+      "name": "宁夏回族自治区",
+      "code": "640000",
+      "file": "regions/640000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/640000.txt",
+      "cities": [
+        {
+          "name": "银川市",
+          "code": "640100",
+          "file": "regions/640100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/640100.txt"
+        },
+        {
+          "name": "石嘴山市",
+          "code": "640200",
+          "file": "regions/640200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/640200.txt"
+        },
+        {
+          "name": "吴忠市",
+          "code": "640300",
+          "file": "regions/640300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/640300.txt"
+        },
+        {
+          "name": "固原市",
+          "code": "640400",
+          "file": "regions/640400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/640400.txt"
+        },
+        {
+          "name": "中卫市",
+          "code": "640500",
+          "file": "regions/640500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/640500.txt"
+        }
+      ]
+    },
+    {
+      "name": "新疆维吾尔自治区",
+      "code": "650000",
+      "file": "regions/650000.txt",
+      "url": "https://metowolf.github.io/iplist/data/cncity/650000.txt",
+      "cities": [
+        {
+          "name": "乌鲁木齐市",
+          "code": "650100",
+          "file": "regions/650100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/650100.txt"
+        },
+        {
+          "name": "克拉玛依市",
+          "code": "650200",
+          "file": "regions/650200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/650200.txt"
+        },
+        {
+          "name": "吐鲁番市",
+          "code": "650400",
+          "file": "regions/650400.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/650400.txt"
+        },
+        {
+          "name": "哈密市",
+          "code": "650500",
+          "file": "regions/650500.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/650500.txt"
+        },
+        {
+          "name": "昌吉回族自治州",
+          "code": "652300",
+          "file": "regions/652300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/652300.txt"
+        },
+        {
+          "name": "博尔塔拉蒙古自治州",
+          "code": "652700",
+          "file": "regions/652700.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/652700.txt"
+        },
+        {
+          "name": "巴音郭楞蒙古自治州",
+          "code": "652800",
+          "file": "regions/652800.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/652800.txt"
+        },
+        {
+          "name": "阿克苏地区",
+          "code": "652900",
+          "file": "regions/652900.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/652900.txt"
+        },
+        {
+          "name": "克孜勒苏柯尔克孜自治州",
+          "code": "653000",
+          "file": "regions/653000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/653000.txt"
+        },
+        {
+          "name": "喀什地区",
+          "code": "653100",
+          "file": "regions/653100.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/653100.txt"
+        },
+        {
+          "name": "和田地区",
+          "code": "653200",
+          "file": "regions/653200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/653200.txt"
+        },
+        {
+          "name": "伊犁哈萨克自治州",
+          "code": "654000",
+          "file": "regions/654000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/654000.txt"
+        },
+        {
+          "name": "塔城地区",
+          "code": "654200",
+          "file": "regions/654200.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/654200.txt"
+        },
+        {
+          "name": "阿勒泰地区",
+          "code": "654300",
+          "file": "regions/654300.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/654300.txt"
+        },
+        {
+          "name": "省直辖县(*)",
+          "code": "659000",
+          "file": "regions/659000.txt",
+          "url": "https://metowolf.github.io/iplist/data/cncity/659000.txt"
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,7 @@ type geoCheckOptions struct {
 	Address             string
 	Mode                string
 	ProvinceCSV         string
+	CityFile            string
 	WhitelistFile       string
 	EgressWhitelistFile string
 	JSON                bool

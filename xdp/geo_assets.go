@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -1139,6 +1140,10 @@ type geoCheckResult struct {
 	Mode          string `json:"mode"`
 	Province      string `json:"province,omitempty"`
 	ProvinceID    uint16 `json:"province_id,omitempty"`
+	CityProvince  string `json:"city_province,omitempty"`
+	City          string `json:"city,omitempty"`
+	CityCode      string `json:"city_code,omitempty"`
+	CityAllowed   bool   `json:"city_allowed"`
 	CustomAllowed bool   `json:"custom_allowed"`
 	GeoAllowed    bool   `json:"geo_allowed"`
 	Allowed       bool   `json:"allowed"`
@@ -1167,6 +1172,10 @@ func geoCheck(opts geoCheckOptions) error {
 	if err != nil {
 		return err
 	}
+	cityMatch, err := cityFileContainsAddress(opts.CityFile, addr)
+	if err != nil {
+		return err
+	}
 	result := geoCheckResult{
 		Address: addr.String(),
 		Mode:    mode,
@@ -1178,6 +1187,18 @@ func geoCheck(opts geoCheckOptions) error {
 	if geoHit {
 		result.ProvinceID = provinceID
 		result.Province = provinceName
+	}
+	if cityMatch.Matched {
+		result.CityAllowed = true
+		result.CityProvince = cityMatch.Province
+		result.City = cityMatch.City
+		result.CityCode = cityMatch.Code
+		result.Allowed = true
+		result.MatchedSource = "city"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
+		return nil
 	}
 	if customAllowed {
 		result.CustomAllowed = true
@@ -1240,6 +1261,8 @@ func writeGeoCheckResult(opts geoCheckOptions, result geoCheckResult) error {
 		return nil
 	}
 	switch {
+	case result.CityAllowed:
+		_, _ = fmt.Fprintf(os.Stdout, "allow city province=%s city=%s code=%s\n", result.CityProvince, result.City, result.CityCode)
 	case result.CustomAllowed:
 		_, _ = fmt.Fprintln(os.Stdout, "allow custom")
 	case result.Allowed && result.MatchedSource == "geo":
@@ -1291,6 +1314,50 @@ func cidrFilesContainAddress(files []string, addr netip.Addr) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+type cityCheckMatch struct {
+	Matched  bool
+	Code     string
+	Province string
+	City     string
+}
+
+func cityFileContainsAddress(filePath string, addr netip.Addr) (cityCheckMatch, error) {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" || !addr.Is4() {
+		return cityCheckMatch{}, nil
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cityCheckMatch{}, nil
+		}
+		return cityCheckMatch{}, fmt.Errorf("读取市白名单文件失败 (%s): %w", filePath, err)
+	}
+	for lineNo, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 4 {
+			return cityCheckMatch{}, fmt.Errorf("解析市白名单失败 (%s:%d): 需要 code/province/city/cidr 四列", filePath, lineNo+1)
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(parts[3]))
+		if err != nil {
+			return cityCheckMatch{}, fmt.Errorf("解析市白名单 CIDR 失败 (%s:%d): %w", filePath, lineNo+1, err)
+		}
+		if prefix.Masked().Contains(addr) {
+			return cityCheckMatch{
+				Matched:  true,
+				Code:     strings.TrimSpace(parts[0]),
+				Province: strings.TrimSpace(parts[1]),
+				City:     strings.TrimSpace(parts[2]),
+			}, nil
+		}
+	}
+	return cityCheckMatch{}, nil
 }
 
 func geoAssetContainsAddress(assets *geoAssetRuntime, addr netip.Addr) (uint16, string, bool, error) {

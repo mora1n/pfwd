@@ -16,6 +16,10 @@ whitelist_allow_ipv6_file() {
     printf '%s\n' "$PFWD_WHITELIST_ALLOW_IPV6_FILE"
 }
 
+whitelist_city_runtime_ipv4_file() {
+    printf '%s\n' "$PFWD_WHITELIST_CITY_IPV4_FILE"
+}
+
 whitelist_enabled() {
     jq -r '.settings.whitelist.enabled // false' "$PFWD_CONFIG_FILE"
 }
@@ -42,6 +46,14 @@ whitelist_cn_provinces_json() {
 
 whitelist_cn_provinces_tsv() {
     jq -r '.settings.whitelist.cn_provinces // [] | .[]' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_cn_city_codes_json() {
+    jq -c '.settings.whitelist.cn_city_codes // []' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_cn_city_codes_tsv() {
+    jq -r '.settings.whitelist.cn_city_codes // [] | .[]' "$PFWD_CONFIG_FILE"
 }
 
 whitelist_cn_mode_label() {
@@ -93,6 +105,10 @@ whitelist_custom_cidrs_count() {
     jq -r '.settings.whitelist.custom_cidrs // [] | length' "$PFWD_CONFIG_FILE"
 }
 
+whitelist_city_codes_count() {
+    jq -r '.settings.whitelist.cn_city_codes // [] | length' "$PFWD_CONFIG_FILE"
+}
+
 whitelist_runtime_hash() {
     jq -r '.settings.whitelist.runtime_hash // ""' "$PFWD_CONFIG_FILE"
 }
@@ -113,6 +129,14 @@ whitelist_geo_ipv6_asset_file() {
     printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-geo-cn-v6.bin"
 }
 
+whitelist_city_meta_file() {
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-city-cn-meta.json"
+}
+
+whitelist_city_ipv4_asset_file() {
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-city-cn-v4.tsv"
+}
+
 whitelist_require_geo_assets() {
     [ "$(whitelist_cn_mode)" = "off" ] && return 0
     [ -f "$(whitelist_geo_meta_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_meta_file)"
@@ -120,11 +144,143 @@ whitelist_require_geo_assets() {
     [ -f "$(whitelist_geo_ipv6_asset_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_ipv6_asset_file)"
 }
 
+whitelist_require_city_assets() {
+    [ -f "$(whitelist_city_meta_file)" ] || pfwd_die "缺少市级白名单资产：$(whitelist_city_meta_file)"
+    [ -f "$(whitelist_city_ipv4_asset_file)" ] || pfwd_die "缺少市级白名单资产：$(whitelist_city_ipv4_asset_file)"
+}
+
 whitelist_geo_province_rows() {
     local meta_file
     meta_file="$(whitelist_geo_meta_file)"
     [ -f "$meta_file" ] || pfwd_die "缺少 geo 省份资产：$meta_file，请先执行 ./xdp/build.sh 或使用完整安装包"
     jq -r '.provinces[]? | [.id, .name] | @tsv' "$meta_file"
+}
+
+whitelist_city_available_province_rows() {
+    whitelist_require_city_assets
+    jq -r '
+      [ .provinces[]? | select(((.cities // []) | length) > 0) ]
+      | to_entries[]
+      | [(.key + 1), (.value.code | tostring), .value.name, ((.value.cities // []) | length)]
+      | @tsv
+    ' "$(whitelist_city_meta_file)"
+}
+
+whitelist_city_rows_by_province_code() {
+    local province_code="$1"
+    whitelist_require_city_assets
+    jq -r --arg code "$province_code" '
+      (.provinces[]? | select((.code | tostring) == $code)) as $province
+      | ($province.cities // [])
+      | to_entries[]
+      | [(.key + 1), (.value.code | tostring), .value.name]
+      | @tsv
+    ' "$(whitelist_city_meta_file)"
+}
+
+whitelist_city_selected_rows() {
+    [ "$(whitelist_city_codes_count)" -eq 0 ] && return 0
+    whitelist_require_city_assets
+    jq -r --argjson codes "$(whitelist_cn_city_codes_json)" '
+      .provinces[]? as $province
+      | ($province.cities // [])[]?
+      | (.code | tostring) as $code
+      | select($codes | index($code))
+      | [$code, $province.name, .name]
+      | @tsv
+    ' "$(whitelist_city_meta_file)"
+}
+
+whitelist_city_province_code_by_selector() {
+    local selector="$1"
+    whitelist_require_city_assets
+    jq -er --arg selector "$selector" '
+      def norm:
+        gsub("(特别行政区|维吾尔自治区|壮族自治区|回族自治区|自治区|省|市|地区|盟)$"; "");
+      [ .provinces[]? | select(((.cities // []) | length) > 0) ] as $items
+      | ($selector | gsub("^\\s+|\\s+$"; "")) as $raw
+      | ($raw | norm) as $normalized
+      | first(
+          $items
+          | to_entries[]
+          | select(
+              ((.key + 1) | tostring) == $raw
+              or ((.value.code | tostring) == $raw)
+              or (.value.name == $raw)
+              or ((.value.name | norm) == $normalized)
+            )
+          | (.value.code | tostring)
+        )
+    ' "$(whitelist_city_meta_file)" 2>/dev/null || pfwd_die "未找到可选省份：$selector"
+}
+
+whitelist_city_code_by_selector() {
+    local province_selector="$1"
+    local city_selector="$2"
+    local province_code
+    province_code="$(whitelist_city_province_code_by_selector "$province_selector")"
+    jq -er --arg province_code "$province_code" --arg selector "$city_selector" '
+      def norm:
+        gsub("(特别行政区|维吾尔自治区|壮族自治区|回族自治区|自治区|省|市|地区|盟)$"; "");
+      (.provinces[]? | select((.code | tostring) == $province_code)) as $province
+      | ($province.cities // []) as $items
+      | ($selector | gsub("^\\s+|\\s+$"; "")) as $raw
+      | ($raw | norm) as $normalized
+      | first(
+          $items
+          | to_entries[]
+          | select(
+              ((.key + 1) | tostring) == $raw
+              or ((.value.code | tostring) == $raw)
+              or (.value.name == $raw)
+              or ((.value.name | norm) == $normalized)
+            )
+          | (.value.code | tostring)
+        )
+    ' "$(whitelist_city_meta_file)" 2>/dev/null || pfwd_die "未找到城市：$city_selector"
+}
+
+whitelist_validate_city_codes_file() {
+    local codes_file="$1"
+    [ -f "$codes_file" ] || pfwd_die "城市临时文件不存在：$codes_file"
+    whitelist_require_city_assets
+    local tmp code
+    tmp="$(mktemp)"
+    whitelist_city_available_codes > "$tmp"
+    while IFS= read -r code; do
+        code="$(printf '%s' "$code" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$code" ] || continue
+        grep -Fxq "$code" "$tmp" || { rm -f "$tmp"; pfwd_die "未知城市 code：$code"; }
+    done < "$codes_file"
+    rm -f "$tmp"
+}
+
+whitelist_city_available_codes() {
+    jq -r '.provinces[]? | (.cities // [])[]? | (.code | tostring)' "$(whitelist_city_meta_file)"
+}
+
+whitelist_city_selection_summary() {
+    local count preview suffix
+    local -a rows=() shown=()
+    if [ "$(whitelist_city_codes_count)" -eq 0 ]; then
+        printf '未选择'
+        return 0
+    fi
+    mapfile -t rows < <(whitelist_city_selected_rows | awk -F '\t' '{print $2 "/" $3}')
+    count="${#rows[@]}"
+    if [ "$count" -eq 0 ]; then
+        printf '未选择'
+        return 0
+    fi
+    if [ "$count" -le 2 ]; then
+        printf '%s' "$(printf '%s\n' "${rows[@]}" | pfwd_join_lines '、')"
+        return 0
+    fi
+    shown=("${rows[@]:0:3}")
+    suffix=""
+    [ "$count" -gt 3 ] && suffix="..."
+    preview="$(printf '%s\n' "${shown[@]}" | pfwd_join_lines '、')"
+    printf '%s 个（%s%s）' "$count" "$preview" "$suffix"
 }
 
 whitelist_validate_cn_provinces_file() {
@@ -321,6 +477,50 @@ whitelist_config_set_custom_cidrs() {
     rm -f "$normalized_file"
 }
 
+whitelist_config_set_city_codes() {
+    local codes_file="$1"
+    local normalized_file
+    [ -f "$codes_file" ] || pfwd_die "城市临时文件不存在：$codes_file"
+    whitelist_validate_city_codes_file "$codes_file"
+    normalized_file="$(mktemp)"
+    awk 'NR == FNR { wanted[$1] = 1; next } ($1 in wanted) { print }' \
+      "$codes_file" <(whitelist_city_available_codes) > "$normalized_file"
+    config_update --rawfile codes "$normalized_file" '
+      (.settings.whitelist //= {})
+      | .settings.whitelist.cn_city_codes =
+          (($codes
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | reduce .[] as $code ([]; if index($code) then . else . + [$code] end)))
+    '
+    rm -f "$normalized_file"
+}
+
+whitelist_clear_city_codes() {
+    config_update '
+      (.settings.whitelist //= {})
+      | .settings.whitelist.cn_city_codes = []
+    '
+}
+
+whitelist_delete_city_codes_by_indexes() {
+    local indexes="$1"
+    [ -n "$indexes" ] || pfwd_die "缺少市白名单序号"
+    config_update --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+      (.settings.whitelist //= {})
+      | (.settings.whitelist.cn_city_codes // []) as $items
+      | if ($idxs | length) == 0 then
+          error("缺少市白名单序号")
+        elif (($idxs | min) < 1) or (($idxs | max) > ($items | length)) then
+          error("市白名单序号超出范围")
+        else
+          .settings.whitelist.cn_city_codes =
+            [ range(0; $items | length) as $i | select(([$idxs[] - 1] | index($i)) | not) | $items[$i] ]
+        end
+    '
+}
+
 whitelist_append_custom_cidr() {
     local cidr="$1"
     cidr="$(normalize_ip_or_cidr "$cidr")"
@@ -386,6 +586,10 @@ whitelist_merge_runtime() {
     tmp_v6="$(mktemp)"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
+    whitelist_materialize_city_runtime
+    if [ -s "$(whitelist_city_runtime_ipv4_file)" ]; then
+        cut -f4 "$(whitelist_city_runtime_ipv4_file)" >> "$tmp_v4"
+    fi
 
     if [ -s "$tmp_v4" ]; then
         whitelist_write_allow_file "$tmp_v4"
@@ -400,10 +604,29 @@ whitelist_merge_runtime() {
     rm -f "$tmp_v4" "$tmp_v6"
 }
 
+whitelist_materialize_city_runtime() {
+    local target tmp_codes
+    target="$(whitelist_city_runtime_ipv4_file)"
+    mkdir -p "$(dirname "$target")"
+    tmp_codes="$(mktemp)"
+    whitelist_cn_city_codes_tsv > "$tmp_codes"
+    if [ ! -s "$tmp_codes" ]; then
+        : > "$target"
+        rm -f "$tmp_codes"
+        return 0
+    fi
+    whitelist_require_city_assets
+    awk -F '\t' 'NR == FNR { wanted[$1] = 1; next } ($1 in wanted) { print }' \
+      "$tmp_codes" "$(whitelist_city_ipv4_asset_file)" | pfwd_write_atomic "$target"
+    rm -f "$tmp_codes"
+    [ -s "$target" ] || pfwd_die "已选市白名单没有可用 IPv4 CIDR"
+}
+
 whitelist_prepare_runtime() {
     if [ "$(whitelist_enabled)" != "true" ]; then
         rm -f "$(whitelist_allow_ipv4_file)" "$(whitelist_allow_ipv6_file)" 2>/dev/null || true
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
+        rm -f "$(whitelist_city_runtime_ipv4_file)" 2>/dev/null || true
         return 0
     fi
 
@@ -426,12 +649,15 @@ whitelist_runtime_hash_compute() {
 enabled=$(whitelist_enabled)
 cn_mode=$(whitelist_cn_mode)
 cn_provinces=$(whitelist_cn_provinces_tsv | paste -sd ',' -)
+cn_city_codes=$(whitelist_cn_city_codes_tsv | paste -sd ',' -)
 custom:
 $(whitelist_custom_cidrs_tsv)
 ipv4:
 $(cat "$(whitelist_allow_ipv4_file)" 2>/dev/null || true)
 ipv6:
 $(cat "$(whitelist_allow_ipv6_file)" 2>/dev/null || true)
+city_ipv4:
+$(cat "$(whitelist_city_runtime_ipv4_file)" 2>/dev/null || true)
 EOF
 )"
     printf '%s' "$payload" | cksum | awk '{print $1}'
@@ -461,18 +687,26 @@ whitelist_status_json() {
       --argjson enabled "$(whitelist_enabled)" \
       --arg cn_mode "$(whitelist_cn_mode)" \
       --argjson cn_provinces "$(whitelist_cn_provinces_json)" \
+      --argjson cn_city_codes "$(whitelist_cn_city_codes_json)" \
+      --arg city_selection "$(whitelist_city_selection_summary)" \
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
+      --arg city_ipv4_file "$(whitelist_city_runtime_ipv4_file)" \
       --argjson entries "$(whitelist_entry_count)" \
       --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
+      --argjson city_count "$(whitelist_city_codes_count)" \
       '{
         enabled: $enabled,
         cn_mode: $cn_mode,
         cn_provinces: $cn_provinces,
+        cn_city_codes: $cn_city_codes,
+        city_selection: $city_selection,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
+        city_ipv4_file: $city_ipv4_file,
         entries: $entries,
-        custom_cidrs_count: $custom_cidrs_count
+        custom_cidrs_count: $custom_cidrs_count,
+        city_count: $city_count
       }'
 }
 
@@ -483,9 +717,11 @@ whitelist_render_status() {
       [
         ["启用白名单", (if .enabled then "开" else "关" end)],
         ["国内 IP 策略", (if .enabled then (if .cn_mode == "all" then "国内IP" elif .cn_mode == "provinces" then ("省份：" + ((.cn_provinces // []) | join("、"))) else "关闭" end) else "-" end)],
+        ["市白名单", (if .enabled then .city_selection else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["IPv4 文件", .allow_ipv4_file],
+        ["市级 IPv4 文件", .city_ipv4_file],
         ["IPv6 文件", .allow_ipv6_file]
       ]
       | map(@tsv)

@@ -281,6 +281,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard whitelist status
   pfwd guard whitelist check --address IP [--listen-port PORT] [--protocol tcp|udp]
   pfwd guard whitelist-cn list|status|all|off|select <省份...>
+  pfwd guard whitelist-city list [省份]|status|add <省份> <城市...>|delete <序号...>|clear
   pfwd guard whitelist-custom list|add|clear|delete|update ...
   pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
   pfwd guard egress-whitelist status
@@ -314,7 +315,7 @@ pfwd - XDP 端口转发管理脚本
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
   内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
   流量防护（协议封锁 + 入口白名单 + 出口白名单）由 `guard` 子命令管理。
-  入口白名单限制的是入站来源 IPv4 / IPv6 CIDR；可选关闭国内段、允许全部国内 IP，或按省份批量允许；也可额外追加自定义 CIDR，且支持输入单个 IP（自动规范化为 /32 或 /128）。
+  入口白名单限制的是入站来源 IPv4 / IPv6 CIDR；可选关闭国内段、允许全部国内 IP，或按省份批量允许；也可额外追加市级 IPv4 白名单和自定义 CIDR，且支持输入单个 IP（自动规范化为 /32 或 /128）。省白名单和市白名单不互斥，最终取并集。
   入口防护跳过端口由 `guard protocols --skip-port` 设置，匹配公网监听端口；命中后跳过入口白名单和协议封锁，不影响出口白名单。
   `guard whitelist check` 可诊断某个来源 IP 在指定监听端口/协议下应放行、拦截或因跳过端口放行。
   出口白名单限制的是转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但解析出的每个目标 IP 都必须命中出口白名单；同时会作用于宿主机全部非 loopback 出口流量，并共享同一套国内 IP / 省份策略。

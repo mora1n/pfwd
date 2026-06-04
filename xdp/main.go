@@ -33,7 +33,7 @@ import (
 //go:embed xdp_bpfel.o
 var xdpBPFEL []byte
 
-const binaryVersion = "0.2.4"
+const binaryVersion = "0.2.7"
 const dataplaneVersion = 2
 const mapABIVersion = 11
 const auxStateVersion = 1
@@ -61,6 +61,7 @@ const (
 const ruleCounterPinSuffix = "_rule_counters"
 const tcPrefBPFIngress = "10"
 const tcPrefBPFEgress = "10"
+const tcLegacyDefaultBPFPreference = "49152"
 const connStateTCPSynPending = uint8(1)
 const connStateTCPEstablished = uint8(2)
 const statsEntryCount = 10
@@ -692,6 +693,7 @@ func runGeoCheck(args []string) error {
 	fs.StringVar(&opts.Address, "address", "", "ip address")
 	fs.StringVar(&opts.Mode, "mode", "all", "off|all|provinces")
 	fs.StringVar(&opts.ProvinceCSV, "provinces", "", "comma separated province names")
+	fs.StringVar(&opts.CityFile, "city-file", "", "selected ingress city whitelist tsv")
 	fs.StringVar(&opts.WhitelistFile, "whitelist-file", "", "colon separated ingress custom cidr files")
 	fs.StringVar(&opts.EgressWhitelistFile, "egress-whitelist-file", "", "colon separated egress custom cidr files")
 	fs.BoolVar(&opts.JSON, "json", false, "print machine-readable decision result")
@@ -1525,6 +1527,13 @@ func clearWhitelistCacheMaps(cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
 	return nil
 }
 
+func clearAllowedFlows(flowMap *ebpf.Map) error {
+	if err := clearMap[connKey, connVal](flowMap); err != nil {
+		return fmt.Errorf("清理连接缓存失败: %w", err)
+	}
+	return nil
+}
+
 func clearGeoMaps(bucketV4, bucketV6, segmentsV4, segmentsV6, provincePolicy *ebpf.Map) error {
 	if err := clearArrayMap[geoBucket](bucketV4); err != nil {
 		return err
@@ -1709,6 +1718,7 @@ func applyIncrementalAuxState(
 		return runtimeAuxState{}, nil, err
 	}
 	actions := make([]auxActionSummary, 0, 4)
+	allowedFlowsCleared := false
 
 	whitelistFiles := effectiveWhitelistFiles(runtimeData, opts)
 	if !currentValid {
@@ -1729,12 +1739,17 @@ func applyIncrementalAuxState(
 		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
+		if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		allowedFlowsCleared = true
 		if nextState.WhitelistEnabled {
 			if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, whitelistFiles); err != nil {
 				return runtimeAuxState{}, nil, err
 			}
 		}
 		recordAuxAction(&actions, "whitelist", "reload", countChangedWhitelistHashes(current.WhitelistHashes, nextState.WhitelistHashes))
+		recordAuxAction(&actions, "allowed_flows", "reload", 0)
 	}
 
 	if !currentValid {
@@ -1794,6 +1809,13 @@ func applyIncrementalAuxState(
 		if ingressPolicyChanged {
 			if err := clearWhitelistCacheMaps(objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
 				return runtimeAuxState{}, nil, fmt.Errorf("清理入口白名单 geo cache 失败: %w", err)
+			}
+			if !allowedFlowsCleared {
+				if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+					return runtimeAuxState{}, nil, err
+				}
+				allowedFlowsCleared = true
+				recordAuxAction(&actions, "allowed_flows", "reload", 0)
 			}
 			recordAuxAction(&actions, "whitelist_geo_cache", "reload", 0)
 		}
@@ -3560,6 +3582,7 @@ func attachPinnedTCFilter(ifaceName string, pin string, direction string) error 
 	if direction == "egress" {
 		pref = tcPrefBPFEgress
 	}
+	removeLegacyTCFilters(ifaceName, direction, pref)
 	if err := runTC("filter", "replace", "dev", ifaceName, direction, "pref", pref, "bpf", "direct-action", "object-pinned", pin); err != nil {
 		return err
 	}
@@ -3648,6 +3671,7 @@ func attachTCProgramWithTCXResult(
 	if direction == "egress" {
 		pref = tcPrefBPFEgress
 	}
+	removeLegacyTCFilters(iface.Name, direction, pref)
 	if err := runTC("filter", "replace", "dev", iface.Name, direction, "pref", pref, "bpf", "direct-action", "object-pinned", pin); err != nil {
 		return "", fmt.Errorf("TCX attach 失败 (%v)，classic TC attach 失败: %w", tcxErr, err)
 	}
@@ -3747,6 +3771,7 @@ func removeTCRuntime(pin string, ifaceName string, direction string) error {
 			pref = tcPrefBPFEgress
 		}
 		_ = runTC("filter", "delete", "dev", ifaceName, direction, "pref", pref)
+		removeLegacyTCFilters(ifaceName, direction, pref)
 	}
 	return nil
 }
@@ -4327,6 +4352,25 @@ func runTC(args ...string) error {
 		return fmt.Errorf("tc %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func tcFilterPrefHasPFWDProgram(ifaceName string, direction string, pref string) bool {
+	cmd := exec.Command("tc", "filter", "show", "dev", ifaceName, direction, "pref", pref)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	text := string(output)
+	return strings.Contains(text, "name pfwd_") || strings.Contains(text, "pfwd_xdp_")
+}
+
+func removeLegacyTCFilters(ifaceName string, direction string, currentPref string) {
+	if ifaceName == "" || currentPref == tcLegacyDefaultBPFPreference {
+		return
+	}
+	if tcFilterPrefHasPFWDProgram(ifaceName, direction, tcLegacyDefaultBPFPreference) {
+		_ = runTC("filter", "delete", "dev", ifaceName, direction, "pref", tcLegacyDefaultBPFPreference)
+	}
 }
 
 func usageError() error {

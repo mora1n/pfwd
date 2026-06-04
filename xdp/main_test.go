@@ -479,6 +479,37 @@ func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
 		t.Fatalf("geoCheck output=%q, want custom allow", out.String())
 	}
 
+	cityPath := filepath.Join(tmpDir, "city.tsv")
+	if err := os.WriteFile(cityPath, []byte("430100\t湖南省\t长沙市\t203.0.113.0/24\n"), 0o644); err != nil {
+		t.Fatalf("write city cidr: %v", err)
+	}
+	out.Reset()
+	r, w, err = os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe city json: %v", err)
+	}
+	os.Stdout = w
+	err = geoCheck(geoCheckOptions{
+		AssetDir: tmpDir,
+		Address:  "203.0.113.7",
+		Mode:     "provinces",
+		CityFile: cityPath,
+		JSON:     true,
+	})
+	_ = w.Close()
+	_, _ = io.Copy(&out, r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatalf("geoCheck(city allow): %v", err)
+	}
+	var cityResult geoCheckResult
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &cityResult); err != nil {
+		t.Fatalf("unmarshal city geoCheck json: %v output=%q", err, out.String())
+	}
+	if !cityResult.Allowed || !cityResult.CityAllowed || cityResult.CityCode != "430100" || cityResult.MatchedSource != "city" {
+		t.Fatalf("geoCheck city json=%+v, want allowed city 430100", cityResult)
+	}
+
 	out.Reset()
 	r, w, err = os.Pipe()
 	if err != nil {
