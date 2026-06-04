@@ -1248,6 +1248,12 @@ func TestXDPSettingsABISize(t *testing.T) {
 	}
 }
 
+func TestRuleValABISize(t *testing.T) {
+	if got, want := binary.Size(ruleVal{}), 104; got != want {
+		t.Fatalf("ruleVal binary size=%d, want %d", got, want)
+	}
+}
+
 func TestRuntimeStatusReusableRequiresCurrentMapABI(t *testing.T) {
 	opts := applyOptions{GuardMode: "full"}
 	settings := runtimeSettings{}

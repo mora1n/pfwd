@@ -483,6 +483,7 @@ type ruleVal struct {
 	Flags                    uint16
 	WhitelistPolicyID        uint16
 	PadRule                  uint16
+	PadRuleAlign             [4]uint8
 	RuleLimitBytes           uint64
 	UserLimitBytes           uint64
 	TrafficRatioScaled       uint64
