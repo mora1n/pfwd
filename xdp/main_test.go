@@ -1006,6 +1006,14 @@ func TestMakeRuleValWhitelistFlags(t *testing.T) {
 			denyFlags: ruleFlagNeedsAllow | ruleFlagAllowCustom | ruleFlagAllowGeo,
 		},
 		{
+			name: "whitelist enabled without sources blocks without LPM strategy",
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+			},
+			wantFlags: ruleFlagNeedsAllow,
+			denyFlags: ruleFlagAllowCustom | ruleFlagAllowGeo,
+		},
+		{
 			name: "custom only uses LPM strategy",
 			settings: runtimeSettings{
 				WhitelistEnabled: true,

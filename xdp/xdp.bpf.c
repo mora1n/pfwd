@@ -123,6 +123,14 @@ static __always_inline int rule_needs_allow(const struct pfwd_rule_val *rule) {
     return rule && (rule->flags & PFWD_RULE_F_NEEDS_ALLOW);
 }
 
+static __always_inline int rule_has_allow_strategy(const struct pfwd_rule_val *rule) {
+    return rule && (rule->flags & (PFWD_RULE_F_ALLOW_CUSTOM | PFWD_RULE_F_ALLOW_GEO));
+}
+
+static __always_inline int settings_has_egress_allow_strategy(const struct pfwd_settings *settings) {
+    return settings && (settings->egress_whitelist_custom || settings->egress_whitelist_geo);
+}
+
 static __always_inline int rule_snat_fixed(const struct pfwd_rule_val *rule) {
     return rule && (rule->flags & PFWD_RULE_F_SNAT_FIXED);
 }
@@ -833,31 +841,31 @@ static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 v
 }
 
 static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_rule_val *rule) {
-    int verdict = whitelist_cache_hit_v4(addr);
+    int verdict;
 
+    if (!rule_has_allow_strategy(rule)) {
+        return 0;
+    }
+    verdict = whitelist_cache_hit_v4(addr);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!rule) {
-        return 0;
-    }
-    verdict = (rule->flags & (PFWD_RULE_F_ALLOW_CUSTOM | PFWD_RULE_F_ALLOW_GEO)) &&
-              whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_rule_val *rule) {
-    int verdict = whitelist_cache_hit_v6(addr);
+    int verdict;
 
+    if (!rule_has_allow_strategy(rule)) {
+        return 0;
+    }
+    verdict = whitelist_cache_hit_v6(addr);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!rule) {
-        return 0;
-    }
-    verdict = (rule->flags & (PFWD_RULE_F_ALLOW_CUSTOM | PFWD_RULE_F_ALLOW_GEO)) &&
-              whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -913,31 +921,31 @@ static __always_inline void egress_whitelist_cache_store_v6(const __u8 addr[16],
 }
 
 static __always_inline int egress_whitelist_allowed_v4(__be32 addr, const struct pfwd_settings *settings) {
-    int verdict = egress_whitelist_cache_hit_v4(addr);
+    int verdict;
 
+    if (!settings_has_egress_allow_strategy(settings)) {
+        return 0;
+    }
+    verdict = egress_whitelist_cache_hit_v4(addr);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!settings) {
-        return 0;
-    }
-    verdict = (settings->egress_whitelist_custom || settings->egress_whitelist_geo) &&
-              egress_whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = egress_whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_settings *settings) {
-    int verdict = egress_whitelist_cache_hit_v6(addr);
+    int verdict;
 
+    if (!settings_has_egress_allow_strategy(settings)) {
+        return 0;
+    }
+    verdict = egress_whitelist_cache_hit_v6(addr);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    if (!settings) {
-        return 0;
-    }
-    verdict = (settings->egress_whitelist_custom || settings->egress_whitelist_geo) &&
-              egress_whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    verdict = egress_whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -1271,75 +1279,117 @@ static __always_inline int fib_redirect_v6(struct xdp_md *ctx, struct ethhdr *et
     return bpf_redirect(params.ifindex, 0);
 }
 
+static __always_inline __u64 prefix_mask(__u32 len) {
+    switch (len) {
+    case 1: return 0x00000000000000ffULL;
+    case 2: return 0x000000000000ffffULL;
+    case 3: return 0x0000000000ffffffULL;
+    case 4: return 0x00000000ffffffffULL;
+    case 5: return 0x000000ffffffffffULL;
+    case 6: return 0x0000ffffffffffffULL;
+    case 7: return 0x00ffffffffffffffULL;
+    default: return 0xffffffffffffffffULL;
+    }
+}
+
+static __always_inline int match_fixed_prefix(__u64 prefix, __u32 seen_len, __u64 pattern, __u32 pattern_len) {
+    __u32 match_len = seen_len;
+    __u64 mask;
+
+    if (match_len > pattern_len) {
+        match_len = pattern_len;
+    }
+    if (match_len == 0) {
+        return PFWD_INSPECT_NEED_MORE;
+    }
+    mask = prefix_mask(match_len);
+    if ((prefix & mask) != (pattern & mask)) {
+        return PFWD_INSPECT_ALLOW;
+    }
+    return seen_len >= pattern_len ? PFWD_INSPECT_DROP : PFWD_INSPECT_NEED_MORE;
+}
+
 static __always_inline int match_http(const __u8 *payload, __u32 len) {
-    if (len < 4) return 0;
+    __u64 prefix = *(__u64 *)payload;
+
+    if (len == 0) return PFWD_INSPECT_NEED_MORE;
     switch (payload[0]) {
     case 'G':
-        return payload[1] == 'E' && payload[2] == 'T' && payload[3] == ' ';
+        return match_fixed_prefix(prefix, len, 0x0000000020544547ULL, 4);
     case 'H':
-        return len >= 5 && payload[1] == 'E' && payload[2] == 'A' && payload[3] == 'D' && payload[4] == ' ';
+        return match_fixed_prefix(prefix, len, 0x0000002044414548ULL, 5);
     case 'P':
-        if (payload[1] == 'U') return payload[2] == 'T' && payload[3] == ' ';
-        if (len >= 5 && payload[1] == 'O') return payload[2] == 'S' && payload[3] == 'T' && payload[4] == ' ';
-        if (len >= 6 && payload[1] == 'A') return payload[2] == 'T' && payload[3] == 'C' && payload[4] == 'H' && payload[5] == ' ';
-        if (len >= 8 && payload[1] == 'R') return payload[2] == 'I' && payload[3] == ' ' && payload[4] == '*' && payload[5] == ' ' && payload[6] == 'H' && payload[7] == 'T';
-        return 0;
+        if (len == 1) return PFWD_INSPECT_NEED_MORE;
+        if (payload[1] == 'U') return match_fixed_prefix(prefix, len, 0x0000000020545550ULL, 4);
+        if (payload[1] == 'O') return match_fixed_prefix(prefix, len, 0x0000002054534f50ULL, 5);
+        if (payload[1] == 'A') return match_fixed_prefix(prefix, len, 0x0000204843544150ULL, 6);
+        if (payload[1] == 'R') return match_fixed_prefix(prefix, len, 0x5448202a20495250ULL, 8);
+        return PFWD_INSPECT_ALLOW;
     case 'T':
-        return len >= 6 && payload[1] == 'R' && payload[2] == 'A' && payload[3] == 'C' && payload[4] == 'E' && payload[5] == ' ';
+        return match_fixed_prefix(prefix, len, 0x0000204543415254ULL, 6);
     case 'D':
-        return len >= 7 && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'E' && payload[4] == 'T' && payload[5] == 'E' && payload[6] == ' ';
+        return match_fixed_prefix(prefix, len, 0x00204554454c4544ULL, 7);
     case 'O':
-        return len >= 8 && payload[1] == 'P' && payload[2] == 'T' && payload[3] == 'I' && payload[4] == 'O' && payload[5] == 'N' && payload[6] == 'S' && payload[7] == ' ';
+        return match_fixed_prefix(prefix, len, 0x20534e4f4954504fULL, 8);
     case 'C':
-        return len >= 8 && payload[1] == 'O' && payload[2] == 'N' && payload[3] == 'N' && payload[4] == 'E' && payload[5] == 'C' && payload[6] == 'T' && payload[7] == ' ';
+        return match_fixed_prefix(prefix, len, 0x205443454e4e4f43ULL, 8);
     }
-    return 0;
+    return PFWD_INSPECT_ALLOW;
 }
 
 static __always_inline int match_tls_client_hello(const __u8 *payload, __u32 len) {
-    return len >= 6 && payload[0] == 0x16 && payload[1] == 0x03 && payload[2] <= 0x04 && payload[5] == 0x01;
+    if (len == 0) return PFWD_INSPECT_NEED_MORE;
+    if (payload[0] != 0x16) return PFWD_INSPECT_ALLOW;
+    if (len < 2) return PFWD_INSPECT_NEED_MORE;
+    if (payload[1] != 0x03) return PFWD_INSPECT_ALLOW;
+    if (len < 3) return PFWD_INSPECT_NEED_MORE;
+    if (payload[2] > 0x04) return PFWD_INSPECT_ALLOW;
+    if (len < 6) return PFWD_INSPECT_NEED_MORE;
+    return payload[5] == 0x01 ? PFWD_INSPECT_DROP : PFWD_INSPECT_ALLOW;
 }
 
 static __always_inline int match_socks(const __u8 *payload, __u32 len) {
-    if (len >= 3 && payload[0] == 0x05 && payload[1] >= 0x01 && payload[1] <= 0x10) return 1;
-    if (len >= 8 && payload[0] == 0x04 && (payload[1] == 0x01 || payload[1] == 0x02)) return 1;
-    return 0;
+    if (len == 0) return PFWD_INSPECT_NEED_MORE;
+    if (payload[0] == 0x05) {
+        if (len < 2) return PFWD_INSPECT_NEED_MORE;
+        if (payload[1] < 0x01 || payload[1] > 0x10) return PFWD_INSPECT_ALLOW;
+        return len >= 3 ? PFWD_INSPECT_DROP : PFWD_INSPECT_NEED_MORE;
+    }
+    if (payload[0] == 0x04) {
+        if (len < 2) return PFWD_INSPECT_NEED_MORE;
+        if (payload[1] != 0x01 && payload[1] != 0x02) return PFWD_INSPECT_ALLOW;
+        return len >= 8 ? PFWD_INSPECT_DROP : PFWD_INSPECT_NEED_MORE;
+    }
+    return PFWD_INSPECT_ALLOW;
 }
 
 static __always_inline int inspect_guard_prefix(const struct pfwd_guard_prefix_val *prefix, const struct pfwd_rule_val *rule) {
-    int http_possible = 0;
-    int tls_possible = 0;
-    int socks_possible = 0;
+    int http_result = PFWD_INSPECT_ALLOW;
+    int tls_result = PFWD_INSPECT_ALLOW;
+    int socks_result = PFWD_INSPECT_ALLOW;
     __u16 flags = rule ? rule->flags : 0;
     int block_http = flags & PFWD_RULE_F_BLOCK_HTTP;
     int block_tls = flags & PFWD_RULE_F_BLOCK_TLS;
     int block_socks = flags & PFWD_RULE_F_BLOCK_SOCKS;
 
-    if (prefix->seen_len >= 3) {
-        if (block_http) {
-            http_possible = match_http(prefix->prefix, prefix->seen_len);
-        }
-        if (block_socks) {
-            socks_possible = match_socks(prefix->prefix, prefix->seen_len);
-        }
+    if (block_http) {
+        http_result = match_http(prefix->prefix, prefix->seen_len);
     }
-    if (prefix->seen_len >= 6 && block_tls) {
-        tls_possible = match_tls_client_hello(prefix->prefix, prefix->seen_len);
+    if (block_tls) {
+        tls_result = match_tls_client_hello(prefix->prefix, prefix->seen_len);
     }
-    if (prefix->seen_len >= 3 && (!block_tls || prefix->seen_len >= 6)) {
-        if ((!block_http || !http_possible) &&
-            (!block_socks || !socks_possible) &&
-            (!block_tls || !tls_possible)) {
-            return PFWD_INSPECT_ALLOW;
-        }
+    if (block_socks) {
+        socks_result = match_socks(prefix->prefix, prefix->seen_len);
     }
-    if ((block_http && http_possible) ||
-        (block_socks && socks_possible) ||
-        (block_tls && tls_possible)) {
+    if (http_result == PFWD_INSPECT_DROP ||
+        tls_result == PFWD_INSPECT_DROP ||
+        socks_result == PFWD_INSPECT_DROP) {
         stat_inc(PFWD_STAT_PROTOCOL_DROPPED);
         return PFWD_INSPECT_DROP;
     }
-    if (prefix->seen_len < 8) {
+    if (http_result == PFWD_INSPECT_NEED_MORE ||
+        tls_result == PFWD_INSPECT_NEED_MORE ||
+        socks_result == PFWD_INSPECT_NEED_MORE) {
         return PFWD_INSPECT_NEED_MORE;
     }
     return PFWD_INSPECT_ALLOW;
@@ -1585,7 +1635,8 @@ static __always_inline int inspect_xdp_tcp_flow(
     const __u8 saddr[16],
     const __u8 daddr[16],
     __be16 sport,
-    __be16 dport
+    __be16 dport,
+    int guard_bypassed
 ) {
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
@@ -1596,7 +1647,7 @@ static __always_inline int inspect_xdp_tcp_flow(
     if (!protocol_guard_active(rule)) {
         return XDP_PASS;
     }
-    if (ingress_guard_bypassed(rule, dport)) {
+    if (guard_bypassed) {
         return XDP_PASS;
     }
     flow.family = family;
@@ -1656,7 +1707,8 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     __be32 saddr,
     __be32 daddr,
     __be16 sport,
-    __be16 dport
+    __be16 dport,
+    int guard_bypassed
 ) {
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
@@ -1667,7 +1719,7 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     if (!protocol_guard_active(rule)) {
         return XDP_PASS;
     }
-    if (ingress_guard_bypassed(rule, dport)) {
+    if (guard_bypassed) {
         return XDP_PASS;
     }
     flow.family = 4;
@@ -1956,7 +2008,7 @@ static __always_inline int tc_local_forward_v4(
             return TC_ACT_OK;
         }
         if (!guard_bypassed && rule_needs_guard(rule)) {
-            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
@@ -2019,7 +2071,7 @@ static __always_inline int tc_local_forward_v6(
             return TC_ACT_OK;
         }
         if (!guard_bypassed && rule_needs_guard(rule)) {
-            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
@@ -2055,13 +2107,14 @@ static __always_inline int tc_local_forward_v6(
 static __always_inline int tc_ingress_allowed_v4(
     struct ipv4hdr_min *ip4,
     struct pfwd_rule_val *rule,
+    int guard_bypassed,
     __be16 dport,
     __u64 packet_len
 ) {
     if (!rule) {
         return 1;
     }
-    if (ingress_guard_bypassed(rule, dport) || !rule_needs_allow(rule)) {
+    if (guard_bypassed || !rule_needs_allow(rule)) {
         return 1;
     }
     if (whitelist_allowed_v4(ip4->saddr, rule)) {
@@ -2075,13 +2128,14 @@ static __always_inline int tc_ingress_allowed_v4(
 static __always_inline int tc_ingress_allowed_v6(
     struct ipv6hdr_min *ip6,
     struct pfwd_rule_val *rule,
+    int guard_bypassed,
     __be16 dport,
     __u64 packet_len
 ) {
     if (!rule) {
         return 1;
     }
-    if (ingress_guard_bypassed(rule, dport) || !rule_needs_allow(rule)) {
+    if (guard_bypassed || !rule_needs_allow(rule)) {
         return 1;
     }
     if (whitelist_allowed_v6(ip6->saddr, rule)) {
@@ -2459,7 +2513,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_PASS;
                 }
                 if (!guard_bypassed && rule_needs_guard(rule)) {
-                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
@@ -2636,7 +2690,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                     return XDP_PASS;
                 }
                 if (!guard_bypassed && rule_needs_guard(rule)) {
-                    if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+                    if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
@@ -2794,6 +2848,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             struct tcphdr_min tcp_hdr = {};
             __u32 l4_off = ETH_HLEN + ihl;
             int needs_pull = 0;
+            int guard_bypassed = 0;
 
             if (tc_load_tcp_min(skb, l4_off, &tcp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -2806,10 +2861,11 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 if (rule_target_is_loopback(4, rule)) {
                     needs_pull = 1;
                 } else {
-                    if (!tc_ingress_allowed_v4(ip4, rule, dport, packet_len)) {
+                    guard_bypassed = ingress_guard_bypassed(rule, dport);
+                    if (!tc_ingress_allowed_v4(ip4, rule, guard_bypassed, dport, packet_len)) {
                         return TC_ACT_SHOT;
                     }
-                    if (rule_needs_guard(rule)) {
+                    if (!guard_bypassed && rule_needs_guard(rule)) {
                         needs_pull = 1;
                     }
                 }
@@ -2860,7 +2916,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
@@ -2880,9 +2936,11 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, rule, packet_len);
             }
-            if (rule && !rule_xdp_disabled(rule) &&
-                !tc_ingress_allowed_v4(ip4, rule, dport, packet_len)) {
-                return TC_ACT_SHOT;
+            if (rule && !rule_xdp_disabled(rule)) {
+                int guard_bypassed = ingress_guard_bypassed(rule, dport);
+                if (!tc_ingress_allowed_v4(ip4, rule, guard_bypassed, dport, packet_len)) {
+                    return TC_ACT_SHOT;
+                }
             }
             return TC_ACT_OK;
         }
@@ -2919,6 +2977,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
         if (protocol == IPPROTO_TCP) {
             struct tcphdr_min tcp_hdr = {};
             int needs_pull = 0;
+            int guard_bypassed = 0;
 
             if (tc_load_tcp_min(skb, ETH_HLEN + sizeof(struct ipv6hdr_min), &tcp_hdr) < 0) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
@@ -2931,10 +2990,11 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 if (rule_target_is_loopback(6, rule)) {
                     needs_pull = 1;
                 } else {
-                    if (!tc_ingress_allowed_v6(ip6, rule, dport, packet_len)) {
+                    guard_bypassed = ingress_guard_bypassed(rule, dport);
+                    if (!tc_ingress_allowed_v6(ip6, rule, guard_bypassed, dport, packet_len)) {
                         return TC_ACT_SHOT;
                     }
-                    if (rule_needs_guard(rule)) {
+                    if (!guard_bypassed && rule_needs_guard(rule)) {
                         needs_pull = 1;
                     }
                 }
@@ -2985,7 +3045,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
-            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
@@ -3004,9 +3064,11 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, rule, packet_len);
             }
-            if (rule && !rule_xdp_disabled(rule) &&
-                !tc_ingress_allowed_v6(ip6, rule, dport, packet_len)) {
-                return TC_ACT_SHOT;
+            if (rule && !rule_xdp_disabled(rule)) {
+                int guard_bypassed = ingress_guard_bypassed(rule, dport);
+                if (!tc_ingress_allowed_v6(ip6, rule, guard_bypassed, dport, packet_len)) {
+                    return TC_ACT_SHOT;
+                }
             }
             return TC_ACT_OK;
         }
