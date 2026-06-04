@@ -173,14 +173,20 @@ whitelist_custom_cidrs_json() {
     jq -c '.settings.whitelist.custom_cidrs // []' "$PFWD_CONFIG_FILE"
 }
 
+whitelist_nonempty_line_count() {
+    local file="$1"
+    if [ -s "$file" ]; then
+        sed '/^$/d' "$file" | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
 whitelist_entry_count() {
     local total=0
-    if [ -s "$(whitelist_allow_ipv4_file)" ]; then
-        total=$((total + $(sed '/^$/d' "$(whitelist_allow_ipv4_file)" | wc -l | tr -d ' ')))
-    fi
-    if [ -s "$(whitelist_allow_ipv6_file)" ]; then
-        total=$((total + $(sed '/^$/d' "$(whitelist_allow_ipv6_file)" | wc -l | tr -d ' ')))
-    fi
+    total=$((total + $(whitelist_nonempty_line_count "$(whitelist_allow_ipv4_file)")))
+    total=$((total + $(whitelist_nonempty_line_count "$(whitelist_allow_ipv6_file)")))
+    total=$((total + $(whitelist_nonempty_line_count "$(whitelist_city_runtime_ipv4_file)")))
     echo "$total"
 }
 

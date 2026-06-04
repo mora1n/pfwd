@@ -257,6 +257,35 @@ PY
     )
 }
 
+fw_render_interval_set_elements_from_stdin() {
+    local ip_version="${1:-}"
+    python3 -c '
+import ipaddress
+import sys
+
+want = sys.argv[1]
+networks = []
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "\t" in line:
+        line = line.split("\t")[-1].strip()
+    network = ipaddress.ip_network(line, strict=False)
+    if want in ("4", "6") and network.version != int(want):
+        continue
+    networks.append(network)
+
+first = True
+for network in ipaddress.collapse_addresses(networks):
+    if not first:
+        print(", ", end="")
+    print(network, end="")
+    first = False
+' "$ip_version"
+}
+
 fw_render_host_egress_objects() {
     local runtime_json="$1"
     local host_v4_file host_v6_file
@@ -292,6 +321,152 @@ fw_render_host_egress_chain() {
     echo '    meta nfproto ipv4 counter drop comment "pfwd host egress whitelist drop v4"'
     echo '    meta nfproto ipv6 counter drop comment "pfwd host egress whitelist drop v6"'
     echo "  }"
+}
+
+fw_ingress_whitelist_enabled() {
+    local runtime_json="$1"
+    jq -e '(.settings.whitelist_enabled // false) == true' >/dev/null <<< "$runtime_json"
+}
+
+fw_ingress_whitelist_set_name() {
+    local ipver="$1"
+    local policy_id="$2"
+    printf 'pfwd_ingress_allow_v%s_%s' "$ipver" "$policy_id"
+}
+
+fw_ingress_whitelist_policy_rows() {
+    local runtime_json="$1"
+    jq -c '
+      . as $runtime
+      | ($runtime.settings.ingress_whitelist_policies // []) as $policies
+      | ($policies | map((.id // 0))) as $known
+      | (
+          [$policies[]?]
+          + (
+              [$runtime.rules[]? | (.whitelist_policy_id // 0)]
+              | unique
+              | map(select(($known | index(.)) | not) | {
+                  id: .,
+                  source: "synthetic",
+                  cn_mode: "off",
+                  cn_provinces: [],
+                  cn_city_codes: []
+                })
+            )
+        )
+      | unique_by(.id // 0)
+      | sort_by(.id // 0)
+      | .[]
+    ' <<< "$runtime_json"
+}
+
+fw_ingress_whitelist_policy_cidrs() {
+    local runtime_json="$1"
+    local policy_json="$2"
+    local ipver="$3"
+    local file mode provinces asset_dir bin city_count tmp_codes
+
+    jq -r '.settings.whitelist_files // [] | .[]' <<< "$runtime_json" |
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        [ -f "$file" ] && cat "$file"
+    done
+
+    mode="$(jq -r '.cn_mode // "off"' <<< "$policy_json")"
+    asset_dir="$(jq -r '.settings.geo_asset_dir // empty' <<< "$runtime_json")"
+    case "$mode" in
+        all|provinces)
+            bin="$(forwarder_bin_path)"
+            [ -x "$bin" ] || pfwd_die "缺少 XDP 辅助程序：$bin"
+            provinces="$(jq -r '(.cn_provinces // []) | join(",")' <<< "$policy_json")"
+            "$bin" geo-export \
+              --asset-dir "$asset_dir" \
+              --mode "$mode" \
+              --provinces "$provinces" \
+              --ip-version "$ipver"
+            ;;
+    esac
+
+    if [ "$ipver" = "4" ]; then
+        city_count="$(jq -r '(.cn_city_codes // []) | length' <<< "$policy_json")"
+        if [ "$city_count" -gt 0 ]; then
+            bin="$(forwarder_bin_path)"
+            [ -x "$bin" ] || pfwd_die "缺少 XDP 辅助程序：$bin"
+            tmp_codes="$(mktemp)"
+            jq -r '.cn_city_codes // [] | .[]' <<< "$policy_json" > "$tmp_codes"
+            if ! "$bin" city-export \
+              --asset-dir "$asset_dir" \
+              --codes-file "$tmp_codes" | awk -F '\t' 'NF >= 4 {print $4}'; then
+                rm -f "$tmp_codes"
+                return 1
+            fi
+            rm -f "$tmp_codes"
+        fi
+    fi
+}
+
+fw_render_ingress_whitelist_sets() {
+    local runtime_json="$1"
+    fw_ingress_whitelist_enabled "$runtime_json" || return 0
+
+    local policy_json policy_id ipver elements
+    while IFS= read -r policy_json; do
+        [ -n "$policy_json" ] || continue
+        policy_id="$(jq -r '.id // 0' <<< "$policy_json")"
+        for ipver in 4 6; do
+            echo "  set $(fw_ingress_whitelist_set_name "$ipver" "$policy_id") {"
+            echo "    type ipv${ipver}_addr"
+            echo "    flags interval"
+            elements="$(fw_ingress_whitelist_policy_cidrs "$runtime_json" "$policy_json" "$ipver" |
+              fw_render_interval_set_elements_from_stdin "$ipver")"
+            if [ -n "$elements" ]; then
+                printf '    elements = { %s }\n' "$elements"
+            fi
+            echo "  }"
+            echo
+        done
+    done < <(fw_ingress_whitelist_policy_rows "$runtime_json")
+}
+
+fw_render_ingress_whitelist_chain() {
+    local runtime_json="$1"
+    fw_ingress_whitelist_enabled "$runtime_json" || return 0
+
+    echo "  chain ingress_whitelist {"
+    echo "    type filter hook prerouting priority dstnat - 10; policy accept;"
+    jq -r '
+      (.settings.protocol_skip_ports // []) as $skip
+      | [
+          .rules[]?
+          | select((.listen_port as $port | ($skip | index($port)) | not))
+          | (.protocol // "tcp") as $raw_proto
+          | (if $raw_proto == "tcp_udp" then ["tcp", "udp"][] else $raw_proto end) as $proto
+          | {
+              proto: $proto,
+              ipver: ((.ip_version // 4) | tostring),
+              port: (.listen_port | tonumber),
+              policy: ((.whitelist_policy_id // 0) | tostring)
+            }
+        ]
+      | unique_by([.proto, .ipver, .port])
+      | sort_by(.ipver, .proto, .port)
+      | .[]
+      | [.proto, .ipver, (.port | tostring), .policy]
+      | @tsv
+    ' <<< "$runtime_json" |
+    while IFS=$'\t' read -r proto ipver port policy_id; do
+        [ -n "$proto" ] || continue
+        case "$ipver" in
+            4)
+                echo "    $proto dport $port ip saddr != @$(fw_ingress_whitelist_set_name 4 "$policy_id") counter drop comment \"pfwd ingress whitelist\""
+                ;;
+            6)
+                echo "    $proto dport $port ip6 saddr != @$(fw_ingress_whitelist_set_name 6 "$policy_id") counter drop comment \"pfwd ingress whitelist\""
+                ;;
+        esac
+    done
+    echo "  }"
+    echo
 }
 
 fw_render_runtime_to_stdout() {
@@ -333,6 +508,9 @@ fw_render_runtime_to_stdout() {
     done < <(fw_runtime_rule_rows "$runtime_json")
 
     echo "table $family $table {"
+    fw_render_ingress_whitelist_sets "$runtime_json"
+    fw_render_ingress_whitelist_chain "$runtime_json"
+
     echo "    chain prerouting {"
     echo "        type nat hook prerouting priority dstnat; policy accept;"
     for ipver in 4 6; do

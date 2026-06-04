@@ -29,6 +29,13 @@ type cityExportOptions struct {
 	CodesFile string
 }
 
+type geoExportOptions struct {
+	AssetDir    string
+	Mode        string
+	ProvinceCSV string
+	IPVersion   string
+}
+
 func whitelistFileHashes(files []string) ([]whitelistContentHash, error) {
 	if len(files) == 0 {
 		return nil, nil

@@ -1529,6 +1529,82 @@ func geoModeEnabled(mode string) bool {
 	}
 }
 
+func geoExport(opts geoExportOptions) error {
+	assetDir := strings.TrimSpace(opts.AssetDir)
+	if assetDir == "" {
+		return fmt.Errorf("geo-export 缺少 --asset-dir")
+	}
+	mode := strings.TrimSpace(opts.Mode)
+	if mode == "" {
+		mode = "all"
+	}
+	switch mode {
+	case "off":
+		return nil
+	case "all", "provinces":
+	default:
+		return fmt.Errorf("无效 geo mode: %s", mode)
+	}
+	ipVersion := strings.TrimSpace(opts.IPVersion)
+	if ipVersion == "" {
+		ipVersion = "46"
+	}
+	if ipVersion != "4" && ipVersion != "6" && ipVersion != "46" {
+		return fmt.Errorf("无效 ip-version: %s", ipVersion)
+	}
+	assets, err := loadGeoAssets(assetDir)
+	if err != nil {
+		return err
+	}
+	var allowed map[uint16]struct{}
+	if mode == "provinces" {
+		selected := parseProvinceCSV(opts.ProvinceCSV)
+		if len(selected) == 0 {
+			return nil
+		}
+		allowed = map[uint16]struct{}{}
+		for province := range selected {
+			id, ok := assets.ProvinceIDs[province]
+			if !ok {
+				return fmt.Errorf("未知省份：%s", province)
+			}
+			allowed[id] = struct{}{}
+		}
+	}
+	includeProvince := func(id uint16) bool {
+		if allowed == nil {
+			return true
+		}
+		_, ok := allowed[id]
+		return ok
+	}
+	if ipVersion == "4" || ipVersion == "46" {
+		for _, prefix := range assets.PrefixesV4 {
+			if !includeProvince(prefix.ProvinceID) {
+				continue
+			}
+			cidr, err := geoPrefixV4CIDR(prefix)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintln(os.Stdout, cidr)
+		}
+	}
+	if ipVersion == "6" || ipVersion == "46" {
+		for _, prefix := range assets.PrefixesV6 {
+			if !includeProvince(prefix.ProvinceID) {
+				continue
+			}
+			cidr, err := geoPrefixV6CIDR(prefix)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintln(os.Stdout, cidr)
+		}
+	}
+	return nil
+}
+
 type geoCheckResult struct {
 	Address       string `json:"address"`
 	Mode          string `json:"mode"`
@@ -1743,6 +1819,24 @@ func cityPrefixCIDR(prefix cityPrefixV4) (string, error) {
 	var raw [4]byte
 	binary.BigEndian.PutUint32(raw[:], prefix.Addr)
 	addr := netip.AddrFrom4(raw)
+	return netip.PrefixFrom(addr, int(prefix.PrefixLen)).Masked().String(), nil
+}
+
+func geoPrefixV4CIDR(prefix geoPrefixV4) (string, error) {
+	if prefix.PrefixLen > 32 {
+		return "", fmt.Errorf("无效 geo v4 prefix_len：%d", prefix.PrefixLen)
+	}
+	var raw [4]byte
+	binary.BigEndian.PutUint32(raw[:], prefix.Addr)
+	addr := netip.AddrFrom4(raw)
+	return netip.PrefixFrom(addr, int(prefix.PrefixLen)).Masked().String(), nil
+}
+
+func geoPrefixV6CIDR(prefix geoPrefixV6) (string, error) {
+	if prefix.PrefixLen > 128 {
+		return "", fmt.Errorf("无效 geo v6 prefix_len：%d", prefix.PrefixLen)
+	}
+	addr := netip.AddrFrom16(prefix.Addr)
 	return netip.PrefixFrom(addr, int(prefix.PrefixLen)).Masked().String(), nil
 }
 

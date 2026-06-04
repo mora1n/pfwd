@@ -426,6 +426,86 @@ func TestGeoAssetRoundTripAndLookup(t *testing.T) {
 	})
 }
 
+func TestGeoExport(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := geoAssetMeta{
+		FormatVersion: geoAssetVersion,
+		BuiltAt:       time.Now().UTC().Format(time.RFC3339),
+		Provinces: []geoProvinceEntry{
+			{ID: 1, Name: "浙江省"},
+			{ID: 2, Name: "湖南省"},
+		},
+		IPv4Buckets:  0,
+		IPv4Segments: 2,
+		IPv4Prefixes: 2,
+		IPv6Buckets:  0,
+		IPv6Segments: 1,
+		IPv6Prefixes: 1,
+	}
+	metaContent, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal geo meta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, geoMetaAssetFile), metaContent, 0o644); err != nil {
+		t.Fatalf("write geo meta: %v", err)
+	}
+	v4Prefixes := []geoPrefixV4{
+		{PrefixLen: 24, Addr: binary.BigEndian.Uint32([]byte{203, 0, 113, 0}), ProvinceID: 1},
+		{PrefixLen: 24, Addr: binary.BigEndian.Uint32([]byte{198, 51, 100, 0}), ProvinceID: 2},
+	}
+	if err := writeGeoAssetV4(filepath.Join(tmpDir, geoIPv4AssetFile), v4Prefixes, 2); err != nil {
+		t.Fatalf("writeGeoAssetV4: %v", err)
+	}
+	v6Prefixes := []geoPrefixV6{
+		{PrefixLen: 112, Addr: netip.MustParseAddr("240e::").As16(), ProvinceID: 1},
+	}
+	if err := writeGeoAssetV6(filepath.Join(tmpDir, geoIPv6AssetFile), v6Prefixes, 2); err != nil {
+		t.Fatalf("writeGeoAssetV6: %v", err)
+	}
+
+	capture := func(opts geoExportOptions) (string, error) {
+		t.Helper()
+		var out bytes.Buffer
+		oldStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe geo export: %v", err)
+		}
+		os.Stdout = w
+		err = geoExport(opts)
+		_ = w.Close()
+		os.Stdout = oldStdout
+		_, _ = io.Copy(&out, r)
+		_ = r.Close()
+		return out.String(), err
+	}
+
+	all, err := capture(geoExportOptions{AssetDir: tmpDir, Mode: "all", IPVersion: "46"})
+	if err != nil {
+		t.Fatalf("geoExport all: %v", err)
+	}
+	wantAll := "203.0.113.0/24\n198.51.100.0/24\n240e::/112\n"
+	if all != wantAll {
+		t.Fatalf("geoExport all=%q, want %q", all, wantAll)
+	}
+
+	provinceV4, err := capture(geoExportOptions{AssetDir: tmpDir, Mode: "provinces", ProvinceCSV: "浙江省", IPVersion: "4"})
+	if err != nil {
+		t.Fatalf("geoExport province v4: %v", err)
+	}
+	if provinceV4 != "203.0.113.0/24\n" {
+		t.Fatalf("geoExport province v4=%q, want Zhejiang v4 only", provinceV4)
+	}
+
+	empty, err := capture(geoExportOptions{AssetDir: tmpDir, Mode: "provinces", IPVersion: "4"})
+	if err != nil {
+		t.Fatalf("geoExport empty province: %v", err)
+	}
+	if empty != "" {
+		t.Fatalf("geoExport empty province=%q, want empty", empty)
+	}
+}
+
 func TestCityIPv4AssetRoundTripAndExport(t *testing.T) {
 	tmpDir := t.TempDir()
 	meta := `{

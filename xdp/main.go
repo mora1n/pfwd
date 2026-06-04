@@ -675,6 +675,8 @@ func run(args []string) error {
 		return runGeoBuild(args[1:])
 	case "geo-check":
 		return runGeoCheck(args[1:])
+	case "geo-export":
+		return runGeoExport(args[1:])
 	case "city-export":
 		return runCityExport(args[1:])
 	case "apply":
@@ -740,6 +742,23 @@ func runGeoCheck(args []string) error {
 		return fmt.Errorf("geo-check 缺少 --address")
 	}
 	return geoCheck(opts)
+}
+
+func runGeoExport(args []string) error {
+	fs := flag.NewFlagSet("geo-export", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var opts geoExportOptions
+	fs.StringVar(&opts.AssetDir, "asset-dir", "", "geo asset dir")
+	fs.StringVar(&opts.Mode, "mode", "all", "off|all|provinces")
+	fs.StringVar(&opts.ProvinceCSV, "provinces", "", "comma separated province names")
+	fs.StringVar(&opts.IPVersion, "ip-version", "46", "4|6|46")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("geo-export 不接受额外参数")
+	}
+	return geoExport(opts)
 }
 
 func runCityExport(args []string) error {
@@ -4655,5 +4674,6 @@ func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp geo-export --asset-dir DIR --mode all|provinces [--provinces CSV --ip-version 4|6|46]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp city-export --asset-dir DIR --codes-file FILE")
 }
