@@ -115,7 +115,7 @@ service_bundle_rows() {
     printf '0644\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\n'
     printf '0644\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\n'
     printf '0644\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\n'
-    printf '0644\tassets/pfwd-city-cn-v4.tsv\tassets/pfwd-city-cn-v4.tsv\tassets/pfwd-city-cn-v4.tsv\n'
+    printf '0644\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
         printf '0644\tlib/%s.sh\tlib/%s.sh\tlib/%s.sh\n' "$lib" "$lib" "$lib"
     done

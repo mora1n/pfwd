@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +31,14 @@ const (
 	geoIPv4AssetFile = "pfwd-geo-cn-v4.bin"
 	geoIPv6AssetFile = "pfwd-geo-cn-v6.bin"
 	geoMetaAssetFile = "pfwd-geo-meta.json"
+
+	cityIPv4AssetFile = "pfwd-city-cn-v4.bin"
+	cityMetaAssetFile = "pfwd-city-cn-meta.json"
+	cityAssetMagic    = "PFCI"
+	cityAssetVersion  = 1
+	cityHeaderSize    = 20
+	cityIndexSize     = 12
+	cityPrefixSize    = 8
 
 	xdbHeaderSize      = 256
 	xdbVersionOffset   = 0
@@ -106,6 +115,21 @@ type geoProvinceEntry struct {
 	Name string `json:"name"`
 }
 
+type cityAssetMeta struct {
+	Provinces []cityProvinceMeta `json:"provinces"`
+}
+
+type cityProvinceMeta struct {
+	Name   string          `json:"name"`
+	Code   string          `json:"code"`
+	Cities []cityEntryMeta `json:"cities"`
+}
+
+type cityEntryMeta struct {
+	Name string `json:"name"`
+	Code string `json:"code"`
+}
+
 type geoAssetMeta struct {
 	FormatVersion uint16             `json:"format_version"`
 	BuiltAt       string             `json:"built_at"`
@@ -146,6 +170,7 @@ type downloadedXDB struct {
 
 type xdbScanSegmentV4 struct {
 	Province string
+	City     string
 	Start    [4]byte
 	End      [4]byte
 }
@@ -160,6 +185,12 @@ type geoRangeV4 struct {
 	Province string
 	Start    uint32
 	End      uint32
+}
+
+type cityRangeV4 struct {
+	Code  uint32
+	Start uint32
+	End   uint32
 }
 
 type geoRangeV6 struct {
@@ -180,6 +211,33 @@ type geoAssetStats struct {
 	PrefixCount        int
 	MaxBucketCount     uint32
 	MaxLookupSteps     int
+}
+
+type cityHeader struct {
+	Magic       [4]byte
+	Version     uint16
+	IPVersion   uint16
+	IndexCount  uint32
+	PrefixCount uint32
+	Reserved    uint32
+}
+
+type cityIndexRecord struct {
+	Code   uint32
+	Offset uint32
+	Count  uint32
+}
+
+type cityPrefixV4 struct {
+	PrefixLen uint32
+	Addr      uint32
+}
+
+type cityMetaEntry struct {
+	Code     uint32
+	CodeText string
+	Province string
+	City     string
 }
 
 type xdbScanHandlerV4 func(segment xdbScanSegmentV4) error
@@ -233,6 +291,13 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 		return err
 	}
 	if err := writeGeoAssetV4FromSegments(filepath.Join(opts.AssetDir, geoIPv4AssetFile), v4Plan, v4Segments, provinceIDs, len(provinceMeta)); err != nil {
+		return err
+	}
+	cityIndex, err := loadCityMetaIndex(filepath.Join(opts.AssetDir, cityMetaAssetFile))
+	if err != nil {
+		return err
+	}
+	if err := writeCityIPv4AssetFromSegments(filepath.Join(opts.AssetDir, cityIPv4AssetFile), v4Segments, cityIndex); err != nil {
 		return err
 	}
 
@@ -575,6 +640,43 @@ func writeGeoAssetV4FromSegments(path string, plan *geoAssetPlan, segments []xdb
 	return writeGeoAssetV4(path, encoded, provinceCount)
 }
 
+func writeCityIPv4AssetFromSegments(path string, segments []xdbScanSegmentV4, catalog cityMetaCatalog) error {
+	ranges, err := cityRangesV4FromSegments(segments, catalog)
+	if err != nil {
+		return err
+	}
+	merged := mergeCityRangesV4(ranges)
+	prefixesByCode := map[uint32][]cityPrefixV4{}
+	for _, item := range merged {
+		for _, prefix := range cidrPrefixesFromRangeV4(item.Start, item.End, nil) {
+			prefixesByCode[item.Code] = append(prefixesByCode[item.Code], cityPrefixV4{
+				PrefixLen: prefix.PrefixLen,
+				Addr:      prefix.Addr,
+			})
+		}
+	}
+	codes := make([]uint32, 0, len(prefixesByCode))
+	for code := range prefixesByCode {
+		codes = append(codes, code)
+	}
+	slices.Sort(codes)
+	indexes := make([]cityIndexRecord, 0, len(codes))
+	prefixes := make([]cityPrefixV4, 0, len(merged))
+	for _, code := range codes {
+		items := prefixesByCode[code]
+		if len(items) == 0 {
+			continue
+		}
+		indexes = append(indexes, cityIndexRecord{
+			Code:   code,
+			Offset: uint32(len(prefixes)),
+			Count:  uint32(len(items)),
+		})
+		prefixes = append(prefixes, items...)
+	}
+	return writeCityIPv4Asset(path, indexes, prefixes)
+}
+
 func writeGeoAssetV6FromSegments(path string, plan *geoAssetPlan, segments []xdbScanSegmentV6, provinceIDs map[string]uint16, provinceCount int) error {
 	if plan == nil {
 		return fmt.Errorf("缺少 geo v6 计划")
@@ -591,6 +693,205 @@ func writeGeoAssetV6FromSegments(path string, plan *geoAssetPlan, segments []xdb
 		}
 	}
 	return writeGeoAssetV6(path, encoded, provinceCount)
+}
+
+type cityMetaCatalog struct {
+	ByName              map[string]cityMetaEntry
+	ByCode              map[uint32]cityMetaEntry
+	ProvincesWithCities map[string]struct{}
+	DirectByProvince    map[string]cityMetaEntry
+}
+
+func loadCityMetaIndex(path string) (cityMetaCatalog, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return cityMetaCatalog{}, fmt.Errorf("读取 city 元数据失败: %w", err)
+	}
+	var meta cityAssetMeta
+	if err := json.Unmarshal(content, &meta); err != nil {
+		return cityMetaCatalog{}, fmt.Errorf("解析 city 元数据失败: %w", err)
+	}
+	catalog := cityMetaCatalog{
+		ByName:              map[string]cityMetaEntry{},
+		ByCode:              map[uint32]cityMetaEntry{},
+		ProvincesWithCities: map[string]struct{}{},
+		DirectByProvince:    map[string]cityMetaEntry{},
+	}
+	for _, province := range meta.Provinces {
+		if len(province.Cities) == 0 {
+			continue
+		}
+		provinceName := strings.TrimSpace(province.Name)
+		catalog.ProvincesWithCities[cityMetaProvinceKey(provinceName)] = struct{}{}
+		for _, city := range province.Cities {
+			code, err := parseCityCode(city.Code)
+			if err != nil {
+				return cityMetaCatalog{}, err
+			}
+			entry := cityMetaEntry{
+				Code:     code,
+				CodeText: strings.TrimSpace(city.Code),
+				Province: provinceName,
+				City:     strings.TrimSpace(city.Name),
+			}
+			catalog.ByCode[code] = entry
+			catalog.ByName[cityMetaKey(provinceName, city.Name)] = entry
+			catalog.ByName[cityMetaNormalizedKey(provinceName, city.Name)] = entry
+			if strings.Contains(entry.City, "省直辖") {
+				catalog.DirectByProvince[cityMetaProvinceKey(provinceName)] = entry
+			}
+		}
+	}
+	return catalog, nil
+}
+
+func parseCityCode(raw string) (uint32, error) {
+	raw = strings.TrimSpace(raw)
+	value, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("解析城市 code 失败 (%s): %w", raw, err)
+	}
+	return uint32(value), nil
+}
+
+func cityRangesV4FromSegments(segments []xdbScanSegmentV4, catalog cityMetaCatalog) ([]cityRangeV4, error) {
+	ranges := make([]cityRangeV4, 0, len(segments))
+	unmatched := map[string]struct{}{}
+	for _, segment := range segments {
+		if invalidRegionPart(segment.City) {
+			continue
+		}
+		entry, ok, err := findCityMetaEntry(catalog, segment.Province, segment.City)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			if _, hasCities := catalog.ProvincesWithCities[cityMetaProvinceKey(segment.Province)]; !hasCities {
+				continue
+			}
+			unmatched[strings.TrimSpace(segment.Province)+"/"+strings.TrimSpace(segment.City)] = struct{}{}
+			continue
+		}
+		start := xdbIPv4SegmentValue(segment.Start)
+		end := xdbIPv4SegmentValue(segment.End)
+		if start > end {
+			continue
+		}
+		ranges = append(ranges, cityRangeV4{Code: entry.Code, Start: start, End: end})
+	}
+	if len(unmatched) > 0 {
+		items := make([]string, 0, len(unmatched))
+		for item := range unmatched {
+			items = append(items, item)
+		}
+		slices.Sort(items)
+		if len(items) > 12 {
+			items = items[:12]
+		}
+		return nil, fmt.Errorf("xdb 城市未匹配 city meta：%s", strings.Join(items, ", "))
+	}
+	return ranges, nil
+}
+
+func findCityMetaEntry(catalog cityMetaCatalog, province, city string) (cityMetaEntry, bool, error) {
+	if entry, ok := catalog.ByName[cityMetaKey(province, city)]; ok {
+		return entry, true, nil
+	}
+	if entry, ok := catalog.ByName[cityMetaNormalizedKey(province, city)]; ok {
+		return entry, true, nil
+	}
+	provinceKey := cityMetaProvinceKey(province)
+	cityKey := normalizeCityMetaName(city)
+	var matched cityMetaEntry
+	matchedCount := 0
+	for _, entry := range catalog.ByCode {
+		if cityMetaProvinceKey(entry.Province) != provinceKey {
+			continue
+		}
+		metaCityKey := normalizeCityMetaName(entry.City)
+		if metaCityKey == cityKey || strings.HasPrefix(metaCityKey, cityKey) || strings.HasPrefix(cityKey, metaCityKey) {
+			matched = entry
+			matchedCount++
+		}
+	}
+	if matchedCount > 1 {
+		return cityMetaEntry{}, false, fmt.Errorf("xdb 城市匹配 city meta 存在多候选：%s/%s", strings.TrimSpace(province), strings.TrimSpace(city))
+	}
+	if matchedCount == 1 {
+		return matched, true, nil
+	}
+	if entry, ok := catalog.DirectByProvince[provinceKey]; ok {
+		return entry, true, nil
+	}
+	return cityMetaEntry{}, false, nil
+}
+
+func mergeCityRangesV4(ranges []cityRangeV4) []cityRangeV4 {
+	slices.SortFunc(ranges, func(left, right cityRangeV4) int {
+		if left.Code < right.Code {
+			return -1
+		}
+		if left.Code > right.Code {
+			return 1
+		}
+		if left.Start < right.Start {
+			return -1
+		}
+		if left.Start > right.Start {
+			return 1
+		}
+		if left.End < right.End {
+			return -1
+		}
+		if left.End > right.End {
+			return 1
+		}
+		return 0
+	})
+	merged := make([]cityRangeV4, 0, len(ranges))
+	for _, current := range ranges {
+		if current.Start > current.End {
+			continue
+		}
+		if len(merged) == 0 {
+			merged = append(merged, current)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		adjacent := last.End != ^uint32(0) && current.Start == last.End+1
+		if last.Code == current.Code && (current.Start <= last.End || adjacent) {
+			if current.End > last.End {
+				last.End = current.End
+			}
+			continue
+		}
+		merged = append(merged, current)
+	}
+	return merged
+}
+
+func cityMetaKey(province, city string) string {
+	return strings.TrimSpace(province) + "\t" + strings.TrimSpace(city)
+}
+
+func cityMetaNormalizedKey(province, city string) string {
+	return cityMetaProvinceKey(province) + "\t" + normalizeCityMetaName(city)
+}
+
+func cityMetaProvinceKey(province string) string {
+	return normalizeCityMetaName(province)
+}
+
+func normalizeCityMetaName(value string) string {
+	value = strings.TrimSpace(value)
+	for _, suffix := range []string{
+		"特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区", "土家族苗族自治州",
+		"藏族羌族自治州", "哈尼族彝族自治州", "傣族自治州", "布依族苗族自治州",
+		"苗族侗族自治州", "自治州", "自治区", "地区", "盟", "省", "市",
+	} {
+		value = strings.TrimSuffix(value, suffix)
+	}
+	return value
 }
 
 func mergeGeoSegmentsV4(segments []xdbScanSegmentV4) []geoRangeV4 {
@@ -798,7 +1099,7 @@ func scanCNXDBv4(path string, handler xdbScanHandlerV4) error {
 		if _, err := io.ReadFull(file, buf); err != nil {
 			return fmt.Errorf("读取 IPv4 xdb index 失败: %w", err)
 		}
-		province, ok, err := xdbProvinceByIndex(file, buf, 4)
+		province, city, ok, err := xdbLocationByIndex(file, buf, 4)
 		if err != nil {
 			return err
 		}
@@ -809,7 +1110,7 @@ func scanCNXDBv4(path string, handler xdbScanHandlerV4) error {
 		var end [4]byte
 		copy(start[:], buf[:4])
 		copy(end[:], buf[4:8])
-		if err := handler(xdbScanSegmentV4{Province: province, Start: start, End: end}); err != nil {
+		if err := handler(xdbScanSegmentV4{Province: province, City: city, Start: start, End: end}); err != nil {
 			return err
 		}
 	}
@@ -840,7 +1141,7 @@ func scanCNXDBv6(path string, handler xdbScanHandlerV6) error {
 		if _, err := io.ReadFull(file, buf); err != nil {
 			return fmt.Errorf("读取 IPv6 xdb index 失败: %w", err)
 		}
-		province, ok, err := xdbProvinceByIndex(file, buf, 6)
+		province, _, ok, err := xdbLocationByIndex(file, buf, 6)
 		if err != nil {
 			return err
 		}
@@ -876,7 +1177,7 @@ func xdbIndexCount(indexStart, indexEnd uint32, segmentSize int) int {
 	return int((indexEnd-indexStart)/uint32(segmentSize)) + 1
 }
 
-func xdbProvinceByIndex(file *os.File, segment []byte, ipVersion uint16) (string, bool, error) {
+func xdbLocationByIndex(file *os.File, segment []byte, ipVersion uint16) (string, string, bool, error) {
 	var offset int
 	if ipVersion == 4 {
 		offset = 8
@@ -887,20 +1188,32 @@ func xdbProvinceByIndex(file *os.File, segment []byte, ipVersion uint16) (string
 	dataPtr := binary.LittleEndian.Uint32(segment[offset+2:])
 	region, err := readXDBRegion(file, dataPtr, dataLen)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	if !strings.HasPrefix(region, "中国|") {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	parts := strings.Split(region, "|")
 	if len(parts) < 2 {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	province := strings.TrimSpace(parts[1])
-	if province == "" || province == "0" || province == "Reserved" {
-		return "", false, nil
+	if invalidRegionPart(province) {
+		return "", "", false, nil
 	}
-	return province, true, nil
+	city := ""
+	if len(parts) >= 3 {
+		city = strings.TrimSpace(parts[2])
+		if invalidRegionPart(city) {
+			city = ""
+		}
+	}
+	return province, city, true, nil
+}
+
+func invalidRegionPart(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || value == "0" || value == "Reserved"
 }
 
 func readXDBRegion(file *os.File, ptr uint32, length uint16) (string, error) {
@@ -1041,6 +1354,39 @@ func writeGeoAsset[T any](path string, header geoHeader, prefixes []T, label str
 	return nil
 }
 
+func writeCityIPv4Asset(path string, indexes []cityIndexRecord, prefixes []cityPrefixV4) (err error) {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("创建 city v4 资产失败: %w", err)
+	}
+	defer func() {
+		closeErr := file.Close()
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+	header := cityHeader{}
+	copy(header.Magic[:], []byte(cityAssetMagic))
+	header.Version = cityAssetVersion
+	header.IPVersion = 4
+	header.IndexCount = uint32(len(indexes))
+	header.PrefixCount = uint32(len(prefixes))
+	if err := binary.Write(file, binary.LittleEndian, header); err != nil {
+		return fmt.Errorf("写入 city v4 header 失败: %w", err)
+	}
+	for _, item := range indexes {
+		if err := binary.Write(file, binary.LittleEndian, item); err != nil {
+			return fmt.Errorf("写入 city v4 index 失败: %w", err)
+		}
+	}
+	for _, prefix := range prefixes {
+		if err := binary.Write(file, binary.LittleEndian, prefix); err != nil {
+			return fmt.Errorf("写入 city v4 prefix 失败: %w", err)
+		}
+	}
+	return nil
+}
+
 func readGeoAssetV4(path string) ([]geoPrefixV4, uint16, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -1075,6 +1421,52 @@ func readGeoAssetV4(path string) ([]geoPrefixV4, uint16, error) {
 		offset += 12
 	}
 	return prefixes, header.IPVersion, nil
+}
+
+func readCityIPv4Asset(path string) ([]cityIndexRecord, []cityPrefixV4, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取 city v4 资产失败: %w", err)
+	}
+	if len(content) < cityHeaderSize {
+		return nil, nil, fmt.Errorf("city v4 资产过短")
+	}
+	var header cityHeader
+	if err := binary.Read(bytes.NewReader(content[:cityHeaderSize]), binary.LittleEndian, &header); err != nil {
+		return nil, nil, fmt.Errorf("解析 city v4 header 失败: %w", err)
+	}
+	if string(header.Magic[:]) != cityAssetMagic {
+		return nil, nil, fmt.Errorf("city v4 magic 不匹配")
+	}
+	if header.Version != cityAssetVersion {
+		return nil, nil, fmt.Errorf("city v4 资产版本=%d，不支持", header.Version)
+	}
+	if header.IPVersion != 4 {
+		return nil, nil, fmt.Errorf("city v4 资产 ip_version=%d，不支持", header.IPVersion)
+	}
+	indexBytes := int(header.IndexCount) * cityIndexSize
+	prefixBytes := int(header.PrefixCount) * cityPrefixSize
+	if len(content) < cityHeaderSize+indexBytes+prefixBytes {
+		return nil, nil, fmt.Errorf("city v4 资产数据截断")
+	}
+	indexes := make([]cityIndexRecord, int(header.IndexCount))
+	offset := cityHeaderSize
+	for i := range indexes {
+		indexes[i].Code = binary.LittleEndian.Uint32(content[offset:])
+		indexes[i].Offset = binary.LittleEndian.Uint32(content[offset+4:])
+		indexes[i].Count = binary.LittleEndian.Uint32(content[offset+8:])
+		if indexes[i].Offset+indexes[i].Count > header.PrefixCount {
+			return nil, nil, fmt.Errorf("city v4 index 越界 (code=%d)", indexes[i].Code)
+		}
+		offset += cityIndexSize
+	}
+	prefixes := make([]cityPrefixV4, int(header.PrefixCount))
+	for i := range prefixes {
+		prefixes[i].PrefixLen = binary.LittleEndian.Uint32(content[offset:])
+		prefixes[i].Addr = binary.LittleEndian.Uint32(content[offset+4:])
+		offset += cityPrefixSize
+	}
+	return indexes, prefixes, nil
 }
 
 func readGeoAssetV6(path string) ([]geoPrefixV6, uint16, error) {
@@ -1249,6 +1641,107 @@ func geoCheck(opts geoCheckOptions) error {
 	default:
 		return fmt.Errorf("无效 geo mode: %s", mode)
 	}
+}
+
+func cityExport(opts cityExportOptions) error {
+	assetDir := strings.TrimSpace(opts.AssetDir)
+	if assetDir == "" {
+		return fmt.Errorf("city-export 缺少 --asset-dir")
+	}
+	codes, err := readCityCodesFile(opts.CodesFile)
+	if err != nil {
+		return err
+	}
+	if len(codes) == 0 {
+		return nil
+	}
+	catalog, err := loadCityMetaIndex(filepath.Join(assetDir, cityMetaAssetFile))
+	if err != nil {
+		return err
+	}
+	indexes, prefixes, err := readCityIPv4Asset(filepath.Join(assetDir, cityIPv4AssetFile))
+	if err != nil {
+		return err
+	}
+	for _, code := range codes {
+		meta, ok := catalog.ByCode[code]
+		if !ok {
+			return fmt.Errorf("未知城市 code：%d", code)
+		}
+		index, ok := findCityIndex(indexes, code)
+		if !ok {
+			return fmt.Errorf("城市 code 没有可用 IPv4 CIDR：%d", code)
+		}
+		start := int(index.Offset)
+		end := int(index.Offset + index.Count)
+		if start < 0 || end > len(prefixes) || start > end {
+			return fmt.Errorf("city v4 index 越界 (code=%d)", code)
+		}
+		for _, prefix := range prefixes[start:end] {
+			cidr, err := cityPrefixCIDR(prefix)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(os.Stdout, "%s\t%s\t%s\t%s\n", meta.CodeText, meta.Province, meta.City, cidr)
+		}
+	}
+	return nil
+}
+
+func readCityCodesFile(filePath string) ([]uint32, error) {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return nil, fmt.Errorf("city-export 缺少 --codes-file")
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("读取城市 code 文件失败 (%s): %w", filePath, err)
+	}
+	seen := map[uint32]struct{}{}
+	out := []uint32{}
+	for lineNo, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		code, err := parseCityCode(line)
+		if err != nil {
+			return nil, fmt.Errorf("解析城市 code 文件失败 (%s:%d): %w", filePath, lineNo+1, err)
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+func findCityIndex(indexes []cityIndexRecord, code uint32) (cityIndexRecord, bool) {
+	pos, ok := slices.BinarySearchFunc(indexes, code, func(item cityIndexRecord, target uint32) int {
+		if item.Code < target {
+			return -1
+		}
+		if item.Code > target {
+			return 1
+		}
+		return 0
+	})
+	if !ok {
+		return cityIndexRecord{}, false
+	}
+	return indexes[pos], true
+}
+
+func cityPrefixCIDR(prefix cityPrefixV4) (string, error) {
+	if prefix.PrefixLen > 32 {
+		return "", fmt.Errorf("无效 city v4 prefix_len：%d", prefix.PrefixLen)
+	}
+	var raw [4]byte
+	binary.BigEndian.PutUint32(raw[:], prefix.Addr)
+	addr := netip.AddrFrom4(raw)
+	return netip.PrefixFrom(addr, int(prefix.PrefixLen)).Masked().String(), nil
 }
 
 func writeGeoCheckResult(opts geoCheckOptions, result geoCheckResult) error {

@@ -134,7 +134,7 @@ whitelist_city_meta_file() {
 }
 
 whitelist_city_ipv4_asset_file() {
-    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-city-cn-v4.tsv"
+    printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-city-cn-v4.bin"
 }
 
 whitelist_require_geo_assets() {
@@ -616,8 +616,10 @@ whitelist_materialize_city_runtime() {
         return 0
     fi
     whitelist_require_city_assets
-    awk -F '\t' 'NR == FNR { wanted[$1] = 1; next } ($1 in wanted) { print }' \
-      "$tmp_codes" "$(whitelist_city_ipv4_asset_file)" | pfwd_write_atomic "$target"
+    [ -x "$(forwarder_bin_path)" ] || { rm -f "$tmp_codes"; pfwd_die "缺少 XDP 辅助程序：$(forwarder_bin_path)" ; }
+    "$(forwarder_bin_path)" city-export \
+      --asset-dir "$(whitelist_geo_asset_dir)" \
+      --codes-file "$tmp_codes" | pfwd_write_atomic "$target"
     rm -f "$tmp_codes"
     [ -s "$target" ] || pfwd_die "已选市白名单没有可用 IPv4 CIDR"
 }

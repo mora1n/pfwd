@@ -30,7 +30,11 @@ func writeTestXDBv4(t *testing.T, path string, segments []xdbScanSegmentV4) {
 		regions := map[string]testXDBRegion{}
 		nextRegionPtr := regionPtr
 		for _, segment := range segments {
-			raw := "中国|" + segment.Province + "|0|0|0"
+			city := segment.City
+			if city == "" {
+				city = "0"
+			}
+			raw := "中国|" + segment.Province + "|" + city + "|0|0"
 			info, ok := regions[raw]
 			if !ok {
 				info = testXDBRegion{ptr: nextRegionPtr, raw: raw}
@@ -49,7 +53,11 @@ func writeTestXDBv4(t *testing.T, path string, segments []xdbScanSegmentV4) {
 		out := []byte{}
 		seen := map[string]struct{}{}
 		for _, segment := range segments {
-			raw := "中国|" + segment.Province + "|0|0|0"
+			city := segment.City
+			if city == "" {
+				city = "0"
+			}
+			raw := "中国|" + segment.Province + "|" + city + "|0|0"
 			if _, ok := seen[raw]; ok {
 				continue
 			}
@@ -144,12 +152,11 @@ func mustIPv4XDBBytes(t *testing.T, raw string) [4]byte {
 	return out
 }
 
-func testRuleKey(family uint8, protocol uint8, listenPort uint16, listenAddr [16]byte) ruleKey {
+func testRuleKey(family uint8, protocol uint8, listenPort uint16) ruleKey {
 	return ruleKey{
 		Family:     family,
 		Protocol:   protocol,
 		ListenPort: htons(listenPort),
-		ListenAddr: listenAddr,
 	}
 }
 
@@ -205,17 +212,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 			name: "wildcard listen preserves matching connection",
 			allowed: func(t *testing.T) map[ruleKey]ruleSemantics {
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): baseRuleSemantics(t),
-				}
-			},
-			value:       func(value connVal) connVal { return value },
-			wantAllowed: true,
-		},
-		{
-			name: "exact listen preserves matching connection",
-			allowed: func(t *testing.T) map[ruleKey]ruleSemantics {
-				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, mustAddr16(t, "47.79.34.146")): baseRuleSemantics(t),
+					testRuleKey(4, 6, 38182): baseRuleSemantics(t),
 				}
 			},
 			value:       func(value connVal) connVal { return value },
@@ -227,7 +224,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				semantics := baseRuleSemantics(t)
 				semantics.TargetAddr = mustAddr16(t, "1.0.0.1")
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): semantics,
+					testRuleKey(4, 6, 38182): semantics,
 				}
 			},
 			value:       func(value connVal) connVal { return value },
@@ -240,7 +237,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				semantics.SourceAddrFromRule = true
 				semantics.SourceAddr = mustAddr16(t, "203.0.113.20")
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): semantics,
+					testRuleKey(4, 6, 38182): semantics,
 				}
 			},
 			value:       func(value connVal) connVal { return value },
@@ -253,7 +250,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				semantics.SourceAddrFromRule = true
 				semantics.SourceAddr = mustAddr16(t, "203.0.113.20")
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): semantics,
+					testRuleKey(4, 6, 38182): semantics,
 				}
 			},
 			value: func(value connVal) connVal {
@@ -268,7 +265,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				semantics := baseRuleSemantics(t)
 				semantics.TrafficMode = 1
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): semantics,
+					testRuleKey(4, 6, 38182): semantics,
 				}
 			},
 			value:       func(value connVal) connVal { return value },
@@ -280,7 +277,7 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				semantics := baseRuleSemantics(t)
 				semantics.BillingEnabled = 0
 				return map[ruleKey]ruleSemantics{
-					testRuleKey(4, 6, 38182, [16]byte{}): semantics,
+					testRuleKey(4, 6, 38182): semantics,
 				}
 			},
 			value:       func(value connVal) connVal { return value },
@@ -295,6 +292,18 @@ func TestConnectionAllowedByRuntime(t *testing.T) {
 				t.Fatalf("connectionAllowedByRuntime()=%v, want %v", got, tc.wantAllowed)
 			}
 		})
+	}
+}
+
+func TestMakeRuleKeyRejectsConcreteListenIP(t *testing.T) {
+	_, err := makeRuleKey(runtimeRule{
+		IPVersion:  4,
+		Protocol:   "tcp",
+		ListenPort: 38182,
+		ListenIP:   "47.79.34.146",
+	})
+	if err == nil || !strings.Contains(err.Error(), "不支持具体 listen_ip") {
+		t.Fatalf("makeRuleKey error=%v, want concrete listen_ip rejection", err)
 	}
 }
 
@@ -415,6 +424,72 @@ func TestGeoAssetRoundTripAndLookup(t *testing.T) {
 			t.Fatalf("findGeoPrefixV6 province=%d, want 3", found.ProvinceID)
 		}
 	})
+}
+
+func TestCityIPv4AssetRoundTripAndExport(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := `{
+  "provinces": [
+    {
+      "name": "湖南省",
+      "code": "430000",
+      "cities": [
+        {"name": "长沙市", "code": "430100"},
+        {"name": "株洲市", "code": "430200"}
+      ]
+    }
+  ]
+}
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, cityMetaAssetFile), []byte(meta), 0o644); err != nil {
+		t.Fatalf("write city meta: %v", err)
+	}
+	catalog, err := loadCityMetaIndex(filepath.Join(tmpDir, cityMetaAssetFile))
+	if err != nil {
+		t.Fatalf("loadCityMetaIndex: %v", err)
+	}
+	segments := []xdbScanSegmentV4{
+		{Province: "湖南省", City: "长沙市", Start: mustIPv4XDBBytes(t, "203.0.113.0"), End: mustIPv4XDBBytes(t, "203.0.113.255")},
+		{Province: "湖南省", City: "株洲市", Start: mustIPv4XDBBytes(t, "198.51.100.0"), End: mustIPv4XDBBytes(t, "198.51.100.255")},
+	}
+	if err := writeCityIPv4AssetFromSegments(filepath.Join(tmpDir, cityIPv4AssetFile), segments, catalog); err != nil {
+		t.Fatalf("writeCityIPv4AssetFromSegments: %v", err)
+	}
+	indexes, prefixes, err := readCityIPv4Asset(filepath.Join(tmpDir, cityIPv4AssetFile))
+	if err != nil {
+		t.Fatalf("readCityIPv4Asset: %v", err)
+	}
+	if len(indexes) != 2 || len(prefixes) != 2 {
+		t.Fatalf("city asset indexes=%d prefixes=%d, want 2/2", len(indexes), len(prefixes))
+	}
+	index, ok := findCityIndex(indexes, 430100)
+	if !ok || index.Count != 1 {
+		t.Fatalf("findCityIndex(430100)=%+v ok=%v, want one prefix", index, ok)
+	}
+	codesPath := filepath.Join(tmpDir, "codes.txt")
+	if err := os.WriteFile(codesPath, []byte("430100\n"), 0o644); err != nil {
+		t.Fatalf("write city codes: %v", err)
+	}
+
+	var out bytes.Buffer
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe city export: %v", err)
+	}
+	os.Stdout = w
+	err = cityExport(cityExportOptions{AssetDir: tmpDir, CodesFile: codesPath})
+	_ = w.Close()
+	os.Stdout = oldStdout
+	_, _ = io.Copy(&out, r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatalf("cityExport: %v", err)
+	}
+	want := "430100\t湖南省\t长沙市\t203.0.113.0/24\n"
+	if out.String() != want {
+		t.Fatalf("cityExport output=%q, want %q", out.String(), want)
+	}
 }
 
 func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
@@ -756,7 +831,7 @@ func TestGeoPolicyChangeHelpers(t *testing.T) {
 	}
 }
 
-func TestGeoPolicyFlagsByProvince(t *testing.T) {
+func TestGeoAllowedProvinceIDs(t *testing.T) {
 	assets := &geoAssetRuntime{
 		Meta: geoAssetMeta{
 			Provinces: []geoProvinceEntry{
@@ -773,57 +848,61 @@ func TestGeoPolicyFlagsByProvince(t *testing.T) {
 	}
 
 	tests := []struct {
-		name             string
-		ingressMode      string
-		ingressProvinces []string
-		egressMode       string
-		egressProvinces  []string
-		want             map[uint16]uint8
-		wantErr          string
+		name      string
+		mode      string
+		provinces []string
+		want      map[uint16]struct{}
+		wantErr   string
 	}{
 		{
-			name:             "ingress provinces and egress all merge flags",
-			ingressMode:      "provinces",
-			ingressProvinces: []string{"浙江省", "广东省"},
-			egressMode:       "all",
-			want: map[uint16]uint8{
-				1: geoPolicyIngress | geoPolicyEgress,
-				2: geoPolicyIngress | geoPolicyEgress,
-				3: geoPolicyEgress,
+			name:      "province mode selects requested province ids",
+			mode:      "provinces",
+			provinces: []string{"浙江省", "广东省", "广东省"},
+			want: map[uint16]struct{}{
+				1: {},
+				2: {},
 			},
 		},
 		{
-			name:        "disabled modes produce empty flags",
-			want:        map[uint16]uint8{},
-			ingressMode: "off",
-			egressMode:  "off",
+			name: "all mode selects every known province",
+			mode: "all",
+			want: map[uint16]struct{}{
+				1: {},
+				2: {},
+				3: {},
+			},
 		},
 		{
-			name:             "unknown ingress province returns explicit error",
-			ingressMode:      "provinces",
-			ingressProvinces: []string{"不存在省"},
-			wantErr:          "未知入口省份：不存在省",
+			name: "off mode produces empty set",
+			mode: "off",
+			want: map[uint16]struct{}{},
+		},
+		{
+			name:      "unknown province returns explicit error",
+			mode:      "provinces",
+			provinces: []string{"不存在省"},
+			wantErr:   "未知白名单省份：不存在省",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := geoPolicyFlagsByProvince(assets, tc.ingressMode, tc.ingressProvinces, tc.egressMode, tc.egressProvinces)
+			got, err := geoAllowedProvinceIDs(assets, tc.mode, tc.provinces)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("geoPolicyFlagsByProvince error=%v, want contains %q", err, tc.wantErr)
+					t.Fatalf("geoAllowedProvinceIDs error=%v, want contains %q", err, tc.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("geoPolicyFlagsByProvince: %v", err)
+				t.Fatalf("geoAllowedProvinceIDs: %v", err)
 			}
 			if len(got) != len(tc.want) {
-				t.Fatalf("flags len=%d, want %d: got=%v", len(got), len(tc.want), got)
+				t.Fatalf("allowed len=%d, want %d: got=%v", len(got), len(tc.want), got)
 			}
-			for provinceID, wantFlags := range tc.want {
-				if got[provinceID] != wantFlags {
-					t.Fatalf("province %d flags=%d, want %d", provinceID, got[provinceID], wantFlags)
+			for provinceID := range tc.want {
+				if _, ok := got[provinceID]; !ok {
+					t.Fatalf("province %d missing from allowed set: got=%v", provinceID, got)
 				}
 			}
 		})

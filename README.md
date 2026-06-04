@@ -66,7 +66,7 @@ tar -czf pfwd.tar.gz \
   assets/pfwd-geo-cn-v6.bin \
   assets/pfwd-geo-meta.json \
   assets/pfwd-city-cn-meta.json \
-  assets/pfwd-city-cn-v4.tsv
+  assets/pfwd-city-cn-v4.bin
 ```
 
 目标机器上解压并安装：
@@ -108,6 +108,8 @@ pfwd add \
 - 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量；国内 IP / 省份策略与目标校验、宿主机出口共用一套配置
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`
 - 入口防护跳过端口：指定公网监听端口可绕过入口白名单和协议封锁；不影响出口白名单
+
+国内 IP / 省份策略会在加载期从 geo 资产编译进入口或出口白名单 LPM map，XDP 热路径只做一次白名单查询，不在包处理路径里读取 xdb 或独立 geo map。
 
 常用命令：
 
@@ -225,7 +227,7 @@ install -m 644 assets/pfwd-geo-cn-v4.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-
 install -m 644 assets/pfwd-geo-cn-v6.bin /usr/local/lib/pfwd/assets/pfwd-geo-cn-v6.bin
 install -m 644 assets/pfwd-geo-meta.json /usr/local/lib/pfwd/assets/pfwd-geo-meta.json
 install -m 644 assets/pfwd-city-cn-meta.json /usr/local/lib/pfwd/assets/pfwd-city-cn-meta.json
-install -m 644 assets/pfwd-city-cn-v4.tsv /usr/local/lib/pfwd/assets/pfwd-city-cn-v4.tsv
+install -m 644 assets/pfwd-city-cn-v4.bin /usr/local/lib/pfwd/assets/pfwd-city-cn-v4.bin
 
 ln -sf /usr/local/lib/pfwd/pfwd.sh /usr/local/bin/pfwd
 ln -sf /usr/local/lib/pfwd/bbr.sh /usr/local/bin/pfwd-bbr

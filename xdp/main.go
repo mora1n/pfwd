@@ -33,9 +33,9 @@ import (
 //go:embed xdp_bpfel.o
 var xdpBPFEL []byte
 
-const binaryVersion = "0.2.7"
+const binaryVersion = "0.2.8"
 const dataplaneVersion = 2
-const mapABIVersion = 11
+const mapABIVersion = 12
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -55,8 +55,6 @@ const (
 	ruleFlagBlockSOCKS   = uint16(1 << 10)
 	ruleFlagAllowCustom  = uint16(1 << 11)
 	ruleFlagAllowGeo     = uint16(1 << 12)
-	geoPolicyIngress     = uint8(1 << 0)
-	geoPolicyEgress      = uint8(1 << 1)
 )
 const ruleCounterPinSuffix = "_rule_counters"
 const tcPrefBPFIngress = "10"
@@ -111,13 +109,7 @@ type bpfObjects struct {
 	PFWDEgressWhitelistCacheV6 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v6"`
 	PFWDFlows                  *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
 	PFWDHostEgressFlows        *ebpf.Map     `ebpf:"pfwd_host_egress_flows"`
-	PFWDGuardPrefixes          *ebpf.Map     `ebpf:"pfwd_guard_prefixes"`
 	PFWDSkipPorts              *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
-	PFWDGeoBucketV4            *ebpf.Map     `ebpf:"pfwd_geo_bucket_v4"`
-	PFWDGeoBucketV6            *ebpf.Map     `ebpf:"pfwd_geo_bucket_v6"`
-	PFWDGeoSegmentsV4          *ebpf.Map     `ebpf:"pfwd_geo_segments_v4"`
-	PFWDGeoSegmentsV6          *ebpf.Map     `ebpf:"pfwd_geo_segments_v6"`
-	PFWDGeoProvincePolicy      *ebpf.Map     `ebpf:"pfwd_geo_province_policy"`
 	PFWDScratch                *ebpf.Map     `ebpf:"pfwd_scratch"`
 }
 
@@ -129,8 +121,7 @@ func (o *bpfObjects) Close() {
 		o.PFWDXDP, o.PFWDIngress, o.PFWDHostEgress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
 		o.PFWDRuleCounter, o.PFWDRuleReplyCounter, o.PFWDRuleDropCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
 		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDEgressWhitelistV4, o.PFWDEgressWhitelistV6,
-		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDHostEgressFlows, o.PFWDGuardPrefixes, o.PFWDSkipPorts,
-		o.PFWDGeoBucketV4, o.PFWDGeoBucketV6, o.PFWDGeoSegmentsV4, o.PFWDGeoSegmentsV6, o.PFWDGeoProvincePolicy, o.PFWDScratch,
+		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDHostEgressFlows, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
 			_ = closer.Close()
@@ -425,13 +416,7 @@ type runtimeMapPins struct {
 	EgressWhitelistCacheV6 string
 	AllowedFlows           string
 	HostEgressFlows        string
-	GuardPrefixes          string
 	SkipPorts              string
-	GeoBucketV4            string
-	GeoBucketV6            string
-	GeoSegmentsV4          string
-	GeoSegmentsV6          string
-	GeoProvincePolicy      string
 }
 
 type xdpSettings struct {
@@ -452,7 +437,6 @@ type ruleKey struct {
 	Family     uint8
 	Protocol   uint8
 	ListenPort uint16
-	ListenAddr [16]byte
 }
 
 type ruleVal struct {
@@ -609,26 +593,11 @@ type flowKey struct {
 	Daddr    [16]byte
 }
 
-type guardPrefixVal struct {
+type guardFlowVal struct {
+	Verdict uint8
 	SeenLen uint8
-	Pad     [7]byte
-	Prefix  [8]byte
-}
-
-type geoPrefixKeyV4 struct {
-	PrefixLen uint32
-	Addr      uint32
-}
-
-type geoPrefixKeyV6 struct {
-	PrefixLen uint32
-	Addr      [16]byte
-}
-
-type geoPrefixMapVal struct {
-	ProvinceID  uint16
-	PolicyFlags uint8
-	Pad         uint8
+	Pad     [6]uint8
+	Prefix  [8]uint8
 }
 
 func main() {
@@ -647,6 +616,8 @@ func run(args []string) error {
 		return runGeoBuild(args[1:])
 	case "geo-check":
 		return runGeoCheck(args[1:])
+	case "city-export":
+		return runCityExport(args[1:])
 	case "apply":
 		return runApply(args[1:])
 	case "remove":
@@ -710,6 +681,21 @@ func runGeoCheck(args []string) error {
 		return fmt.Errorf("geo-check 缺少 --address")
 	}
 	return geoCheck(opts)
+}
+
+func runCityExport(args []string) error {
+	fs := flag.NewFlagSet("city-export", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var opts cityExportOptions
+	fs.StringVar(&opts.AssetDir, "asset-dir", "", "geo asset dir")
+	fs.StringVar(&opts.CodesFile, "codes-file", "", "selected city codes file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("city-export 不接受额外参数")
+	}
+	return cityExport(opts)
 }
 
 func runApply(args []string) error {
@@ -1122,13 +1108,7 @@ func loadObjects(guardMode string, hostEgressEnabled bool) (*bpfObjects, error) 
 		PFWDEgressWhitelistCacheV6: coll.Maps["pfwd_egress_whitelist_cache_v6"],
 		PFWDFlows:                  coll.Maps["pfwd_allowed_flows"],
 		PFWDHostEgressFlows:        coll.Maps["pfwd_host_egress_flows"],
-		PFWDGuardPrefixes:          coll.Maps["pfwd_guard_prefixes"],
 		PFWDSkipPorts:              coll.Maps["pfwd_protocol_skip_ports"],
-		PFWDGeoBucketV4:            coll.Maps["pfwd_geo_bucket_v4"],
-		PFWDGeoBucketV6:            coll.Maps["pfwd_geo_bucket_v6"],
-		PFWDGeoSegmentsV4:          coll.Maps["pfwd_geo_segments_v4"],
-		PFWDGeoSegmentsV6:          coll.Maps["pfwd_geo_segments_v6"],
-		PFWDGeoProvincePolicy:      coll.Maps["pfwd_geo_province_policy"],
 		PFWDScratch:                coll.Maps["pfwd_scratch"],
 	}
 	return objs, nil
@@ -1528,27 +1508,8 @@ func clearWhitelistCacheMaps(cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
 }
 
 func clearAllowedFlows(flowMap *ebpf.Map) error {
-	if err := clearMap[connKey, connVal](flowMap); err != nil {
-		return fmt.Errorf("清理连接缓存失败: %w", err)
-	}
-	return nil
-}
-
-func clearGeoMaps(bucketV4, bucketV6, segmentsV4, segmentsV6, provincePolicy *ebpf.Map) error {
-	if err := clearArrayMap[geoBucket](bucketV4); err != nil {
-		return err
-	}
-	if err := clearArrayMap[geoBucket](bucketV6); err != nil {
-		return err
-	}
-	if err := clearMap[geoPrefixKeyV4, geoPrefixMapVal](segmentsV4); err != nil {
-		return err
-	}
-	if err := clearMap[geoPrefixKeyV6, geoPrefixMapVal](segmentsV6); err != nil {
-		return err
-	}
-	if err := clearArrayMap[geoProvincePolicyVal](provincePolicy); err != nil {
-		return err
+	if err := clearMap[flowKey, guardFlowVal](flowMap); err != nil {
+		return fmt.Errorf("清理 guard flow cache 失败: %w", err)
 	}
 	return nil
 }
@@ -1572,99 +1533,92 @@ func clearArrayMap[T any](m *ebpf.Map) error {
 	return nil
 }
 
-func loadGeoMaps(
-	assets *geoAssetRuntime,
-	bucketV4, bucketV6, segmentsV4, segmentsV6, provincePolicy *ebpf.Map,
-	ingressMode string,
-	ingressProvinces []string,
-	egressMode string,
-	egressProvinces []string,
+func loadEffectiveWhitelist(
+	mapV4 *ebpf.Map,
+	mapV6 *ebpf.Map,
+	files []string,
+	geoAssetDir string,
+	cnMode string,
+	cnProvinces []string,
 ) error {
-	if assets == nil {
-		return fmt.Errorf("缺少 geo 资产")
+	if err := loadWhitelistFiles(mapV4, mapV6, files); err != nil {
+		return err
 	}
-	if bucketV4 == nil || bucketV6 == nil || segmentsV4 == nil || segmentsV6 == nil || provincePolicy == nil {
-		return fmt.Errorf("geo BPF map 未加载")
+	if !geoModeEnabled(cnMode) {
+		return nil
 	}
-	flagsByProvince, err := geoPolicyFlagsByProvince(assets, ingressMode, ingressProvinces, egressMode, egressProvinces)
+	assets, err := loadGeoAssets(geoAssetDir)
 	if err != nil {
 		return err
 	}
+	allowed, err := geoAllowedProvinceIDs(assets, cnMode, cnProvinces)
+	if err != nil {
+		return err
+	}
+	return loadGeoPrefixesIntoWhitelist(mapV4, mapV6, assets, allowed)
+}
+
+func loadGeoPrefixesIntoWhitelist(mapV4 *ebpf.Map, mapV6 *ebpf.Map, assets *geoAssetRuntime, allowed map[uint16]struct{}) error {
+	if assets == nil {
+		return fmt.Errorf("缺少 geo 资产")
+	}
+	if mapV4 == nil || mapV6 == nil {
+		return fmt.Errorf("白名单 BPF map 未加载")
+	}
+	value := uint8(1)
 	for i, prefix := range assets.PrefixesV4 {
-		key := geoPrefixKeyV4{
+		if _, ok := allowed[prefix.ProvinceID]; !ok {
+			continue
+		}
+		key := whitelistKeyV4{
 			PrefixLen: prefix.PrefixLen,
 			Addr:      ipv4LPMTrieAddr(ipv4BEToBytes(prefix.Addr)),
 		}
-		value := geoPrefixMapVal{
-			ProvinceID:  prefix.ProvinceID,
-			PolicyFlags: flagsByProvince[prefix.ProvinceID],
-		}
-		if err := segmentsV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo prefix v4 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
+		if err := mapV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入入口/出口 geo whitelist v4 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
 		}
 	}
 	for i, prefix := range assets.PrefixesV6 {
-		key := geoPrefixKeyV6{
+		if _, ok := allowed[prefix.ProvinceID]; !ok {
+			continue
+		}
+		key := whitelistKeyV6{
 			PrefixLen: prefix.PrefixLen,
 			Addr:      prefix.Addr,
 		}
-		value := geoPrefixMapVal{
-			ProvinceID:  prefix.ProvinceID,
-			PolicyFlags: flagsByProvince[prefix.ProvinceID],
-		}
-		if err := segmentsV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo prefix v6 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
-		}
-	}
-	for provinceID, flags := range flagsByProvince {
-		key := uint32(provinceID)
-		value := geoProvincePolicyVal{Flags: flags}
-		if err := provincePolicy.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo province policy 失败 (province=%d): %w", provinceID, err)
+		if err := mapV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入入口/出口 geo whitelist v6 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
 		}
 	}
 	return nil
 }
 
-func geoPolicyFlagsByProvince(
+func geoAllowedProvinceIDs(
 	assets *geoAssetRuntime,
-	ingressMode string,
-	ingressProvinces []string,
-	egressMode string,
-	egressProvinces []string,
-) (map[uint16]uint8, error) {
-	flagsByProvince := make(map[uint16]uint8)
-	if geoModeEnabled(ingressMode) {
-		if ingressMode == "all" {
-			for _, province := range assets.Meta.Provinces {
-				flagsByProvince[province.ID] |= geoPolicyIngress
-			}
-		} else {
-			for _, province := range normalizeProvinceNames(ingressProvinces) {
-				id, ok := assets.ProvinceIDs[province]
-				if !ok {
-					return nil, fmt.Errorf("未知入口省份：%s", province)
-				}
-				flagsByProvince[id] |= geoPolicyIngress
-			}
-		}
+	mode string,
+	provinces []string,
+) (map[uint16]struct{}, error) {
+	if assets == nil {
+		return nil, fmt.Errorf("缺少 geo 资产")
 	}
-	if geoModeEnabled(egressMode) {
-		if egressMode == "all" {
-			for _, province := range assets.Meta.Provinces {
-				flagsByProvince[province.ID] |= geoPolicyEgress
-			}
-		} else {
-			for _, province := range normalizeProvinceNames(egressProvinces) {
-				id, ok := assets.ProvinceIDs[province]
-				if !ok {
-					return nil, fmt.Errorf("未知出口省份：%s", province)
-				}
-				flagsByProvince[id] |= geoPolicyEgress
-			}
+	allowed := make(map[uint16]struct{})
+	switch strings.TrimSpace(mode) {
+	case "all":
+		for _, province := range assets.Meta.Provinces {
+			allowed[province.ID] = struct{}{}
 		}
+	case "provinces":
+		for _, province := range normalizeProvinceNames(provinces) {
+			id, ok := assets.ProvinceIDs[province]
+			if !ok {
+				return nil, fmt.Errorf("未知白名单省份：%s", province)
+			}
+			allowed[id] = struct{}{}
+		}
+	default:
+		return allowed, nil
 	}
-	return flagsByProvince, nil
+	return allowed, nil
 }
 
 func normalizeProvinceNames(values []string) []string {
@@ -1721,21 +1675,13 @@ func applyIncrementalAuxState(
 	allowedFlowsCleared := false
 
 	whitelistFiles := effectiveWhitelistFiles(runtimeData, opts)
-	if !currentValid {
-		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
-			return runtimeAuxState{}, nil, err
-		}
-		if nextState.WhitelistEnabled {
-			if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, whitelistFiles); err != nil {
-				return runtimeAuxState{}, nil, err
-			}
-		}
-		recordAuxAction(&actions, "whitelist", "reload", len(nextState.WhitelistHashes))
-	} else if nextState.WhitelistEnabled && whitelistHashesEqual(current.WhitelistHashes, nextState.WhitelistHashes) {
-		recordAuxAction(&actions, "whitelist", "reuse", 0)
-	} else if !nextState.WhitelistEnabled && len(current.WhitelistHashes) == 0 {
-		recordAuxAction(&actions, "whitelist", "reuse", 0)
-	} else {
+	geoAssetsChanged := !currentValid || !whitelistHashesEqual(current.GeoAssetHashes, nextState.GeoAssetHashes)
+	ingressWhitelistChanged := !currentValid ||
+		current.WhitelistEnabled != nextState.WhitelistEnabled ||
+		!whitelistHashesEqual(current.WhitelistHashes, nextState.WhitelistHashes) ||
+		geoAssetsChanged ||
+		ingressGeoPolicyChanged(current, nextState)
+	if ingressWhitelistChanged {
 		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
@@ -1744,12 +1690,25 @@ func applyIncrementalAuxState(
 		}
 		allowedFlowsCleared = true
 		if nextState.WhitelistEnabled {
-			if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, whitelistFiles); err != nil {
+			if err := loadEffectiveWhitelist(
+				objs.PFWDWhitelistV4,
+				objs.PFWDWhitelistV6,
+				whitelistFiles,
+				runtimeData.Settings.GeoAssetDir,
+				nextState.IngressCNMode,
+				nextState.IngressCNProvinces,
+			); err != nil {
 				return runtimeAuxState{}, nil, err
 			}
 		}
-		recordAuxAction(&actions, "whitelist", "reload", countChangedWhitelistHashes(current.WhitelistHashes, nextState.WhitelistHashes))
+		changedItems := countChangedWhitelistHashes(current.WhitelistHashes, nextState.WhitelistHashes)
+		if geoAssetsChanged || ingressGeoPolicyChanged(current, nextState) {
+			changedItems++
+		}
+		recordAuxAction(&actions, "whitelist", "reload", changedItems)
 		recordAuxAction(&actions, "allowed_flows", "reload", 0)
+	} else {
+		recordAuxAction(&actions, "whitelist", "reuse", 0)
 	}
 
 	if !currentValid {
@@ -1767,84 +1726,40 @@ func applyIncrementalAuxState(
 		recordAuxAction(&actions, "protocol_skip_ports", "delta-update", changedItems)
 	}
 
-	if !currentValid {
+	egressWhitelistChanged := !currentValid ||
+		current.HostEgressEnabled != nextState.HostEgressEnabled ||
+		!whitelistHashesEqual(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes) ||
+		geoAssetsChanged ||
+		egressGeoPolicyChanged(current, nextState)
+	if egressWhitelistChanged {
 		if err := clearWhitelistMaps(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
 		if nextState.HostEgressEnabled {
-			if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
-				return runtimeAuxState{}, nil, err
-			}
-		}
-		recordAuxAction(&actions, "egress_whitelist", "reload", len(nextState.EgressWhitelistHashes))
-	} else if nextState.HostEgressEnabled && whitelistHashesEqual(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes) {
-		recordAuxAction(&actions, "egress_whitelist", "reuse", 0)
-	} else if !nextState.HostEgressEnabled && len(current.EgressWhitelistHashes) == 0 {
-		recordAuxAction(&actions, "egress_whitelist", "reuse", 0)
-	} else {
-		if err := clearWhitelistMaps(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
-			return runtimeAuxState{}, nil, err
-		}
-		if nextState.HostEgressEnabled {
-			if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
-				return runtimeAuxState{}, nil, err
-			}
-		}
-		recordAuxAction(&actions, "egress_whitelist", "reload", countChangedWhitelistHashes(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes))
-	}
-
-	geoStateChanged := !currentValid ||
-		!whitelistHashesEqual(current.GeoAssetHashes, nextState.GeoAssetHashes) ||
-		current.IngressCNMode != nextState.IngressCNMode ||
-		current.EgressCNMode != nextState.EgressCNMode ||
-		!stringSlicesEqual(normalizeProvinceNames(current.IngressCNProvinces), normalizeProvinceNames(nextState.IngressCNProvinces)) ||
-		!stringSlicesEqual(normalizeProvinceNames(current.EgressCNProvinces), normalizeProvinceNames(nextState.EgressCNProvinces))
-	if geoStateChanged {
-		geoAssetsChanged := !currentValid || !whitelistHashesEqual(current.GeoAssetHashes, nextState.GeoAssetHashes)
-		ingressPolicyChanged := geoAssetsChanged || ingressGeoPolicyChanged(current, nextState)
-		egressPolicyChanged := geoAssetsChanged || egressGeoPolicyChanged(current, nextState)
-		if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
-			return runtimeAuxState{}, nil, err
-		}
-		if ingressPolicyChanged {
-			if err := clearWhitelistCacheMaps(objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
-				return runtimeAuxState{}, nil, fmt.Errorf("清理入口白名单 geo cache 失败: %w", err)
-			}
-			if !allowedFlowsCleared {
-				if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
-					return runtimeAuxState{}, nil, err
-				}
-				allowedFlowsCleared = true
-				recordAuxAction(&actions, "allowed_flows", "reload", 0)
-			}
-			recordAuxAction(&actions, "whitelist_geo_cache", "reload", 0)
-		}
-		if egressPolicyChanged {
-			if err := clearWhitelistCacheMaps(objs.PFWDEgressWhitelistCacheV4, objs.PFWDEgressWhitelistCacheV6); err != nil {
-				return runtimeAuxState{}, nil, fmt.Errorf("清理出口白名单 geo cache 失败: %w", err)
-			}
-			recordAuxAction(&actions, "egress_whitelist_geo_cache", "reload", 0)
-		}
-		if geoModeEnabled(nextState.IngressCNMode) || geoModeEnabled(nextState.EgressCNMode) {
-			assets, err := loadGeoAssets(runtimeData.Settings.GeoAssetDir)
-			if err != nil {
-				return runtimeAuxState{}, nil, err
-			}
-			if err := loadGeoMaps(
-				assets,
-				objs.PFWDGeoBucketV4,
-				objs.PFWDGeoBucketV6,
-				objs.PFWDGeoSegmentsV4,
-				objs.PFWDGeoSegmentsV6,
-				objs.PFWDGeoProvincePolicy,
-				nextState.IngressCNMode,
-				nextState.IngressCNProvinces,
+			if err := loadEffectiveWhitelist(
+				objs.PFWDEgressWhitelistV4,
+				objs.PFWDEgressWhitelistV6,
+				runtimeData.Settings.EgressWhitelistFiles,
+				runtimeData.Settings.GeoAssetDir,
 				nextState.EgressCNMode,
 				nextState.EgressCNProvinces,
 			); err != nil {
 				return runtimeAuxState{}, nil, err
 			}
 		}
+		changedItems := countChangedWhitelistHashes(current.EgressWhitelistHashes, nextState.EgressWhitelistHashes)
+		if geoAssetsChanged || egressGeoPolicyChanged(current, nextState) {
+			changedItems++
+		}
+		recordAuxAction(&actions, "egress_whitelist", "reload", changedItems)
+	} else {
+		recordAuxAction(&actions, "egress_whitelist", "reuse", 0)
+	}
+
+	geoStateChanged := geoAssetsChanged ||
+		ingressGeoPolicyChanged(current, nextState) ||
+		egressGeoPolicyChanged(current, nextState)
+	if geoStateChanged {
 		recordAuxAction(&actions, "geo_assets", "reload", countChangedWhitelistHashes(current.GeoAssetHashes, nextState.GeoAssetHashes))
 	} else {
 		recordAuxAction(&actions, "geo_assets", "reuse", 0)
@@ -1872,11 +1787,10 @@ func applyIncrementalAuxState(
 		current.BlockSOCKS != nextState.BlockSOCKS ||
 		!protocolSkipPortsEqual(current.ProtocolSkipPorts, nextState.ProtocolSkipPorts)
 	if guardStateChanged {
-		if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
-			return runtimeAuxState{}, nil, err
-		}
-		if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
-			return runtimeAuxState{}, nil, err
+		if !allowedFlowsCleared {
+			if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+				return runtimeAuxState{}, nil, err
+			}
 		}
 		recordAuxAction(&actions, "guard_runtime_cache", "reload", 0)
 	} else {
@@ -1934,13 +1848,29 @@ func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) ru
 		EgressWhitelistCacheV6: filepath.Join(dir, namespace+"_egress_whitelist_cache_v6"),
 		AllowedFlows:           filepath.Join(dir, namespace+"_allowed_flows"),
 		HostEgressFlows:        filepath.Join(dir, namespace+"_host_egress_flows"),
-		GuardPrefixes:          filepath.Join(dir, namespace+"_guard_prefixes"),
 		SkipPorts:              filepath.Join(dir, namespace+"_protocol_skip_ports"),
-		GeoBucketV4:            filepath.Join(dir, namespace+"_geo_bucket_v4"),
-		GeoBucketV6:            filepath.Join(dir, namespace+"_geo_bucket_v6"),
-		GeoSegmentsV4:          filepath.Join(dir, namespace+"_geo_segments_v4"),
-		GeoSegmentsV6:          filepath.Join(dir, namespace+"_geo_segments_v6"),
-		GeoProvincePolicy:      filepath.Join(dir, namespace+"_geo_province_policy"),
+	}
+}
+
+func legacyRuntimeMapPinsFromRuleCounterPin(ruleCounterPin string) []string {
+	dir := filepath.Dir(ruleCounterPin)
+	namespace := runtimePinNamespace(ruleCounterPin)
+	return []string{
+		filepath.Join(dir, namespace+"_guard_prefixes"),
+		filepath.Join(dir, namespace+"_geo_bucket_v4"),
+		filepath.Join(dir, namespace+"_geo_bucket_v6"),
+		filepath.Join(dir, namespace+"_geo_segments_v4"),
+		filepath.Join(dir, namespace+"_geo_segments_v6"),
+		filepath.Join(dir, namespace+"_geo_province_policy"),
+	}
+}
+
+func cleanupLegacyRuntimeMapPins(ruleCounterPin string) {
+	for _, path := range legacyRuntimeMapPinsFromRuleCounterPin(ruleCounterPin) {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		_ = os.Remove(path)
 	}
 }
 
@@ -2041,7 +1971,14 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		return err
 	}
 	if runtimeData.Settings.WhitelistEnabled {
-		if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, dataplaneSettings.WhitelistFiles); err != nil {
+		if err := loadEffectiveWhitelist(
+			objs.PFWDWhitelistV4,
+			objs.PFWDWhitelistV6,
+			dataplaneSettings.WhitelistFiles,
+			runtimeData.Settings.GeoAssetDir,
+			runtimeData.Settings.IngressCNMode,
+			runtimeData.Settings.IngressCNProvinces,
+		); err != nil {
 			return err
 		}
 	}
@@ -2049,27 +1986,11 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		if objs.PFWDEgressWhitelistV4 == nil || objs.PFWDEgressWhitelistV6 == nil || objs.PFWDEgressWhitelistCacheV4 == nil || objs.PFWDEgressWhitelistCacheV6 == nil || objs.PFWDHostEgressFlows == nil {
 			return fmt.Errorf("宿主机出口白名单 BPF map 未加载")
 		}
-		if err := loadWhitelistFiles(objs.PFWDEgressWhitelistV4, objs.PFWDEgressWhitelistV6, runtimeData.Settings.EgressWhitelistFiles); err != nil {
-			return err
-		}
-	}
-	if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
-		return err
-	}
-	if geoModeEnabled(runtimeData.Settings.IngressCNMode) || geoModeEnabled(runtimeData.Settings.EgressCNMode) {
-		assets, err := loadGeoAssets(runtimeData.Settings.GeoAssetDir)
-		if err != nil {
-			return err
-		}
-		if err := loadGeoMaps(
-			assets,
-			objs.PFWDGeoBucketV4,
-			objs.PFWDGeoBucketV6,
-			objs.PFWDGeoSegmentsV4,
-			objs.PFWDGeoSegmentsV6,
-			objs.PFWDGeoProvincePolicy,
-			runtimeData.Settings.IngressCNMode,
-			runtimeData.Settings.IngressCNProvinces,
+		if err := loadEffectiveWhitelist(
+			objs.PFWDEgressWhitelistV4,
+			objs.PFWDEgressWhitelistV6,
+			runtimeData.Settings.EgressWhitelistFiles,
+			runtimeData.Settings.GeoAssetDir,
 			runtimeData.Settings.EgressCNMode,
 			runtimeData.Settings.EgressCNProvinces,
 		); err != nil {
@@ -2127,13 +2048,7 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		pinLayout.EgressWhitelistCacheV6: objs.PFWDEgressWhitelistCacheV6,
 		pinLayout.AllowedFlows:           objs.PFWDFlows,
 		pinLayout.HostEgressFlows:        objs.PFWDHostEgressFlows,
-		pinLayout.GuardPrefixes:          objs.PFWDGuardPrefixes,
 		pinLayout.SkipPorts:              objs.PFWDSkipPorts,
-		pinLayout.GeoBucketV4:            objs.PFWDGeoBucketV4,
-		pinLayout.GeoBucketV6:            objs.PFWDGeoBucketV6,
-		pinLayout.GeoSegmentsV4:          objs.PFWDGeoSegmentsV4,
-		pinLayout.GeoSegmentsV6:          objs.PFWDGeoSegmentsV6,
-		pinLayout.GeoProvincePolicy:      objs.PFWDGeoProvincePolicy,
 	}
 	for path, m := range pins {
 		if m == nil {
@@ -2147,6 +2062,7 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 			return fmt.Errorf("pin map 失败 (%s): %w", path, err)
 		}
 	}
+	cleanupLegacyRuntimeMapPins(opts.RuleCounterPin)
 	return nil
 }
 
@@ -2245,31 +2161,7 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 	if err != nil {
 		return nil, err
 	}
-	guardPrefixes, err := load(pinLayout.GuardPrefixes, "加载 pinned guard_prefixes map 失败")
-	if err != nil {
-		return nil, err
-	}
 	skipPorts, err := load(pinLayout.SkipPorts, "加载 pinned skip_ports map 失败")
-	if err != nil {
-		return nil, err
-	}
-	geoBucketV4, err := load(pinLayout.GeoBucketV4, "加载 pinned geo_bucket_v4 map 失败")
-	if err != nil {
-		return nil, err
-	}
-	geoBucketV6, err := load(pinLayout.GeoBucketV6, "加载 pinned geo_bucket_v6 map 失败")
-	if err != nil {
-		return nil, err
-	}
-	geoSegmentsV4, err := load(pinLayout.GeoSegmentsV4, "加载 pinned geo_segments_v4 map 失败")
-	if err != nil {
-		return nil, err
-	}
-	geoSegmentsV6, err := load(pinLayout.GeoSegmentsV6, "加载 pinned geo_segments_v6 map 失败")
-	if err != nil {
-		return nil, err
-	}
-	geoProvincePolicy, err := load(pinLayout.GeoProvincePolicy, "加载 pinned geo_province_policy map 失败")
 	if err != nil {
 		return nil, err
 	}
@@ -2293,13 +2185,7 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		PFWDEgressWhitelistCacheV6: egressWhitelistCacheV6,
 		PFWDFlows:                  allowedFlows,
 		PFWDHostEgressFlows:        hostEgressFlows,
-		PFWDGuardPrefixes:          guardPrefixes,
 		PFWDSkipPorts:              skipPorts,
-		PFWDGeoBucketV4:            geoBucketV4,
-		PFWDGeoBucketV6:            geoBucketV6,
-		PFWDGeoSegmentsV4:          geoSegmentsV4,
-		PFWDGeoSegmentsV6:          geoSegmentsV6,
-		PFWDGeoProvincePolicy:      geoProvincePolicy,
 	}, nil
 }
 
@@ -2453,19 +2339,13 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
 		return err
 	}
-	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
-		return err
-	}
 	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
-		return err
-	}
-	if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
 		return err
 	}
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
@@ -2514,19 +2394,13 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
 		return err
 	}
-	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
-		return err
-	}
 	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
-		return err
-	}
-	if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
 		return err
 	}
 	if err := clearPerCPUCounterMap(objs.PFWDRuleCounter, maxRules); err != nil {
@@ -2569,16 +2443,10 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearMap[flowKey, uint8](objs.PFWDFlows); err != nil {
-		return err
-	}
-	if err := clearMap[flowKey, guardPrefixVal](objs.PFWDGuardPrefixes); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
 		return err
 	}
 	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
-		return err
-	}
-	if err := clearGeoMaps(objs.PFWDGeoBucketV4, objs.PFWDGeoBucketV6, objs.PFWDGeoSegmentsV4, objs.PFWDGeoSegmentsV6, objs.PFWDGeoProvincePolicy); err != nil {
 		return err
 	}
 	return nil
@@ -2637,13 +2505,7 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 		"pfwd_egress_whitelist_cache_v6": pinLayout.EgressWhitelistCacheV6,
 		"pfwd_allowed_flows":             pinLayout.AllowedFlows,
 		"pfwd_host_egress_flows":         pinLayout.HostEgressFlows,
-		"pfwd_guard_prefixes":            pinLayout.GuardPrefixes,
 		"pfwd_protocol_skip_ports":       pinLayout.SkipPorts,
-		"pfwd_geo_bucket_v4":             pinLayout.GeoBucketV4,
-		"pfwd_geo_bucket_v6":             pinLayout.GeoBucketV6,
-		"pfwd_geo_segments_v4":           pinLayout.GeoSegmentsV4,
-		"pfwd_geo_segments_v6":           pinLayout.GeoSegmentsV6,
-		"pfwd_geo_province_policy":       pinLayout.GeoProvincePolicy,
 	}
 	for name, path := range pins {
 		mapSpec := spec.Maps[name]
@@ -2792,13 +2654,7 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
 		pinLayout.HostEgressFlows,
-		pinLayout.GuardPrefixes,
 		pinLayout.SkipPorts,
-		pinLayout.GeoBucketV4,
-		pinLayout.GeoBucketV6,
-		pinLayout.GeoSegmentsV4,
-		pinLayout.GeoSegmentsV6,
-		pinLayout.GeoProvincePolicy,
 	}
 	for _, path := range requiredMapPins {
 		if !pinnedPathExists(path) {
@@ -2896,13 +2752,8 @@ func connectionAllowedByRuntime(key connKey, value connVal, allowed map[ruleKey]
 		Family:     key.Family,
 		Protocol:   key.Protocol,
 		ListenPort: key.ListenPort,
-		ListenAddr: key.ListenAddr,
 	}
 	expected, ok := allowed[ruleLookup]
-	if !ok {
-		ruleLookup.ListenAddr = [16]byte{}
-		expected, ok = allowed[ruleLookup]
-	}
 	return ok && connectionMatchesRule(key, value, expected)
 }
 
@@ -3406,14 +3257,10 @@ func makeRuleKey(rule runtimeRule) (ruleKey, error) {
 	}
 	key.Protocol = proto
 	key.ListenPort = htons(rule.ListenPort)
-	if rule.ListenIP == "" || rule.ListenIP == "::" || rule.ListenIP == "0.0.0.0" {
-		return key, nil
+	listenIP := strings.TrimSpace(rule.ListenIP)
+	if listenIP != "" && listenIP != "::" && listenIP != "0.0.0.0" {
+		return key, fmt.Errorf("当前 XDP rule key 仅支持通配监听地址，不支持具体 listen_ip：%s", rule.ListenIP)
 	}
-	addr, err := netip.ParseAddr(rule.ListenIP)
-	if err != nil {
-		return key, err
-	}
-	key.ListenAddr = addrTo16(addr)
 	return key, nil
 }
 
@@ -3863,18 +3710,13 @@ func removeRuntime(opts removeOptions) error {
 		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
 		pinLayout.HostEgressFlows,
-		pinLayout.GuardPrefixes,
 		pinLayout.SkipPorts,
-		pinLayout.GeoBucketV4,
-		pinLayout.GeoBucketV6,
-		pinLayout.GeoSegmentsV4,
-		pinLayout.GeoSegmentsV6,
-		pinLayout.GeoProvincePolicy,
 	} {
 		if path != "" {
 			_ = os.Remove(path)
 		}
 	}
+	cleanupLegacyRuntimeMapPins(pinLayout.RuleCounter)
 	return nil
 }
 
@@ -4385,4 +4227,5 @@ func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp city-export --asset-dir DIR --codes-file FILE")
 }

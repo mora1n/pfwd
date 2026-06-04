@@ -24,6 +24,11 @@ type geoCheckOptions struct {
 	JSON                bool
 }
 
+type cityExportOptions struct {
+	AssetDir  string
+	CodesFile string
+}
+
 func whitelistFileHashes(files []string) ([]whitelistContentHash, error) {
 	if len(files) == 0 {
 		return nil, nil

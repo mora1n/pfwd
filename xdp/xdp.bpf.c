@@ -88,7 +88,6 @@ struct pfwd_rule_key {
     __u8 family;
     __u8 protocol;
     __u16 listen_port;
-    __u8 listen_addr[16];
 };
 
 struct pfwd_rule_val {
@@ -213,32 +212,6 @@ struct pfwd_whitelist_key_v6 {
     __u8 addr[16];
 };
 
-struct pfwd_geo_bucket {
-    __u32 start;
-    __u32 count;
-};
-
-struct pfwd_geo_prefix_key_v4 {
-    __u32 prefixlen;
-    __u32 addr;
-};
-
-struct pfwd_geo_prefix_key_v6 {
-    __u32 prefixlen;
-    __u8 addr[16];
-};
-
-struct pfwd_geo_prefix_val {
-    __u16 province_id;
-    __u8 policy_flags;
-    __u8 pad;
-};
-
-struct pfwd_geo_province_policy {
-    __u8 flags;
-    __u8 pad[3];
-};
-
 struct pfwd_flow_key {
     __u8 family;
     __u8 protocol;
@@ -251,6 +224,13 @@ struct pfwd_flow_key {
 struct pfwd_guard_prefix_val {
     __u8 seen_len;
     __u8 pad[7];
+    __u8 prefix[8];
+};
+
+struct pfwd_guard_flow_val {
+    __u8 verdict;
+    __u8 seen_len;
+    __u8 pad[6];
     __u8 prefix[8];
 };
 
@@ -387,47 +367,10 @@ struct {
 } pfwd_egress_whitelist_cache_v6 SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 65536);
-    __type(key, __u32);
-    __type(value, struct pfwd_geo_bucket);
-} pfwd_geo_bucket_v4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 65536);
-    __type(key, __u32);
-    __type(value, struct pfwd_geo_bucket);
-} pfwd_geo_bucket_v6 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __uint(max_entries, 131072);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, struct pfwd_geo_prefix_key_v4);
-    __type(value, struct pfwd_geo_prefix_val);
-} pfwd_geo_segments_v4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __uint(max_entries, 32768);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, struct pfwd_geo_prefix_key_v6);
-    __type(value, struct pfwd_geo_prefix_val);
-} pfwd_geo_segments_v6 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 256);
-    __type(key, __u32);
-    __type(value, struct pfwd_geo_province_policy);
-} pfwd_geo_province_policy SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, struct pfwd_flow_key);
-    __type(value, __u8);
+    __type(value, struct pfwd_guard_flow_val);
 } pfwd_allowed_flows SEC(".maps");
 
 struct {
@@ -436,13 +379,6 @@ struct {
     __type(key, struct pfwd_flow_key);
     __type(value, __u8);
 } pfwd_host_egress_flows SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct pfwd_flow_key);
-    __type(value, struct pfwd_guard_prefix_val);
-} pfwd_guard_prefixes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -896,29 +832,8 @@ static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 v
     bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
-static __always_inline int geo_match_v4(__be32 addr, __u8 policy_flag) {
-    struct pfwd_geo_prefix_key_v4 key = {
-        .prefixlen = 32,
-        .addr = addr,
-    };
-    struct pfwd_geo_prefix_val *value = bpf_map_lookup_elem(&pfwd_geo_segments_v4, &key);
-    return value && ((value->policy_flags & policy_flag) != 0);
-}
-
-static __always_inline int geo_match_v6(const __u8 addr[16], __u8 policy_flag) {
-    struct pfwd_geo_prefix_key_v6 key = {
-        .prefixlen = 128,
-    };
-    struct pfwd_geo_prefix_val *value;
-    pfwd_memcpy16(key.addr, addr);
-    value = bpf_map_lookup_elem(&pfwd_geo_segments_v6, &key);
-    return value && ((value->policy_flags & policy_flag) != 0);
-}
-
 static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_rule_val *rule) {
     int verdict = whitelist_cache_hit_v4(addr);
-    int custom;
-    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
@@ -926,21 +841,14 @@ static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_r
     if (!rule) {
         return 0;
     }
-    custom = rule->flags & PFWD_RULE_F_ALLOW_CUSTOM;
-    geo = rule->flags & PFWD_RULE_F_ALLOW_GEO;
-    if (geo) {
-        verdict = (geo_match_v4(addr, 1) || (custom && whitelist_match_v4(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    } else {
-        verdict = (custom && whitelist_match_v4(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    }
+    verdict = (rule->flags & (PFWD_RULE_F_ALLOW_CUSTOM | PFWD_RULE_F_ALLOW_GEO)) &&
+              whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_rule_val *rule) {
     int verdict = whitelist_cache_hit_v6(addr);
-    int custom;
-    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
@@ -948,13 +856,8 @@ static __always_inline int whitelist_allowed_v6(const __u8 addr[16], const struc
     if (!rule) {
         return 0;
     }
-    custom = rule->flags & PFWD_RULE_F_ALLOW_CUSTOM;
-    geo = rule->flags & PFWD_RULE_F_ALLOW_GEO;
-    if (geo) {
-        verdict = (geo_match_v6(addr, 1) || (custom && whitelist_match_v6(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    } else {
-        verdict = (custom && whitelist_match_v6(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    }
+    verdict = (rule->flags & (PFWD_RULE_F_ALLOW_CUSTOM | PFWD_RULE_F_ALLOW_GEO)) &&
+              whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -1011,8 +914,6 @@ static __always_inline void egress_whitelist_cache_store_v6(const __u8 addr[16],
 
 static __always_inline int egress_whitelist_allowed_v4(__be32 addr, const struct pfwd_settings *settings) {
     int verdict = egress_whitelist_cache_hit_v4(addr);
-    int custom;
-    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
@@ -1020,21 +921,14 @@ static __always_inline int egress_whitelist_allowed_v4(__be32 addr, const struct
     if (!settings) {
         return 0;
     }
-    custom = settings->egress_whitelist_custom;
-    geo = settings->egress_whitelist_geo;
-    if (geo) {
-        verdict = (geo_match_v4(addr, 2) || (custom && egress_whitelist_match_v4(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    } else {
-        verdict = (custom && egress_whitelist_match_v4(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    }
+    verdict = (settings->egress_whitelist_custom || settings->egress_whitelist_geo) &&
+              egress_whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v4(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_settings *settings) {
     int verdict = egress_whitelist_cache_hit_v6(addr);
-    int custom;
-    int geo;
 
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
@@ -1042,13 +936,8 @@ static __always_inline int egress_whitelist_allowed_v6(const __u8 addr[16], cons
     if (!settings) {
         return 0;
     }
-    custom = settings->egress_whitelist_custom;
-    geo = settings->egress_whitelist_geo;
-    if (geo) {
-        verdict = (geo_match_v6(addr, 2) || (custom && egress_whitelist_match_v6(addr))) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    } else {
-        verdict = (custom && egress_whitelist_match_v6(addr)) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    }
+    verdict = (settings->egress_whitelist_custom || settings->egress_whitelist_geo) &&
+              egress_whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
     egress_whitelist_cache_store_v6(addr, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
@@ -1383,16 +1272,27 @@ static __always_inline int fib_redirect_v6(struct xdp_md *ctx, struct ethhdr *et
 }
 
 static __always_inline int match_http(const __u8 *payload, __u32 len) {
-    if (len >= 8 && payload[0] == 'O' && payload[1] == 'P' && payload[2] == 'T' && payload[3] == 'I' && payload[4] == 'O' && payload[5] == 'N' && payload[6] == 'S' && payload[7] == ' ') return 1;
-    if (len >= 4 && payload[0] == 'G' && payload[1] == 'E' && payload[2] == 'T' && payload[3] == ' ') return 1;
-    if (len >= 5 && payload[0] == 'P' && payload[1] == 'O' && payload[2] == 'S' && payload[3] == 'T' && payload[4] == ' ') return 1;
-    if (len >= 5 && payload[0] == 'H' && payload[1] == 'E' && payload[2] == 'A' && payload[3] == 'D' && payload[4] == ' ') return 1;
-    if (len >= 4 && payload[0] == 'P' && payload[1] == 'U' && payload[2] == 'T' && payload[3] == ' ') return 1;
-    if (len >= 6 && payload[0] == 'P' && payload[1] == 'A' && payload[2] == 'T' && payload[3] == 'C' && payload[4] == 'H' && payload[5] == ' ') return 1;
-    if (len >= 6 && payload[0] == 'T' && payload[1] == 'R' && payload[2] == 'A' && payload[3] == 'C' && payload[4] == 'E' && payload[5] == ' ') return 1;
-    if (len >= 7 && payload[0] == 'D' && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'E' && payload[4] == 'T' && payload[5] == 'E' && payload[6] == ' ') return 1;
-    if (len >= 8 && payload[0] == 'C' && payload[1] == 'O' && payload[2] == 'N' && payload[3] == 'N' && payload[4] == 'E' && payload[5] == 'C' && payload[6] == 'T' && payload[7] == ' ') return 1;
-    if (len >= 8 && payload[0] == 'P' && payload[1] == 'R' && payload[2] == 'I' && payload[3] == ' ' && payload[4] == '*' && payload[5] == ' ' && payload[6] == 'H' && payload[7] == 'T') return 1;
+    if (len < 4) return 0;
+    switch (payload[0]) {
+    case 'G':
+        return payload[1] == 'E' && payload[2] == 'T' && payload[3] == ' ';
+    case 'H':
+        return len >= 5 && payload[1] == 'E' && payload[2] == 'A' && payload[3] == 'D' && payload[4] == ' ';
+    case 'P':
+        if (payload[1] == 'U') return payload[2] == 'T' && payload[3] == ' ';
+        if (len >= 5 && payload[1] == 'O') return payload[2] == 'S' && payload[3] == 'T' && payload[4] == ' ';
+        if (len >= 6 && payload[1] == 'A') return payload[2] == 'T' && payload[3] == 'C' && payload[4] == 'H' && payload[5] == ' ';
+        if (len >= 8 && payload[1] == 'R') return payload[2] == 'I' && payload[3] == ' ' && payload[4] == '*' && payload[5] == ' ' && payload[6] == 'H' && payload[7] == 'T';
+        return 0;
+    case 'T':
+        return len >= 6 && payload[1] == 'R' && payload[2] == 'A' && payload[3] == 'C' && payload[4] == 'E' && payload[5] == ' ';
+    case 'D':
+        return len >= 7 && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'E' && payload[4] == 'T' && payload[5] == 'E' && payload[6] == ' ';
+    case 'O':
+        return len >= 8 && payload[1] == 'P' && payload[2] == 'T' && payload[3] == 'I' && payload[4] == 'O' && payload[5] == 'N' && payload[6] == 'S' && payload[7] == ' ';
+    case 'C':
+        return len >= 8 && payload[1] == 'O' && payload[2] == 'N' && payload[3] == 'N' && payload[4] == 'E' && payload[5] == 'C' && payload[6] == 'T' && payload[7] == ' ';
+    }
     return 0;
 }
 
@@ -1445,25 +1345,56 @@ static __always_inline int inspect_guard_prefix(const struct pfwd_guard_prefix_v
     return PFWD_INSPECT_ALLOW;
 }
 
-static __always_inline int flow_cached_verdict(struct pfwd_flow_key *key) {
-    __u8 *value = bpf_map_lookup_elem(&pfwd_allowed_flows, key);
+static __always_inline int guard_flow_cached_verdict(const struct pfwd_guard_flow_val *value) {
     if (!value) {
         return PFWD_CACHE_UNKNOWN;
     }
-    return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
+    if (value->verdict == PFWD_CACHE_DROP) {
+        return PFWD_CACHE_DROP;
+    }
+    if (value->verdict == PFWD_CACHE_ALLOW) {
+        return PFWD_CACHE_ALLOW;
+    }
+    return PFWD_CACHE_UNKNOWN;
 }
 
-static __always_inline void flow_store_verdict(struct pfwd_flow_key *key, __u8 verdict) {
-    __u8 value = verdict;
+static __always_inline void guard_flow_store_verdict(struct pfwd_flow_key *key, __u8 verdict) {
+    struct pfwd_guard_flow_val value = {};
+    value.verdict = verdict;
     bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
 }
 
-static __always_inline void flow_store_allow(struct pfwd_flow_key *key) {
-    flow_store_verdict(key, PFWD_CACHE_ALLOW);
+static __always_inline void guard_flow_store_allow(struct pfwd_flow_key *key) {
+    guard_flow_store_verdict(key, PFWD_CACHE_ALLOW);
 }
 
-static __always_inline void flow_store_drop(struct pfwd_flow_key *key) {
-    flow_store_verdict(key, PFWD_CACHE_DROP);
+static __always_inline void guard_flow_store_drop(struct pfwd_flow_key *key) {
+    guard_flow_store_verdict(key, PFWD_CACHE_DROP);
+}
+
+static __always_inline void guard_flow_store_prefix(
+    struct pfwd_flow_key *key,
+    const struct pfwd_guard_prefix_val *prefix
+) {
+    struct pfwd_guard_flow_val value = {};
+    if (!prefix) {
+        return;
+    }
+    value.verdict = PFWD_CACHE_UNKNOWN;
+    value.seen_len = prefix->seen_len;
+    *(__u64 *)value.prefix = *(__u64 *)prefix->prefix;
+    bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
+}
+
+static __always_inline void guard_flow_load_prefix(
+    const struct pfwd_guard_flow_val *flow,
+    struct pfwd_guard_prefix_val *prefix
+) {
+    if (!flow || !prefix) {
+        return;
+    }
+    prefix->seen_len = flow->seen_len;
+    *(__u64 *)prefix->prefix = *(__u64 *)flow->prefix;
 }
 
 static __always_inline int host_egress_flow_cached_verdict(struct pfwd_flow_key *key) {
@@ -1559,52 +1490,26 @@ static __always_inline int ingress_guard_bypassed(const struct pfwd_rule_val *ru
 static __always_inline struct pfwd_rule_val *lookup_forward_rule(
     __u8 family,
     __u8 protocol,
-    __be16 listen_port,
-    const __u8 listen_addr[16]
+    __be16 listen_port
 ) {
-    struct pfwd_rule_key exact_key = {
+    struct pfwd_rule_key key = {
         .family = family,
         .protocol = protocol,
         .listen_port = listen_port,
     };
-    struct pfwd_rule_key wildcard_key = {
-        .family = family,
-        .protocol = protocol,
-        .listen_port = listen_port,
-    };
-    struct pfwd_rule_val *rule;
-
-    pfwd_memcpy16(exact_key.listen_addr, listen_addr);
-    rule = bpf_map_lookup_elem(&pfwd_rules, &exact_key);
-    if (rule) {
-        return rule;
-    }
-    return bpf_map_lookup_elem(&pfwd_rules, &wildcard_key);
+    return bpf_map_lookup_elem(&pfwd_rules, &key);
 }
 
 static __always_inline struct pfwd_rule_val *lookup_forward_rule_v4(
     __u8 protocol,
-    __be16 listen_port,
-    __be32 listen_addr
+    __be16 listen_port
 ) {
-    struct pfwd_rule_key exact_key = {
+    struct pfwd_rule_key key = {
         .family = 4,
         .protocol = protocol,
         .listen_port = listen_port,
     };
-    struct pfwd_rule_key wildcard_key = {
-        .family = 4,
-        .protocol = protocol,
-        .listen_port = listen_port,
-    };
-    struct pfwd_rule_val *rule;
-
-    *(__be32 *)&exact_key.listen_addr[0] = listen_addr;
-    rule = bpf_map_lookup_elem(&pfwd_rules, &exact_key);
-    if (rule) {
-        return rule;
-    }
-    return bpf_map_lookup_elem(&pfwd_rules, &wildcard_key);
+    return bpf_map_lookup_elem(&pfwd_rules, &key);
 }
 
 static __always_inline int protocol_guard_active(const struct pfwd_rule_val *rule) {
@@ -1685,7 +1590,7 @@ static __always_inline int inspect_xdp_tcp_flow(
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
     struct pfwd_guard_prefix_val payload_prefix = {};
-    struct pfwd_guard_prefix_val *stored_prefix;
+    struct pfwd_guard_flow_val *stored_flow;
     int verdict;
 
     if (!protocol_guard_active(rule)) {
@@ -1700,7 +1605,8 @@ static __always_inline int inspect_xdp_tcp_flow(
     flow.dport = dport;
     pfwd_memcpy16(flow.saddr, saddr);
     pfwd_memcpy16(flow.daddr, daddr);
-    verdict = flow_cached_verdict(&flow);
+    stored_flow = bpf_map_lookup_elem(&pfwd_allowed_flows, &flow);
+    verdict = guard_flow_cached_verdict(stored_flow);
     if (verdict == PFWD_CACHE_ALLOW) {
         return XDP_PASS;
     }
@@ -1712,34 +1618,33 @@ static __always_inline int inspect_xdp_tcp_flow(
     if (payload_prefix.seen_len == 0) {
         return XDP_PASS;
     }
-    stored_prefix = bpf_map_lookup_elem(&pfwd_guard_prefixes, &flow);
-    if (!stored_prefix && payload_prefix.seen_len >= 8) {
+    if (!stored_flow && payload_prefix.seen_len >= 8) {
         verdict = inspect_guard_prefix(&payload_prefix, rule);
         if (verdict == PFWD_INSPECT_DROP) {
-            flow_store_drop(&flow);
+            guard_flow_store_drop(&flow);
             count_drop(rule, packet_len);
             return XDP_DROP;
         }
-        flow_store_allow(&flow);
+        guard_flow_store_allow(&flow);
         return XDP_PASS;
     }
-    if (stored_prefix) {
-        next_prefix = *stored_prefix;
+    if (stored_flow) {
+        guard_flow_load_prefix(stored_flow, &next_prefix);
     }
     if (append_guard_prefix(&payload_prefix, &next_prefix) < 0) {
         return XDP_PASS;
     }
     verdict = inspect_guard_prefix(&next_prefix, rule);
     if (verdict == PFWD_INSPECT_DROP) {
-        flow_store_drop(&flow);
+        guard_flow_store_drop(&flow);
         count_drop(rule, packet_len);
         return XDP_DROP;
     }
     if (verdict == PFWD_INSPECT_NEED_MORE) {
-        bpf_map_update_elem(&pfwd_guard_prefixes, &flow, &next_prefix, BPF_ANY);
+        guard_flow_store_prefix(&flow, &next_prefix);
         return XDP_PASS;
     }
-    flow_store_allow(&flow);
+    guard_flow_store_allow(&flow);
     return XDP_PASS;
 }
 
@@ -1756,7 +1661,7 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
     struct pfwd_guard_prefix_val payload_prefix = {};
-    struct pfwd_guard_prefix_val *stored_prefix;
+    struct pfwd_guard_flow_val *stored_flow;
     int verdict;
 
     if (!protocol_guard_active(rule)) {
@@ -1771,7 +1676,8 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     flow.dport = dport;
     *(__be32 *)&flow.saddr[0] = saddr;
     *(__be32 *)&flow.daddr[0] = daddr;
-    verdict = flow_cached_verdict(&flow);
+    stored_flow = bpf_map_lookup_elem(&pfwd_allowed_flows, &flow);
+    verdict = guard_flow_cached_verdict(stored_flow);
     if (verdict == PFWD_CACHE_ALLOW) {
         return XDP_PASS;
     }
@@ -1783,34 +1689,33 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     if (payload_prefix.seen_len == 0) {
         return XDP_PASS;
     }
-    stored_prefix = bpf_map_lookup_elem(&pfwd_guard_prefixes, &flow);
-    if (!stored_prefix && payload_prefix.seen_len >= 8) {
+    if (!stored_flow && payload_prefix.seen_len >= 8) {
         verdict = inspect_guard_prefix(&payload_prefix, rule);
         if (verdict == PFWD_INSPECT_DROP) {
-            flow_store_drop(&flow);
+            guard_flow_store_drop(&flow);
             count_drop(rule, packet_len);
             return XDP_DROP;
         }
-        flow_store_allow(&flow);
+        guard_flow_store_allow(&flow);
         return XDP_PASS;
     }
-    if (stored_prefix) {
-        next_prefix = *stored_prefix;
+    if (stored_flow) {
+        guard_flow_load_prefix(stored_flow, &next_prefix);
     }
     if (append_guard_prefix(&payload_prefix, &next_prefix) < 0) {
         return XDP_PASS;
     }
     verdict = inspect_guard_prefix(&next_prefix, rule);
     if (verdict == PFWD_INSPECT_DROP) {
-        flow_store_drop(&flow);
+        guard_flow_store_drop(&flow);
         count_drop(rule, packet_len);
         return XDP_DROP;
     }
     if (verdict == PFWD_INSPECT_NEED_MORE) {
-        bpf_map_update_elem(&pfwd_guard_prefixes, &flow, &next_prefix, BPF_ANY);
+        guard_flow_store_prefix(&flow, &next_prefix);
         return XDP_PASS;
     }
-    flow_store_allow(&flow);
+    guard_flow_store_allow(&flow);
     return XDP_PASS;
 }
 
@@ -2518,7 +2423,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             dport = udp->dest;
         }
 
-        rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
+        rule = lookup_forward_rule_v4(protocol, dport);
         if (rule) {
             if (rule_xdp_disabled(rule)) {
                 stat_inc(PFWD_STAT_PASSED);
@@ -2701,7 +2606,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
             sport = udp->source;
             dport = udp->dest;
         }
-        rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+        rule = lookup_forward_rule(6, protocol, dport);
         if (rule) {
             if (rule_xdp_disabled(rule)) {
                 stat_inc(PFWD_STAT_PASSED);
@@ -2896,7 +2801,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             }
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
-            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
+            rule = lookup_forward_rule_v4(protocol, dport);
             if (rule && !rule_xdp_disabled(rule)) {
                 if (rule_target_is_loopback(4, rule)) {
                     needs_pull = 1;
@@ -2971,7 +2876,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             }
             sport = udp_hdr.source;
             dport = udp_hdr.dest;
-            rule = lookup_forward_rule_v4(protocol, dport, ip4->daddr);
+            rule = lookup_forward_rule_v4(protocol, dport);
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(4, rule)) {
                 return tc_local_forward_v4(skb, data_end, ip4, ihl, protocol, sport, dport, rule, packet_len);
             }
@@ -3021,7 +2926,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             }
             sport = tcp_hdr.source;
             dport = tcp_hdr.dest;
-            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            rule = lookup_forward_rule(6, protocol, dport);
             if (rule && !rule_xdp_disabled(rule)) {
                 if (rule_target_is_loopback(6, rule)) {
                     needs_pull = 1;
@@ -3095,7 +3000,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             }
             sport = udp_hdr.source;
             dport = udp_hdr.dest;
-            rule = lookup_forward_rule(6, protocol, dport, ip6->daddr);
+            rule = lookup_forward_rule(6, protocol, dport);
             if (rule && !rule_xdp_disabled(rule) && rule_target_is_loopback(6, rule)) {
                 return tc_local_forward_v6(skb, data_end, ip6, protocol, sport, dport, rule, packet_len);
             }
@@ -3331,21 +3236,19 @@ SEC("sk_lookup")
 int pfwd_sk_lookup(struct bpf_sk_lookup *ctx) {
     struct pfwd_rule_val *rule;
     struct bpf_sock *sk;
-    __u8 listen_addr[16];
     int err;
 
     if (ctx->protocol != IPPROTO_TCP && ctx->protocol != IPPROTO_UDP) {
         return SK_PASS;
     }
     if (ctx->family == AF_INET) {
-        rule = lookup_forward_rule_v4((__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port), ctx->local_ip4);
+        rule = lookup_forward_rule_v4((__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port));
         if (!rule || !rule_target_is_loopback(4, rule)) {
             return SK_PASS;
         }
         sk = lookup_local_socket_v4(ctx, (__u8)ctx->protocol, ctx->remote_ip4, ipv4_from16(rule->target_addr), ctx->remote_port, rule->target_port);
     } else if (ctx->family == AF_INET6) {
-        pfwd_memcpy16(listen_addr, (const __u8 *)ctx->local_ip6);
-        rule = lookup_forward_rule(6, (__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port), listen_addr);
+        rule = lookup_forward_rule(6, (__u8)ctx->protocol, bpf_htons((__u16)ctx->local_port));
         if (!rule || !rule_target_is_loopback(6, rule)) {
             return SK_PASS;
         }
