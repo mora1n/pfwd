@@ -546,6 +546,27 @@ downmask_random_ratio() {
     awk -v min="$min" -v max="$max" -v seed="$RANDOM$$" 'BEGIN { srand(seed); printf "%.4f", min + rand() * (max - min) }'
 }
 
+downmask_next_day_ratio() {
+    local min="$1"
+    local max="$2"
+    local previous="${3:-}"
+    local candidate
+    candidate="$(downmask_random_ratio "$min" "$max")"
+    if [ -n "$previous" ] && [ "$candidate" = "$previous" ]; then
+        candidate="$(awk -v min="$min" -v max="$max" -v previous="$previous" 'BEGIN {
+            adjusted = previous + 0.0001
+            if (adjusted > max) {
+                adjusted = previous - 0.0001
+            }
+            if (adjusted < min || adjusted > max) {
+                adjusted = previous
+            }
+            printf "%.4f", adjusted
+        }')"
+    fi
+    printf '%s\n' "$candidate"
+}
+
 downmask_in_time_window() {
     local now start end
     now="$(date '+%H:%M')"
@@ -888,7 +909,10 @@ downmask_prepare_day_state() {
         local min_r max_r
         min_r="$(jq -r '.min_ratio // 1.5' <<< "$downmask_cfg")"
         max_r="$(jq -r '.max_ratio // 2.8' <<< "$downmask_cfg")"
-        target_ratio="$(downmask_random_ratio "$min_r" "$max_r")"
+        local previous_date previous_target_ratio
+        previous_date="$state_date"
+        previous_target_ratio="$target_ratio"
+        target_ratio="$(downmask_next_day_ratio "$min_r" "$max_r" "$previous_target_ratio")"
         rx_accum=0
         tx_accum=0
         last_rx="$raw_rx"
@@ -904,6 +928,8 @@ downmask_prepare_day_state() {
             --argjson last_rx_raw "$last_rx" \
             --argjson last_tx_raw "$last_tx" \
             --argjson next_eligible_at "$next_eligible" \
+            --arg previous_date "$previous_date" \
+            --arg previous_target_ratio "$previous_target_ratio" \
             --arg updated_at "$(pfwd_now_iso)" '
             {
                 date: $date,
@@ -918,8 +944,11 @@ downmask_prepare_day_state() {
                 last_actual_bytes: 0,
                 last_planned_bytes: 0,
                 last_error: "",
+                generated_at: $updated_at,
                 updated_at: $updated_at
-            }')" || return 1
+            }
+            | if $previous_date == "" then . else .previous_date = $previous_date end
+            | if $previous_target_ratio == "" then . else .previous_target_ratio = ($previous_target_ratio | tonumber) end')" || return 1
     else
         local delta_rx delta_tx
         if [ "$raw_rx" -ge "$last_rx" ]; then
@@ -1213,11 +1242,12 @@ downmask_status_json() {
 }
 
 downmask_render_status() {
-    local json pull_mode iface ratio rx tx debt action feed_tcp feed_udp ab_targets protocol_mode
+    local json pull_mode iface date ratio rx tx debt action feed_tcp feed_udp ab_targets protocol_mode
     downmask_validate_configured_active_source
     json="$(downmask_status_json)"
     pull_mode="$(jq -r '.config.pull_mode // "off"' <<< "$json")"
     iface="$(jq -r '.day_state.iface // .config.iface // "-"' <<< "$json")"
+    date="$(jq -r '.day_state.date // "-"' <<< "$json")"
     ratio="$(jq -r '.day_state.target_ratio // "-"' <<< "$json")"
     rx="$(jq -r '.day_state.rx_accum // 0' <<< "$json")"
     tx="$(jq -r '.day_state.tx_accum // 0' <<< "$json")"
@@ -1230,6 +1260,7 @@ downmask_render_status() {
 
     printf 'pull_mode\t%s\n' "$pull_mode"
     printf 'iface\t%s\n' "$iface"
+    printf 'date\t%s\n' "$date"
     printf 'target_ratio\t%s\n' "$ratio"
     printf 'rx_accum\t%s\n' "$rx"
     printf 'tx_accum\t%s\n' "$tx"
