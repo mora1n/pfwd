@@ -992,10 +992,12 @@ func TestMakeRuleValWhitelistFlags(t *testing.T) {
 		TrafficRatio:   1,
 	}
 	tests := []struct {
-		name      string
-		settings  runtimeSettings
-		wantFlags uint16
-		denyFlags uint16
+		name         string
+		policyID     uint16
+		settings     runtimeSettings
+		wantFlags    uint16
+		denyFlags    uint16
+		wantPolicyID uint16
 	}{
 		{
 			name: "whitelist off leaves allow strategy empty",
@@ -1040,11 +1042,55 @@ func TestMakeRuleValWhitelistFlags(t *testing.T) {
 			},
 			wantFlags: ruleFlagNeedsAllow | ruleFlagAllowCustom | ruleFlagAllowGeo,
 		},
+		{
+			name:     "port policy off overrides global geo",
+			policyID: 7,
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				IngressPolicies: []ingressPolicy{
+					{ID: 0, CNMode: "all"},
+					{ID: 7, CNMode: "off"},
+				},
+			},
+			wantFlags:    ruleFlagNeedsAllow,
+			denyFlags:    ruleFlagAllowCustom | ruleFlagAllowGeo,
+			wantPolicyID: 7,
+		},
+		{
+			name:     "port city policy enables geo strategy",
+			policyID: 7,
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				IngressPolicies: []ingressPolicy{
+					{ID: 0, CNMode: "off"},
+					{ID: 7, CNMode: "off", CNCityCodes: []string{"330100"}},
+				},
+			},
+			wantFlags:    ruleFlagNeedsAllow | ruleFlagAllowGeo,
+			denyFlags:    ruleFlagAllowCustom,
+			wantPolicyID: 7,
+		},
+		{
+			name:     "port province policy enables geo strategy",
+			policyID: 7,
+			settings: runtimeSettings{
+				WhitelistEnabled: true,
+				IngressPolicies: []ingressPolicy{
+					{ID: 0, CNMode: "off"},
+					{ID: 7, CNMode: "provinces", CNProvinces: []string{"浙江省"}},
+				},
+			},
+			wantFlags:    ruleFlagNeedsAllow | ruleFlagAllowGeo,
+			denyFlags:    ruleFlagAllowCustom,
+			wantPolicyID: 7,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := makeRuleVal(baseRule, tc.settings)
+			rule := baseRule
+			rule.WhitelistPolicyID = tc.policyID
+			got, err := makeRuleVal(rule, tc.settings)
 			if err != nil {
 				t.Fatalf("makeRuleVal: %v", err)
 			}
@@ -1053,6 +1099,9 @@ func TestMakeRuleValWhitelistFlags(t *testing.T) {
 			}
 			if got.Flags&tc.denyFlags != 0 {
 				t.Fatalf("flags=%#x, denied bits %#x present", got.Flags, got.Flags&tc.denyFlags)
+			}
+			if got.WhitelistPolicyID != tc.wantPolicyID {
+				t.Fatalf("whitelist_policy_id=%d, want %d", got.WhitelistPolicyID, tc.wantPolicyID)
 			}
 		})
 	}

@@ -4641,6 +4641,26 @@ ui_guard_cn_all_province_rows() {
     done < <(ui_guard_cn_all_provinces)
 }
 
+ui_guard_port_province_rows() {
+    local listen_port="$1"
+    local idx=1 province
+    local -A selected=()
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        selected["$province"]=1
+    done < <(whitelist_effective_cn_provinces_tsv_for_port "$listen_port")
+
+    while IFS= read -r province; do
+        [ -n "$province" ] || continue
+        if [ -n "${selected[$province]:-}" ]; then
+            printf '%s\t%s\t已选\n' "$idx" "$province"
+        else
+            printf '%s\t%s\t\n' "$idx" "$province"
+        fi
+        idx=$((idx + 1))
+    done < <(ui_guard_cn_all_provinces)
+}
+
 ui_guard_cn_selected_province_rows() {
     local kind="$1"
     local idx=1 province
@@ -5001,6 +5021,208 @@ ui_menu_guard_city_selection() {
     done
 }
 
+ui_guard_port_selected_summary_rows() {
+    local listen_port="$1"
+    whitelist_port_policy_status_json "$listen_port" | jq -r '
+      [
+        ["监听端口", (.listen_port | tostring)],
+        ["策略来源", .source],
+        ["国内 IP 策略", .cn_summary],
+        ["市白名单", .city_summary]
+      ] | map(@tsv) | .[]
+    '
+}
+
+ui_select_listen_port_from_forward() {
+    local forward_id listen_port
+    ui_select_forward true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    forward_id="$UI_REPLY"
+    listen_port="$(jq -r --arg id "$forward_id" '.forwards[]? | select(.id == $id) | .listen_port // empty' "$PFWD_CONFIG_FILE")"
+    [ -n "$listen_port" ] || { ui_warn "未找到转发监听端口"; return 1; }
+    UI_REPLY="$listen_port"
+}
+
+ui_render_guard_port_whitelist_page() {
+    local listen_port="$1"
+    ui_header "入口白名单 - 按端口配置"
+    ui_notice_render
+    if [ -z "$listen_port" ]; then
+        ui_print_line "当前端口：未选择" "$UI_C_WARN"
+    else
+        ui_table_render $'项目\t值' "$(ui_guard_port_selected_summary_rows "$listen_port")" "2"
+    fi
+    echo
+    ui_menu_item 1 "选择监听端口"
+    ui_menu_item 2 "允许全部国内IP"
+    ui_menu_item 3 "关闭国内IP/省份"
+    ui_menu_item 4 "选择省份"
+    ui_menu_item 5 "添加城市"
+    ui_menu_item 6 "删除城市"
+    ui_menu_item 7 "清空城市"
+    ui_menu_item 8 "清除端口覆盖"
+    ui_menu_item 0 "返回"
+}
+
+ui_guard_port_city_rows() {
+    local listen_port="$1"
+    local province_code="$2"
+    local idx code city
+    local -A selected=()
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        selected["$code"]=1
+    done < <(whitelist_effective_cn_city_codes_tsv_for_port "$listen_port")
+
+    while IFS=$'\t' read -r idx code city; do
+        [ -n "$idx" ] || continue
+        if [ -n "${selected[$code]:-}" ]; then
+            printf '%s\t%s\t%s\t已选\n' "$idx" "$code" "$city"
+        else
+            printf '%s\t%s\t%s\t\n' "$idx" "$code" "$city"
+        fi
+    done < <(whitelist_city_rows_by_province_code "$province_code")
+}
+
+ui_guard_port_city_selected_rows() {
+    local listen_port="$1"
+    local idx=1 code province city
+    while IFS=$'\t' read -r code province city; do
+        [ -n "$code" ] || continue
+        printf '%s\t%s\t%s\t%s\n' "$idx" "$code" "$province" "$city"
+        idx=$((idx + 1))
+    done < <(whitelist_city_selected_rows_from_codes_json "$(whitelist_effective_cn_city_codes_json_for_port "$listen_port")")
+}
+
+ui_menu_guard_port_select_provinces() {
+    local listen_port="$1"
+    local total raw parsed provinces
+    local -a names=()
+    total="$(ui_guard_cn_all_province_count)"
+    [ "$total" -gt 0 ] || { ui_warn "暂无省份资产"; return 1; }
+    ui_clear_screen
+    ui_header "入口白名单 - 端口 $listen_port - 选择省份"
+    ui_table_render $'序号\t省份\t当前' "$(ui_guard_port_province_rows "$listen_port")" "2"
+    ui_read "选择省份序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$total" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$UI_REPLY"
+    provinces="$(ui_guard_cn_provinces_from_indexes "$parsed")"
+    mapfile -t names < <(printf '%s\n' "$provinces" | sed '/^$/d')
+    [ "${#names[@]}" -gt 0 ] || { ui_warn "未解析到省份"; return 1; }
+    ui_run cmd_guard_whitelist_port_cn --listen-port "$listen_port" select "${names[@]}"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 已设置省份" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_port_city_add() {
+    local listen_port="$1"
+    local province_count raw parsed province_code city_count codes
+    local -a city_codes=()
+    province_count="$(ui_guard_city_province_count)"
+    [ "$province_count" -gt 0 ] || { ui_warn "暂无市级白名单资产"; return 1; }
+    ui_render_page ui_render_guard_city_province_page
+    ui_read "选择省份序号；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$province_count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$(printf '%s\n' "$UI_REPLY" | head -n1)"
+    province_code="$(ui_guard_city_province_code_by_index "$parsed")"
+    [ -n "$province_code" ] || { ui_warn "省份序号不存在"; return 1; }
+
+    city_count="$(ui_guard_city_city_count "$province_code")"
+    [ "$city_count" -gt 0 ] || { ui_warn "该省份暂无市级细分"; return 1; }
+    ui_clear_screen
+    ui_header "入口白名单 - 端口 $listen_port - 添加城市"
+    ui_table_render $'序号\tcode\t城市\t当前' "$(ui_guard_port_city_rows "$listen_port" "$province_code")" "2"
+    ui_read "选择城市序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$city_count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    codes="$(ui_guard_city_codes_from_indexes "$province_code" "$UI_REPLY")"
+    mapfile -t city_codes < <(printf '%s\n' "$codes" | sed '/^$/d')
+    [ "${#city_codes[@]}" -gt 0 ] || { ui_warn "未解析到城市"; return 1; }
+    ui_run cmd_guard_whitelist_port_city --listen-port "$listen_port" add "$province_code" "${city_codes[@]}"
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 已添加城市" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_port_city_delete() {
+    local listen_port="$1"
+    local count raw parsed
+    count="$(whitelist_effective_cn_city_codes_tsv_for_port "$listen_port" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "当前端口没有已选城市"
+        return 1
+    fi
+    ui_clear_screen
+    ui_header "入口白名单 - 端口 $listen_port - 删除城市"
+    ui_table_render $'序号\tcode\t省份\t城市' "$(ui_guard_port_city_selected_rows "$listen_port")" "2"
+    ui_read "选择要删除的城市序号，可单/多/连续；0 返回" || return 1
+    raw="$UI_REPLY"
+    ui_multiselect_parse_indexes "$raw" "$count" true || return 1
+    [ "$UI_EDIT_ABORTED" = "1" ] && return 0
+    parsed="$UI_REPLY"
+    ui_run cmd_guard_whitelist_port_city --listen-port "$listen_port" delete $parsed
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 已删除城市" "$UI_C_MENU_NUM"
+}
+
+ui_menu_guard_port_whitelist() {
+    local listen_port=""
+    while true; do
+        ui_render_page ui_render_guard_port_whitelist_page "$listen_port"
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_select_listen_port_from_forward || { ui_pause; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && continue
+                listen_port="$UI_REPLY"
+                ui_notice_set "已选择端口：$listen_port" "$UI_C_MENU_NUM"
+                ;;
+            2)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_run cmd_guard_whitelist_port_cn --listen-port "$listen_port" all
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 已允许国内IP" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_run cmd_guard_whitelist_port_cn --listen-port "$listen_port" off
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 已关闭国内IP/省份" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            4)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_menu_guard_port_select_provinces "$listen_port"
+                ui_maybe_pause success
+                ;;
+            5)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_menu_guard_port_city_add "$listen_port"
+                ui_maybe_pause success
+                ;;
+            6)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_menu_guard_port_city_delete "$listen_port"
+                ui_maybe_pause success
+                ;;
+            7)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_run cmd_guard_whitelist_port_city --listen-port "$listen_port" clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 市白名单已清空" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            8)
+                [ -n "$listen_port" ] || { ui_warn "请先选择监听端口"; ui_pause; continue; }
+                ui_run cmd_guard_whitelist_port clear --listen-port "$listen_port"
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口白名单端口 $listen_port 覆盖已清除" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
 ui_render_ingress_whitelist_menu_page() {
     ui_header "入口白名单"
     ui_notice_render
@@ -5010,7 +5232,8 @@ ui_render_ingress_whitelist_menu_page() {
     ui_menu_item 2 "关闭入口白名单"
     ui_menu_item 3 "省白名单"
     ui_menu_item 4 "市白名单"
-    ui_menu_item 5 "入口自定义 CIDR"
+    ui_menu_item 5 "按端口配置"
+    ui_menu_item 6 "入口自定义 CIDR"
     ui_menu_item 0 "返回"
 }
 
@@ -5038,6 +5261,9 @@ ui_menu_ingress_whitelist() {
                 ui_maybe_pause success
                 ;;
             5)
+                ui_menu_guard_port_whitelist
+                ;;
+            6)
                 ui_menu_whitelist_cidrs
                 ;;
             0) return 0 ;;

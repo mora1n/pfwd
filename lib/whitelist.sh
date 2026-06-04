@@ -56,6 +56,89 @@ whitelist_cn_city_codes_tsv() {
     jq -r '.settings.whitelist.cn_city_codes // [] | .[]' "$PFWD_CONFIG_FILE"
 }
 
+whitelist_port_policies_json() {
+    jq -c '.settings.whitelist.port_policies // []' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_port_policy_count() {
+    jq -r '.settings.whitelist.port_policies // [] | length' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_port_policy_json() {
+    local listen_port="$1"
+    jq -c --argjson port "$listen_port" '
+      (.settings.whitelist.port_policies // [])
+      | map(select((.listen_port // 0) == $port))
+      | first // empty
+    ' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_port_policy_exists() {
+    local listen_port="$1"
+    [ -n "$(whitelist_port_policy_json "$listen_port")" ]
+}
+
+whitelist_effective_policy_source_for_port() {
+    local listen_port="$1"
+    if [ -n "$listen_port" ] && whitelist_port_policy_exists "$listen_port"; then
+        printf '端口覆盖'
+    else
+        printf '全局默认'
+    fi
+}
+
+whitelist_effective_cn_mode_for_port() {
+    local listen_port="$1"
+    if [ -n "$listen_port" ] && whitelist_port_policy_exists "$listen_port"; then
+        jq -r --argjson port "$listen_port" '
+          (.settings.whitelist.port_policies // [])
+          | map(select((.listen_port // 0) == $port))
+          | first
+          | .cn_mode // "off"
+        ' "$PFWD_CONFIG_FILE"
+        return 0
+    fi
+    whitelist_cn_mode
+}
+
+whitelist_effective_cn_provinces_json_for_port() {
+    local listen_port="$1"
+    if [ -n "$listen_port" ] && whitelist_port_policy_exists "$listen_port"; then
+        jq -c --argjson port "$listen_port" '
+          (.settings.whitelist.port_policies // [])
+          | map(select((.listen_port // 0) == $port))
+          | first
+          | .cn_provinces // []
+        ' "$PFWD_CONFIG_FILE"
+        return 0
+    fi
+    whitelist_cn_provinces_json
+}
+
+whitelist_effective_cn_provinces_tsv_for_port() {
+    local listen_port="$1"
+    whitelist_effective_cn_provinces_json_for_port "$listen_port" | jq -r '.[]'
+}
+
+whitelist_effective_cn_city_codes_json_for_port() {
+    local listen_port="$1"
+    if [ -n "$listen_port" ] && whitelist_port_policy_exists "$listen_port"; then
+        jq -c --argjson port "$listen_port" '
+          (.settings.whitelist.port_policies // [])
+          | map(select((.listen_port // 0) == $port))
+          | first
+          | .cn_city_codes // []
+        ' "$PFWD_CONFIG_FILE"
+        return 0
+    fi
+    whitelist_cn_city_codes_json
+}
+
+whitelist_effective_cn_city_codes_tsv_for_port() {
+    local listen_port="$1"
+    whitelist_effective_cn_city_codes_json_for_port "$listen_port" | jq -r '.[]'
+}
+
 whitelist_cn_mode_label() {
     local mode="${1:-$(whitelist_cn_mode)}"
     case "$mode" in
@@ -137,8 +220,34 @@ whitelist_city_ipv4_asset_file() {
     printf '%s\n' "$(whitelist_geo_asset_dir)/pfwd-city-cn-v4.bin"
 }
 
+whitelist_any_geo_policy_enabled() {
+    jq -r '
+      def mode_enabled($mode): ($mode == "all" or $mode == "provinces");
+      (.settings.whitelist // {}) as $wl
+      | (
+          mode_enabled(
+            if (($wl.cn_mode // "") | type) == "string" and (($wl.cn_mode // "") | length) > 0 then
+              $wl.cn_mode
+            elif (($wl.include_cn? | type) == "boolean") then
+              (if $wl.include_cn then "all" else "off" end)
+            else
+              "all"
+            end
+          )
+          or (($wl.port_policies // []) | any(mode_enabled(.cn_mode // "off")))
+        )
+    ' "$PFWD_CONFIG_FILE"
+}
+
+whitelist_any_city_policy_enabled() {
+    jq -r '
+      (.settings.whitelist // {}) as $wl
+      | ((($wl.cn_city_codes // []) | length) > 0
+         or (($wl.port_policies // []) | any(((.cn_city_codes // []) | length) > 0)))
+    ' "$PFWD_CONFIG_FILE"
+}
+
 whitelist_require_geo_assets() {
-    [ "$(whitelist_cn_mode)" = "off" ] && return 0
     [ -f "$(whitelist_geo_meta_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_meta_file)"
     [ -f "$(whitelist_geo_ipv4_asset_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_ipv4_asset_file)"
     [ -f "$(whitelist_geo_ipv6_asset_file)" ] || pfwd_die "缺少 geo 资产：$(whitelist_geo_ipv6_asset_file)"
@@ -179,9 +288,14 @@ whitelist_city_rows_by_province_code() {
 }
 
 whitelist_city_selected_rows() {
-    [ "$(whitelist_city_codes_count)" -eq 0 ] && return 0
+    whitelist_city_selected_rows_from_codes_json "$(whitelist_cn_city_codes_json)"
+}
+
+whitelist_city_selected_rows_from_codes_json() {
+    local codes_json="$1"
+    [ "$(jq -r 'length' <<< "$codes_json")" -eq 0 ] && return 0
     whitelist_require_city_assets
-    jq -r --argjson codes "$(whitelist_cn_city_codes_json)" '
+    jq -r --argjson codes "$codes_json" '
       .provinces[]? as $province
       | ($province.cities // [])[]?
       | (.code | tostring) as $code
@@ -260,13 +374,18 @@ whitelist_city_available_codes() {
 }
 
 whitelist_city_selection_summary() {
+    whitelist_city_selection_summary_from_codes_json "$(whitelist_cn_city_codes_json)"
+}
+
+whitelist_city_selection_summary_from_codes_json() {
+    local codes_json="$1"
     local count preview suffix
     local -a rows=() shown=()
-    if [ "$(whitelist_city_codes_count)" -eq 0 ]; then
+    if [ "$(jq -r 'length' <<< "$codes_json")" -eq 0 ]; then
         printf '未选择'
         return 0
     fi
-    mapfile -t rows < <(whitelist_city_selected_rows | awk -F '\t' '{print $2 "/" $3}')
+    mapfile -t rows < <(whitelist_city_selected_rows_from_codes_json "$codes_json" | awk -F '\t' '{print $2 "/" $3}')
     count="${#rows[@]}"
     if [ "$count" -eq 0 ]; then
         printf '未选择'
@@ -497,6 +616,146 @@ whitelist_config_set_city_codes() {
     rm -f "$normalized_file"
 }
 
+whitelist_port_policy_base_json() {
+    local listen_port="$1"
+    local existing
+    existing="$(whitelist_port_policy_json "$listen_port")"
+    if [ -n "$existing" ]; then
+        jq -c --argjson port "$listen_port" '
+          .listen_port = $port
+          | .cn_mode = (.cn_mode // "off")
+          | .cn_provinces = (.cn_provinces // [])
+          | .cn_city_codes = (.cn_city_codes // [])
+        ' <<< "$existing"
+        return 0
+    fi
+    jq -n \
+      --argjson port "$listen_port" \
+      --arg mode "$(whitelist_cn_mode)" \
+      --argjson provinces "$(whitelist_cn_provinces_json)" \
+      --argjson codes "$(whitelist_cn_city_codes_json)" '
+      {
+        listen_port: $port,
+        cn_mode: $mode,
+        cn_provinces: $provinces,
+        cn_city_codes: $codes
+      }
+    '
+}
+
+whitelist_config_upsert_port_policy_json() {
+    local policy_json="$1"
+    local listen_port
+    listen_port="$(jq -r '.listen_port' <<< "$policy_json")"
+    validate_port "$listen_port"
+    config_update --argjson policy "$policy_json" '
+      (.settings.whitelist //= {})
+      | (.settings.whitelist.port_policies //= [])
+      | .settings.whitelist.port_policies =
+          (
+            ((.settings.whitelist.port_policies // [])
+             | map(select((.listen_port // 0) != ($policy.listen_port // 0)))) + [$policy]
+          )
+          | sort_by(.listen_port)
+    '
+}
+
+whitelist_config_apply_port_cn_selection() {
+    local listen_port="$1"
+    local mode="$2"
+    local provinces_file="${3:-}"
+    validate_port "$listen_port"
+    whitelist_validate_cn_mode "$mode"
+    case "$mode" in
+        off|all)
+            whitelist_config_upsert_port_policy_json "$(
+              whitelist_port_policy_base_json "$listen_port" | jq -c --arg mode "$mode" '
+                .cn_mode = $mode
+                | .cn_provinces = []
+              '
+            )"
+            ;;
+        provinces)
+            [ -n "$provinces_file" ] || pfwd_die "缺少入口端口省份列表"
+            [ -f "$provinces_file" ] || pfwd_die "入口端口省份临时文件不存在：$provinces_file"
+            whitelist_validate_cn_provinces_file "$provinces_file"
+            whitelist_config_upsert_port_policy_json "$(
+              whitelist_port_policy_base_json "$listen_port" | jq -c --arg mode "$mode" --rawfile provinces "$provinces_file" '
+                .cn_mode = $mode
+                | .cn_provinces =
+                    (($provinces
+                      | split("\n")
+                      | map(gsub("^\\s+|\\s+$"; ""))
+                      | map(select(length > 0))
+                      | reduce .[] as $province ([]; if index($province) then . else . + [$province] end)))
+              '
+            )"
+            ;;
+    esac
+}
+
+whitelist_config_set_port_city_codes() {
+    local listen_port="$1"
+    local codes_file="$2"
+    local normalized_file
+    validate_port "$listen_port"
+    [ -f "$codes_file" ] || pfwd_die "入口端口城市临时文件不存在：$codes_file"
+    whitelist_validate_city_codes_file "$codes_file"
+    normalized_file="$(mktemp)"
+    awk 'NR == FNR { wanted[$1] = 1; next } ($1 in wanted) { print }' \
+      "$codes_file" <(whitelist_city_available_codes) > "$normalized_file"
+    whitelist_config_upsert_port_policy_json "$(
+      whitelist_port_policy_base_json "$listen_port" | jq -c --rawfile codes "$normalized_file" '
+        .cn_city_codes =
+          (($codes
+            | split("\n")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | reduce .[] as $code ([]; if index($code) then . else . + [$code] end)))
+      '
+    )"
+    rm -f "$normalized_file"
+}
+
+whitelist_clear_port_city_codes() {
+    local listen_port="$1"
+    validate_port "$listen_port"
+    whitelist_config_upsert_port_policy_json "$(
+      whitelist_port_policy_base_json "$listen_port" | jq -c '.cn_city_codes = []'
+    )"
+}
+
+whitelist_delete_port_city_codes_by_indexes() {
+    local listen_port="$1"
+    local indexes="$2"
+    validate_port "$listen_port"
+    [ -n "$indexes" ] || pfwd_die "缺少入口端口市白名单序号"
+    whitelist_config_upsert_port_policy_json "$(
+      whitelist_port_policy_base_json "$listen_port" \
+        | jq -c --argjson idxs "$(printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)')" '
+            (.cn_city_codes // []) as $items
+            | if ($idxs | length) == 0 then
+                error("缺少入口端口市白名单序号")
+              elif (($idxs | min) < 1) or (($idxs | max) > ($items | length)) then
+                error("入口端口市白名单序号超出范围")
+              else
+                .cn_city_codes =
+                  [ range(0; $items | length) as $i | select(([$idxs[] - 1] | index($i)) | not) | $items[$i] ]
+              end
+          '
+    )"
+}
+
+whitelist_clear_port_policy() {
+    local listen_port="$1"
+    validate_port "$listen_port"
+    config_update --argjson port "$listen_port" '
+      (.settings.whitelist //= {})
+      | .settings.whitelist.port_policies =
+          ((.settings.whitelist.port_policies // []) | map(select((.listen_port // 0) != $port)))
+    '
+}
+
 whitelist_clear_city_codes() {
     config_update '
       (.settings.whitelist //= {})
@@ -587,9 +846,6 @@ whitelist_merge_runtime() {
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
     whitelist_materialize_city_runtime
-    if [ -s "$(whitelist_city_runtime_ipv4_file)" ]; then
-        cut -f4 "$(whitelist_city_runtime_ipv4_file)" >> "$tmp_v4"
-    fi
 
     if [ -s "$tmp_v4" ]; then
         whitelist_write_allow_file "$tmp_v4"
@@ -632,10 +888,13 @@ whitelist_prepare_runtime() {
         return 0
     fi
 
-    if [ "$(whitelist_cn_mode)" != "off" ]; then
+    if [ "$(whitelist_any_geo_policy_enabled)" = "true" ]; then
         whitelist_require_geo_assets
     else
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
+    fi
+    if [ "$(whitelist_any_city_policy_enabled)" = "true" ]; then
+        whitelist_require_city_assets
     fi
 
     whitelist_merge_runtime
@@ -652,6 +911,7 @@ enabled=$(whitelist_enabled)
 cn_mode=$(whitelist_cn_mode)
 cn_provinces=$(whitelist_cn_provinces_tsv | paste -sd ',' -)
 cn_city_codes=$(whitelist_cn_city_codes_tsv | paste -sd ',' -)
+port_policies=$(whitelist_port_policies_json)
 custom:
 $(whitelist_custom_cidrs_tsv)
 ipv4:
@@ -690,6 +950,7 @@ whitelist_status_json() {
       --arg cn_mode "$(whitelist_cn_mode)" \
       --argjson cn_provinces "$(whitelist_cn_provinces_json)" \
       --argjson cn_city_codes "$(whitelist_cn_city_codes_json)" \
+      --argjson port_policies "$(whitelist_port_policies_json)" \
       --arg city_selection "$(whitelist_city_selection_summary)" \
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
@@ -697,19 +958,138 @@ whitelist_status_json() {
       --argjson entries "$(whitelist_entry_count)" \
       --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
       --argjson city_count "$(whitelist_city_codes_count)" \
+      --argjson port_policy_count "$(whitelist_port_policy_count)" \
       '{
         enabled: $enabled,
         cn_mode: $cn_mode,
         cn_provinces: $cn_provinces,
         cn_city_codes: $cn_city_codes,
+        port_policies: $port_policies,
         city_selection: $city_selection,
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
         city_ipv4_file: $city_ipv4_file,
         entries: $entries,
         custom_cidrs_count: $custom_cidrs_count,
-        city_count: $city_count
+        city_count: $city_count,
+        port_policy_count: $port_policy_count
       }'
+}
+
+whitelist_effective_cn_selection_summary_for_port() {
+    local listen_port="$1"
+    local mode provinces
+    mode="$(whitelist_effective_cn_mode_for_port "$listen_port")"
+    case "$mode" in
+        all)
+            printf '国内IP'
+            ;;
+        provinces)
+            provinces="$(whitelist_effective_cn_provinces_tsv_for_port "$listen_port" | pfwd_join_lines '、')"
+            [ -n "$provinces" ] || provinces="未选择"
+            printf '省份：%s' "$provinces"
+            ;;
+        *)
+            printf '关闭'
+            ;;
+    esac
+}
+
+whitelist_effective_city_selection_summary_for_port() {
+    local listen_port="$1"
+    whitelist_city_selection_summary_from_codes_json "$(whitelist_effective_cn_city_codes_json_for_port "$listen_port")"
+}
+
+whitelist_port_policy_rows() {
+    local row port mode city source provinces_json codes_json city_summary cn_summary
+    while IFS=$'\t' read -r port mode provinces_json codes_json; do
+        [ -n "$port" ] || continue
+        cn_summary="$(
+          case "$mode" in
+              all) printf '国内IP' ;;
+              provinces)
+                  jq -r '.[]' <<< "$provinces_json" | pfwd_join_lines '、' | {
+                      IFS= read -r row
+                      [ -n "$row" ] || row="未选择"
+                      printf '省份：%s' "$row"
+                  }
+                  ;;
+              *) printf '关闭' ;;
+          esac
+        )"
+        city_summary="$(whitelist_city_selection_summary_from_codes_json "$codes_json")"
+        source="$(whitelist_effective_policy_source_for_port "$port")"
+        printf '%s\t%s\t%s\t%s\n' "$port" "$source" "$cn_summary" "$city_summary"
+    done < <(jq -r '
+      (.settings.whitelist.port_policies // [])
+      | sort_by(.listen_port)
+      | .[]
+      | [
+          (.listen_port | tostring),
+          (.cn_mode // "off"),
+          ((.cn_provinces // []) | @json),
+          ((.cn_city_codes // []) | @json)
+        ] | @tsv
+    ' "$PFWD_CONFIG_FILE")
+}
+
+whitelist_port_policy_status_json() {
+    local listen_port="$1"
+    validate_port "$listen_port"
+    jq -n \
+      --argjson listen_port "$listen_port" \
+      --arg source "$(whitelist_effective_policy_source_for_port "$listen_port")" \
+      --arg mode "$(whitelist_effective_cn_mode_for_port "$listen_port")" \
+      --argjson provinces "$(whitelist_effective_cn_provinces_json_for_port "$listen_port")" \
+      --argjson city_codes "$(whitelist_effective_cn_city_codes_json_for_port "$listen_port")" \
+      --arg cn_summary "$(whitelist_effective_cn_selection_summary_for_port "$listen_port")" \
+      --arg city_summary "$(whitelist_effective_city_selection_summary_for_port "$listen_port")" '
+      {
+        listen_port: $listen_port,
+        source: $source,
+        cn_mode: $mode,
+        cn_provinces: $provinces,
+        cn_city_codes: $city_codes,
+        cn_summary: $cn_summary,
+        city_summary: $city_summary
+      }
+    '
+}
+
+whitelist_runtime_policies_json() {
+    local config_file="${1:-$PFWD_CONFIG_FILE}"
+    jq -c '
+      def normalized_mode($wl):
+        if (($wl.cn_mode // "") | type) == "string" and (($wl.cn_mode // "") | length) > 0 then
+          $wl.cn_mode
+        elif (($wl.include_cn? | type) == "boolean") then
+          (if $wl.include_cn then "all" else "off" end)
+        else
+          "all"
+        end;
+      (.settings.whitelist // {}) as $wl
+      | (
+          [{
+            id: 0,
+            source: "global",
+            cn_mode: normalized_mode($wl),
+            cn_provinces: ($wl.cn_provinces // []),
+            cn_city_codes: ($wl.cn_city_codes // [])
+          }]
+          + [
+              ($wl.port_policies // [] | sort_by(.listen_port) | to_entries[]) as $entry
+              | $entry.value
+              | {
+                  id: ($entry.key + 1),
+                  source: "port",
+                  listen_port: (.listen_port | tonumber),
+                  cn_mode: (.cn_mode // "off"),
+                  cn_provinces: (.cn_provinces // []),
+                  cn_city_codes: (.cn_city_codes // [])
+                }
+            ]
+        )
+    ' "$config_file"
 }
 
 whitelist_render_status() {
@@ -720,6 +1100,7 @@ whitelist_render_status() {
         ["启用白名单", (if .enabled then "开" else "关" end)],
         ["国内 IP 策略", (if .enabled then (if .cn_mode == "all" then "国内IP" elif .cn_mode == "provinces" then ("省份：" + ((.cn_provinces // []) | join("、"))) else "关闭" end) else "-" end)],
         ["市白名单", (if .enabled then .city_selection else "-" end)],
+        ["端口覆盖", (if .enabled then ((.port_policy_count // 0) | tostring) else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["IPv4 文件", .allow_ipv4_file],

@@ -64,6 +64,12 @@ enum pfwd_cache_verdict {
     PFWD_CACHE_DROP = 2,
 };
 
+enum pfwd_whitelist_cn_mode {
+    PFWD_WL_CN_OFF = 0,
+    PFWD_WL_CN_ALL = 1,
+    PFWD_WL_CN_PROVINCES = 2,
+};
+
 enum pfwd_conn_state {
     PFWD_CONN_STATE_NONE = 0,
     PFWD_CONN_STATE_TCP_SYN_PENDING = 1,
@@ -100,6 +106,8 @@ struct pfwd_rule_val {
     __u8 snat_addr[16];
     __u16 mss_value;
     __u16 flags;
+    __u16 whitelist_policy_id;
+    __u16 pad_rule;
     __u64 rule_limit_bytes;
     __u64 user_limit_bytes;
     __u64 traffic_ratio_scaled;
@@ -243,7 +251,32 @@ struct pfwd_guard_flow_val {
 };
 
 struct pfwd_whitelist_cache_key_v6 {
+    __u16 policy_id;
+    __u16 pad;
     __u8 addr[16];
+};
+
+struct pfwd_whitelist_cache_key_v4 {
+    __u16 policy_id;
+    __u16 pad;
+    __be32 addr;
+};
+
+struct pfwd_policy_mode_val {
+    __u8 cn_mode;
+    __u8 has_cities;
+    __u8 pad[2];
+};
+
+struct pfwd_policy_province_key {
+    __u16 policy_id;
+    __u16 province_id;
+};
+
+struct pfwd_policy_city_key {
+    __u16 policy_id;
+    __u16 pad;
+    __u32 city_code;
 };
 
 struct pfwd_scratch {
@@ -333,7 +366,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __be32);
+    __type(key, struct pfwd_whitelist_cache_key_v4);
     __type(value, __u8);
 } pfwd_whitelist_cache_v4 SEC(".maps");
 
@@ -343,6 +376,51 @@ struct {
     __type(key, struct pfwd_whitelist_cache_key_v6);
     __type(value, __u8);
 } pfwd_whitelist_cache_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 131072);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_whitelist_key_v4);
+    __type(value, __u16);
+} pfwd_ingress_geo_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 32768);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_whitelist_key_v6);
+    __type(value, __u16);
+} pfwd_ingress_geo_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 131072);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_whitelist_key_v4);
+    __type(value, __u32);
+} pfwd_ingress_city_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, PFWD_MAX_RULES + 1);
+    __type(key, __u32);
+    __type(value, struct pfwd_policy_mode_val);
+} pfwd_ingress_policy_modes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_policy_province_key);
+    __type(value, __u8);
+} pfwd_ingress_policy_provinces SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_policy_city_key);
+    __type(value, __u8);
+} pfwd_ingress_policy_cities SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -799,17 +877,25 @@ static __always_inline int whitelist_match_v4(__be32 addr) {
     return value != 0;
 }
 
-static __always_inline int whitelist_cache_hit_v4(__be32 addr) {
-    __u8 *value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v4, &addr);
+static __always_inline int whitelist_cache_hit_v4(__be32 addr, __u16 policy_id) {
+    struct pfwd_whitelist_cache_key_v4 key = {
+        .policy_id = policy_id,
+        .addr = addr,
+    };
+    __u8 *value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v4, &key);
     if (!value) {
         return PFWD_CACHE_UNKNOWN;
     }
     return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
 }
 
-static __always_inline void whitelist_cache_store_v4(__be32 addr, __u8 verdict) {
+static __always_inline void whitelist_cache_store_v4(__be32 addr, __u16 policy_id, __u8 verdict) {
+    struct pfwd_whitelist_cache_key_v4 key = {
+        .policy_id = policy_id,
+        .addr = addr,
+    };
     __u8 value = verdict;
-    bpf_map_update_elem(&pfwd_whitelist_cache_v4, &addr, &value, BPF_ANY);
+    bpf_map_update_elem(&pfwd_whitelist_cache_v4, &key, &value, BPF_ANY);
 }
 
 static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
@@ -822,9 +908,10 @@ static __always_inline int whitelist_match_v6(const __u8 addr[16]) {
     return value != 0;
 }
 
-static __always_inline int whitelist_cache_hit_v6(const __u8 addr[16]) {
+static __always_inline int whitelist_cache_hit_v6(const __u8 addr[16], __u16 policy_id) {
     struct pfwd_whitelist_cache_key_v6 key = {};
     __u8 *value;
+    key.policy_id = policy_id;
     pfwd_memcpy16(key.addr, addr);
     value = bpf_map_lookup_elem(&pfwd_whitelist_cache_v6, &key);
     if (!value) {
@@ -833,40 +920,124 @@ static __always_inline int whitelist_cache_hit_v6(const __u8 addr[16]) {
     return *value == PFWD_CACHE_DROP ? PFWD_CACHE_DROP : PFWD_CACHE_ALLOW;
 }
 
-static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 verdict) {
+static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u16 policy_id, __u8 verdict) {
     struct pfwd_whitelist_cache_key_v6 key = {};
     __u8 value = verdict;
+    key.policy_id = policy_id;
     pfwd_memcpy16(key.addr, addr);
     bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
+static __always_inline int ingress_city_allowed_v4(__be32 addr, __u16 policy_id) {
+    struct pfwd_whitelist_key_v4 key = {
+        .prefixlen = 32,
+        .addr = addr,
+    };
+    struct pfwd_policy_city_key policy_key = {
+        .policy_id = policy_id,
+    };
+    __u32 *city_code = bpf_map_lookup_elem(&pfwd_ingress_city_v4, &key);
+    __u8 *value;
+    if (!city_code) {
+        return 0;
+    }
+    policy_key.city_code = *city_code;
+    value = bpf_map_lookup_elem(&pfwd_ingress_policy_cities, &policy_key);
+    return value && *value != 0;
+}
+
+static __always_inline int ingress_geo_allowed_v4(__be32 addr, __u16 policy_id) {
+    struct pfwd_whitelist_key_v4 key = {
+        .prefixlen = 32,
+        .addr = addr,
+    };
+    __u32 mode_key = policy_id;
+    struct pfwd_policy_mode_val *mode = bpf_map_lookup_elem(&pfwd_ingress_policy_modes, &mode_key);
+    __u16 *province_id;
+    struct pfwd_policy_province_key province_key = {
+        .policy_id = policy_id,
+    };
+    __u8 *value;
+    if (ingress_city_allowed_v4(addr, policy_id)) {
+        return 1;
+    }
+    if (!mode || mode->cn_mode == PFWD_WL_CN_OFF) {
+        return 0;
+    }
+    province_id = bpf_map_lookup_elem(&pfwd_ingress_geo_v4, &key);
+    if (!province_id) {
+        return 0;
+    }
+    if (mode->cn_mode == PFWD_WL_CN_ALL) {
+        return 1;
+    }
+    province_key.province_id = *province_id;
+    value = bpf_map_lookup_elem(&pfwd_ingress_policy_provinces, &province_key);
+    return value && *value != 0;
+}
+
+static __always_inline int ingress_geo_allowed_v6(const __u8 addr[16], __u16 policy_id) {
+    struct pfwd_whitelist_key_v6 key = {
+        .prefixlen = 128,
+    };
+    __u32 mode_key = policy_id;
+    struct pfwd_policy_mode_val *mode = bpf_map_lookup_elem(&pfwd_ingress_policy_modes, &mode_key);
+    __u16 *province_id;
+    struct pfwd_policy_province_key province_key = {
+        .policy_id = policy_id,
+    };
+    __u8 *value;
+    if (!mode || mode->cn_mode == PFWD_WL_CN_OFF) {
+        return 0;
+    }
+    pfwd_memcpy16(key.addr, addr);
+    province_id = bpf_map_lookup_elem(&pfwd_ingress_geo_v6, &key);
+    if (!province_id) {
+        return 0;
+    }
+    if (mode->cn_mode == PFWD_WL_CN_ALL) {
+        return 1;
+    }
+    province_key.province_id = *province_id;
+    value = bpf_map_lookup_elem(&pfwd_ingress_policy_provinces, &province_key);
+    return value && *value != 0;
+}
+
 static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_rule_val *rule) {
     int verdict;
+    __u16 policy_id = rule ? rule->whitelist_policy_id : 0;
 
     if (!rule_has_allow_strategy(rule)) {
         return 0;
     }
-    verdict = whitelist_cache_hit_v4(addr);
+    verdict = whitelist_cache_hit_v4(addr, policy_id);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = whitelist_match_v4(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    whitelist_cache_store_v4(addr, verdict);
+    verdict = (
+        ((rule->flags & PFWD_RULE_F_ALLOW_CUSTOM) && whitelist_match_v4(addr)) ||
+        ((rule->flags & PFWD_RULE_F_ALLOW_GEO) && ingress_geo_allowed_v4(addr, policy_id))
+    ) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    whitelist_cache_store_v4(addr, policy_id, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 
 static __always_inline int whitelist_allowed_v6(const __u8 addr[16], const struct pfwd_rule_val *rule) {
     int verdict;
+    __u16 policy_id = rule ? rule->whitelist_policy_id : 0;
 
     if (!rule_has_allow_strategy(rule)) {
         return 0;
     }
-    verdict = whitelist_cache_hit_v6(addr);
+    verdict = whitelist_cache_hit_v6(addr, policy_id);
     if (verdict != PFWD_CACHE_UNKNOWN) {
         return verdict == PFWD_CACHE_ALLOW;
     }
-    verdict = whitelist_match_v6(addr) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
-    whitelist_cache_store_v6(addr, verdict);
+    verdict = (
+        ((rule->flags & PFWD_RULE_F_ALLOW_CUSTOM) && whitelist_match_v6(addr)) ||
+        ((rule->flags & PFWD_RULE_F_ALLOW_GEO) && ingress_geo_allowed_v6(addr, policy_id))
+    ) ? PFWD_CACHE_ALLOW : PFWD_CACHE_DROP;
+    whitelist_cache_store_v6(addr, policy_id, verdict);
     return verdict == PFWD_CACHE_ALLOW;
 }
 

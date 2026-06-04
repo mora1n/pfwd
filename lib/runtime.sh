@@ -48,6 +48,10 @@ runtime_whitelist_cn_provinces_json() {
     whitelist_cn_provinces_json
 }
 
+runtime_ingress_whitelist_policies_json() {
+    whitelist_runtime_policies_json "${1:-$PFWD_CONFIG_FILE}"
+}
+
 runtime_egress_whitelist_cn_mode() {
     egress_whitelist_cn_mode
 }
@@ -186,6 +190,7 @@ runtime_rule_json_line() {
     local user_limit="$5"
     local billing_used="$6"
     local user_billing_used="$7"
+    local whitelist_policy_id="${8:-0}"
 
     local comment_json snat_source_json mss_mode_json mss_value_json fallback_reason_json loopback_local
     comment_json="null"
@@ -228,7 +233,8 @@ runtime_rule_json_line() {
     printf '"execution_class":%s,' "$(pfwd_json_escape "$execution_class")"
     printf '"fallback_reason":%s,' "$fallback_reason_json"
     printf '"counter_owner":%s,' "$(pfwd_json_escape "$counter_owner")"
-    printf '"loopback_local":%s' "$loopback_local"
+    printf '"loopback_local":%s,' "$loopback_local"
+    printf '"whitelist_policy_id":%s' "$whitelist_policy_id"
     printf '}\n'
 }
 
@@ -243,7 +249,9 @@ runtime_compiled_json() {
     fi
 
     local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json index_store_json persist_indexes="false"
+    local whitelist_policies_json="[]"
     local rules_tmp=""
+    local -A whitelist_policy_id_by_port=()
     local -A user_limit_by_id=() user_index_by_id=() rule_index_by_id=() rule_billing_by_id=() user_billing_by_id=()
     local -A resolve_rows_cache=() resolve_error_cache=() egress_allow_cache=() egress_error_cache=()
     now_minute="$(pfwd_now_minute)"
@@ -276,6 +284,14 @@ runtime_compiled_json() {
     index_store_json="$(runtime_index_store_json "$config_file" "$persist_indexes")"
     user_index_json="$(jq '.current_users' <<< "$index_store_json")"
     rule_index_json="$(jq '.current_rules' <<< "$index_store_json")"
+    if command -v whitelist_runtime_policies_json >/dev/null 2>&1; then
+        whitelist_policies_json="$(runtime_ingress_whitelist_policies_json "$config_file")"
+        while IFS=$'\t' read -r policy_id listen_port; do
+            [ -n "$policy_id" ] || continue
+            [ -n "$listen_port" ] || continue
+            whitelist_policy_id_by_port["$listen_port"]="$policy_id"
+        done < <(jq -r '.[] | select(.source == "port") | [.id, .listen_port] | @tsv' <<< "$whitelist_policies_json")
+    fi
 
     while IFS=$'\t' read -r user_id user_index user_limit user_used; do
         [ -n "$user_id" ] || continue
@@ -359,8 +375,9 @@ runtime_compiled_json() {
             rule_limit="${FORWARDER_TSV_FIELDS[14]:-0}"
             [ -n "$listen_port" ] || continue
 
-            local ip_versions target_rows ipver proto family resolved_ip family_ipver user_limit user_index rule_index billing_used user_billing_used
+            local ip_versions target_rows ipver proto family resolved_ip family_ipver user_limit user_index rule_index billing_used user_billing_used whitelist_policy_id
             local execution_class backend_reason counter_owner
+            whitelist_policy_id="${whitelist_policy_id_by_port[$listen_port]:-0}"
             ip_versions="$(runtime_infer_ip_version "$listen_ip" "$snat_mode" "$snat_source")"
             user_limit="${user_limit_by_id[$user_id]:-0}"
             user_index="${user_index_by_id[$user_id]:-0}"
@@ -418,7 +435,7 @@ runtime_compiled_json() {
                           "$remote_port" "$family_ipver" "$comment" "$snat_mode" "$snat_source" \
                           "$mss_mode" "$mss_value" "$traffic_mode" "$traffic_ratio" \
                           "$execution_class" "$backend_reason" "$counter_owner" \
-                          "$rule_limit" "${user_limit:-0}" "$billing_used" "$user_billing_used" >> "$rules_tmp"
+                          "$rule_limit" "${user_limit:-0}" "$billing_used" "$user_billing_used" "$whitelist_policy_id" >> "$rules_tmp"
                     done <<< "$target_rows"
                 done < <(runtime_protocol_rows "$protocol")
             done <<< "$ip_versions"
@@ -445,6 +462,7 @@ runtime_compiled_json() {
       --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$config_file"; else echo false; fi)" \
       --argjson skip_ports "$(runtime_protocol_skip_ports_json)" \
       --argjson files "$(runtime_whitelist_files_json)" \
+      --argjson ingress_policies "$whitelist_policies_json" \
       --argjson egress_files "$(runtime_egress_whitelist_files_json)" \
       --arg host_egress_allow_ipv4_file "$(egress_whitelist_host_allow_ipv4_file)" \
       --arg host_egress_allow_ipv6_file "$(egress_whitelist_host_allow_ipv6_file)" \
@@ -466,6 +484,7 @@ runtime_compiled_json() {
         block_socks: $block_socks,
         protocol_skip_ports: $skip_ports,
         whitelist_files: $files,
+        ingress_whitelist_policies: $ingress_policies,
         egress_whitelist_files: $egress_files,
         host_egress_allow_ipv4_file: $host_egress_allow_ipv4_file,
         host_egress_allow_ipv6_file: $host_egress_allow_ipv6_file
@@ -664,6 +683,9 @@ runtime_remove_pinned_state() {
           "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" \
           "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" \
           "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
+          "$PFWD_XDP_INGRESS_GEO_V4_PIN_PATH" "$PFWD_XDP_INGRESS_GEO_V6_PIN_PATH" \
+          "$PFWD_XDP_INGRESS_CITY_V4_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH" \
+          "$PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH" \
           "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" || true
 }
 

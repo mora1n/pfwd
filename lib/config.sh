@@ -29,6 +29,7 @@ config_default_json() {
       "cn_provinces": [],
       "cn_city_codes": [],
       "custom_cidrs": [],
+      "port_policies": [],
       "runtime_hash": ""
     },
     "egress_whitelist": {

@@ -1514,6 +1514,8 @@ func geoAssetHashes(assetDir string) ([]whitelistContentHash, error) {
 		filepath.Join(assetDir, geoIPv4AssetFile),
 		filepath.Join(assetDir, geoIPv6AssetFile),
 		filepath.Join(assetDir, geoMetaAssetFile),
+		filepath.Join(assetDir, cityIPv4AssetFile),
+		filepath.Join(assetDir, cityMetaAssetFile),
 	}
 	return whitelistFileHashes(files)
 }

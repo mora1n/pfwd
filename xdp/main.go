@@ -35,7 +35,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.8"
 const dataplaneVersion = 2
-const mapABIVersion = 12
+const mapABIVersion = 13
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -55,6 +55,11 @@ const (
 	ruleFlagBlockSOCKS   = uint16(1 << 10)
 	ruleFlagAllowCustom  = uint16(1 << 11)
 	ruleFlagAllowGeo     = uint16(1 << 12)
+)
+const (
+	whitelistCNModeOff       = uint8(0)
+	whitelistCNModeAll       = uint8(1)
+	whitelistCNModeProvinces = uint8(2)
 )
 const ruleCounterPinSuffix = "_rule_counters"
 const tcPrefBPFIngress = "10"
@@ -103,6 +108,12 @@ type bpfObjects struct {
 	PFWDWhitelistV6            *ebpf.Map     `ebpf:"pfwd_whitelist_v6"`
 	PFWDWhitelistCacheV4       *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v4"`
 	PFWDWhitelistCacheV6       *ebpf.Map     `ebpf:"pfwd_whitelist_cache_v6"`
+	PFWDIngressGeoV4           *ebpf.Map     `ebpf:"pfwd_ingress_geo_v4"`
+	PFWDIngressGeoV6           *ebpf.Map     `ebpf:"pfwd_ingress_geo_v6"`
+	PFWDIngressCityV4          *ebpf.Map     `ebpf:"pfwd_ingress_city_v4"`
+	PFWDIngressPolicyModes     *ebpf.Map     `ebpf:"pfwd_ingress_policy_modes"`
+	PFWDIngressPolicyProvinces *ebpf.Map     `ebpf:"pfwd_ingress_policy_provinces"`
+	PFWDIngressPolicyCities    *ebpf.Map     `ebpf:"pfwd_ingress_policy_cities"`
 	PFWDEgressWhitelistV4      *ebpf.Map     `ebpf:"pfwd_egress_whitelist_v4"`
 	PFWDEgressWhitelistV6      *ebpf.Map     `ebpf:"pfwd_egress_whitelist_v6"`
 	PFWDEgressWhitelistCacheV4 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v4"`
@@ -120,7 +131,8 @@ func (o *bpfObjects) Close() {
 	for _, closer := range []interface{ Close() error }{
 		o.PFWDXDP, o.PFWDIngress, o.PFWDHostEgress, o.PFWDLoopbackEgress, o.PFWDSkLookup, o.PFWDSettings, o.PFWDRules, o.PFWDConnections, o.PFWDReverse,
 		o.PFWDRuleCounter, o.PFWDRuleReplyCounter, o.PFWDRuleDropCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
-		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDEgressWhitelistV4, o.PFWDEgressWhitelistV6,
+		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDIngressGeoV4, o.PFWDIngressGeoV6, o.PFWDIngressCityV4,
+		o.PFWDIngressPolicyModes, o.PFWDIngressPolicyProvinces, o.PFWDIngressPolicyCities, o.PFWDEgressWhitelistV4, o.PFWDEgressWhitelistV6,
 		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDHostEgressFlows, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
@@ -209,6 +221,7 @@ type runtimeAuxState struct {
 	IngressCNMode         string                 `json:"ingress_cn_mode,omitempty"`
 	EgressCNMode          string                 `json:"egress_cn_mode,omitempty"`
 	IngressCNProvinces    []string               `json:"ingress_cn_provinces,omitempty"`
+	IngressPolicies       []ingressPolicy        `json:"ingress_whitelist_policies,omitempty"`
 	EgressCNProvinces     []string               `json:"egress_cn_provinces,omitempty"`
 }
 
@@ -224,19 +237,20 @@ type attachTiming struct {
 }
 
 type runtimeSemanticSettings struct {
-	Interface          string   `json:"interface"`
-	GuardEnabled       bool     `json:"guard_enabled"`
-	WhitelistEnabled   bool     `json:"whitelist_enabled"`
-	HostEgressEnabled  bool     `json:"host_egress_enabled"`
-	BlockHTTP          bool     `json:"block_http"`
-	BlockTLS           bool     `json:"block_tls"`
-	BlockSOCKS         bool     `json:"block_socks"`
-	ProtocolSkipPorts  []uint16 `json:"protocol_skip_ports,omitempty"`
-	GuardIngressMode   string   `json:"guard_ingress_mode,omitempty"`
-	IngressCNMode      string   `json:"ingress_cn_mode,omitempty"`
-	EgressCNMode       string   `json:"egress_cn_mode,omitempty"`
-	IngressCNProvinces []string `json:"ingress_cn_provinces,omitempty"`
-	EgressCNProvinces  []string `json:"egress_cn_provinces,omitempty"`
+	Interface          string          `json:"interface"`
+	GuardEnabled       bool            `json:"guard_enabled"`
+	WhitelistEnabled   bool            `json:"whitelist_enabled"`
+	HostEgressEnabled  bool            `json:"host_egress_enabled"`
+	BlockHTTP          bool            `json:"block_http"`
+	BlockTLS           bool            `json:"block_tls"`
+	BlockSOCKS         bool            `json:"block_socks"`
+	ProtocolSkipPorts  []uint16        `json:"protocol_skip_ports,omitempty"`
+	GuardIngressMode   string          `json:"guard_ingress_mode,omitempty"`
+	IngressCNMode      string          `json:"ingress_cn_mode,omitempty"`
+	EgressCNMode       string          `json:"egress_cn_mode,omitempty"`
+	IngressCNProvinces []string        `json:"ingress_cn_provinces,omitempty"`
+	IngressPolicies    []ingressPolicy `json:"ingress_whitelist_policies,omitempty"`
+	EgressCNProvinces  []string        `json:"egress_cn_provinces,omitempty"`
 }
 
 type runtimeSemanticRule struct {
@@ -259,25 +273,36 @@ type runtimeSemanticRule struct {
 	BillingUsedBase     uint64  `json:"billing_used_base_bytes,omitempty"`
 	UserBillingUsedBase uint64  `json:"user_billing_used_base_bytes,omitempty"`
 	XDPDisabled         bool    `json:"xdp_disabled,omitempty"`
+	WhitelistPolicyID   uint16  `json:"whitelist_policy_id,omitempty"`
 }
 
 type runtimeSettings struct {
-	Interface            string   `json:"interface"`
-	GuardEnabled         bool     `json:"guard_enabled"`
-	WhitelistEnabled     bool     `json:"whitelist_enabled"`
-	HostEgressEnabled    bool     `json:"host_egress_enabled"`
-	BlockHTTP            bool     `json:"block_http"`
-	BlockTLS             bool     `json:"block_tls"`
-	BlockSOCKS           bool     `json:"block_socks"`
-	ProtocolSkipPorts    []uint16 `json:"protocol_skip_ports,omitempty"`
-	WhitelistFiles       []string `json:"whitelist_files,omitempty"`
-	EgressWhitelistFiles []string `json:"egress_whitelist_files,omitempty"`
-	GuardIngressMode     string   `json:"guard_ingress_mode,omitempty"`
-	GeoAssetDir          string   `json:"geo_asset_dir,omitempty"`
-	IngressCNMode        string   `json:"ingress_cn_mode,omitempty"`
-	IngressCNProvinces   []string `json:"ingress_cn_provinces,omitempty"`
-	EgressCNMode         string   `json:"egress_cn_mode,omitempty"`
-	EgressCNProvinces    []string `json:"egress_cn_provinces,omitempty"`
+	Interface            string          `json:"interface"`
+	GuardEnabled         bool            `json:"guard_enabled"`
+	WhitelistEnabled     bool            `json:"whitelist_enabled"`
+	HostEgressEnabled    bool            `json:"host_egress_enabled"`
+	BlockHTTP            bool            `json:"block_http"`
+	BlockTLS             bool            `json:"block_tls"`
+	BlockSOCKS           bool            `json:"block_socks"`
+	ProtocolSkipPorts    []uint16        `json:"protocol_skip_ports,omitempty"`
+	WhitelistFiles       []string        `json:"whitelist_files,omitempty"`
+	EgressWhitelistFiles []string        `json:"egress_whitelist_files,omitempty"`
+	GuardIngressMode     string          `json:"guard_ingress_mode,omitempty"`
+	GeoAssetDir          string          `json:"geo_asset_dir,omitempty"`
+	IngressCNMode        string          `json:"ingress_cn_mode,omitempty"`
+	IngressCNProvinces   []string        `json:"ingress_cn_provinces,omitempty"`
+	IngressPolicies      []ingressPolicy `json:"ingress_whitelist_policies,omitempty"`
+	EgressCNMode         string          `json:"egress_cn_mode,omitempty"`
+	EgressCNProvinces    []string        `json:"egress_cn_provinces,omitempty"`
+}
+
+type ingressPolicy struct {
+	ID          uint16   `json:"id"`
+	Source      string   `json:"source,omitempty"`
+	ListenPort  uint16   `json:"listen_port,omitempty"`
+	CNMode      string   `json:"cn_mode,omitempty"`
+	CNProvinces []string `json:"cn_provinces,omitempty"`
+	CNCityCodes []string `json:"cn_city_codes,omitempty"`
 }
 
 type runtimeUser struct {
@@ -311,6 +336,7 @@ type runtimeRule struct {
 	FeatureProfile      string   `json:"feature_profile,omitempty"`
 	FeatureFlags        []string `json:"feature_flags,omitempty"`
 	XDPDisabled         bool     `json:"xdp_disabled,omitempty"`
+	WhitelistPolicyID   uint16   `json:"whitelist_policy_id,omitempty"`
 	RemoteInput         string   `json:"remote_input,omitempty"`
 	Comment             string   `json:"comment,omitempty"`
 }
@@ -410,6 +436,12 @@ type runtimeMapPins struct {
 	WhitelistV6            string
 	WhitelistCacheV4       string
 	WhitelistCacheV6       string
+	IngressGeoV4           string
+	IngressGeoV6           string
+	IngressCityV4          string
+	IngressPolicyModes     string
+	IngressPolicyProvinces string
+	IngressPolicyCities    string
 	EgressWhitelistV4      string
 	EgressWhitelistV6      string
 	EgressWhitelistCacheV4 string
@@ -449,6 +481,8 @@ type ruleVal struct {
 	SNATAddr                 [16]byte
 	MSSValue                 uint16
 	Flags                    uint16
+	WhitelistPolicyID        uint16
+	PadRule                  uint16
 	RuleLimitBytes           uint64
 	UserLimitBytes           uint64
 	TrafficRatioScaled       uint64
@@ -581,7 +615,32 @@ type whitelistKeyV6 struct {
 }
 
 type whitelistCacheKeyV6 struct {
-	Addr [16]byte
+	PolicyID uint16
+	Pad      uint16
+	Addr     [16]byte
+}
+
+type whitelistCacheKeyV4 struct {
+	PolicyID uint16
+	Pad      uint16
+	Addr     uint32
+}
+
+type ingressPolicyModeVal struct {
+	CNMode    uint8
+	HasCities uint8
+	Pad       [2]uint8
+}
+
+type ingressPolicyProvinceKey struct {
+	PolicyID   uint16
+	ProvinceID uint16
+}
+
+type ingressPolicyCityKey struct {
+	PolicyID uint16
+	Pad      uint16
+	CityCode uint32
 }
 
 type flowKey struct {
@@ -1102,6 +1161,12 @@ func loadObjects(guardMode string, hostEgressEnabled bool) (*bpfObjects, error) 
 		PFWDWhitelistV6:            coll.Maps["pfwd_whitelist_v6"],
 		PFWDWhitelistCacheV4:       coll.Maps["pfwd_whitelist_cache_v4"],
 		PFWDWhitelistCacheV6:       coll.Maps["pfwd_whitelist_cache_v6"],
+		PFWDIngressGeoV4:           coll.Maps["pfwd_ingress_geo_v4"],
+		PFWDIngressGeoV6:           coll.Maps["pfwd_ingress_geo_v6"],
+		PFWDIngressCityV4:          coll.Maps["pfwd_ingress_city_v4"],
+		PFWDIngressPolicyModes:     coll.Maps["pfwd_ingress_policy_modes"],
+		PFWDIngressPolicyProvinces: coll.Maps["pfwd_ingress_policy_provinces"],
+		PFWDIngressPolicyCities:    coll.Maps["pfwd_ingress_policy_cities"],
 		PFWDEgressWhitelistV4:      coll.Maps["pfwd_egress_whitelist_v4"],
 		PFWDEgressWhitelistV6:      coll.Maps["pfwd_egress_whitelist_v6"],
 		PFWDEgressWhitelistCacheV4: coll.Maps["pfwd_egress_whitelist_cache_v4"],
@@ -1209,28 +1274,30 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 		IngressCNMode:      runtimeData.Settings.IngressCNMode,
 		EgressCNMode:       runtimeData.Settings.EgressCNMode,
 		IngressCNProvinces: append([]string{}, runtimeData.Settings.IngressCNProvinces...),
+		IngressPolicies:    normalizeIngressPolicies(runtimeData.Settings),
 		EgressCNProvinces:  append([]string{}, runtimeData.Settings.EgressCNProvinces...),
 	}
 	rules := make([]runtimeSemanticRule, 0, len(runtimeData.Rules))
 	for _, rule := range runtimeData.Rules {
 		semanticRule := runtimeSemanticRule{
-			Index:          rule.Index,
-			UserIndex:      rule.UserIndex,
-			ListenIP:       rule.ListenIP,
-			ListenPort:     rule.ListenPort,
-			Protocol:       rule.Protocol,
-			IPVersion:      rule.IPVersion,
-			ResolvedTarget: rule.ResolvedTarget,
-			RemotePort:     rule.RemotePort,
-			SNATMode:       rule.SNATMode,
-			SNATSource:     rule.SNATSource,
-			MSSMode:        rule.MSSMode,
-			MSSValue:       rule.MSSValue,
-			TrafficMode:    rule.TrafficMode,
-			TrafficRatio:   rule.TrafficRatio,
-			RuleLimit:      rule.RuleLimit,
-			UserLimit:      rule.UserLimit,
-			XDPDisabled:    rule.XDPDisabled,
+			Index:             rule.Index,
+			UserIndex:         rule.UserIndex,
+			ListenIP:          rule.ListenIP,
+			ListenPort:        rule.ListenPort,
+			Protocol:          rule.Protocol,
+			IPVersion:         rule.IPVersion,
+			ResolvedTarget:    rule.ResolvedTarget,
+			RemotePort:        rule.RemotePort,
+			SNATMode:          rule.SNATMode,
+			SNATSource:        rule.SNATSource,
+			MSSMode:           rule.MSSMode,
+			MSSValue:          rule.MSSValue,
+			TrafficMode:       rule.TrafficMode,
+			TrafficRatio:      rule.TrafficRatio,
+			RuleLimit:         rule.RuleLimit,
+			UserLimit:         rule.UserLimit,
+			XDPDisabled:       rule.XDPDisabled,
+			WhitelistPolicyID: rule.WhitelistPolicyID,
 		}
 		if rule.RuleLimit > 0 || rule.UserLimit > 0 {
 			semanticRule.BillingUsedBase = rule.BillingUsedBase
@@ -1289,6 +1356,7 @@ func runtimeAuxStateFromRuntime(runtimeData *runtimeFile) (runtimeAuxState, erro
 		IngressCNMode:         runtimeData.Settings.IngressCNMode,
 		EgressCNMode:          runtimeData.Settings.EgressCNMode,
 		IngressCNProvinces:    append([]string{}, runtimeData.Settings.IngressCNProvinces...),
+		IngressPolicies:       normalizeIngressPolicies(runtimeData.Settings),
 		EgressCNProvinces:     append([]string{}, runtimeData.Settings.EgressCNProvinces...),
 	}, nil
 }
@@ -1507,6 +1575,44 @@ func clearWhitelistCacheMaps(cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
 	return nil
 }
 
+func clearIngressWhitelistMaps(mapV4 *ebpf.Map, mapV6 *ebpf.Map, cacheV4 *ebpf.Map, cacheV6 *ebpf.Map) error {
+	if err := clearMap[whitelistKeyV4, uint8](mapV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint8](mapV6); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV4, uint8](cacheV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistCacheKeyV6, uint8](cacheV6); err != nil {
+		return err
+	}
+	return nil
+}
+
+func clearIngressGeoPolicyMaps(objs *bpfObjects) error {
+	if err := clearMap[whitelistKeyV4, uint16](objs.PFWDIngressGeoV4); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV6, uint16](objs.PFWDIngressGeoV6); err != nil {
+		return err
+	}
+	if err := clearMap[whitelistKeyV4, uint32](objs.PFWDIngressCityV4); err != nil {
+		return err
+	}
+	if err := clearArrayMap[ingressPolicyModeVal](objs.PFWDIngressPolicyModes); err != nil {
+		return err
+	}
+	if err := clearMap[ingressPolicyProvinceKey, uint8](objs.PFWDIngressPolicyProvinces); err != nil {
+		return err
+	}
+	if err := clearMap[ingressPolicyCityKey, uint8](objs.PFWDIngressPolicyCities); err != nil {
+		return err
+	}
+	return nil
+}
+
 func clearAllowedFlows(flowMap *ebpf.Map) error {
 	if err := clearMap[flowKey, guardFlowVal](flowMap); err != nil {
 		return fmt.Errorf("清理 guard flow cache 失败: %w", err)
@@ -1556,6 +1662,148 @@ func loadEffectiveWhitelist(
 		return err
 	}
 	return loadGeoPrefixesIntoWhitelist(mapV4, mapV6, assets, allowed)
+}
+
+func loadIngressWhitelist(objs *bpfObjects, settings runtimeSettings) error {
+	if objs.PFWDWhitelistV4 == nil || objs.PFWDWhitelistV6 == nil ||
+		objs.PFWDIngressGeoV4 == nil || objs.PFWDIngressGeoV6 == nil ||
+		objs.PFWDIngressCityV4 == nil || objs.PFWDIngressPolicyModes == nil ||
+		objs.PFWDIngressPolicyProvinces == nil || objs.PFWDIngressPolicyCities == nil {
+		return fmt.Errorf("入口白名单 BPF map 未加载")
+	}
+	if err := loadWhitelistFiles(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, settings.WhitelistFiles); err != nil {
+		return err
+	}
+	policies := normalizeIngressPolicies(settings)
+	if ingressPoliciesNeedGeo(policies) {
+		assets, err := loadGeoAssets(settings.GeoAssetDir)
+		if err != nil {
+			return err
+		}
+		if err := loadIngressGeoPrefixes(objs.PFWDIngressGeoV4, objs.PFWDIngressGeoV6, assets); err != nil {
+			return err
+		}
+	}
+	if ingressPoliciesNeedCity(policies) {
+		if err := loadIngressCityPrefixes(objs.PFWDIngressCityV4, settings.GeoAssetDir); err != nil {
+			return err
+		}
+	}
+	return loadIngressPolicyMaps(objs.PFWDIngressPolicyModes, objs.PFWDIngressPolicyProvinces, objs.PFWDIngressPolicyCities, settings.GeoAssetDir, policies)
+}
+
+func loadIngressGeoPrefixes(mapV4 *ebpf.Map, mapV6 *ebpf.Map, assets *geoAssetRuntime) error {
+	if assets == nil {
+		return fmt.Errorf("缺少 geo 资产")
+	}
+	for i, prefix := range assets.PrefixesV4 {
+		key := whitelistKeyV4{
+			PrefixLen: prefix.PrefixLen,
+			Addr:      ipv4LPMTrieAddr(ipv4BEToBytes(prefix.Addr)),
+		}
+		value := prefix.ProvinceID
+		if err := mapV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入入口 geo v4 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
+		}
+	}
+	for i, prefix := range assets.PrefixesV6 {
+		key := whitelistKeyV6{
+			PrefixLen: prefix.PrefixLen,
+			Addr:      prefix.Addr,
+		}
+		value := prefix.ProvinceID
+		if err := mapV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入入口 geo v6 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
+		}
+	}
+	return nil
+}
+
+func loadIngressCityPrefixes(cityMap *ebpf.Map, assetDir string) error {
+	indexes, prefixes, err := readCityIPv4Asset(filepath.Join(assetDir, cityIPv4AssetFile))
+	if err != nil {
+		return err
+	}
+	for _, index := range indexes {
+		end := index.Offset + index.Count
+		if end > uint32(len(prefixes)) {
+			return fmt.Errorf("city v4 index 越界 (code=%d)", index.Code)
+		}
+		for i := index.Offset; i < end; i++ {
+			prefix := prefixes[i]
+			key := whitelistKeyV4{
+				PrefixLen: prefix.PrefixLen,
+				Addr:      ipv4LPMTrieAddr(ipv4BEToBytes(prefix.Addr)),
+			}
+			value := index.Code
+			if err := cityMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("写入入口 city v4 失败 (code=%d prefix=%d): %w", index.Code, prefix.PrefixLen, err)
+			}
+		}
+	}
+	return nil
+}
+
+func loadIngressPolicyMaps(
+	modeMap *ebpf.Map,
+	provinceMap *ebpf.Map,
+	cityMap *ebpf.Map,
+	geoAssetDir string,
+	policies []ingressPolicy,
+) error {
+	var assets *geoAssetRuntime
+	value := uint8(1)
+	for _, policy := range normalizeIngressPolicies(runtimeSettings{IngressPolicies: policies}) {
+		key := uint32(policy.ID)
+		modeValue := ingressPolicyModeVal{
+			CNMode:    ingressPolicyModeValue(policy.CNMode),
+			HasCities: boolToUint8(len(policy.CNCityCodes) > 0),
+		}
+		if err := modeMap.Update(&key, &modeValue, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("写入入口白名单 policy mode 失败 (policy=%d): %w", policy.ID, err)
+		}
+		if modeValue.CNMode == whitelistCNModeProvinces {
+			if assets == nil {
+				var err error
+				assets, err = loadGeoAssets(geoAssetDir)
+				if err != nil {
+					return err
+				}
+			}
+			for _, province := range policy.CNProvinces {
+				id, ok := assets.ProvinceIDs[province]
+				if !ok {
+					return fmt.Errorf("未知入口白名单省份：%s", province)
+				}
+				provinceKey := ingressPolicyProvinceKey{PolicyID: policy.ID, ProvinceID: id}
+				if err := provinceMap.Update(&provinceKey, &value, ebpf.UpdateAny); err != nil {
+					return fmt.Errorf("写入入口白名单省份 policy 失败 (policy=%d province=%s): %w", policy.ID, province, err)
+				}
+			}
+		}
+		for _, rawCode := range policy.CNCityCodes {
+			code, err := parseCityCode(rawCode)
+			if err != nil {
+				return err
+			}
+			cityKey := ingressPolicyCityKey{PolicyID: policy.ID, CityCode: code}
+			if err := cityMap.Update(&cityKey, &value, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("写入入口白名单城市 policy 失败 (policy=%d city=%s): %w", policy.ID, rawCode, err)
+			}
+		}
+	}
+	return nil
+}
+
+func ingressPolicyModeValue(mode string) uint8 {
+	switch strings.TrimSpace(mode) {
+	case "all":
+		return whitelistCNModeAll
+	case "provinces":
+		return whitelistCNModeProvinces
+	default:
+		return whitelistCNModeOff
+	}
 }
 
 func loadGeoPrefixesIntoWhitelist(mapV4 *ebpf.Map, mapV6 *ebpf.Map, assets *geoAssetRuntime, allowed map[uint16]struct{}) error {
@@ -1642,6 +1890,118 @@ func normalizeProvinceNames(values []string) []string {
 	return out
 }
 
+func normalizeCityCodes(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	set := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := set[value]; ok {
+			continue
+		}
+		set[value] = struct{}{}
+		out = append(out, value)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func normalizeIngressPolicies(settings runtimeSettings) []ingressPolicy {
+	policies := settings.IngressPolicies
+	if len(policies) == 0 {
+		policies = []ingressPolicy{{
+			ID:          0,
+			Source:      "global",
+			CNMode:      settings.IngressCNMode,
+			CNProvinces: settings.IngressCNProvinces,
+		}}
+	}
+	out := make([]ingressPolicy, 0, len(policies))
+	seen := map[uint16]struct{}{}
+	for _, policy := range policies {
+		if _, ok := seen[policy.ID]; ok {
+			continue
+		}
+		seen[policy.ID] = struct{}{}
+		mode := strings.TrimSpace(policy.CNMode)
+		if mode == "" {
+			mode = "off"
+		}
+		out = append(out, ingressPolicy{
+			ID:          policy.ID,
+			Source:      strings.TrimSpace(policy.Source),
+			ListenPort:  policy.ListenPort,
+			CNMode:      mode,
+			CNProvinces: normalizeProvinceNames(policy.CNProvinces),
+			CNCityCodes: normalizeCityCodes(policy.CNCityCodes),
+		})
+	}
+	slices.SortFunc(out, func(left, right ingressPolicy) int {
+		if left.ID < right.ID {
+			return -1
+		}
+		if left.ID > right.ID {
+			return 1
+		}
+		return 0
+	})
+	return out
+}
+
+func ingressPoliciesEqual(left, right []ingressPolicy) bool {
+	left = normalizeIngressPolicies(runtimeSettings{IngressPolicies: left})
+	right = normalizeIngressPolicies(runtimeSettings{IngressPolicies: right})
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].ID != right[i].ID ||
+			left[i].ListenPort != right[i].ListenPort ||
+			strings.TrimSpace(left[i].CNMode) != strings.TrimSpace(right[i].CNMode) ||
+			!stringSlicesEqual(left[i].CNProvinces, right[i].CNProvinces) ||
+			!stringSlicesEqual(left[i].CNCityCodes, right[i].CNCityCodes) {
+			return false
+		}
+	}
+	return true
+}
+
+func ingressPolicyByID(settings runtimeSettings, id uint16) ingressPolicy {
+	for _, policy := range normalizeIngressPolicies(settings) {
+		if policy.ID == id {
+			return policy
+		}
+	}
+	return ingressPolicy{ID: id, CNMode: "off"}
+}
+
+func ingressPolicyHasGeoStrategy(policy ingressPolicy) bool {
+	return geoModeEnabled(policy.CNMode) || len(normalizeCityCodes(policy.CNCityCodes)) > 0
+}
+
+func ingressPoliciesNeedGeo(policies []ingressPolicy) bool {
+	for _, policy := range normalizeIngressPolicies(runtimeSettings{IngressPolicies: policies}) {
+		if geoModeEnabled(policy.CNMode) {
+			return true
+		}
+	}
+	return false
+}
+
+func ingressPoliciesNeedCity(policies []ingressPolicy) bool {
+	for _, policy := range normalizeIngressPolicies(runtimeSettings{IngressPolicies: policies}) {
+		if len(policy.CNCityCodes) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func effectiveWhitelistFiles(runtimeData *runtimeFile, opts applyOptions) []string {
 	files := runtimeData.Settings.WhitelistFiles
 	if opts.WhitelistFile != "" {
@@ -1652,7 +2012,8 @@ func effectiveWhitelistFiles(runtimeData *runtimeFile, opts applyOptions) []stri
 
 func ingressGeoPolicyChanged(current, next runtimeAuxState) bool {
 	return current.IngressCNMode != next.IngressCNMode ||
-		!stringSlicesEqual(normalizeProvinceNames(current.IngressCNProvinces), normalizeProvinceNames(next.IngressCNProvinces))
+		!stringSlicesEqual(normalizeProvinceNames(current.IngressCNProvinces), normalizeProvinceNames(next.IngressCNProvinces)) ||
+		!ingressPoliciesEqual(current.IngressPolicies, next.IngressPolicies)
 }
 
 func egressGeoPolicyChanged(current, next runtimeAuxState) bool {
@@ -1682,7 +2043,10 @@ func applyIncrementalAuxState(
 		geoAssetsChanged ||
 		ingressGeoPolicyChanged(current, nextState)
 	if ingressWhitelistChanged {
-		if err := clearWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
+		if err := clearIngressWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
+			return runtimeAuxState{}, nil, err
+		}
+		if err := clearIngressGeoPolicyMaps(objs); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
 		if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
@@ -1690,14 +2054,9 @@ func applyIncrementalAuxState(
 		}
 		allowedFlowsCleared = true
 		if nextState.WhitelistEnabled {
-			if err := loadEffectiveWhitelist(
-				objs.PFWDWhitelistV4,
-				objs.PFWDWhitelistV6,
-				whitelistFiles,
-				runtimeData.Settings.GeoAssetDir,
-				nextState.IngressCNMode,
-				nextState.IngressCNProvinces,
-			); err != nil {
+			settings := runtimeData.Settings
+			settings.WhitelistFiles = whitelistFiles
+			if err := loadIngressWhitelist(objs, settings); err != nil {
 				return runtimeAuxState{}, nil, err
 			}
 		}
@@ -1842,6 +2201,12 @@ func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) ru
 		WhitelistV6:            filepath.Join(dir, namespace+"_whitelist_v6"),
 		WhitelistCacheV4:       filepath.Join(dir, namespace+"_whitelist_cache_v4"),
 		WhitelistCacheV6:       filepath.Join(dir, namespace+"_whitelist_cache_v6"),
+		IngressGeoV4:           filepath.Join(dir, namespace+"_ingress_geo_v4"),
+		IngressGeoV6:           filepath.Join(dir, namespace+"_ingress_geo_v6"),
+		IngressCityV4:          filepath.Join(dir, namespace+"_ingress_city_v4"),
+		IngressPolicyModes:     filepath.Join(dir, namespace+"_ingress_policy_modes"),
+		IngressPolicyProvinces: filepath.Join(dir, namespace+"_ingress_policy_provinces"),
+		IngressPolicyCities:    filepath.Join(dir, namespace+"_ingress_policy_cities"),
 		EgressWhitelistV4:      filepath.Join(dir, namespace+"_egress_whitelist_v4"),
 		EgressWhitelistV6:      filepath.Join(dir, namespace+"_egress_whitelist_v6"),
 		EgressWhitelistCacheV4: filepath.Join(dir, namespace+"_egress_whitelist_cache_v4"),
@@ -1971,14 +2336,12 @@ func loadMaps(objs *bpfObjects, runtimeData *runtimeFile, opts applyOptions) err
 		return err
 	}
 	if runtimeData.Settings.WhitelistEnabled {
-		if err := loadEffectiveWhitelist(
-			objs.PFWDWhitelistV4,
-			objs.PFWDWhitelistV6,
-			dataplaneSettings.WhitelistFiles,
-			runtimeData.Settings.GeoAssetDir,
-			runtimeData.Settings.IngressCNMode,
-			runtimeData.Settings.IngressCNProvinces,
-		); err != nil {
+		if objs.PFWDWhitelistV4 == nil || objs.PFWDWhitelistV6 == nil || objs.PFWDWhitelistCacheV4 == nil || objs.PFWDWhitelistCacheV6 == nil ||
+			objs.PFWDIngressGeoV4 == nil || objs.PFWDIngressGeoV6 == nil || objs.PFWDIngressCityV4 == nil ||
+			objs.PFWDIngressPolicyModes == nil || objs.PFWDIngressPolicyProvinces == nil || objs.PFWDIngressPolicyCities == nil {
+			return fmt.Errorf("入口白名单 BPF map 未加载")
+		}
+		if err := loadIngressWhitelist(objs, dataplaneSettings); err != nil {
 			return err
 		}
 	}
@@ -2042,6 +2405,12 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		pinLayout.WhitelistV6:            objs.PFWDWhitelistV6,
 		pinLayout.WhitelistCacheV4:       objs.PFWDWhitelistCacheV4,
 		pinLayout.WhitelistCacheV6:       objs.PFWDWhitelistCacheV6,
+		pinLayout.IngressGeoV4:           objs.PFWDIngressGeoV4,
+		pinLayout.IngressGeoV6:           objs.PFWDIngressGeoV6,
+		pinLayout.IngressCityV4:          objs.PFWDIngressCityV4,
+		pinLayout.IngressPolicyModes:     objs.PFWDIngressPolicyModes,
+		pinLayout.IngressPolicyProvinces: objs.PFWDIngressPolicyProvinces,
+		pinLayout.IngressPolicyCities:    objs.PFWDIngressPolicyCities,
 		pinLayout.EgressWhitelistV4:      objs.PFWDEgressWhitelistV4,
 		pinLayout.EgressWhitelistV6:      objs.PFWDEgressWhitelistV6,
 		pinLayout.EgressWhitelistCacheV4: objs.PFWDEgressWhitelistCacheV4,
@@ -2137,6 +2506,30 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 	if err != nil {
 		return nil, err
 	}
+	ingressGeoV4, err := load(pinLayout.IngressGeoV4, "加载 pinned ingress_geo_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ingressGeoV6, err := load(pinLayout.IngressGeoV6, "加载 pinned ingress_geo_v6 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ingressCityV4, err := load(pinLayout.IngressCityV4, "加载 pinned ingress_city_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ingressPolicyModes, err := load(pinLayout.IngressPolicyModes, "加载 pinned ingress_policy_modes map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ingressPolicyProvinces, err := load(pinLayout.IngressPolicyProvinces, "加载 pinned ingress_policy_provinces map 失败")
+	if err != nil {
+		return nil, err
+	}
+	ingressPolicyCities, err := load(pinLayout.IngressPolicyCities, "加载 pinned ingress_policy_cities map 失败")
+	if err != nil {
+		return nil, err
+	}
 	egressWhitelistV4, err := load(pinLayout.EgressWhitelistV4, "加载 pinned egress_whitelist_v4 map 失败")
 	if err != nil {
 		return nil, err
@@ -2179,6 +2572,12 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		PFWDWhitelistV6:            whitelistV6,
 		PFWDWhitelistCacheV4:       whitelistCacheV4,
 		PFWDWhitelistCacheV6:       whitelistCacheV6,
+		PFWDIngressGeoV4:           ingressGeoV4,
+		PFWDIngressGeoV6:           ingressGeoV6,
+		PFWDIngressCityV4:          ingressCityV4,
+		PFWDIngressPolicyModes:     ingressPolicyModes,
+		PFWDIngressPolicyProvinces: ingressPolicyProvinces,
+		PFWDIngressPolicyCities:    ingressPolicyCities,
 		PFWDEgressWhitelistV4:      egressWhitelistV4,
 		PFWDEgressWhitelistV6:      egressWhitelistV6,
 		PFWDEgressWhitelistCacheV4: egressWhitelistCacheV4,
@@ -2321,10 +2720,13 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
 		return err
 	}
-	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+	if err := clearMap[whitelistCacheKeyV4, uint8](objs.PFWDWhitelistCacheV4); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearIngressGeoPolicyMaps(objs); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
@@ -2376,10 +2778,13 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
 		return err
 	}
-	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+	if err := clearMap[whitelistCacheKeyV4, uint8](objs.PFWDWhitelistCacheV4); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearIngressGeoPolicyMaps(objs); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
@@ -2425,10 +2830,13 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistKeyV6, uint8](objs.PFWDWhitelistV6); err != nil {
 		return err
 	}
-	if err := clearMap[uint32, uint8](objs.PFWDWhitelistCacheV4); err != nil {
+	if err := clearMap[whitelistCacheKeyV4, uint8](objs.PFWDWhitelistCacheV4); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDWhitelistCacheV6); err != nil {
+		return err
+	}
+	if err := clearIngressGeoPolicyMaps(objs); err != nil {
 		return err
 	}
 	if err := clearMap[whitelistKeyV4, uint8](objs.PFWDEgressWhitelistV4); err != nil {
@@ -2499,6 +2907,12 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 		"pfwd_whitelist_v6":              pinLayout.WhitelistV6,
 		"pfwd_whitelist_cache_v4":        pinLayout.WhitelistCacheV4,
 		"pfwd_whitelist_cache_v6":        pinLayout.WhitelistCacheV6,
+		"pfwd_ingress_geo_v4":            pinLayout.IngressGeoV4,
+		"pfwd_ingress_geo_v6":            pinLayout.IngressGeoV6,
+		"pfwd_ingress_city_v4":           pinLayout.IngressCityV4,
+		"pfwd_ingress_policy_modes":      pinLayout.IngressPolicyModes,
+		"pfwd_ingress_policy_provinces":  pinLayout.IngressPolicyProvinces,
+		"pfwd_ingress_policy_cities":     pinLayout.IngressPolicyCities,
 		"pfwd_egress_whitelist_v4":       pinLayout.EgressWhitelistV4,
 		"pfwd_egress_whitelist_v6":       pinLayout.EgressWhitelistV6,
 		"pfwd_egress_whitelist_cache_v4": pinLayout.EgressWhitelistCacheV4,
@@ -2648,6 +3062,12 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 		pinLayout.WhitelistV6,
 		pinLayout.WhitelistCacheV4,
 		pinLayout.WhitelistCacheV6,
+		pinLayout.IngressGeoV4,
+		pinLayout.IngressGeoV6,
+		pinLayout.IngressCityV4,
+		pinLayout.IngressPolicyModes,
+		pinLayout.IngressPolicyProvinces,
+		pinLayout.IngressPolicyCities,
 		pinLayout.EgressWhitelistV4,
 		pinLayout.EgressWhitelistV6,
 		pinLayout.EgressWhitelistCacheV4,
@@ -3274,6 +3694,7 @@ func makeRuleVal(rule runtimeRule, settings runtimeSettings) (ruleVal, error) {
 	value.UserID = rule.UserIndex
 	value.TargetAddr = addrTo16(target)
 	value.TargetPort = htons(rule.RemotePort)
+	value.WhitelistPolicyID = rule.WhitelistPolicyID
 	switch rule.SNATMode {
 	case "", "masquerade":
 		value.SNATMode = 0
@@ -3342,11 +3763,12 @@ func makeRuleVal(rule runtimeRule, settings runtimeSettings) (ruleVal, error) {
 		}
 	}
 	if settings.WhitelistEnabled {
+		policy := ingressPolicyByID(settings, rule.WhitelistPolicyID)
 		value.Flags |= ruleFlagNeedsAllow
 		if hasWhitelistFiles(settings.WhitelistFiles) {
 			value.Flags |= ruleFlagAllowCustom
 		}
-		if geoModeEnabled(settings.IngressCNMode) {
+		if ingressPolicyHasGeoStrategy(policy) {
 			value.Flags |= ruleFlagAllowGeo
 		}
 	}
@@ -3704,6 +4126,12 @@ func removeRuntime(opts removeOptions) error {
 		pinLayout.WhitelistV6,
 		pinLayout.WhitelistCacheV4,
 		pinLayout.WhitelistCacheV6,
+		pinLayout.IngressGeoV4,
+		pinLayout.IngressGeoV6,
+		pinLayout.IngressCityV4,
+		pinLayout.IngressPolicyModes,
+		pinLayout.IngressPolicyProvinces,
+		pinLayout.IngressPolicyCities,
 		pinLayout.EgressWhitelistV4,
 		pinLayout.EgressWhitelistV6,
 		pinLayout.EgressWhitelistCacheV4,
