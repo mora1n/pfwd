@@ -238,7 +238,7 @@ guard_config_set_protocols() {
 
 guard_config_set_protocol_skip_ports() {
     local ports_file="$1"
-    [ -f "$ports_file" ] || guard_die "Guard 跳过端口临时文件不存在：$ports_file"
+    [ -f "$ports_file" ] || guard_die "入口防护跳过端口临时文件不存在：$ports_file"
     while IFS= read -r port; do
         [ -n "$port" ] || continue
         validate_port "$port"
@@ -478,7 +478,7 @@ guard_render_status() {
         ["封锁 HTTP", (if .block_http then "开" else "关" end)],
         ["封锁 TLS", (if .block_tls then "开" else "关" end)],
         ["封锁 SOCKS", (if .block_socks then "开" else "关" end)],
-        ["Guard 跳过端口", .protocol_skip_ports],
+        ["入口防护跳过端口", .protocol_skip_ports],
         ["启用入口白名单", (if .wl_enabled then "开" else "关" end)],
         ["入口国内 IP 策略", (if .wl_enabled then .wl_cn_summary else "-" end)],
         ["入口自定义 CIDR", (.wl_custom_count | tostring)],

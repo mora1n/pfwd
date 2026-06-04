@@ -3093,10 +3093,11 @@ ui_print_guard_skip_ports() {
     local ports
     ports="$(guard_protocol_skip_ports_display)"
     if [ "$ports" != "-" ]; then
-        ui_print_line "当前 Guard 跳过端口：$ports" "$UI_C_ACCENT"
+        ui_print_line "当前入口防护跳过端口：$ports" "$UI_C_ACCENT"
     else
-        ui_print_line "当前 Guard 跳过端口：-" "$UI_C_DIM"
+        ui_print_line "当前入口防护跳过端口：-" "$UI_C_DIM"
     fi
+    ui_print_line "说明：按公网监听端口匹配；命中后跳过入口白名单和协议封锁，不影响出口白名单。" "$UI_C_DIM"
 }
 
 ui_guard_skip_port_rows() {
@@ -3115,7 +3116,7 @@ ui_print_guard_skip_port_list() {
 }
 
 ui_render_guard_skip_ports_menu_page() {
-    ui_header "Guard 跳过端口"
+    ui_header "入口防护跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3126,7 +3127,7 @@ ui_render_guard_skip_ports_menu_page() {
 }
 
 ui_render_guard_skip_ports_delete_page() {
-    ui_header "删除 Guard 跳过端口"
+    ui_header "删除入口防护跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3136,7 +3137,7 @@ ui_render_guard_skip_ports_delete_page() {
 }
 
 ui_render_guard_skip_ports_update_page() {
-    ui_header "修改 Guard 跳过端口"
+    ui_header "修改入口防护跳过端口"
     ui_notice_render
     ui_print_guard_skip_ports
     echo
@@ -3200,7 +3201,7 @@ ui_menu_guard_skip_ports_delete() {
     local count raw indexes delete_indexes remaining_ports port idx delete_all
     count="$(guard_protocol_skip_ports_count)"
     if [ "$count" -eq 0 ]; then
-        ui_warn "当前没有 Guard 跳过端口"
+        ui_warn "当前没有入口防护跳过端口"
         ui_pause
         return 0
     fi
@@ -3223,7 +3224,7 @@ ui_menu_guard_skip_ports_delete() {
         if [ "$delete_all" -eq 1 ]; then
             ui_run cmd_guard protocols --clear-skip-ports
             if [ "$UI_STATUS" -eq 0 ]; then
-                ui_notice_set "Guard 跳过端口已清空" "$UI_C_MENU_NUM"
+                ui_notice_set "入口防护跳过端口已清空" "$UI_C_MENU_NUM"
                 ui_pause
             fi
             return 0
@@ -3241,7 +3242,7 @@ ui_menu_guard_skip_ports_delete() {
         done < <(guard_protocol_skip_ports_tsv)
         ui_guard_skip_ports_apply_list "$remaining_ports"
         if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "Guard 跳过端口已删除" "$UI_C_MENU_NUM"
+            ui_notice_set "入口防护跳过端口已删除" "$UI_C_MENU_NUM"
             ui_pause
         fi
         return 0
@@ -3251,7 +3252,7 @@ ui_menu_guard_skip_ports_delete() {
 ui_menu_guard_skip_ports_add() {
     local new_ports merged_ports
     while true; do
-        if ! ui_guard_skip_ports_prompt_spec "增加 Guard 跳过端口" "输入端口规格，支持单端口、逗号多端口和连续范围。0) 返回。" ""; then
+        if ! ui_guard_skip_ports_prompt_spec "增加入口防护跳过端口" "输入公网监听端口规格，支持单端口、逗号多端口和连续范围。0) 返回。" ""; then
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             ui_pause
             continue
@@ -3260,7 +3261,7 @@ ui_menu_guard_skip_ports_add() {
         merged_ports="$(printf '%s\n%s\n' "$(guard_protocol_skip_ports_tsv)" "$new_ports" | sed '/^$/d' | awk '!seen[$0]++')"
         ui_guard_skip_ports_apply_list "$merged_ports"
         if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
+            ui_notice_set "入口防护跳过端口已更新" "$UI_C_MENU_NUM"
             ui_pause
         fi
         return 0
@@ -3271,7 +3272,7 @@ ui_menu_guard_skip_ports_update() {
     local count raw indexes selected_indexes selected_ports new_ports updated_ports port idx
     count="$(guard_protocol_skip_ports_count)"
     if [ "$count" -eq 0 ]; then
-        ui_warn "当前没有 Guard 跳过端口"
+        ui_warn "当前没有入口防护跳过端口"
         ui_pause
         return 0
     fi
@@ -3290,7 +3291,7 @@ ui_menu_guard_skip_ports_update() {
             [ -n "$port" ] || continue
             selected_ports="${selected_ports}${selected_ports:+,}$port"
         done <<< "$selected_indexes"
-        if ! ui_guard_skip_ports_prompt_spec "修改 Guard 跳过端口" "输入新的端口规格；会替换所选端口。0) 返回。" "$selected_ports"; then
+        if ! ui_guard_skip_ports_prompt_spec "修改入口防护跳过端口" "输入新的公网监听端口规格；会替换所选端口。0) 返回。" "$selected_ports"; then
             [ "$UI_EDIT_ABORTED" = "1" ] && return 0
             ui_pause
             continue
@@ -3308,7 +3309,7 @@ ui_menu_guard_skip_ports_update() {
         updated_ports="$(printf '%s\n%s\n' "$updated_ports" "$new_ports" | sed '/^$/d' | awk '!seen[$0]++')"
         ui_guard_skip_ports_apply_list "$updated_ports"
         if [ "$UI_STATUS" -eq 0 ]; then
-            ui_notice_set "Guard 跳过端口已更新" "$UI_C_MENU_NUM"
+            ui_notice_set "入口防护跳过端口已更新" "$UI_C_MENU_NUM"
             ui_pause
         fi
         return 0

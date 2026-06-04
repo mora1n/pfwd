@@ -1,6 +1,6 @@
 {
-  "format_version": 1,
-  "built_at": "2026-06-02T08:50:07Z",
+  "format_version": 2,
+  "built_at": "2026-06-04T00:00:01Z",
   "ipv4": {
     "requested_urls": [
       "https://cdn.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/ip2region_v4.xdb",
@@ -165,8 +165,14 @@
       "name": "黑龙江省"
     }
   ],
-  "ipv4_buckets": 8129,
-  "ipv4_segments": 66094,
-  "ipv6_buckets": 46,
-  "ipv6_segments": 7366
+  "ipv4_buckets": 0,
+  "ipv4_segments": 34003,
+  "ipv4_raw_segments": 66094,
+  "ipv4_merged_segments": 24686,
+  "ipv4_prefixes": 34003,
+  "ipv6_buckets": 0,
+  "ipv6_segments": 13518,
+  "ipv6_raw_segments": 7366,
+  "ipv6_merged_segments": 7116,
+  "ipv6_prefixes": 13518
 }

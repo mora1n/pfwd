@@ -214,17 +214,17 @@ struct pfwd_geo_bucket {
     __u32 count;
 };
 
-struct pfwd_geo_segment_v4 {
-    __u32 start;
-    __u32 end;
-    __u16 province_id;
-    __u8 policy_flags;
-    __u8 pad;
+struct pfwd_geo_prefix_key_v4 {
+    __u32 prefixlen;
+    __u32 addr;
 };
 
-struct pfwd_geo_segment_v6 {
-    __u8 start[16];
-    __u8 end[16];
+struct pfwd_geo_prefix_key_v6 {
+    __u32 prefixlen;
+    __u8 addr[16];
+};
+
+struct pfwd_geo_prefix_val {
     __u16 province_id;
     __u8 policy_flags;
     __u8 pad;
@@ -397,17 +397,19 @@ struct {
 } pfwd_geo_bucket_v6 SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 131072);
-    __type(key, __u32);
-    __type(value, struct pfwd_geo_segment_v4);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_geo_prefix_key_v4);
+    __type(value, struct pfwd_geo_prefix_val);
 } pfwd_geo_segments_v4 SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 32768);
-    __type(key, __u32);
-    __type(value, struct pfwd_geo_segment_v6);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct pfwd_geo_prefix_key_v6);
+    __type(value, struct pfwd_geo_prefix_val);
 } pfwd_geo_segments_v6 SEC(".maps");
 
 struct {
@@ -890,113 +892,23 @@ static __always_inline void whitelist_cache_store_v6(const __u8 addr[16], __u8 v
     bpf_map_update_elem(&pfwd_whitelist_cache_v6, &key, &value, BPF_ANY);
 }
 
-static __always_inline __u32 ipv6_word_be(const __u8 addr[16], int offset) {
-    return ((__u32)addr[offset] << 24) | ((__u32)addr[offset + 1] << 16) |
-           ((__u32)addr[offset + 2] << 8) | (__u32)addr[offset + 3];
-}
-
-static __always_inline int ipv6_addr_cmp(const __u8 left[16], const __u8 right[16]) {
-    __u32 left_word, right_word;
-    left_word = ipv6_word_be(left, 0);
-    right_word = ipv6_word_be(right, 0);
-    if (left_word != right_word) return left_word < right_word ? -1 : 1;
-    left_word = ipv6_word_be(left, 4);
-    right_word = ipv6_word_be(right, 4);
-    if (left_word != right_word) return left_word < right_word ? -1 : 1;
-    left_word = ipv6_word_be(left, 8);
-    right_word = ipv6_word_be(right, 8);
-    if (left_word != right_word) return left_word < right_word ? -1 : 1;
-    left_word = ipv6_word_be(left, 12);
-    right_word = ipv6_word_be(right, 12);
-    if (left_word != right_word) return left_word < right_word ? -1 : 1;
-    return 0;
-}
-
-static __always_inline int ipv6_addr_lt(const __u8 left[16], const __u8 right[16]) {
-    return ipv6_addr_cmp(left, right) < 0;
-}
-
-static __always_inline int ipv6_addr_gt(const __u8 left[16], const __u8 right[16]) {
-    return ipv6_addr_cmp(left, right) > 0;
-}
-
 static __always_inline int geo_match_v4(__be32 addr, __u8 policy_flag) {
-    __u32 host_addr = bpf_ntohl(addr);
-    __u32 bucket_key = ((host_addr >> 24) & 0xffU) << 8 | ((host_addr >> 16) & 0xffU);
-    struct pfwd_geo_bucket *bucket = bpf_map_lookup_elem(&pfwd_geo_bucket_v4, &bucket_key);
-    __u32 low, high, loops = 0;
-
-    if (!bucket || bucket->count == 0) {
-        return 0;
-    }
-    low = bucket->start;
-    high = bucket->start + bucket->count - 1;
-#pragma unroll
-    for (loops = 0; loops < 16; loops++) {
-        __u32 mid;
-        struct pfwd_geo_segment_v4 *segment;
-
-        if (low > high) {
-            break;
-        }
-        mid = low + ((high - low) >> 1);
-        segment = bpf_map_lookup_elem(&pfwd_geo_segments_v4, &mid);
-        if (!segment) {
-            return 0;
-        }
-        if (host_addr < segment->start) {
-            if (mid == 0) {
-                break;
-            }
-            high = mid - 1;
-            continue;
-        }
-        if (host_addr > segment->end) {
-            low = mid + 1;
-            continue;
-        }
-        return (segment->policy_flags & policy_flag) != 0;
-    }
-    return 0;
+    struct pfwd_geo_prefix_key_v4 key = {
+        .prefixlen = 32,
+        .addr = addr,
+    };
+    struct pfwd_geo_prefix_val *value = bpf_map_lookup_elem(&pfwd_geo_segments_v4, &key);
+    return value && ((value->policy_flags & policy_flag) != 0);
 }
 
 static __always_inline int geo_match_v6(const __u8 addr[16], __u8 policy_flag) {
-    __u32 bucket_key = ((__u32)addr[0] << 8) | (__u32)addr[1];
-    struct pfwd_geo_bucket *bucket = bpf_map_lookup_elem(&pfwd_geo_bucket_v6, &bucket_key);
-    __u32 low, high, loops = 0;
-
-    if (!bucket || bucket->count == 0) {
-        return 0;
-    }
-    low = bucket->start;
-    high = bucket->start + bucket->count - 1;
-#pragma unroll
-    for (loops = 0; loops < 16; loops++) {
-        __u32 mid;
-        struct pfwd_geo_segment_v6 *segment;
-
-        if (low > high) {
-            break;
-        }
-        mid = low + ((high - low) >> 1);
-        segment = bpf_map_lookup_elem(&pfwd_geo_segments_v6, &mid);
-        if (!segment) {
-            return 0;
-        }
-        if (ipv6_addr_lt(addr, segment->start)) {
-            if (mid == 0) {
-                break;
-            }
-            high = mid - 1;
-            continue;
-        }
-        if (ipv6_addr_gt(addr, segment->end)) {
-            low = mid + 1;
-            continue;
-        }
-        return (segment->policy_flags & policy_flag) != 0;
-    }
-    return 0;
+    struct pfwd_geo_prefix_key_v6 key = {
+        .prefixlen = 128,
+    };
+    struct pfwd_geo_prefix_val *value;
+    pfwd_memcpy16(key.addr, addr);
+    value = bpf_map_lookup_elem(&pfwd_geo_segments_v6, &key);
+    return value && ((value->policy_flags & policy_flag) != 0);
 }
 
 static __always_inline int whitelist_allowed_v4(__be32 addr, const struct pfwd_rule_val *rule) {

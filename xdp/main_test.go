@@ -360,53 +360,46 @@ func TestRuleValEquivalentForRefresh(t *testing.T) {
 }
 
 func TestGeoAssetRoundTripAndLookup(t *testing.T) {
-	t.Run("v4 roundtrip and bucket lookup", func(t *testing.T) {
+	t.Run("v4 prefix roundtrip and lookup", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		buckets := make([]geoBucket, geoBucketEntries)
-		bucketIndex := int(1)<<8 | int(2)
-		buckets[bucketIndex] = geoBucket{Start: 0, Count: 2}
-		segments := []geoSegmentV4{
-			{Start: binary.BigEndian.Uint32([]byte{1, 2, 0, 0}), End: binary.BigEndian.Uint32([]byte{1, 2, 0, 255}), ProvinceID: 1},
-			{Start: binary.BigEndian.Uint32([]byte{1, 2, 1, 0}), End: binary.BigEndian.Uint32([]byte{1, 2, 1, 255}), ProvinceID: 2},
+		prefixes := []geoPrefixV4{
+			{PrefixLen: 24, Addr: binary.BigEndian.Uint32([]byte{1, 2, 0, 0}), ProvinceID: 1},
+			{PrefixLen: 24, Addr: binary.BigEndian.Uint32([]byte{1, 2, 1, 0}), ProvinceID: 2},
 		}
 		path := filepath.Join(tmpDir, geoIPv4AssetFile)
-		if err := writeGeoAssetV4(path, buckets, segments, 2); err != nil {
+		if err := writeGeoAssetV4(path, prefixes, 2); err != nil {
 			t.Fatalf("writeGeoAssetV4: %v", err)
 		}
-		gotBuckets, gotSegments, ipVer, err := readGeoAssetV4(path)
+		gotPrefixes, ipVer, err := readGeoAssetV4(path)
 		if err != nil {
 			t.Fatalf("readGeoAssetV4: %v", err)
 		}
 		if ipVer != 4 {
 			t.Fatalf("readGeoAssetV4 ipVer=%d, want 4", ipVer)
 		}
-		if gotBuckets[bucketIndex].Count != 2 {
-			t.Fatalf("bucket count=%d, want 2", gotBuckets[bucketIndex].Count)
+		if len(gotPrefixes) != 2 {
+			t.Fatalf("prefix count=%d, want 2", len(gotPrefixes))
 		}
-		found, ok := findGeoSegmentV4(gotSegments, gotBuckets[bucketIndex], binary.BigEndian.Uint32([]byte{1, 2, 1, 42}))
+		found, ok := findGeoPrefixV4(gotPrefixes, binary.BigEndian.Uint32([]byte{1, 2, 1, 42}))
 		if !ok {
-			t.Fatalf("findGeoSegmentV4 not found")
+			t.Fatalf("findGeoPrefixV4 not found")
 		}
 		if found.ProvinceID != 2 {
-			t.Fatalf("findGeoSegmentV4 province=%d, want 2", found.ProvinceID)
+			t.Fatalf("findGeoPrefixV4 province=%d, want 2", found.ProvinceID)
 		}
 	})
 
-	t.Run("v6 roundtrip and bucket lookup", func(t *testing.T) {
+	t.Run("v6 prefix roundtrip and lookup", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		buckets := make([]geoBucket, geoBucketEntries)
-		bucketIndex := int(0x24)<<8 | int(0x0e)
-		buckets[bucketIndex] = geoBucket{Start: 0, Count: 1}
 		start := netip.MustParseAddr("240e::").As16()
-		end := netip.MustParseAddr("240e::ffff").As16()
-		segments := []geoSegmentV6{
-			{Start: start, End: end, ProvinceID: 3},
+		prefixes := []geoPrefixV6{
+			{PrefixLen: 112, Addr: start, ProvinceID: 3},
 		}
 		path := filepath.Join(tmpDir, geoIPv6AssetFile)
-		if err := writeGeoAssetV6(path, buckets, segments, 3); err != nil {
+		if err := writeGeoAssetV6(path, prefixes, 3); err != nil {
 			t.Fatalf("writeGeoAssetV6: %v", err)
 		}
-		gotBuckets, gotSegments, ipVer, err := readGeoAssetV6(path)
+		gotPrefixes, ipVer, err := readGeoAssetV6(path)
 		if err != nil {
 			t.Fatalf("readGeoAssetV6: %v", err)
 		}
@@ -414,12 +407,12 @@ func TestGeoAssetRoundTripAndLookup(t *testing.T) {
 			t.Fatalf("readGeoAssetV6 ipVer=%d, want 6", ipVer)
 		}
 		target := netip.MustParseAddr("240e::1234").As16()
-		found, ok := findGeoSegmentV6(gotSegments, gotBuckets[bucketIndex], target)
+		found, ok := findGeoPrefixV6(gotPrefixes, target)
 		if !ok {
-			t.Fatalf("findGeoSegmentV6 not found")
+			t.Fatalf("findGeoPrefixV6 not found")
 		}
 		if found.ProvinceID != 3 {
-			t.Fatalf("findGeoSegmentV6 province=%d, want 3", found.ProvinceID)
+			t.Fatalf("findGeoPrefixV6 province=%d, want 3", found.ProvinceID)
 		}
 	})
 }
@@ -432,9 +425,10 @@ func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
 		Provinces: []geoProvinceEntry{
 			{ID: 1, Name: "广东省"},
 		},
-		IPv4Buckets:  geoBucketEntries,
+		IPv4Buckets:  0,
 		IPv4Segments: 1,
-		IPv6Buckets:  geoBucketEntries,
+		IPv4Prefixes: 1,
+		IPv6Buckets:  0,
 		IPv6Segments: 0,
 	}
 	metaContent, err := json.Marshal(meta)
@@ -444,16 +438,13 @@ func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpDir, geoMetaAssetFile), metaContent, 0o644); err != nil {
 		t.Fatalf("write meta: %v", err)
 	}
-	buckets := make([]geoBucket, geoBucketEntries)
-	bucketIndex := int(1)<<8 | int(2)
-	buckets[bucketIndex] = geoBucket{Start: 0, Count: 1}
-	segments := []geoSegmentV4{
-		{Start: binary.BigEndian.Uint32([]byte{1, 2, 0, 0}), End: binary.BigEndian.Uint32([]byte{1, 2, 255, 255}), ProvinceID: 1},
+	prefixes := []geoPrefixV4{
+		{PrefixLen: 16, Addr: binary.BigEndian.Uint32([]byte{1, 2, 0, 0}), ProvinceID: 1},
 	}
-	if err := writeGeoAssetV4(filepath.Join(tmpDir, geoIPv4AssetFile), buckets, segments, 1); err != nil {
+	if err := writeGeoAssetV4(filepath.Join(tmpDir, geoIPv4AssetFile), prefixes, 1); err != nil {
 		t.Fatalf("write v4 asset: %v", err)
 	}
-	if err := writeGeoAssetV6(filepath.Join(tmpDir, geoIPv6AssetFile), make([]geoBucket, geoBucketEntries), nil, 1); err != nil {
+	if err := writeGeoAssetV6(filepath.Join(tmpDir, geoIPv6AssetFile), nil, 1); err != nil {
 		t.Fatalf("write v6 asset: %v", err)
 	}
 
@@ -487,15 +478,42 @@ func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
 	if !strings.Contains(out.String(), "allow custom") {
 		t.Fatalf("geoCheck output=%q, want custom allow", out.String())
 	}
+
+	out.Reset()
+	r, w, err = os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe json: %v", err)
+	}
+	os.Stdout = w
+	err = geoCheck(geoCheckOptions{
+		AssetDir:    tmpDir,
+		Address:     "1.2.3.4",
+		Mode:        "provinces",
+		ProvinceCSV: "浙江省",
+		JSON:        true,
+	})
+	_ = w.Close()
+	_, _ = io.Copy(&out, r)
+	_ = r.Close()
+	if err == nil || !strings.Contains(err.Error(), "省份未授权") {
+		t.Fatalf("geoCheck(json deny) error=%v, want province deny", err)
+	}
+	var result geoCheckResult
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &result); err != nil {
+		t.Fatalf("unmarshal geoCheck json: %v output=%q", err, out.String())
+	}
+	if result.Allowed || result.GeoAllowed || result.Province != "广东省" || result.MatchedSource != "province-deny" {
+		t.Fatalf("geoCheck json=%+v, want denied 广东省 province-deny", result)
+	}
 }
 
 func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
-	t.Run("v4 bucket planning uses prefix offsets", func(t *testing.T) {
+	t.Run("v4 planning merges adjacent ranges into prefixes", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		xdbPath := filepath.Join(tmpDir, "test-v4.xdb")
 		segs := []xdbScanSegmentV4{
 			{Province: "广东省", Start: mustIPv4XDBBytes(t, "1.2.0.0"), End: mustIPv4XDBBytes(t, "1.2.0.255")},
-			{Province: "广东省", Start: mustIPv4XDBBytes(t, "1.3.0.0"), End: mustIPv4XDBBytes(t, "1.3.0.255")},
+			{Province: "广东省", Start: mustIPv4XDBBytes(t, "1.2.1.0"), End: mustIPv4XDBBytes(t, "1.2.1.255")},
 			{Province: "北京市", Start: mustIPv4XDBBytes(t, "2.0.0.0"), End: mustIPv4XDBBytes(t, "2.0.255.255")},
 		}
 		writeTestXDBv4(t, xdbPath, segs)
@@ -504,26 +522,14 @@ func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 		if err != nil {
 			t.Fatalf("planGeoAssetV4: %v", err)
 		}
-		if stats.BucketCount != 3 {
-			t.Fatalf("bucket count=%d, want 3", stats.BucketCount)
+		if stats.RawSegmentCount != 3 {
+			t.Fatalf("raw segment count=%d, want 3", stats.RawSegmentCount)
 		}
-		if stats.SegmentCount != 3 {
-			t.Fatalf("segment count=%d, want 3", stats.SegmentCount)
+		if stats.MergedSegmentCount != 2 {
+			t.Fatalf("merged segment count=%d, want 2", stats.MergedSegmentCount)
 		}
-		if stats.MaxBucketCount != 1 {
-			t.Fatalf("max bucket count=%d, want 1", stats.MaxBucketCount)
-		}
-		if stats.MaxLookupSteps != 1 {
-			t.Fatalf("max lookup steps=%d, want 1", stats.MaxLookupSteps)
-		}
-		if got := plan.Buckets[int(1)<<8|int(2)]; got != (geoBucket{Start: 0, Count: 1}) {
-			t.Fatalf("bucket 1.2=%+v, want {Start:0 Count:1}", got)
-		}
-		if got := plan.Buckets[int(1)<<8|int(3)]; got != (geoBucket{Start: 1, Count: 1}) {
-			t.Fatalf("bucket 1.3=%+v, want {Start:1 Count:1}", got)
-		}
-		if got := plan.Buckets[int(2)<<8|int(0)]; got != (geoBucket{Start: 2, Count: 1}) {
-			t.Fatalf("bucket 2.0=%+v, want {Start:2 Count:1}", got)
+		if stats.PrefixCount != 2 || plan.PrefixCount != 2 {
+			t.Fatalf("prefix count stats=%d plan=%d, want 2", stats.PrefixCount, plan.PrefixCount)
 		}
 
 		outPath := filepath.Join(tmpDir, geoIPv4AssetFile)
@@ -531,17 +537,17 @@ func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 		if err := writeGeoAssetV4FromSegments(outPath, plan, segs, provinceIDs, 2); err != nil {
 			t.Fatalf("writeGeoAssetV4FromSegments: %v", err)
 		}
-		buckets, segments, ipVer, err := readGeoAssetV4(outPath)
+		prefixes, ipVer, err := readGeoAssetV4(outPath)
 		if err != nil {
 			t.Fatalf("readGeoAssetV4: %v", err)
 		}
 		if ipVer != 4 {
 			t.Fatalf("ipVer=%d, want 4", ipVer)
 		}
-		target := binary.BigEndian.Uint32([]byte{1, 3, 0, 42})
-		found, ok := findGeoSegmentV4(segments, buckets[int(1)<<8|int(3)], target)
+		target := binary.BigEndian.Uint32([]byte{1, 2, 1, 42})
+		found, ok := findGeoPrefixV4(prefixes, target)
 		if !ok {
-			t.Fatalf("findGeoSegmentV4 not found")
+			t.Fatalf("findGeoPrefixV4 not found")
 		}
 		if found.ProvinceID != 2 {
 			t.Fatalf("province=%d, want 2", found.ProvinceID)
@@ -561,11 +567,11 @@ func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 		if err != nil {
 			t.Fatalf("planGeoAssetV6: %v", err)
 		}
-		if stats.BucketCount != 2 {
-			t.Fatalf("bucket count=%d, want 2", stats.BucketCount)
+		if stats.RawSegmentCount != 2 {
+			t.Fatalf("raw segment count=%d, want 2", stats.RawSegmentCount)
 		}
-		if stats.SegmentCount != 2 {
-			t.Fatalf("segment count=%d, want 2", stats.SegmentCount)
+		if stats.PrefixCount != 2 || plan.PrefixCount != 2 {
+			t.Fatalf("prefix count stats=%d plan=%d, want 2", stats.PrefixCount, plan.PrefixCount)
 		}
 
 		outPath := filepath.Join(tmpDir, geoIPv6AssetFile)
@@ -573,7 +579,7 @@ func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 		if err := writeGeoAssetV6FromSegments(outPath, plan, segs, provinceIDs, 2); err != nil {
 			t.Fatalf("writeGeoAssetV6FromSegments: %v", err)
 		}
-		buckets, segments, ipVer, err := readGeoAssetV6(outPath)
+		prefixes, ipVer, err := readGeoAssetV6(outPath)
 		if err != nil {
 			t.Fatalf("readGeoAssetV6: %v", err)
 		}
@@ -581,9 +587,9 @@ func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 			t.Fatalf("ipVer=%d, want 6", ipVer)
 		}
 		target := netip.MustParseAddr("240f::1234").As16()
-		found, ok := findGeoSegmentV6(segments, buckets[int(target[0])<<8|int(target[1])], target)
+		found, ok := findGeoPrefixV6(prefixes, target)
 		if !ok {
-			t.Fatalf("findGeoSegmentV6 not found")
+			t.Fatalf("findGeoPrefixV6 not found")
 		}
 		if found.ProvinceID != 1 {
 			t.Fatalf("province=%d, want 1", found.ProvinceID)

@@ -1320,6 +1320,11 @@ cmd_guard() {
 
 cmd_guard_whitelist() {
     config_init >/dev/null
+    if [ "${1:-}" = "check" ]; then
+        shift
+        cmd_guard_whitelist_check "$@"
+        return 0
+    fi
     local enabled="__KEEP__" include_cn="__KEEP__" cidr="" replace_custom="false" clear_custom="false"
     local cn_mode="__KEEP__"
     local status_requested="false"
@@ -1384,6 +1389,138 @@ cmd_guard_whitelist() {
     whitelist_apply_runtime
     cmd_apply_guard_runtime
     echo "协议封锁 / 入口白名单已更新"
+}
+
+cmd_guard_whitelist_check() {
+    config_init >/dev/null
+    local address="" listen_port="" protocol=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --address)
+                address="${2:-}"
+                shift 2
+                ;;
+            --listen-port)
+                listen_port="${2:-}"
+                shift 2
+                ;;
+            --protocol)
+                protocol="${2:-}"
+                shift 2
+                ;;
+            *) pfwd_die "未知选项：$1" ;;
+        esac
+    done
+    [ -n "$address" ] || pfwd_die "用法：pfwd guard whitelist check --address IP [--listen-port PORT] [--protocol tcp|udp]"
+    if [ -n "$listen_port" ]; then
+        validate_port "$listen_port"
+    fi
+    case "$protocol" in
+        ""|tcp|udp) ;;
+        *) pfwd_die "无效协议：$protocol，必须是 tcp 或 udp" ;;
+    esac
+
+    local mode provinces files bin output geo_status geo_error_file geo_error
+    mode="$(whitelist_cn_mode)"
+    provinces="$(whitelist_cn_provinces_tsv | paste -sd, -)"
+    files="$(whitelist_allow_ipv4_file):$(whitelist_allow_ipv6_file)"
+    bin="$(guard_bin_path)"
+    [ -x "$bin" ] || pfwd_die "缺少 XDP 预编译二进制：$bin"
+
+    geo_error_file="$(mktemp)"
+    if output="$("$bin" geo-check \
+        --json \
+        --asset-dir "$(whitelist_geo_asset_dir)" \
+        --address "$address" \
+        --mode "$mode" \
+        --provinces "$provinces" \
+        --whitelist-file "$files" 2>"$geo_error_file")"; then
+        geo_status=0
+    else
+        geo_status=$?
+    fi
+    geo_error="$(cat "$geo_error_file")"
+    rm -f "$geo_error_file"
+    [ -n "$output" ] || pfwd_die "geo-check 未返回结果：$geo_error"
+    jq -e . >/dev/null <<< "$output" || pfwd_die "geo-check 返回非 JSON：$output ${geo_error:+($geo_error)}"
+
+    local wl_enabled skip_hit="false" rule_summary="-" rule_id="-" rule_flags="-" conclusion reason
+    wl_enabled="$(whitelist_enabled)"
+    if [ -n "$listen_port" ]; then
+        if guard_protocol_skip_ports_tsv | grep -Fxq "$listen_port"; then
+            skip_hit="true"
+        fi
+        if [ -f "$PFWD_FORWARDER_RUNTIME_FILE" ]; then
+            if [ -n "$protocol" ]; then
+                rule_summary="$(jq -r --argjson port "$listen_port" --arg proto "$protocol" '
+                  (.rules // [])
+                  | map(select((.listen_port // 0) == $port and (.protocol // "") == $proto and (.enabled // true)))
+                  | first
+                  | if . == null then "-" else
+                      [(.id // "-"), (.protocol // "-"), ((.listen_ip // "::") + ":" + ((.listen_port // 0) | tostring)), ((.remote_host // "-") + ":" + ((.remote_port // 0) | tostring)), (.execution_class // "-")] | @tsv
+                    end
+                ' "$PFWD_FORWARDER_RUNTIME_FILE")"
+            else
+                rule_summary="$(jq -r --argjson port "$listen_port" '
+                  (.rules // [])
+                  | map(select((.listen_port // 0) == $port and (.enabled // true)))
+                  | first
+                  | if . == null then "-" else
+                      [(.id // "-"), (.protocol // "-"), ((.listen_ip // "::") + ":" + ((.listen_port // 0) | tostring)), ((.remote_host // "-") + ":" + ((.remote_port // 0) | tostring)), (.execution_class // "-")] | @tsv
+                    end
+                ' "$PFWD_FORWARDER_RUNTIME_FILE")"
+            fi
+        fi
+    fi
+
+    local geo_allowed custom_allowed allowed province matched_source
+    geo_allowed="$(jq -r '.geo_allowed' <<< "$output")"
+    custom_allowed="$(jq -r '.custom_allowed' <<< "$output")"
+    allowed="$(jq -r '.allowed' <<< "$output")"
+    province="$(jq -r '.province // "-"' <<< "$output")"
+    matched_source="$(jq -r '.matched_source' <<< "$output")"
+
+    if [ "$skip_hit" = "true" ]; then
+        conclusion="放行"
+        reason="命中入口防护跳过端口；该监听端口跳过入口白名单和协议封锁"
+    elif [ "$wl_enabled" != "true" ]; then
+        conclusion="放行"
+        reason="入口白名单未启用"
+    elif [ "$allowed" = "true" ]; then
+        conclusion="放行"
+        if [ "$custom_allowed" = "true" ]; then
+            reason="命中入口自定义 CIDR"
+        else
+            reason="命中国内 IP 策略"
+        fi
+    else
+        conclusion="应拦截"
+        case "$matched_source" in
+            province-deny) reason="省份未授权：$province" ;;
+            not-cn) reason="未命中国内 IP 资产或自定义 CIDR" ;;
+            mode-off) reason="国内 IP 策略已关闭且未命中自定义 CIDR" ;;
+            *) reason="未命中入口白名单" ;;
+        esac
+    fi
+
+    if [ "$rule_summary" != "-" ]; then
+        rule_id="$(cut -f1 <<< "$rule_summary")"
+        rule_flags="$(cut -f2- <<< "$rule_summary")"
+    fi
+
+    printf '地址\t%s\n' "$address"
+    printf '省份\t%s\n' "$province"
+    printf '入口白名单\t%s\n' "$(if [ "$wl_enabled" = "true" ]; then printf '开'; else printf '关'; fi)"
+    printf '国内 IP 策略\t%s\n' "$(whitelist_cn_selection_summary)"
+    if [ -n "$listen_port" ]; then
+        printf '监听端口\t%s%s\n' "$listen_port" "$(if [ -n "$protocol" ]; then printf '/%s' "$protocol"; fi)"
+        printf '入口防护跳过\t%s\n' "$(if [ "$skip_hit" = "true" ]; then printf '是'; else printf '否'; fi)"
+        printf '运行态规则\t%s\n' "$rule_id"
+        printf '规则详情\t%s\n' "$rule_flags"
+    fi
+    printf 'geo-check\t%s\n' "$(if [ "$geo_status" -eq 0 ]; then printf 'allow'; else printf 'deny'; fi)"
+    printf '结论\t%s\n' "$conclusion"
+    printf '原因\t%s\n' "$reason"
 }
 
 cmd_guard_whitelist_custom() {

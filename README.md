@@ -105,7 +105,7 @@ pfwd add \
 - 入口白名单：限制入站来源 IPv4 / IPv6 CIDR，支持关闭国内段、允许全部国内 IP，或按省份批量允许；也可追加自定义 CIDR 或单个 IP
 - 出口白名单：限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量；国内 IP / 省份策略与目标校验、宿主机出口共用一套配置
 - 协议封锁：按 TCP 首包拒绝 `HTTP`、`TLS ClientHello`、`SOCKS4/5`
-- Guard 跳过端口：指定监听端口可绕过入口 Guard，包括入口白名单和协议封锁；不影响出口白名单
+- 入口防护跳过端口：指定公网监听端口可绕过入口白名单和协议封锁；不影响出口白名单
 
 常用命令：
 
@@ -116,6 +116,7 @@ pfwd guard whitelist --enabled true
 pfwd guard whitelist-cn all
 pfwd guard whitelist-cn select 广东省 江苏省
 pfwd guard whitelist-custom add 203.0.113.5
+pfwd guard whitelist check --address 61.187.9.117 --listen-port 41422 --protocol tcp
 pfwd guard egress-whitelist --enabled true
 pfwd guard egress-whitelist-cn all
 pfwd guard egress-whitelist-cn select 浙江省 上海市

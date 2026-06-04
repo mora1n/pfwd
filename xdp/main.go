@@ -33,9 +33,9 @@ import (
 //go:embed xdp_bpfel.o
 var xdpBPFEL []byte
 
-const binaryVersion = "0.2.3"
+const binaryVersion = "0.2.4"
 const dataplaneVersion = 2
-const mapABIVersion = 10
+const mapABIVersion = 11
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -614,17 +614,17 @@ type guardPrefixVal struct {
 	Prefix  [8]byte
 }
 
-type geoSegmentMapV4 struct {
-	Start       uint32
-	End         uint32
-	ProvinceID  uint16
-	PolicyFlags uint8
-	Pad         uint8
+type geoPrefixKeyV4 struct {
+	PrefixLen uint32
+	Addr      uint32
 }
 
-type geoSegmentMapV6 struct {
-	Start       [16]byte
-	End         [16]byte
+type geoPrefixKeyV6 struct {
+	PrefixLen uint32
+	Addr      [16]byte
+}
+
+type geoPrefixMapVal struct {
 	ProvinceID  uint16
 	PolicyFlags uint8
 	Pad         uint8
@@ -694,6 +694,7 @@ func runGeoCheck(args []string) error {
 	fs.StringVar(&opts.ProvinceCSV, "provinces", "", "comma separated province names")
 	fs.StringVar(&opts.WhitelistFile, "whitelist-file", "", "colon separated ingress custom cidr files")
 	fs.StringVar(&opts.EgressWhitelistFile, "egress-whitelist-file", "", "colon separated egress custom cidr files")
+	fs.BoolVar(&opts.JSON, "json", false, "print machine-readable decision result")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1531,10 +1532,10 @@ func clearGeoMaps(bucketV4, bucketV6, segmentsV4, segmentsV6, provincePolicy *eb
 	if err := clearArrayMap[geoBucket](bucketV6); err != nil {
 		return err
 	}
-	if err := clearArrayMap[geoSegmentMapV4](segmentsV4); err != nil {
+	if err := clearMap[geoPrefixKeyV4, geoPrefixMapVal](segmentsV4); err != nil {
 		return err
 	}
-	if err := clearArrayMap[geoSegmentMapV6](segmentsV6); err != nil {
+	if err := clearMap[geoPrefixKeyV6, geoPrefixMapVal](segmentsV6); err != nil {
 		return err
 	}
 	if err := clearArrayMap[geoProvincePolicyVal](provincePolicy); err != nil {
@@ -1580,42 +1581,30 @@ func loadGeoMaps(
 	if err != nil {
 		return err
 	}
-	for i, bucket := range assets.BucketsV4 {
-		key := uint32(i)
-		value := bucket
-		if err := bucketV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo bucket v4 失败 (key=%d): %w", i, err)
+	for i, prefix := range assets.PrefixesV4 {
+		key := geoPrefixKeyV4{
+			PrefixLen: prefix.PrefixLen,
+			Addr:      ipv4LPMTrieAddr(ipv4BEToBytes(prefix.Addr)),
 		}
-	}
-	for i, bucket := range assets.BucketsV6 {
-		key := uint32(i)
-		value := bucket
-		if err := bucketV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo bucket v6 失败 (key=%d): %w", i, err)
-		}
-	}
-	for i, segment := range assets.SegmentsV4 {
-		key := uint32(i)
-		value := geoSegmentMapV4{
-			Start:       segment.Start,
-			End:         segment.End,
-			ProvinceID:  segment.ProvinceID,
-			PolicyFlags: flagsByProvince[segment.ProvinceID],
+		value := geoPrefixMapVal{
+			ProvinceID:  prefix.ProvinceID,
+			PolicyFlags: flagsByProvince[prefix.ProvinceID],
 		}
 		if err := segmentsV4.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo segment v4 失败 (key=%d): %w", i, err)
+			return fmt.Errorf("写入 geo prefix v4 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
 		}
 	}
-	for i, segment := range assets.SegmentsV6 {
-		key := uint32(i)
-		value := geoSegmentMapV6{
-			Start:       segment.Start,
-			End:         segment.End,
-			ProvinceID:  segment.ProvinceID,
-			PolicyFlags: flagsByProvince[segment.ProvinceID],
+	for i, prefix := range assets.PrefixesV6 {
+		key := geoPrefixKeyV6{
+			PrefixLen: prefix.PrefixLen,
+			Addr:      prefix.Addr,
+		}
+		value := geoPrefixMapVal{
+			ProvinceID:  prefix.ProvinceID,
+			PolicyFlags: flagsByProvince[prefix.ProvinceID],
 		}
 		if err := segmentsV6.Update(&key, &value, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("写入 geo segment v6 失败 (key=%d): %w", i, err)
+			return fmt.Errorf("写入 geo prefix v6 失败 (index=%d prefix=%d): %w", i, prefix.PrefixLen, err)
 		}
 	}
 	for provinceID, flags := range flagsByProvince {
@@ -4226,6 +4215,12 @@ func ipv4LPMTrieAddr(addr [4]byte) uint32 {
 	// The XDP side looks up ip4->saddr directly, so the key bytes after prefixlen
 	// must stay in network order when marshaled as a uint32 on little-endian hosts.
 	return binary.LittleEndian.Uint32(addr[:])
+}
+
+func ipv4BEToBytes(value uint32) [4]byte {
+	var out [4]byte
+	binary.BigEndian.PutUint32(out[:], value)
+	return out
 }
 
 func htons(value uint16) uint16 {

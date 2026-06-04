@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"math/bits"
 	"net/http"
 	"net/netip"
@@ -21,7 +22,7 @@ import (
 
 const (
 	geoAssetMagic    = "PFGE"
-	geoAssetVersion  = 1
+	geoAssetVersion  = 2
 	geoHeaderSize    = 20
 	geoBucketEntries = 1 << 16
 
@@ -39,7 +40,6 @@ const (
 	xdbIPv6SegmentSize = 38
 
 	// Keep these limits in sync with xdp.bpf.c.
-	geoLookupLoopLimit        = 16
 	geoSegmentV4MapMaxEntries = 131072
 	geoSegmentV6MapMaxEntries = 32768
 	geoBuildTimeout           = 5 * time.Minute
@@ -75,16 +75,16 @@ type geoBucket struct {
 	Count uint32
 }
 
-type geoSegmentV4 struct {
-	Start      uint32
-	End        uint32
+type geoPrefixV4 struct {
+	PrefixLen  uint32
+	Addr       uint32
 	ProvinceID uint16
 	Pad        uint16
 }
 
-type geoSegmentV6 struct {
-	Start      [16]byte
-	End        [16]byte
+type geoPrefixV6 struct {
+	PrefixLen  uint32
+	Addr       [16]byte
 	ProvinceID uint16
 	Pad        uint16
 }
@@ -113,16 +113,20 @@ type geoAssetMeta struct {
 	Provinces     []geoProvinceEntry `json:"provinces"`
 	IPv4Buckets   int                `json:"ipv4_buckets"`
 	IPv4Segments  int                `json:"ipv4_segments"`
+	IPv4Raw       int                `json:"ipv4_raw_segments"`
+	IPv4Merged    int                `json:"ipv4_merged_segments"`
+	IPv4Prefixes  int                `json:"ipv4_prefixes"`
 	IPv6Buckets   int                `json:"ipv6_buckets"`
 	IPv6Segments  int                `json:"ipv6_segments"`
+	IPv6Raw       int                `json:"ipv6_raw_segments"`
+	IPv6Merged    int                `json:"ipv6_merged_segments"`
+	IPv6Prefixes  int                `json:"ipv6_prefixes"`
 }
 
 type geoAssetRuntime struct {
 	Meta        geoAssetMeta
-	BucketsV4   []geoBucket
-	SegmentsV4  []geoSegmentV4
-	BucketsV6   []geoBucket
-	SegmentsV6  []geoSegmentV6
+	PrefixesV4  []geoPrefixV4
+	PrefixesV6  []geoPrefixV6
 	ProvinceIDs map[string]uint16
 }
 
@@ -151,16 +155,30 @@ type xdbScanSegmentV6 struct {
 	End      [16]byte
 }
 
+type geoRangeV4 struct {
+	Province string
+	Start    uint32
+	End      uint32
+}
+
+type geoRangeV6 struct {
+	Province string
+	Start    [16]byte
+	End      [16]byte
+}
+
 type geoAssetPlan struct {
-	Buckets      []geoBucket
-	SegmentCount uint32
+	PrefixCount uint32
 }
 
 type geoAssetStats struct {
-	BucketCount    int
-	SegmentCount   int
-	MaxBucketCount uint32
-	MaxLookupSteps int
+	BucketCount        int
+	SegmentCount       int
+	RawSegmentCount    int
+	MergedSegmentCount int
+	PrefixCount        int
+	MaxBucketCount     uint32
+	MaxLookupSteps     int
 }
 
 type xdbScanHandlerV4 func(segment xdbScanSegmentV4) error
@@ -252,10 +270,16 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 			IndexEnd:      binary.LittleEndian.Uint32(v6XDB.Header[xdbIndexEndOff:]),
 		},
 		Provinces:    provinceMeta,
-		IPv4Buckets:  v4Stats.BucketCount,
-		IPv4Segments: v4Stats.SegmentCount,
-		IPv6Buckets:  v6Stats.BucketCount,
-		IPv6Segments: v6Stats.SegmentCount,
+		IPv4Buckets:  0,
+		IPv4Segments: v4Stats.PrefixCount,
+		IPv4Raw:      v4Stats.RawSegmentCount,
+		IPv4Merged:   v4Stats.MergedSegmentCount,
+		IPv4Prefixes: v4Stats.PrefixCount,
+		IPv6Buckets:  0,
+		IPv6Segments: v6Stats.PrefixCount,
+		IPv6Raw:      v6Stats.RawSegmentCount,
+		IPv6Merged:   v6Stats.MergedSegmentCount,
+		IPv6Prefixes: v6Stats.PrefixCount,
 	}
 	preserveStableGeoMetaFields(opts.AssetDir, &meta)
 	content, err := json.MarshalIndent(meta, "", "  ")
@@ -316,14 +340,14 @@ func loadGeoAssets(assetDir string) (*geoAssetRuntime, error) {
 		return nil, fmt.Errorf("解析 geo 元数据失败: %w", err)
 	}
 
-	buckets4, segments4, ipVer4, err := readGeoAssetV4(filepath.Join(assetDir, geoIPv4AssetFile))
+	prefixes4, ipVer4, err := readGeoAssetV4(filepath.Join(assetDir, geoIPv4AssetFile))
 	if err != nil {
 		return nil, err
 	}
 	if ipVer4 != 4 {
 		return nil, fmt.Errorf("geo v4 资产 ip_version 错误: %d", ipVer4)
 	}
-	buckets6, segments6, ipVer6, err := readGeoAssetV6(filepath.Join(assetDir, geoIPv6AssetFile))
+	prefixes6, ipVer6, err := readGeoAssetV6(filepath.Join(assetDir, geoIPv6AssetFile))
 	if err != nil {
 		return nil, err
 	}
@@ -337,10 +361,8 @@ func loadGeoAssets(assetDir string) (*geoAssetRuntime, error) {
 	}
 	return &geoAssetRuntime{
 		Meta:        meta,
-		BucketsV4:   buckets4,
-		SegmentsV4:  segments4,
-		BucketsV6:   buckets6,
-		SegmentsV6:  segments6,
+		PrefixesV4:  prefixes4,
+		PrefixesV6:  prefixes6,
 		ProvinceIDs: provinceIDs,
 	}, nil
 }
@@ -505,63 +527,127 @@ func planGeoAssetV6(path string) (*geoAssetPlan, geoAssetStats, error) {
 }
 
 func planGeoAssetV4Segments(segments []xdbScanSegmentV4) (*geoAssetPlan, geoAssetStats) {
-	slices.SortFunc(segments, func(left, right xdbScanSegmentV4) int {
-		leftStart := xdbIPv4SegmentValue(left.Start)
-		rightStart := xdbIPv4SegmentValue(right.Start)
-		if leftStart < rightStart {
-			return -1
-		}
-		if leftStart > rightStart {
-			return 1
-		}
-		leftEnd := xdbIPv4SegmentValue(left.End)
-		rightEnd := xdbIPv4SegmentValue(right.End)
-		switch {
-		case leftEnd < rightEnd:
-			return -1
-		case leftEnd > rightEnd:
-			return 1
-		default:
-			return strings.Compare(left.Province, right.Province)
-		}
-	})
-
-	buckets := make([]geoBucket, geoBucketEntries)
-	first := 0
-	last := 0
-	active := 0
-	var maxCount uint32
-	for bucket := 0; bucket < geoBucketEntries; bucket++ {
-		bucketStart := uint32(bucket) << 16
-		bucketEnd := bucketStart | 0xFFFF
-		for first < len(segments) && xdbIPv4SegmentValue(segments[first].End) < bucketStart {
-			first++
-		}
-		if last < first {
-			last = first
-		}
-		for last < len(segments) && xdbIPv4SegmentValue(segments[last].Start) <= bucketEnd {
-			last++
-		}
-		if last > first {
-			count := uint32(last - first)
-			buckets[bucket] = geoBucket{Start: uint32(first), Count: count}
-			active++
-			if count > maxCount {
-				maxCount = count
-			}
-		}
+	merged := mergeGeoSegmentsV4(segments)
+	prefixCount := 0
+	for _, segment := range merged {
+		prefixCount += len(cidrPrefixesFromRangeV4(segment.Start, segment.End, nil))
 	}
-	return &geoAssetPlan{Buckets: buckets, SegmentCount: uint32(len(segments))}, geoAssetStats{
-		BucketCount:    active,
-		SegmentCount:   len(segments),
-		MaxBucketCount: maxCount,
-		MaxLookupSteps: binarySearchSteps(maxCount),
+	return &geoAssetPlan{PrefixCount: uint32(prefixCount)}, geoAssetStats{
+		SegmentCount:       prefixCount,
+		RawSegmentCount:    len(segments),
+		MergedSegmentCount: len(merged),
+		PrefixCount:        prefixCount,
+		MaxLookupSteps:     1,
 	}
 }
 
 func planGeoAssetV6Segments(segments []xdbScanSegmentV6) (*geoAssetPlan, geoAssetStats) {
-	slices.SortFunc(segments, func(left, right xdbScanSegmentV6) int {
+	merged := mergeGeoSegmentsV6(segments)
+	prefixCount := 0
+	for _, segment := range merged {
+		prefixCount += len(cidrPrefixesFromRangeV6(segment.Start, segment.End, nil))
+	}
+	return &geoAssetPlan{PrefixCount: uint32(prefixCount)}, geoAssetStats{
+		SegmentCount:       prefixCount,
+		RawSegmentCount:    len(segments),
+		MergedSegmentCount: len(merged),
+		PrefixCount:        prefixCount,
+		MaxLookupSteps:     1,
+	}
+}
+
+func writeGeoAssetV4FromSegments(path string, plan *geoAssetPlan, segments []xdbScanSegmentV4, provinceIDs map[string]uint16, provinceCount int) error {
+	if plan == nil {
+		return fmt.Errorf("缺少 geo v4 计划")
+	}
+	encoded := make([]geoPrefixV4, 0, plan.PrefixCount)
+	for _, segment := range mergeGeoSegmentsV4(segments) {
+		provinceID, ok := provinceIDs[segment.Province]
+		if !ok {
+			return fmt.Errorf("未找到省份编号: %s", segment.Province)
+		}
+		for _, prefix := range cidrPrefixesFromRangeV4(segment.Start, segment.End, nil) {
+			prefix.ProvinceID = provinceID
+			encoded = append(encoded, prefix)
+		}
+	}
+	return writeGeoAssetV4(path, encoded, provinceCount)
+}
+
+func writeGeoAssetV6FromSegments(path string, plan *geoAssetPlan, segments []xdbScanSegmentV6, provinceIDs map[string]uint16, provinceCount int) error {
+	if plan == nil {
+		return fmt.Errorf("缺少 geo v6 计划")
+	}
+	encoded := make([]geoPrefixV6, 0, plan.PrefixCount)
+	for _, segment := range mergeGeoSegmentsV6(segments) {
+		provinceID, ok := provinceIDs[segment.Province]
+		if !ok {
+			return fmt.Errorf("未找到省份编号: %s", segment.Province)
+		}
+		for _, prefix := range cidrPrefixesFromRangeV6(segment.Start, segment.End, nil) {
+			prefix.ProvinceID = provinceID
+			encoded = append(encoded, prefix)
+		}
+	}
+	return writeGeoAssetV6(path, encoded, provinceCount)
+}
+
+func mergeGeoSegmentsV4(segments []xdbScanSegmentV4) []geoRangeV4 {
+	ranges := make([]geoRangeV4, 0, len(segments))
+	for _, segment := range segments {
+		ranges = append(ranges, geoRangeV4{
+			Province: segment.Province,
+			Start:    xdbIPv4SegmentValue(segment.Start),
+			End:      xdbIPv4SegmentValue(segment.End),
+		})
+	}
+	slices.SortFunc(ranges, func(left, right geoRangeV4) int {
+		if left.Start < right.Start {
+			return -1
+		}
+		if left.Start > right.Start {
+			return 1
+		}
+		if left.End < right.End {
+			return -1
+		}
+		if left.End > right.End {
+			return 1
+		}
+		return strings.Compare(left.Province, right.Province)
+	})
+	merged := make([]geoRangeV4, 0, len(ranges))
+	for _, current := range ranges {
+		if current.Start > current.End {
+			continue
+		}
+		if len(merged) == 0 {
+			merged = append(merged, current)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		adjacent := last.End != ^uint32(0) && current.Start == last.End+1
+		if last.Province == current.Province && (current.Start <= last.End || adjacent) {
+			if current.End > last.End {
+				last.End = current.End
+			}
+			continue
+		}
+		merged = append(merged, current)
+	}
+	return merged
+}
+
+func mergeGeoSegmentsV6(segments []xdbScanSegmentV6) []geoRangeV6 {
+	ranges := make([]geoRangeV6, 0, len(segments))
+	for _, segment := range segments {
+		ranges = append(ranges, geoRangeV6{
+			Province: segment.Province,
+			Start:    segment.Start,
+			End:      segment.End,
+		})
+	}
+	slices.SortFunc(ranges, func(left, right geoRangeV6) int {
 		if cmp := bytes.Compare(left.Start[:], right.Start[:]); cmp != 0 {
 			return cmp
 		}
@@ -570,71 +656,106 @@ func planGeoAssetV6Segments(segments []xdbScanSegmentV6) (*geoAssetPlan, geoAsse
 		}
 		return strings.Compare(left.Province, right.Province)
 	})
-
-	buckets := make([]geoBucket, geoBucketEntries)
-	first := 0
-	last := 0
-	active := 0
-	var maxCount uint32
-	for bucket := 0; bucket < geoBucketEntries; bucket++ {
-		bucketStart := ipv6BucketStart(bucket)
-		bucketEnd := ipv6BucketEnd(bucket)
-		for first < len(segments) && bytes.Compare(segments[first].End[:], bucketStart[:]) < 0 {
-			first++
+	merged := make([]geoRangeV6, 0, len(ranges))
+	for _, current := range ranges {
+		if bytes.Compare(current.Start[:], current.End[:]) > 0 {
+			continue
 		}
-		if last < first {
-			last = first
+		if len(merged) == 0 {
+			merged = append(merged, current)
+			continue
 		}
-		for last < len(segments) && bytes.Compare(segments[last].Start[:], bucketEnd[:]) <= 0 {
-			last++
-		}
-		if last > first {
-			count := uint32(last - first)
-			buckets[bucket] = geoBucket{Start: uint32(first), Count: count}
-			active++
-			if count > maxCount {
-				maxCount = count
+		last := &merged[len(merged)-1]
+		nextAfterLast, ok := ipv6RangeNext(last.End)
+		if last.Province == current.Province && (!ok || bytes.Compare(current.Start[:], nextAfterLast[:]) <= 0) {
+			if bytes.Compare(current.End[:], last.End[:]) > 0 {
+				last.End = current.End
 			}
+			continue
 		}
+		merged = append(merged, current)
 	}
-	return &geoAssetPlan{Buckets: buckets, SegmentCount: uint32(len(segments))}, geoAssetStats{
-		BucketCount:    active,
-		SegmentCount:   len(segments),
-		MaxBucketCount: maxCount,
-		MaxLookupSteps: binarySearchSteps(maxCount),
-	}
+	return merged
 }
 
-func writeGeoAssetV4FromSegments(path string, plan *geoAssetPlan, segments []xdbScanSegmentV4, provinceIDs map[string]uint16, provinceCount int) error {
-	encoded := make([]geoSegmentV4, 0, len(segments))
-	for _, segment := range segments {
-		provinceID, ok := provinceIDs[segment.Province]
-		if !ok {
-			return fmt.Errorf("未找到省份编号: %s", segment.Province)
+func cidrPrefixesFromRangeV4(start, end uint32, out []geoPrefixV4) []geoPrefixV4 {
+	for start <= end {
+		alignmentBits := bits.TrailingZeros32(start)
+		if start == 0 {
+			alignmentBits = 32
 		}
-		encoded = append(encoded, geoSegmentV4{
-			Start:      xdbIPv4SegmentValue(segment.Start),
-			End:        xdbIPv4SegmentValue(segment.End),
-			ProvinceID: provinceID,
-		})
+		remaining := uint64(end) - uint64(start) + 1
+		remainingBits := bits.Len64(remaining) - 1
+		blockBits := alignmentBits
+		if remainingBits < blockBits {
+			blockBits = remainingBits
+		}
+		out = append(out, geoPrefixV4{PrefixLen: uint32(32 - blockBits), Addr: start})
+		if blockBits == 32 {
+			break
+		}
+		start += uint32(uint64(1) << blockBits)
 	}
-	return writeGeoAssetV4(path, plan.Buckets, encoded, provinceCount)
+	return out
 }
 
-func writeGeoAssetV6FromSegments(path string, plan *geoAssetPlan, segments []xdbScanSegmentV6, provinceIDs map[string]uint16, provinceCount int) error {
-	encoded := make([]geoSegmentV6, 0, len(segments))
-	for _, segment := range segments {
-		provinceID, ok := provinceIDs[segment.Province]
-		if !ok {
-			return fmt.Errorf("未找到省份编号: %s", segment.Province)
+func cidrPrefixesFromRangeV6(start, end [16]byte, out []geoPrefixV6) []geoPrefixV6 {
+	current := ipv6BytesToBig(start)
+	limit := ipv6BytesToBig(end)
+	one := big.NewInt(1)
+	for current.Cmp(limit) <= 0 {
+		alignmentBits := ipv6TrailingZeros(current)
+		remaining := new(big.Int).Sub(limit, current)
+		remaining.Add(remaining, one)
+		remainingBits := remaining.BitLen() - 1
+		blockBits := alignmentBits
+		if remainingBits < blockBits {
+			blockBits = remainingBits
 		}
-		encoded = append(encoded, geoSegmentV6{
-			Start:      segment.Start,
-			End:        segment.End,
-			ProvinceID: provinceID,
-		})
+		out = append(out, geoPrefixV6{PrefixLen: uint32(128 - blockBits), Addr: bigToIPv6Bytes(current)})
+		if blockBits == 128 {
+			break
+		}
+		current.Add(current, new(big.Int).Lsh(one, uint(blockBits)))
 	}
-	return writeGeoAssetV6(path, plan.Buckets, encoded, provinceCount)
+	return out
+}
+
+func ipv6TrailingZeros(value *big.Int) int {
+	if value.Sign() == 0 {
+		return 128
+	}
+	for i := 0; i < 128; i++ {
+		if value.Bit(i) != 0 {
+			return i
+		}
+	}
+	return 128
+}
+
+func ipv6BytesToBig(value [16]byte) *big.Int {
+	return new(big.Int).SetBytes(value[:])
+}
+
+func bigToIPv6Bytes(value *big.Int) [16]byte {
+	var out [16]byte
+	raw := value.Bytes()
+	copy(out[len(out)-len(raw):], raw)
+	return out
+}
+
+func ipv6RangeNext(value [16]byte) ([16]byte, bool) {
+	out := value
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] != 0xff {
+			out[i]++
+			for j := i + 1; j < len(out); j++ {
+				out[j] = 0
+			}
+			return out, true
+		}
+	}
+	return out, false
 }
 
 func ipv6BucketStart(bucket int) [16]byte {
@@ -866,44 +987,35 @@ func binarySearchSteps(count uint32) int {
 }
 
 func validateGeoAssetStats(label string, stats geoAssetStats, segmentLimit int) error {
-	if stats.SegmentCount > segmentLimit {
-		return fmt.Errorf("geo %s segment_count=%d 超过当前 BPF map 上限 %d", label, stats.SegmentCount, segmentLimit)
-	}
-	if stats.MaxLookupSteps > geoLookupLoopLimit {
-		return fmt.Errorf(
-			"geo %s 最大 bucket 窗口=%d，需要 %d 次二分，超过当前 BPF loop 预算 %d",
-			label,
-			stats.MaxBucketCount,
-			stats.MaxLookupSteps,
-			geoLookupLoopLimit,
-		)
+	if stats.PrefixCount > segmentLimit {
+		return fmt.Errorf("geo %s prefix_count=%d 超过当前 BPF LPM map 上限 %d", label, stats.PrefixCount, segmentLimit)
 	}
 	return nil
 }
 
-func writeGeoAssetV4(path string, buckets []geoBucket, segments []geoSegmentV4, provinceCount int) error {
+func writeGeoAssetV4(path string, prefixes []geoPrefixV4, provinceCount int) error {
 	header := geoHeader{}
 	copy(header.Magic[:], []byte(geoAssetMagic))
 	header.Version = geoAssetVersion
 	header.IPVersion = 4
-	header.BucketCount = uint32(len(buckets))
-	header.SegmentCount = uint32(len(segments))
+	header.BucketCount = 0
+	header.SegmentCount = uint32(len(prefixes))
 	header.ProvinceCount = uint32(provinceCount)
-	return writeGeoAsset(path, header, buckets, segments, "v4")
+	return writeGeoAsset(path, header, prefixes, "v4")
 }
 
-func writeGeoAssetV6(path string, buckets []geoBucket, segments []geoSegmentV6, provinceCount int) error {
+func writeGeoAssetV6(path string, prefixes []geoPrefixV6, provinceCount int) error {
 	header := geoHeader{}
 	copy(header.Magic[:], []byte(geoAssetMagic))
 	header.Version = geoAssetVersion
 	header.IPVersion = 6
-	header.BucketCount = uint32(len(buckets))
-	header.SegmentCount = uint32(len(segments))
+	header.BucketCount = 0
+	header.SegmentCount = uint32(len(prefixes))
 	header.ProvinceCount = uint32(provinceCount)
-	return writeGeoAsset(path, header, buckets, segments, "v6")
+	return writeGeoAsset(path, header, prefixes, "v6")
 }
 
-func writeGeoAsset[T any](path string, header geoHeader, buckets []geoBucket, segments []T, label string) (err error) {
+func writeGeoAsset[T any](path string, header geoHeader, prefixes []T, label string) (err error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("创建 geo %s 资产失败: %w", label, err)
@@ -917,14 +1029,9 @@ func writeGeoAsset[T any](path string, header geoHeader, buckets []geoBucket, se
 	if err := binary.Write(file, binary.LittleEndian, header); err != nil {
 		return fmt.Errorf("编码 geo %s header 失败: %w", label, err)
 	}
-	for _, bucket := range buckets {
-		if err := binary.Write(file, binary.LittleEndian, bucket); err != nil {
-			return fmt.Errorf("编码 geo %s bucket 失败: %w", label, err)
-		}
-	}
-	for _, segment := range segments {
-		if err := binary.Write(file, binary.LittleEndian, segment); err != nil {
-			return fmt.Errorf("编码 geo %s segment 失败: %w", label, err)
+	for _, prefix := range prefixes {
+		if err := binary.Write(file, binary.LittleEndian, prefix); err != nil {
+			return fmt.Errorf("编码 geo %s prefix 失败: %w", label, err)
 		}
 	}
 	if err := file.Chmod(0o644); err != nil {
@@ -933,70 +1040,76 @@ func writeGeoAsset[T any](path string, header geoHeader, buckets []geoBucket, se
 	return nil
 }
 
-func readGeoAssetV4(path string) ([]geoBucket, []geoSegmentV4, uint16, error) {
+func readGeoAssetV4(path string) ([]geoPrefixV4, uint16, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("读取 geo v4 资产失败: %w", err)
+		return nil, 0, fmt.Errorf("读取 geo v4 资产失败: %w", err)
 	}
 	if len(content) < geoHeaderSize {
-		return nil, nil, 0, fmt.Errorf("geo v4 资产过短")
+		return nil, 0, fmt.Errorf("geo v4 资产过短")
 	}
 	var header geoHeader
 	if err := binary.Read(bytes.NewReader(content[:geoHeaderSize]), binary.LittleEndian, &header); err != nil {
-		return nil, nil, 0, fmt.Errorf("解析 geo v4 header 失败: %w", err)
+		return nil, 0, fmt.Errorf("解析 geo v4 header 失败: %w", err)
 	}
 	if string(header.Magic[:]) != geoAssetMagic {
-		return nil, nil, 0, fmt.Errorf("geo v4 magic 不匹配")
+		return nil, 0, fmt.Errorf("geo v4 magic 不匹配")
+	}
+	if header.Version != geoAssetVersion {
+		return nil, 0, fmt.Errorf("geo v4 资产版本=%d，不支持", header.Version)
+	}
+	if header.BucketCount != 0 {
+		return nil, 0, fmt.Errorf("geo v4 资产 bucket_count=%d，不支持 v2 prefix 格式", header.BucketCount)
 	}
 	offset := geoHeaderSize
-	buckets := make([]geoBucket, int(header.BucketCount))
-	for i := range buckets {
-		buckets[i].Start = binary.LittleEndian.Uint32(content[offset:])
-		buckets[i].Count = binary.LittleEndian.Uint32(content[offset+4:])
-		offset += 8
+	prefixes := make([]geoPrefixV4, int(header.SegmentCount))
+	if len(content) < offset+len(prefixes)*12 {
+		return nil, 0, fmt.Errorf("geo v4 prefix 数据截断")
 	}
-	segments := make([]geoSegmentV4, int(header.SegmentCount))
-	for i := range segments {
-		segments[i].Start = binary.LittleEndian.Uint32(content[offset:])
-		segments[i].End = binary.LittleEndian.Uint32(content[offset+4:])
-		segments[i].ProvinceID = binary.LittleEndian.Uint16(content[offset+8:])
-		segments[i].Pad = binary.LittleEndian.Uint16(content[offset+10:])
+	for i := range prefixes {
+		prefixes[i].PrefixLen = binary.LittleEndian.Uint32(content[offset:])
+		prefixes[i].Addr = binary.LittleEndian.Uint32(content[offset+4:])
+		prefixes[i].ProvinceID = binary.LittleEndian.Uint16(content[offset+8:])
+		prefixes[i].Pad = binary.LittleEndian.Uint16(content[offset+10:])
 		offset += 12
 	}
-	return buckets, segments, header.IPVersion, nil
+	return prefixes, header.IPVersion, nil
 }
 
-func readGeoAssetV6(path string) ([]geoBucket, []geoSegmentV6, uint16, error) {
+func readGeoAssetV6(path string) ([]geoPrefixV6, uint16, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("读取 geo v6 资产失败: %w", err)
+		return nil, 0, fmt.Errorf("读取 geo v6 资产失败: %w", err)
 	}
 	if len(content) < geoHeaderSize {
-		return nil, nil, 0, fmt.Errorf("geo v6 资产过短")
+		return nil, 0, fmt.Errorf("geo v6 资产过短")
 	}
 	var header geoHeader
 	if err := binary.Read(bytes.NewReader(content[:geoHeaderSize]), binary.LittleEndian, &header); err != nil {
-		return nil, nil, 0, fmt.Errorf("解析 geo v6 header 失败: %w", err)
+		return nil, 0, fmt.Errorf("解析 geo v6 header 失败: %w", err)
 	}
 	if string(header.Magic[:]) != geoAssetMagic {
-		return nil, nil, 0, fmt.Errorf("geo v6 magic 不匹配")
+		return nil, 0, fmt.Errorf("geo v6 magic 不匹配")
+	}
+	if header.Version != geoAssetVersion {
+		return nil, 0, fmt.Errorf("geo v6 资产版本=%d，不支持", header.Version)
+	}
+	if header.BucketCount != 0 {
+		return nil, 0, fmt.Errorf("geo v6 资产 bucket_count=%d，不支持 v2 prefix 格式", header.BucketCount)
 	}
 	offset := geoHeaderSize
-	buckets := make([]geoBucket, int(header.BucketCount))
-	for i := range buckets {
-		buckets[i].Start = binary.LittleEndian.Uint32(content[offset:])
-		buckets[i].Count = binary.LittleEndian.Uint32(content[offset+4:])
-		offset += 8
+	prefixes := make([]geoPrefixV6, int(header.SegmentCount))
+	if len(content) < offset+len(prefixes)*24 {
+		return nil, 0, fmt.Errorf("geo v6 prefix 数据截断")
 	}
-	segments := make([]geoSegmentV6, int(header.SegmentCount))
-	for i := range segments {
-		copy(segments[i].Start[:], content[offset:offset+16])
-		copy(segments[i].End[:], content[offset+16:offset+32])
-		segments[i].ProvinceID = binary.LittleEndian.Uint16(content[offset+32:])
-		segments[i].Pad = binary.LittleEndian.Uint16(content[offset+34:])
-		offset += 36
+	for i := range prefixes {
+		prefixes[i].PrefixLen = binary.LittleEndian.Uint32(content[offset:])
+		copy(prefixes[i].Addr[:], content[offset+4:offset+20])
+		prefixes[i].ProvinceID = binary.LittleEndian.Uint16(content[offset+20:])
+		prefixes[i].Pad = binary.LittleEndian.Uint16(content[offset+22:])
+		offset += 24
 	}
-	return buckets, segments, header.IPVersion, nil
+	return prefixes, header.IPVersion, nil
 }
 
 func geoAssetHashes(assetDir string) ([]whitelistContentHash, error) {
@@ -1021,6 +1134,17 @@ func geoModeEnabled(mode string) bool {
 	}
 }
 
+type geoCheckResult struct {
+	Address       string `json:"address"`
+	Mode          string `json:"mode"`
+	Province      string `json:"province,omitempty"`
+	ProvinceID    uint16 `json:"province_id,omitempty"`
+	CustomAllowed bool   `json:"custom_allowed"`
+	GeoAllowed    bool   `json:"geo_allowed"`
+	Allowed       bool   `json:"allowed"`
+	MatchedSource string `json:"matched_source"`
+}
+
 func geoCheck(opts geoCheckOptions) error {
 	assets, err := loadGeoAssets(opts.AssetDir)
 	if err != nil {
@@ -1043,35 +1167,91 @@ func geoCheck(opts geoCheckOptions) error {
 	if err != nil {
 		return err
 	}
-	if customAllowed {
-		_, _ = fmt.Fprintln(os.Stdout, "allow custom")
-		return nil
+	result := geoCheckResult{
+		Address: addr.String(),
+		Mode:    mode,
 	}
-	provinceID, provinceName, geoAllowed, err := geoAssetContainsAddress(assets, addr)
+	provinceID, provinceName, geoHit, err := geoAssetContainsAddress(assets, addr)
 	if err != nil {
 		return err
 	}
-	if !geoAllowed {
-		_, _ = fmt.Fprintln(os.Stdout, "deny not-cn")
+	if geoHit {
+		result.ProvinceID = provinceID
+		result.Province = provinceName
+	}
+	if customAllowed {
+		result.CustomAllowed = true
+		result.Allowed = true
+		result.MatchedSource = "custom"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
+		return nil
+	}
+	if !geoHit {
+		result.MatchedSource = "not-cn"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
 		return fmt.Errorf("未命中中国段")
 	}
 	switch mode {
 	case "all":
-		_, _ = fmt.Fprintf(os.Stdout, "allow geo province=%s id=%d\n", provinceName, provinceID)
+		result.GeoAllowed = true
+		result.Allowed = true
+		result.MatchedSource = "geo"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
 		return nil
 	case "provinces":
 		if _, ok := allowedProvinces[provinceName]; ok {
-			_, _ = fmt.Fprintf(os.Stdout, "allow geo province=%s id=%d\n", provinceName, provinceID)
+			result.GeoAllowed = true
+			result.Allowed = true
+			result.MatchedSource = "geo"
+			if err := writeGeoCheckResult(opts, result); err != nil {
+				return err
+			}
 			return nil
 		}
-		_, _ = fmt.Fprintf(os.Stdout, "deny province=%s id=%d\n", provinceName, provinceID)
+		result.MatchedSource = "province-deny"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
 		return fmt.Errorf("省份未授权: %s", provinceName)
 	case "off":
-		_, _ = fmt.Fprintln(os.Stdout, "deny mode-off")
+		result.MatchedSource = "mode-off"
+		if err := writeGeoCheckResult(opts, result); err != nil {
+			return err
+		}
 		return fmt.Errorf("geo 模式已关闭")
 	default:
 		return fmt.Errorf("无效 geo mode: %s", mode)
 	}
+}
+
+func writeGeoCheckResult(opts geoCheckOptions, result geoCheckResult) error {
+	if opts.JSON {
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return fmt.Errorf("序列化 geo-check 结果失败: %w", err)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, string(encoded))
+		return nil
+	}
+	switch {
+	case result.CustomAllowed:
+		_, _ = fmt.Fprintln(os.Stdout, "allow custom")
+	case result.Allowed && result.MatchedSource == "geo":
+		_, _ = fmt.Fprintf(os.Stdout, "allow geo province=%s id=%d\n", result.Province, result.ProvinceID)
+	case result.MatchedSource == "not-cn":
+		_, _ = fmt.Fprintln(os.Stdout, "deny not-cn")
+	case result.MatchedSource == "mode-off":
+		_, _ = fmt.Fprintln(os.Stdout, "deny mode-off")
+	default:
+		_, _ = fmt.Fprintf(os.Stdout, "deny province=%s id=%d\n", result.Province, result.ProvinceID)
+	}
+	return nil
 }
 
 func parseProvinceCSV(raw string) map[string]struct{} {
@@ -1119,27 +1299,19 @@ func geoAssetContainsAddress(assets *geoAssetRuntime, addr netip.Addr) (uint16, 
 	}
 	if addr.Is4() {
 		v4 := addr.As4()
-		bucket := assets.BucketsV4[int(v4[0])<<8|int(v4[1])]
-		if bucket.Count == 0 {
-			return 0, "", false, nil
-		}
 		target := ipv4BytesToBE(v4)
-		segment, ok := findGeoSegmentV4(assets.SegmentsV4, bucket, target)
+		prefix, ok := findGeoPrefixV4(assets.PrefixesV4, target)
 		if !ok {
 			return 0, "", false, nil
 		}
-		return segment.ProvinceID, assets.provinceName(segment.ProvinceID), true, nil
+		return prefix.ProvinceID, assets.provinceName(prefix.ProvinceID), true, nil
 	}
 	v6 := addr.As16()
-	bucket := assets.BucketsV6[int(v6[0])<<8|int(v6[1])]
-	if bucket.Count == 0 {
-		return 0, "", false, nil
-	}
-	segment, ok := findGeoSegmentV6(assets.SegmentsV6, bucket, v6)
+	prefix, ok := findGeoPrefixV6(assets.PrefixesV6, v6)
 	if !ok {
 		return 0, "", false, nil
 	}
-	return segment.ProvinceID, assets.provinceName(segment.ProvinceID), true, nil
+	return prefix.ProvinceID, assets.provinceName(prefix.ProvinceID), true, nil
 }
 
 func (assets *geoAssetRuntime) provinceName(id uint16) string {
@@ -1151,40 +1323,59 @@ func (assets *geoAssetRuntime) provinceName(id uint16) string {
 	return ""
 }
 
-func findGeoSegmentV4(segments []geoSegmentV4, bucket geoBucket, target uint32) (geoSegmentV4, bool) {
-	low := int(bucket.Start)
-	high := low + int(bucket.Count) - 1
-	for low <= high {
-		mid := low + (high-low)/2
-		segment := segments[mid]
-		if target < segment.Start {
-			high = mid - 1
+func findGeoPrefixV4(prefixes []geoPrefixV4, target uint32) (geoPrefixV4, bool) {
+	var best geoPrefixV4
+	found := false
+	for _, prefix := range prefixes {
+		if prefix.PrefixLen > 32 {
 			continue
 		}
-		if target > segment.End {
-			low = mid + 1
+		if found && prefix.PrefixLen <= best.PrefixLen {
 			continue
 		}
-		return segment, true
+		if geoPrefixV4Contains(prefix, target) {
+			best = prefix
+			found = true
+		}
 	}
-	return geoSegmentV4{}, false
+	return best, found
 }
 
-func findGeoSegmentV6(segments []geoSegmentV6, bucket geoBucket, target [16]byte) (geoSegmentV6, bool) {
-	low := int(bucket.Start)
-	high := low + int(bucket.Count) - 1
-	for low <= high {
-		mid := low + (high-low)/2
-		segment := segments[mid]
-		if bytes.Compare(target[:], segment.Start[:]) < 0 {
-			high = mid - 1
-			continue
-		}
-		if bytes.Compare(target[:], segment.End[:]) > 0 {
-			low = mid + 1
-			continue
-		}
-		return segment, true
+func geoPrefixV4Contains(prefix geoPrefixV4, target uint32) bool {
+	if prefix.PrefixLen == 0 {
+		return true
 	}
-	return geoSegmentV6{}, false
+	mask := ^uint32(0) << (32 - prefix.PrefixLen)
+	return target&mask == prefix.Addr&mask
+}
+
+func findGeoPrefixV6(prefixes []geoPrefixV6, target [16]byte) (geoPrefixV6, bool) {
+	var best geoPrefixV6
+	found := false
+	for _, prefix := range prefixes {
+		if prefix.PrefixLen > 128 {
+			continue
+		}
+		if found && prefix.PrefixLen <= best.PrefixLen {
+			continue
+		}
+		if geoPrefixV6Contains(prefix, target) {
+			best = prefix
+			found = true
+		}
+	}
+	return best, found
+}
+
+func geoPrefixV6Contains(prefix geoPrefixV6, target [16]byte) bool {
+	fullBytes := int(prefix.PrefixLen / 8)
+	remainingBits := int(prefix.PrefixLen % 8)
+	if fullBytes > 0 && !bytes.Equal(prefix.Addr[:fullBytes], target[:fullBytes]) {
+		return false
+	}
+	if remainingBits == 0 {
+		return true
+	}
+	mask := byte(0xff << (8 - remainingBits))
+	return prefix.Addr[fullBytes]&mask == target[fullBytes]&mask
 }

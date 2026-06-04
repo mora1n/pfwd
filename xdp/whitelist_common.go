@@ -20,6 +20,7 @@ type geoCheckOptions struct {
 	ProvinceCSV         string
 	WhitelistFile       string
 	EgressWhitelistFile string
+	JSON                bool
 }
 
 func whitelistFileHashes(files []string) ([]whitelistContentHash, error) {
