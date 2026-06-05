@@ -1118,6 +1118,92 @@ func TestGeoAllowedProvinceIDs(t *testing.T) {
 	}
 }
 
+func TestGeoWhitelistPrefixCounts(t *testing.T) {
+	assets := &geoAssetRuntime{
+		PrefixesV4: []geoPrefixV4{
+			{ProvinceID: 1},
+			{ProvinceID: 2},
+			{ProvinceID: 2},
+			{ProvinceID: 3},
+		},
+		PrefixesV6: []geoPrefixV6{
+			{ProvinceID: 2},
+			{ProvinceID: 4},
+		},
+	}
+	allowed := map[uint16]struct{}{
+		2: {},
+		3: {},
+	}
+
+	got := countGeoWhitelistPrefixes(assets, allowed)
+	if got.V4 != 3 || got.V6 != 1 {
+		t.Fatalf("countGeoWhitelistPrefixes()=%+v, want V4=3 V6=1", got)
+	}
+
+	got = countGeoWhitelistPrefixes(assets, nil)
+	if got.V4 != 0 || got.V6 != 0 {
+		t.Fatalf("countGeoWhitelistPrefixes(nil allowed)=%+v, want zero", got)
+	}
+}
+
+func TestValidateGeoWhitelistCapacity(t *testing.T) {
+	if err := validateGeoWhitelistCapacity("v4", 3, 3); err != nil {
+		t.Fatalf("validateGeoWhitelistCapacity exact fit: %v", err)
+	}
+	if err := validateGeoWhitelistCapacity("v6", 0, 0); err != nil {
+		t.Fatalf("validateGeoWhitelistCapacity empty map: %v", err)
+	}
+
+	err := validateGeoWhitelistCapacity("v4", 4, 3)
+	if err == nil {
+		t.Fatalf("validateGeoWhitelistCapacity over capacity error=nil, want error")
+	}
+	want := "geo whitelist v4 prefixes=4 exceeds map max_entries=3"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("validateGeoWhitelistCapacity error=%q, want contains %q", err, want)
+	}
+}
+
+func TestWhitelistV4MapCapacityCoversCurrentGeoAsset(t *testing.T) {
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpBPFEL))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader: %v", err)
+	}
+	for _, name := range []string{"pfwd_whitelist_v4", "pfwd_egress_whitelist_v4"} {
+		mapSpec := spec.Maps[name]
+		if mapSpec == nil {
+			t.Fatalf("missing BPF map %s", name)
+		}
+		if mapSpec.MaxEntries < 131072 {
+			t.Fatalf("%s max_entries=%d, want at least 131072", name, mapSpec.MaxEntries)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join("..", "assets", "pfwd-geo-meta.json"))
+	if err != nil {
+		t.Fatalf("read geo meta: %v", err)
+	}
+	var meta geoAssetMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("unmarshal geo meta: %v", err)
+	}
+	if meta.IPv4Prefixes > int(spec.Maps["pfwd_whitelist_v4"].MaxEntries) {
+		t.Fatalf(
+			"geo asset IPv4 prefixes=%d exceed pfwd_whitelist_v4 max_entries=%d",
+			meta.IPv4Prefixes,
+			spec.Maps["pfwd_whitelist_v4"].MaxEntries,
+		)
+	}
+	if meta.IPv4Prefixes > int(spec.Maps["pfwd_egress_whitelist_v4"].MaxEntries) {
+		t.Fatalf(
+			"geo asset IPv4 prefixes=%d exceed pfwd_egress_whitelist_v4 max_entries=%d",
+			meta.IPv4Prefixes,
+			spec.Maps["pfwd_egress_whitelist_v4"].MaxEntries,
+		)
+	}
+}
+
 func TestMakeRuleValGuardFlags(t *testing.T) {
 	baseRule := runtimeRule{
 		Index:          1,

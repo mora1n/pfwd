@@ -35,7 +35,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.8"
 const dataplaneVersion = 2
-const mapABIVersion = 14
+const mapABIVersion = 15
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -1849,6 +1849,13 @@ func loadGeoPrefixesIntoWhitelist(mapV4 *ebpf.Map, mapV6 *ebpf.Map, assets *geoA
 	if mapV4 == nil || mapV6 == nil {
 		return fmt.Errorf("白名单 BPF map 未加载")
 	}
+	counts := countGeoWhitelistPrefixes(assets, allowed)
+	if err := ensureGeoWhitelistCapacity("v4", counts.V4, mapV4); err != nil {
+		return err
+	}
+	if err := ensureGeoWhitelistCapacity("v6", counts.V6, mapV6); err != nil {
+		return err
+	}
 	value := uint8(1)
 	for i, prefix := range assets.PrefixesV4 {
 		if _, ok := allowed[prefix.ProvinceID]; !ok {
@@ -1875,6 +1882,49 @@ func loadGeoPrefixesIntoWhitelist(mapV4 *ebpf.Map, mapV6 *ebpf.Map, assets *geoA
 		}
 	}
 	return nil
+}
+
+type geoWhitelistPrefixCounts struct {
+	V4 int
+	V6 int
+}
+
+func countGeoWhitelistPrefixes(assets *geoAssetRuntime, allowed map[uint16]struct{}) geoWhitelistPrefixCounts {
+	var counts geoWhitelistPrefixCounts
+	if assets == nil || len(allowed) == 0 {
+		return counts
+	}
+	for _, prefix := range assets.PrefixesV4 {
+		if _, ok := allowed[prefix.ProvinceID]; ok {
+			counts.V4++
+		}
+	}
+	for _, prefix := range assets.PrefixesV6 {
+		if _, ok := allowed[prefix.ProvinceID]; ok {
+			counts.V6++
+		}
+	}
+	return counts
+}
+
+func ensureGeoWhitelistCapacity(version string, needed int, m *ebpf.Map) error {
+	info, err := m.Info()
+	if err != nil {
+		return fmt.Errorf("读取 geo whitelist %s BPF map 信息失败: %w", version, err)
+	}
+	return validateGeoWhitelistCapacity(version, needed, info.MaxEntries)
+}
+
+func validateGeoWhitelistCapacity(version string, needed int, maxEntries uint32) error {
+	if needed <= int(maxEntries) {
+		return nil
+	}
+	return fmt.Errorf(
+		"geo whitelist %s prefixes=%d exceeds map max_entries=%d; rebuild with larger map or reduce CN asset",
+		version,
+		needed,
+		maxEntries,
+	)
 }
 
 func geoAllowedProvinceIDs(

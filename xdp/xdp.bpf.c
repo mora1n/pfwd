@@ -70,6 +70,10 @@ enum pfwd_whitelist_cn_mode {
     PFWD_WL_CN_PROVINCES = 2,
 };
 
+enum pfwd_map_sizes {
+    PFWD_WHITELIST_V4_MAX_ENTRIES = 131072,
+};
+
 enum pfwd_conn_state {
     PFWD_CONN_STATE_NONE = 0,
     PFWD_CONN_STATE_TCP_SYN_PENDING = 1,
@@ -359,7 +363,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __uint(max_entries, 65536);
+    __uint(max_entries, PFWD_WHITELIST_V4_MAX_ENTRIES);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, struct pfwd_whitelist_key_v4);
     __type(value, __u8);
@@ -434,7 +438,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
-    __uint(max_entries, 65536);
+    __uint(max_entries, PFWD_WHITELIST_V4_MAX_ENTRIES);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, struct pfwd_whitelist_key_v4);
     __type(value, __u8);
