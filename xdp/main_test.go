@@ -693,6 +693,135 @@ func TestGeoCheckWithCustomCIDRAndProvinceMode(t *testing.T) {
 	}
 }
 
+func TestGeoCheckHiddenCNUnknownOnlyAllowsAllMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := geoAssetMeta{
+		FormatVersion: geoAssetVersion,
+		BuiltAt:       time.Now().UTC().Format(time.RFC3339),
+		Provinces: []geoProvinceEntry{
+			{ID: 1, Name: "浙江省"},
+			{ID: 2, Name: geoHiddenCNProvinceName, Hidden: true},
+		},
+		IPv4Segments: 1,
+		IPv4Prefixes: 1,
+	}
+	metaContent, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, geoMetaAssetFile), metaContent, 0o644); err != nil {
+		t.Fatalf("write meta: %v", err)
+	}
+	prefixes := []geoPrefixV4{
+		{PrefixLen: 24, Addr: binary.BigEndian.Uint32([]byte{39, 144, 124, 0}), ProvinceID: 2},
+	}
+	if err := writeGeoAssetV4(filepath.Join(tmpDir, geoIPv4AssetFile), prefixes, 2); err != nil {
+		t.Fatalf("write v4 asset: %v", err)
+	}
+	if err := writeGeoAssetV6(filepath.Join(tmpDir, geoIPv6AssetFile), nil, 2); err != nil {
+		t.Fatalf("write v6 asset: %v", err)
+	}
+
+	capture := func(opts geoCheckOptions) (geoCheckResult, error) {
+		t.Helper()
+		var out bytes.Buffer
+		stdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		os.Stdout = w
+		err = geoCheck(opts)
+		_ = w.Close()
+		os.Stdout = stdout
+		_, _ = io.Copy(&out, r)
+		_ = r.Close()
+		var result geoCheckResult
+		if decodeErr := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &result); decodeErr != nil {
+			t.Fatalf("unmarshal geoCheck json: %v output=%q", decodeErr, out.String())
+		}
+		return result, err
+	}
+
+	all, err := capture(geoCheckOptions{AssetDir: tmpDir, Address: "39.144.124.183", Mode: "all", JSON: true})
+	if err != nil {
+		t.Fatalf("geoCheck all: %v", err)
+	}
+	if !all.Allowed || !all.GeoAllowed || all.Province != geoHiddenCNProvinceName || all.MatchedSource != "geo" {
+		t.Fatalf("geoCheck all=%+v, want hidden CN geo allow", all)
+	}
+
+	provinces, err := capture(geoCheckOptions{AssetDir: tmpDir, Address: "39.144.124.183", Mode: "provinces", ProvinceCSV: "浙江省," + geoHiddenCNProvinceName, JSON: true})
+	if err == nil || !strings.Contains(err.Error(), "省份未授权") {
+		t.Fatalf("geoCheck provinces error=%v, want province deny", err)
+	}
+	if provinces.Allowed || provinces.GeoAllowed || provinces.MatchedSource != "province-deny" {
+		t.Fatalf("geoCheck provinces=%+v, want deny hidden province", provinces)
+	}
+}
+
+func TestAdysecIPMergeUnknownCNAndHiddenSubtract(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := `{
+  "provinces": [
+    {
+      "name": "浙江省",
+      "code": "330000",
+      "cities": [
+        {"name": "杭州市", "code": "330100"}
+      ]
+    }
+  ]
+}`
+	metaPath := filepath.Join(tmpDir, cityMetaAssetFile)
+	if err := os.WriteFile(metaPath, []byte(meta), 0o644); err != nil {
+		t.Fatalf("write city meta: %v", err)
+	}
+	catalog, err := loadCityMetaIndex(metaPath)
+	if err != nil {
+		t.Fatalf("loadCityMetaIndex: %v", err)
+	}
+	mergePath := filepath.Join(tmpDir, "ip.merge.txt")
+	content := strings.Join([]string{
+		"39.144.101.0|39.144.136.255|中国|0|0|0|移动",
+		"39.144.137.0|39.144.137.255|中国|0|浙江|杭州|移动",
+		"",
+	}, "\n")
+	if err := os.WriteFile(mergePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write ip.merge: %v", err)
+	}
+	var out geoSupplementalSegments
+	record := geoSourceRecord{Name: "test-ip-merge"}
+	if err := ingestIPMergeSource(mergePath, catalog, &record, &out); err != nil {
+		t.Fatalf("ingestIPMergeSource: %v", err)
+	}
+	if record.RowsAccepted != 2 {
+		t.Fatalf("RowsAccepted=%d, want 2", record.RowsAccepted)
+	}
+	if len(out.V4) != 2 || out.V4[0].Province != geoHiddenCNProvinceName || out.V4[1].Province != "浙江省" || out.V4[1].City != "杭州市" {
+		t.Fatalf("segments=%+v, want hidden unknown and 浙江/杭州", out.V4)
+	}
+	if len(out.CityV4) != 1 || out.CityV4[0].City != "杭州市" {
+		t.Fatalf("city segments=%+v, want only 杭州", out.CityV4)
+	}
+
+	base := []xdbScanSegmentV4{
+		{Province: "浙江省", Start: mustIPv4XDBBytes(t, "39.144.124.0"), End: mustIPv4XDBBytes(t, "39.144.124.255")},
+	}
+	final := finalizeGeoSegmentsV4(base, out.V4[:1])
+	for _, segment := range final {
+		if segment.Province != geoHiddenCNProvinceName {
+			continue
+		}
+		start := xdbIPv4SegmentValue(segment.Start)
+		end := xdbIPv4SegmentValue(segment.End)
+		target := binary.BigEndian.Uint32([]byte{39, 144, 124, 183})
+		if start <= target && target <= end {
+			t.Fatalf("hidden segment still covers known 浙江 range: %+v", segment)
+		}
+	}
+}
+
 func TestGeoAssetPlanningAndStreamingBuild(t *testing.T) {
 	t.Run("v4 planning merges adjacent ranges into prefixes", func(t *testing.T) {
 		tmpDir := t.TempDir()

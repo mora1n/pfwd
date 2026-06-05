@@ -52,8 +52,8 @@ const (
 	// Keep these limits in sync with xdp.bpf.c.
 	geoSegmentV4MapMaxEntries = 131072
 	geoSegmentV6MapMaxEntries = 32768
-	geoBuildTimeout           = 5 * time.Minute
-	geoDownloadTimeout        = 2 * time.Minute
+	geoBuildTimeout           = 20 * time.Minute
+	geoDownloadTimeout        = 4 * time.Minute
 )
 
 var (
@@ -111,8 +111,9 @@ type geoDownloadRecord struct {
 }
 
 type geoProvinceEntry struct {
-	ID   uint16 `json:"id"`
-	Name string `json:"name"`
+	ID     uint16 `json:"id"`
+	Name   string `json:"name"`
+	Hidden bool   `json:"hidden,omitempty"`
 }
 
 type cityAssetMeta struct {
@@ -135,6 +136,7 @@ type geoAssetMeta struct {
 	BuiltAt       string             `json:"built_at"`
 	IPv4          geoDownloadRecord  `json:"ipv4"`
 	IPv6          geoDownloadRecord  `json:"ipv6"`
+	Sources       []geoSourceRecord  `json:"sources,omitempty"`
 	Provinces     []geoProvinceEntry `json:"provinces"`
 	IPv4Buckets   int                `json:"ipv4_buckets"`
 	IPv4Segments  int                `json:"ipv4_segments"`
@@ -149,10 +151,11 @@ type geoAssetMeta struct {
 }
 
 type geoAssetRuntime struct {
-	Meta        geoAssetMeta
-	PrefixesV4  []geoPrefixV4
-	PrefixesV6  []geoPrefixV6
-	ProvinceIDs map[string]uint16
+	Meta              geoAssetMeta
+	PrefixesV4        []geoPrefixV4
+	PrefixesV6        []geoPrefixV6
+	ProvinceIDs       map[string]uint16
+	HiddenProvinceIDs map[uint16]struct{}
 }
 
 type geoProvincePolicyVal struct {
@@ -274,13 +277,32 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 	if err != nil {
 		return err
 	}
+	baseV4Rows := len(v4Segments)
+	baseV6Rows := len(v6Segments)
+	cityIndex, err := loadCityMetaIndex(filepath.Join(opts.AssetDir, cityMetaAssetFile))
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: geoDownloadTimeout}
+	supplemental, err := collectAdysecSupplementalSegments(ctx, client, cityIndex)
+	if err != nil {
+		return err
+	}
+	citySegmentsV4 := finalizeCitySegmentsV4(v4Segments, supplemental.CityV4)
+	v4Segments = finalizeGeoSegmentsV4(v4Segments, supplemental.V4)
+	v6Segments = append(v6Segments, supplemental.V6...)
+
 	provinces := mergeProvinceNames(provinceSetFromSegmentsV4(v4Segments), provinceSetFromSegmentsV6(v6Segments))
 	provinceIDs := make(map[string]uint16, len(provinces))
 	provinceMeta := make([]geoProvinceEntry, 0, len(provinces))
 	for i, province := range provinces {
 		id := uint16(i + 1)
 		provinceIDs[province] = id
-		provinceMeta = append(provinceMeta, geoProvinceEntry{ID: id, Name: province})
+		provinceMeta = append(provinceMeta, geoProvinceEntry{
+			ID:     id,
+			Name:   province,
+			Hidden: province == geoHiddenCNProvinceName,
+		})
 	}
 
 	v4Plan, v4Stats := planGeoAssetV4Segments(v4Segments)
@@ -293,11 +315,7 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 	if err := writeGeoAssetV4FromSegments(filepath.Join(opts.AssetDir, geoIPv4AssetFile), v4Plan, v4Segments, provinceIDs, len(provinceMeta)); err != nil {
 		return err
 	}
-	cityIndex, err := loadCityMetaIndex(filepath.Join(opts.AssetDir, cityMetaAssetFile))
-	if err != nil {
-		return err
-	}
-	if err := writeCityIPv4AssetFromSegments(filepath.Join(opts.AssetDir, cityIPv4AssetFile), v4Segments, cityIndex); err != nil {
+	if err := writeCityIPv4AssetFromSegments(filepath.Join(opts.AssetDir, cityIPv4AssetFile), citySegmentsV4, cityIndex); err != nil {
 		return err
 	}
 
@@ -335,6 +353,10 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 			IndexStart:    binary.LittleEndian.Uint32(v6XDB.Header[xdbIndexStartOff:]),
 			IndexEnd:      binary.LittleEndian.Uint32(v6XDB.Header[xdbIndexEndOff:]),
 		},
+		Sources: append([]geoSourceRecord{
+			geoSourceRecordFromXDB("lionsoul-ip2region-v4", 4, defaultGeoIPv4DownloadURLs, v4XDB, baseV4Rows),
+			geoSourceRecordFromXDB("lionsoul-ip2region-v6", 6, defaultGeoIPv6DownloadURLs, v6XDB, baseV6Rows),
+		}, supplemental.Records...),
 		Provinces:    provinceMeta,
 		IPv4Buckets:  0,
 		IPv4Segments: v4Stats.PrefixCount,
@@ -423,13 +445,17 @@ func loadGeoAssets(assetDir string) (*geoAssetRuntime, error) {
 
 	provinceIDs := make(map[string]uint16, len(meta.Provinces))
 	for _, province := range meta.Provinces {
+		if province.Hidden {
+			continue
+		}
 		provinceIDs[province.Name] = province.ID
 	}
 	return &geoAssetRuntime{
-		Meta:        meta,
-		PrefixesV4:  prefixes4,
-		PrefixesV6:  prefixes6,
-		ProvinceIDs: provinceIDs,
+		Meta:              meta,
+		PrefixesV4:        prefixes4,
+		PrefixesV6:        prefixes6,
+		ProvinceIDs:       provinceIDs,
+		HiddenProvinceIDs: hiddenProvinceIDs(meta),
 	}, nil
 }
 
@@ -696,10 +722,12 @@ func writeGeoAssetV6FromSegments(path string, plan *geoAssetPlan, segments []xdb
 }
 
 type cityMetaCatalog struct {
-	ByName              map[string]cityMetaEntry
-	ByCode              map[uint32]cityMetaEntry
-	ProvincesWithCities map[string]struct{}
-	DirectByProvince    map[string]cityMetaEntry
+	ByName                map[string]cityMetaEntry
+	ByCode                map[uint32]cityMetaEntry
+	ProvincesWithCities   map[string]struct{}
+	DirectByProvince      map[string]cityMetaEntry
+	ProvinceByNormalized  map[string]string
+	ProvinceNamesByLength []string
 }
 
 func loadCityMetaIndex(path string) (cityMetaCatalog, error) {
@@ -712,16 +740,21 @@ func loadCityMetaIndex(path string) (cityMetaCatalog, error) {
 		return cityMetaCatalog{}, fmt.Errorf("解析 city 元数据失败: %w", err)
 	}
 	catalog := cityMetaCatalog{
-		ByName:              map[string]cityMetaEntry{},
-		ByCode:              map[uint32]cityMetaEntry{},
-		ProvincesWithCities: map[string]struct{}{},
-		DirectByProvince:    map[string]cityMetaEntry{},
+		ByName:               map[string]cityMetaEntry{},
+		ByCode:               map[uint32]cityMetaEntry{},
+		ProvincesWithCities:  map[string]struct{}{},
+		DirectByProvince:     map[string]cityMetaEntry{},
+		ProvinceByNormalized: map[string]string{},
 	}
 	for _, province := range meta.Provinces {
+		provinceName := strings.TrimSpace(province.Name)
+		if provinceName != "" {
+			catalog.ProvinceByNormalized[cityMetaProvinceKey(provinceName)] = provinceName
+			catalog.ProvinceNamesByLength = append(catalog.ProvinceNamesByLength, provinceName)
+		}
 		if len(province.Cities) == 0 {
 			continue
 		}
-		provinceName := strings.TrimSpace(province.Name)
 		catalog.ProvincesWithCities[cityMetaProvinceKey(provinceName)] = struct{}{}
 		for _, city := range province.Cities {
 			code, err := parseCityCode(city.Code)
@@ -742,6 +775,15 @@ func loadCityMetaIndex(path string) (cityMetaCatalog, error) {
 			}
 		}
 	}
+	slices.SortFunc(catalog.ProvinceNamesByLength, func(left, right string) int {
+		if len([]rune(left)) > len([]rune(right)) {
+			return -1
+		}
+		if len([]rune(left)) < len([]rune(right)) {
+			return 1
+		}
+		return strings.Compare(left, right)
+	})
 	return catalog, nil
 }
 
@@ -1696,14 +1738,17 @@ func geoCheck(opts geoCheckOptions) error {
 		}
 		return nil
 	case "provinces":
-		if _, ok := allowedProvinces[provinceName]; ok {
-			result.GeoAllowed = true
-			result.Allowed = true
-			result.MatchedSource = "geo"
-			if err := writeGeoCheckResult(opts, result); err != nil {
-				return err
+		if !assets.provinceHidden(provinceID) {
+			_, ok := allowedProvinces[provinceName]
+			if ok {
+				result.GeoAllowed = true
+				result.Allowed = true
+				result.MatchedSource = "geo"
+				if err := writeGeoCheckResult(opts, result); err != nil {
+					return err
+				}
+				return nil
 			}
-			return nil
 		}
 		result.MatchedSource = "province-deny"
 		if err := writeGeoCheckResult(opts, result); err != nil {

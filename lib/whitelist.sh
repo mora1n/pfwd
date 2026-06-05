@@ -268,7 +268,7 @@ whitelist_geo_province_rows() {
     local meta_file
     meta_file="$(whitelist_geo_meta_file)"
     [ -f "$meta_file" ] || pfwd_die "缺少 geo 省份资产：$meta_file，请先执行 ./xdp/build.sh 或使用完整安装包"
-    jq -r '.provinces[]? | [.id, .name] | @tsv' "$meta_file"
+    jq -r '.provinces[]? | select((.hidden // false) | not) | [.id, .name] | @tsv' "$meta_file"
 }
 
 whitelist_city_available_province_rows() {
