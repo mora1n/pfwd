@@ -1254,6 +1254,29 @@ func TestRuleValABISize(t *testing.T) {
 	}
 }
 
+func TestFlowKeyV4ABISize(t *testing.T) {
+	if got, want := binary.Size(flowKeyV4{}), 16; got != want {
+		t.Fatalf("flowKeyV4 binary size=%d, want %d", got, want)
+	}
+}
+
+func TestRuntimeMapPinsIncludeIPv4GuardFlowCache(t *testing.T) {
+	pins := runtimeMapPinsFromPaths(
+		"/sys/fs/bpf/pfwd_rule_counters",
+		"/sys/fs/bpf/pfwd_user_counters",
+		"/sys/fs/bpf/pfwd_stats",
+	)
+	if pins.AllowedFlowsV4 == "" {
+		t.Fatalf("AllowedFlowsV4 is empty")
+	}
+	if pins.AllowedFlowsV4 == pins.AllowedFlows {
+		t.Fatalf("AllowedFlowsV4=%q must differ from AllowedFlows=%q", pins.AllowedFlowsV4, pins.AllowedFlows)
+	}
+	if !strings.HasSuffix(pins.AllowedFlowsV4, "/pfwd_allowed_flows_v4") {
+		t.Fatalf("AllowedFlowsV4=%q, want suffix /pfwd_allowed_flows_v4", pins.AllowedFlowsV4)
+	}
+}
+
 func TestRuntimeStatusReusableRequiresCurrentMapABI(t *testing.T) {
 	opts := applyOptions{GuardMode: "full"}
 	settings := runtimeSettings{}
@@ -1272,6 +1295,81 @@ func TestRuntimeStatusReusableRequiresCurrentMapABI(t *testing.T) {
 	status.MapABIVersion = mapABIVersion - 1
 	if runtimeStatusReusable(status, settings, opts, "eth0", nil, "hash") {
 		t.Fatalf("runtimeStatusReusable()=true for stale ABI, want false")
+	}
+}
+
+func TestGuardRuntimeCacheChanged(t *testing.T) {
+	base := runtimeAuxState{
+		GuardEnabled:      true,
+		WhitelistEnabled:  true,
+		BlockHTTP:         true,
+		BlockTLS:          true,
+		BlockSOCKS:        true,
+		ProtocolSkipPorts: []uint16{40422},
+	}
+	tests := []struct {
+		name         string
+		currentValid bool
+		current      runtimeAuxState
+		next         runtimeAuxState
+		want         bool
+	}{
+		{
+			name:         "unchanged valid state reuses cache",
+			currentValid: true,
+			current:      base,
+			next:         base,
+			want:         false,
+		},
+		{
+			name:         "invalid current state reloads cache",
+			currentValid: false,
+			current:      base,
+			next:         base,
+			want:         true,
+		},
+		{
+			name:         "protocol flag change reloads cache",
+			currentValid: true,
+			current:      base,
+			next: func() runtimeAuxState {
+				next := base
+				next.BlockTLS = false
+				return next
+			}(),
+			want: true,
+		},
+		{
+			name:         "skip-port change reloads cache",
+			currentValid: true,
+			current:      base,
+			next: func() runtimeAuxState {
+				next := base
+				next.ProtocolSkipPorts = []uint16{40422, 41423}
+				return next
+			}(),
+			want: true,
+		},
+		{
+			name:         "egress-only change does not reload guard cache",
+			currentValid: true,
+			current:      base,
+			next: func() runtimeAuxState {
+				next := base
+				next.EgressWhitelistHashes = []whitelistContentHash{{Path: "/tmp/egress", Hash: "abc"}}
+				return next
+			}(),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := guardRuntimeCacheChanged(tc.currentValid, tc.current, tc.next)
+			if got != tc.want {
+				t.Fatalf("guardRuntimeCacheChanged()=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

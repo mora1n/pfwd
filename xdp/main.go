@@ -35,7 +35,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.8"
 const dataplaneVersion = 2
-const mapABIVersion = 13
+const mapABIVersion = 14
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -119,6 +119,7 @@ type bpfObjects struct {
 	PFWDEgressWhitelistCacheV4 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v4"`
 	PFWDEgressWhitelistCacheV6 *ebpf.Map     `ebpf:"pfwd_egress_whitelist_cache_v6"`
 	PFWDFlows                  *ebpf.Map     `ebpf:"pfwd_allowed_flows"`
+	PFWDFlowsV4                *ebpf.Map     `ebpf:"pfwd_allowed_flows_v4"`
 	PFWDHostEgressFlows        *ebpf.Map     `ebpf:"pfwd_host_egress_flows"`
 	PFWDSkipPorts              *ebpf.Map     `ebpf:"pfwd_protocol_skip_ports"`
 	PFWDScratch                *ebpf.Map     `ebpf:"pfwd_scratch"`
@@ -133,7 +134,7 @@ func (o *bpfObjects) Close() {
 		o.PFWDRuleCounter, o.PFWDRuleReplyCounter, o.PFWDRuleDropCounter, o.PFWDUserCounter, o.PFWDStats, o.PFWDWhitelistV4, o.PFWDWhitelistV6,
 		o.PFWDWhitelistCacheV4, o.PFWDWhitelistCacheV6, o.PFWDIngressGeoV4, o.PFWDIngressGeoV6, o.PFWDIngressCityV4,
 		o.PFWDIngressPolicyModes, o.PFWDIngressPolicyProvinces, o.PFWDIngressPolicyCities, o.PFWDEgressWhitelistV4, o.PFWDEgressWhitelistV6,
-		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDHostEgressFlows, o.PFWDSkipPorts, o.PFWDScratch,
+		o.PFWDEgressWhitelistCacheV4, o.PFWDEgressWhitelistCacheV6, o.PFWDFlows, o.PFWDFlowsV4, o.PFWDHostEgressFlows, o.PFWDSkipPorts, o.PFWDScratch,
 	} {
 		if closer != nil {
 			_ = closer.Close()
@@ -447,6 +448,7 @@ type runtimeMapPins struct {
 	EgressWhitelistCacheV4 string
 	EgressWhitelistCacheV6 string
 	AllowedFlows           string
+	AllowedFlowsV4         string
 	HostEgressFlows        string
 	SkipPorts              string
 }
@@ -651,6 +653,16 @@ type flowKey struct {
 	Dport    uint16
 	Saddr    [16]byte
 	Daddr    [16]byte
+}
+
+type flowKeyV4 struct {
+	Family   uint8
+	Protocol uint8
+	Sport    uint16
+	Dport    uint16
+	Pad16    uint16
+	Saddr    uint32
+	Daddr    uint32
 }
 
 type guardFlowVal struct {
@@ -1192,6 +1204,7 @@ func loadObjects(guardMode string, hostEgressEnabled bool) (*bpfObjects, error) 
 		PFWDEgressWhitelistCacheV4: coll.Maps["pfwd_egress_whitelist_cache_v4"],
 		PFWDEgressWhitelistCacheV6: coll.Maps["pfwd_egress_whitelist_cache_v6"],
 		PFWDFlows:                  coll.Maps["pfwd_allowed_flows"],
+		PFWDFlowsV4:                coll.Maps["pfwd_allowed_flows_v4"],
 		PFWDHostEgressFlows:        coll.Maps["pfwd_host_egress_flows"],
 		PFWDSkipPorts:              coll.Maps["pfwd_protocol_skip_ports"],
 		PFWDScratch:                coll.Maps["pfwd_scratch"],
@@ -1633,9 +1646,12 @@ func clearIngressGeoPolicyMaps(objs *bpfObjects) error {
 	return nil
 }
 
-func clearAllowedFlows(flowMap *ebpf.Map) error {
+func clearAllowedFlows(flowMap *ebpf.Map, flowMapV4 *ebpf.Map) error {
 	if err := clearMap[flowKey, guardFlowVal](flowMap); err != nil {
 		return fmt.Errorf("清理 guard flow cache 失败: %w", err)
+	}
+	if err := clearMap[flowKeyV4, guardFlowVal](flowMapV4); err != nil {
+		return fmt.Errorf("清理 IPv4 guard flow cache 失败: %w", err)
 	}
 	return nil
 }
@@ -2041,6 +2057,16 @@ func egressGeoPolicyChanged(current, next runtimeAuxState) bool {
 		!stringSlicesEqual(normalizeProvinceNames(current.EgressCNProvinces), normalizeProvinceNames(next.EgressCNProvinces))
 }
 
+func guardRuntimeCacheChanged(currentValid bool, current, next runtimeAuxState) bool {
+	return !currentValid ||
+		current.GuardEnabled != next.GuardEnabled ||
+		current.WhitelistEnabled != next.WhitelistEnabled ||
+		current.BlockHTTP != next.BlockHTTP ||
+		current.BlockTLS != next.BlockTLS ||
+		current.BlockSOCKS != next.BlockSOCKS ||
+		!protocolSkipPortsEqual(current.ProtocolSkipPorts, next.ProtocolSkipPorts)
+}
+
 func applyIncrementalAuxState(
 	objs *bpfObjects,
 	runtimeData *runtimeFile,
@@ -2069,7 +2095,7 @@ func applyIncrementalAuxState(
 		if err := clearIngressGeoPolicyMaps(objs); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
-		if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+		if err := clearAllowedFlows(objs.PFWDFlows, objs.PFWDFlowsV4); err != nil {
 			return runtimeAuxState{}, nil, err
 		}
 		allowedFlowsCleared = true
@@ -2158,16 +2184,9 @@ func applyIncrementalAuxState(
 		recordAuxAction(&actions, "host_egress_drop_cache", "reuse", 0)
 	}
 
-	guardStateChanged := !currentValid ||
-		current.GuardEnabled != nextState.GuardEnabled ||
-		current.WhitelistEnabled != nextState.WhitelistEnabled ||
-		current.BlockHTTP != nextState.BlockHTTP ||
-		current.BlockTLS != nextState.BlockTLS ||
-		current.BlockSOCKS != nextState.BlockSOCKS ||
-		!protocolSkipPortsEqual(current.ProtocolSkipPorts, nextState.ProtocolSkipPorts)
-	if guardStateChanged {
+	if guardRuntimeCacheChanged(currentValid, current, nextState) {
 		if !allowedFlowsCleared {
-			if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+			if err := clearAllowedFlows(objs.PFWDFlows, objs.PFWDFlowsV4); err != nil {
 				return runtimeAuxState{}, nil, err
 			}
 		}
@@ -2232,6 +2251,7 @@ func runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, statsPin string) ru
 		EgressWhitelistCacheV4: filepath.Join(dir, namespace+"_egress_whitelist_cache_v4"),
 		EgressWhitelistCacheV6: filepath.Join(dir, namespace+"_egress_whitelist_cache_v6"),
 		AllowedFlows:           filepath.Join(dir, namespace+"_allowed_flows"),
+		AllowedFlowsV4:         filepath.Join(dir, namespace+"_allowed_flows_v4"),
 		HostEgressFlows:        filepath.Join(dir, namespace+"_host_egress_flows"),
 		SkipPorts:              filepath.Join(dir, namespace+"_protocol_skip_ports"),
 	}
@@ -2436,6 +2456,7 @@ func pinRuntimeMaps(objs *bpfObjects, opts applyOptions) error {
 		pinLayout.EgressWhitelistCacheV4: objs.PFWDEgressWhitelistCacheV4,
 		pinLayout.EgressWhitelistCacheV6: objs.PFWDEgressWhitelistCacheV6,
 		pinLayout.AllowedFlows:           objs.PFWDFlows,
+		pinLayout.AllowedFlowsV4:         objs.PFWDFlowsV4,
 		pinLayout.HostEgressFlows:        objs.PFWDHostEgressFlows,
 		pinLayout.SkipPorts:              objs.PFWDSkipPorts,
 	}
@@ -2570,6 +2591,10 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedFlowsV4, err := load(pinLayout.AllowedFlowsV4, "加载 pinned allowed_flows_v4 map 失败")
+	if err != nil {
+		return nil, err
+	}
 	hostEgressFlows, err := load(pinLayout.HostEgressFlows, "加载 pinned host_egress_flows map 失败")
 	if err != nil {
 		return nil, err
@@ -2603,6 +2628,7 @@ func loadPinnedRuntimeMaps(pinLayout runtimeMapPins) (*bpfObjects, error) {
 		PFWDEgressWhitelistCacheV4: egressWhitelistCacheV4,
 		PFWDEgressWhitelistCacheV6: egressWhitelistCacheV6,
 		PFWDFlows:                  allowedFlows,
+		PFWDFlowsV4:                allowedFlowsV4,
 		PFWDHostEgressFlows:        hostEgressFlows,
 		PFWDSkipPorts:              skipPorts,
 	}, nil
@@ -2761,7 +2787,7 @@ func clearRuntimeMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows, objs.PFWDFlowsV4); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
@@ -2819,7 +2845,7 @@ func clearMutableConfigMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows, objs.PFWDFlowsV4); err != nil {
 		return err
 	}
 	if err := clearMap[flowKey, uint8](objs.PFWDHostEgressFlows); err != nil {
@@ -2871,7 +2897,7 @@ func clearIncrementalAuxMaps(objs *bpfObjects) error {
 	if err := clearMap[whitelistCacheKeyV6, uint8](objs.PFWDEgressWhitelistCacheV6); err != nil {
 		return err
 	}
-	if err := clearAllowedFlows(objs.PFWDFlows); err != nil {
+	if err := clearAllowedFlows(objs.PFWDFlows, objs.PFWDFlowsV4); err != nil {
 		return err
 	}
 	if err := clearPortArrayMap(objs.PFWDSkipPorts); err != nil {
@@ -2938,6 +2964,7 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 		"pfwd_egress_whitelist_cache_v4": pinLayout.EgressWhitelistCacheV4,
 		"pfwd_egress_whitelist_cache_v6": pinLayout.EgressWhitelistCacheV6,
 		"pfwd_allowed_flows":             pinLayout.AllowedFlows,
+		"pfwd_allowed_flows_v4":          pinLayout.AllowedFlowsV4,
 		"pfwd_host_egress_flows":         pinLayout.HostEgressFlows,
 		"pfwd_protocol_skip_ports":       pinLayout.SkipPorts,
 	}
@@ -3093,6 +3120,7 @@ func canIncrementalApply(payload statusPayload, runtimeData *runtimeFile, opts a
 		pinLayout.EgressWhitelistCacheV4,
 		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
+		pinLayout.AllowedFlowsV4,
 		pinLayout.HostEgressFlows,
 		pinLayout.SkipPorts,
 	}
@@ -4157,6 +4185,7 @@ func removeRuntime(opts removeOptions) error {
 		pinLayout.EgressWhitelistCacheV4,
 		pinLayout.EgressWhitelistCacheV6,
 		pinLayout.AllowedFlows,
+		pinLayout.AllowedFlowsV4,
 		pinLayout.HostEgressFlows,
 		pinLayout.SkipPorts,
 	} {

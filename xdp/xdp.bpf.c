@@ -237,6 +237,16 @@ struct pfwd_flow_key {
     __u8 daddr[16];
 };
 
+struct pfwd_flow_key_v4 {
+    __u8 family;
+    __u8 protocol;
+    __u16 sport;
+    __u16 dport;
+    __u16 pad16;
+    __be32 saddr;
+    __be32 daddr;
+};
+
 struct pfwd_guard_prefix_val {
     __u8 seen_len;
     __u8 pad[7];
@@ -458,6 +468,13 @@ struct {
     __type(key, struct pfwd_flow_key);
     __type(value, struct pfwd_guard_flow_val);
 } pfwd_allowed_flows SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pfwd_flow_key_v4);
+    __type(value, struct pfwd_guard_flow_val);
+} pfwd_allowed_flows_v4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1593,6 +1610,20 @@ static __always_inline void guard_flow_store_drop(struct pfwd_flow_key *key) {
     guard_flow_store_verdict(key, PFWD_CACHE_DROP);
 }
 
+static __always_inline void guard_flow_store_verdict_v4(struct pfwd_flow_key_v4 *key, __u8 verdict) {
+    struct pfwd_guard_flow_val value = {};
+    value.verdict = verdict;
+    bpf_map_update_elem(&pfwd_allowed_flows_v4, key, &value, BPF_ANY);
+}
+
+static __always_inline void guard_flow_store_allow_v4(struct pfwd_flow_key_v4 *key) {
+    guard_flow_store_verdict_v4(key, PFWD_CACHE_ALLOW);
+}
+
+static __always_inline void guard_flow_store_drop_v4(struct pfwd_flow_key_v4 *key) {
+    guard_flow_store_verdict_v4(key, PFWD_CACHE_DROP);
+}
+
 static __always_inline void guard_flow_store_prefix(
     struct pfwd_flow_key *key,
     const struct pfwd_guard_prefix_val *prefix
@@ -1605,6 +1636,20 @@ static __always_inline void guard_flow_store_prefix(
     value.seen_len = prefix->seen_len;
     *(__u64 *)value.prefix = *(__u64 *)prefix->prefix;
     bpf_map_update_elem(&pfwd_allowed_flows, key, &value, BPF_ANY);
+}
+
+static __always_inline void guard_flow_store_prefix_v4(
+    struct pfwd_flow_key_v4 *key,
+    const struct pfwd_guard_prefix_val *prefix
+) {
+    struct pfwd_guard_flow_val value = {};
+    if (!prefix) {
+        return;
+    }
+    value.verdict = PFWD_CACHE_UNKNOWN;
+    value.seen_len = prefix->seen_len;
+    *(__u64 *)value.prefix = *(__u64 *)prefix->prefix;
+    bpf_map_update_elem(&pfwd_allowed_flows_v4, key, &value, BPF_ANY);
 }
 
 static __always_inline void guard_flow_load_prefix(
@@ -1881,7 +1926,7 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     __be16 dport,
     int guard_bypassed
 ) {
-    struct pfwd_flow_key flow = {};
+    struct pfwd_flow_key_v4 flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
     struct pfwd_guard_prefix_val payload_prefix = {};
     struct pfwd_guard_flow_val *stored_flow;
@@ -1897,9 +1942,9 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     flow.protocol = IPPROTO_TCP;
     flow.sport = sport;
     flow.dport = dport;
-    *(__be32 *)&flow.saddr[0] = saddr;
-    *(__be32 *)&flow.daddr[0] = daddr;
-    stored_flow = bpf_map_lookup_elem(&pfwd_allowed_flows, &flow);
+    flow.saddr = saddr;
+    flow.daddr = daddr;
+    stored_flow = bpf_map_lookup_elem(&pfwd_allowed_flows_v4, &flow);
     verdict = guard_flow_cached_verdict(stored_flow);
     if (verdict == PFWD_CACHE_ALLOW) {
         return XDP_PASS;
@@ -1915,11 +1960,11 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     if (!stored_flow && payload_prefix.seen_len >= 8) {
         verdict = inspect_guard_prefix(&payload_prefix, rule);
         if (verdict == PFWD_INSPECT_DROP) {
-            guard_flow_store_drop(&flow);
+            guard_flow_store_drop_v4(&flow);
             count_drop(rule, packet_len);
             return XDP_DROP;
         }
-        guard_flow_store_allow(&flow);
+        guard_flow_store_allow_v4(&flow);
         return XDP_PASS;
     }
     if (stored_flow) {
@@ -1930,15 +1975,15 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     }
     verdict = inspect_guard_prefix(&next_prefix, rule);
     if (verdict == PFWD_INSPECT_DROP) {
-        guard_flow_store_drop(&flow);
+        guard_flow_store_drop_v4(&flow);
         count_drop(rule, packet_len);
         return XDP_DROP;
     }
     if (verdict == PFWD_INSPECT_NEED_MORE) {
-        guard_flow_store_prefix(&flow, &next_prefix);
+        guard_flow_store_prefix_v4(&flow, &next_prefix);
         return XDP_PASS;
     }
-    guard_flow_store_allow(&flow);
+    guard_flow_store_allow_v4(&flow);
     return XDP_PASS;
 }
 
@@ -2174,16 +2219,18 @@ static __always_inline int tc_local_forward_v4(
         struct tcphdr_min *tcp = (void *)ip4 + ihl;
         __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
         void *payload_start = (void *)tcp + tcp_len;
+        int syn_only;
         if (tcp_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (!guard_bypassed && rule_needs_guard(rule)) {
+        syn_only = tcp_syn_only(tcp);
+        if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
             if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
-        conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
+        conn_state = syn_only ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
     if (counter_plan_needs_policy(&counters)) {
         load_input_counter_plan(rule, packet_len, &counters);
@@ -2237,16 +2284,18 @@ static __always_inline int tc_local_forward_v6(
         struct tcphdr_min *tcp = (void *)(ip6 + 1);
         __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
         void *payload_start = (void *)tcp + tcp_len;
+        int syn_only;
         if (tcp_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end) {
             stat_inc(PFWD_STAT_PARSE_SKIPPED);
             return TC_ACT_OK;
         }
-        if (!guard_bypassed && rule_needs_guard(rule)) {
+        syn_only = tcp_syn_only(tcp);
+        if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
             if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
-        conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
+        conn_state = syn_only ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
     }
     if (counter_plan_needs_policy(&counters)) {
         load_input_counter_plan(rule, packet_len, &counters);
@@ -2679,16 +2728,18 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 struct tcphdr_min *tcp = (void *)ip4 + ihl;
                 __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
                 void *payload_start = (void *)tcp + tcp_len;
+                int syn_only;
                 if (tcp_len < sizeof(*tcp)) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (!guard_bypassed && rule_needs_guard(rule)) {
+                syn_only = tcp_syn_only(tcp);
+                if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
                     if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
-                tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
+                tcp_conn_state = syn_only ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
             if (counter_plan_needs_policy(&counters)) {
                 load_input_counter_plan(rule, packet_len, &counters);
@@ -2856,16 +2907,18 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 struct tcphdr_min *tcp = (void *)(ip6 + 1);
                 __u32 tcp_len = (__u32)(tcp->doff_res >> 4) * 4;
                 void *payload_start = (void *)tcp + tcp_len;
+                int syn_only;
                 if (tcp_len < sizeof(*tcp)) {
                     stat_inc(PFWD_STAT_PARSE_SKIPPED);
                     return XDP_PASS;
                 }
-                if (!guard_bypassed && rule_needs_guard(rule)) {
+                syn_only = tcp_syn_only(tcp);
+                if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
                     if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
-                tcp_conn_state = tcp_syn_only(tcp) ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
+                tcp_conn_state = syn_only ? PFWD_CONN_STATE_TCP_SYN_PENDING : PFWD_CONN_STATE_TCP_ESTABLISHED;
             }
             if (counter_plan_needs_policy(&counters)) {
                 load_input_counter_plan(rule, packet_len, &counters);
@@ -3087,6 +3140,9 @@ int pfwd_ingress(struct __sk_buff *skb) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
                 return TC_ACT_OK;
             }
+            if (tcp_syn_only(tcp)) {
+                return TC_ACT_OK;
+            }
             if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
@@ -3214,6 +3270,9 @@ int pfwd_ingress(struct __sk_buff *skb) {
             payload_start = (void *)tcp + tcp_len;
             if (tcp_len < sizeof(*tcp)) {
                 stat_inc(PFWD_STAT_PARSE_SKIPPED);
+                return TC_ACT_OK;
+            }
+            if (tcp_syn_only(tcp)) {
                 return TC_ACT_OK;
             }
             if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
