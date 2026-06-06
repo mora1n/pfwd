@@ -5483,6 +5483,7 @@ ui_menu_egress_whitelist() {
 
 ui_print_downmask_summary() {
     local json pull_mode iface date ratio action ab_targets ab_mode
+    local previous_date previous_ratio generated_at generation_source
     if ! json="$(downmask_status_json 2>&1)"; then
         printf '  下行伪装状态读取失败：%s\n' "$json"
         return 0
@@ -5492,6 +5493,10 @@ ui_print_downmask_summary() {
     date="$(jq -r '.day_state.date // "-"' <<< "$json" 2>/dev/null || echo -)"
     ratio="$(jq -r '.day_state.target_ratio // "-"' <<< "$json" 2>/dev/null || echo -)"
     action="$(jq -r '.day_state.last_action // "-"' <<< "$json" 2>/dev/null || echo -)"
+    previous_date="$(jq -r '.day_state.previous_date // "-"' <<< "$json" 2>/dev/null || echo -)"
+    previous_ratio="$(jq -r '.day_state.previous_target_ratio // "-"' <<< "$json" 2>/dev/null || echo -)"
+    generated_at="$(jq -r '.day_state.generated_at // "-"' <<< "$json" 2>/dev/null || echo -)"
+    generation_source="$(jq -r '.day_state.generation_source // "-"' <<< "$json" 2>/dev/null || echo -)"
     ab_targets="$(jq -r '.ab_targets | length' <<< "$json" 2>/dev/null || echo 0)"
     ab_mode="$(jq -r '.config.ab_pull.protocol_mode // "single"' <<< "$json" 2>/dev/null || echo single)"
     local tws twe window_text
@@ -5509,6 +5514,7 @@ ui_print_downmask_summary() {
     feed_tcp="$(jq -r '.config.ab_feed.tcp_enabled // false' <<< "$json" 2>/dev/null || echo false)"
     feed_udp="$(jq -r '.config.ab_feed.udp_enabled // false' <<< "$json" 2>/dev/null || echo false)"
     printf '  拉流模式：%s  接口：%s  生效时段：%s  日期：%s  今日目标比例：%s  动作：%s\n' "$pull_mode" "$iface" "$window_text" "$date" "$ratio" "$action"
+    printf '  上一日：%s  上一日比例：%s  生成来源：%s  生成于：%s\n' "$previous_date" "$previous_ratio" "$generation_source" "$generated_at"
     printf '  今日入站：%s  今日出站：%s\n' "$(format_bytes "$rx")" "$(format_bytes "$tx")"
     printf '  A机拉流：模式=%s  B机池=%s 台\n' "$ab_mode" "$ab_targets"
     printf '  B机喂流 TCP：%s  UDP：%s\n' "$feed_tcp" "$feed_udp"

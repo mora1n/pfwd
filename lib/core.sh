@@ -123,15 +123,43 @@ pfwd_require_jq() {
 }
 
 pfwd_now_iso() {
+    if [ -n "${PFWD_TEST_NOW_ISO:-}" ]; then
+        printf '%s\n' "$PFWD_TEST_NOW_ISO"
+        return 0
+    fi
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
 pfwd_today() {
+    if [ -n "${PFWD_TEST_TODAY:-}" ]; then
+        printf '%s\n' "$PFWD_TEST_TODAY"
+        return 0
+    fi
+    if [ -n "${PFWD_TEST_NOW_ISO:-}" ]; then
+        printf '%s\n' "${PFWD_TEST_NOW_ISO%%T*}"
+        return 0
+    fi
     date '+%Y-%m-%d'
 }
 
 pfwd_now_minute() {
+    if [ -n "${PFWD_TEST_NOW_ISO:-}" ]; then
+        date -u -d "$PFWD_TEST_NOW_ISO" '+%Y-%m-%d %H:%M'
+        return 0
+    fi
     date '+%Y-%m-%d %H:%M'
+}
+
+pfwd_now_epoch() {
+    if [ -n "${PFWD_TEST_NOW_EPOCH:-}" ]; then
+        printf '%s\n' "$PFWD_TEST_NOW_EPOCH"
+        return 0
+    fi
+    if [ -n "${PFWD_TEST_NOW_ISO:-}" ]; then
+        date -u -d "$PFWD_TEST_NOW_ISO" '+%s'
+        return 0
+    fi
+    date '+%s'
 }
 
 pfwd_join_lines() {
