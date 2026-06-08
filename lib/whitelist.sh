@@ -192,7 +192,13 @@ whitelist_lease_entries_json() {
         printf '[]\n'
         return 0
     fi
-    jq -c 'if type == "array" then . else [] end' "$file" 2>/dev/null || printf '[]\n'
+    jq -c -s '
+      if length == 0 then
+        []
+      else
+        (.[0] | if type == "array" then . else [] end)
+      end
+    ' "$file" 2>/dev/null || printf '[]\n'
 }
 
 whitelist_lease_entries_sorted_json() {
@@ -322,9 +328,14 @@ whitelist_require_city_assets() {
 
 whitelist_geo_province_rows() {
     local meta_file
-    meta_file="$(whitelist_geo_meta_file)"
-    [ -f "$meta_file" ] || pfwd_die "缺少 geo 省份资产：$meta_file，请先执行 ./xdp/build.sh 或使用完整安装包"
-    jq -r '.provinces[]? | select((.hidden // false) | not) | [.id, .name] | @tsv' "$meta_file"
+    meta_file="$(whitelist_city_meta_file)"
+    [ -f "$meta_file" ] || pfwd_die "缺少入口省份目录资产：$meta_file，请先执行 ./xdp/build.sh 或使用完整安装包"
+    jq -r '
+      (.provinces // [])
+      | to_entries[]
+      | [(.key + 1), .value.name]
+      | @tsv
+    ' "$meta_file"
 }
 
 whitelist_city_available_province_rows() {

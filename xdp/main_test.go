@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -819,6 +820,76 @@ func TestAdysecIPMergeUnknownCNAndHiddenSubtract(t *testing.T) {
 		if start <= target && target <= end {
 			t.Fatalf("hidden segment still covers known 浙江 range: %+v", segment)
 		}
+	}
+}
+
+func TestNormalizeGeoSegmentsCanonicalizesCorruptProvinceNames(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := `{
+  "provinces": [
+    {
+      "name": "浙江省",
+      "code": "330000",
+      "cities": [
+        {"name": "杭州市", "code": "330100"}
+      ]
+    }
+  ]
+}`
+	metaPath := filepath.Join(tmpDir, cityMetaAssetFile)
+	if err := os.WriteFile(metaPath, []byte(meta), 0o644); err != nil {
+		t.Fatalf("write city meta: %v", err)
+	}
+	catalog, err := loadCityMetaIndex(metaPath)
+	if err != nil {
+		t.Fatalf("loadCityMetaIndex: %v", err)
+	}
+
+	v4 := normalizeGeoSegmentsV4([]xdbScanSegmentV4{
+		{Province: "\x01}\u8dcc\u000e中国–浙江–杭州", City: ""},
+		{Province: "中国", City: ""},
+		{Province: "台湾省", City: ""},
+	}, catalog)
+	if len(v4) != 3 {
+		t.Fatalf("normalizeGeoSegmentsV4 len=%d, want 3", len(v4))
+	}
+	if v4[0].Province != "浙江省" {
+		t.Fatalf("v4[0].Province=%q, want 浙江省", v4[0].Province)
+	}
+	if v4[1].Province != geoHiddenCNProvinceName {
+		t.Fatalf("v4[1].Province=%q, want hidden", v4[1].Province)
+	}
+	if v4[2].Province != "台湾省" {
+		t.Fatalf("v4[2].Province=%q, want 台湾省", v4[2].Province)
+	}
+
+	v6 := normalizeGeoSegmentsV6([]xdbScanSegmentV6{
+		{Province: "\u0007\u0004\uFFFD'中国–浙江–杭州"},
+		{Province: "中国"},
+		{Province: "香港特别行政区"},
+	}, catalog)
+	if len(v6) != 3 {
+		t.Fatalf("normalizeGeoSegmentsV6 len=%d, want 3", len(v6))
+	}
+	if v6[0].Province != "浙江省" {
+		t.Fatalf("v6[0].Province=%q, want 浙江省", v6[0].Province)
+	}
+	if v6[1].Province != geoHiddenCNProvinceName {
+		t.Fatalf("v6[1].Province=%q, want hidden", v6[1].Province)
+	}
+	if v6[2].Province != "香港特别行政区" {
+		t.Fatalf("v6[2].Province=%q, want 香港特别行政区", v6[2].Province)
+	}
+
+	if got := normalizeGeoProvinceName("Dubai", catalog); got != geoHiddenCNProvinceName {
+		t.Fatalf("normalizeGeoProvinceName(Dubai)=%q, want hidden", got)
+	}
+	if got := normalizeGeoProvinceName("114DNS", catalog); got != geoHiddenCNProvinceName {
+		t.Fatalf("normalizeGeoProvinceName(114DNS)=%q, want hidden", got)
+	}
+	provinces := mergeProvinceNames(provinceSetFromSegmentsV4(v4), provinceSetFromSegmentsV6(v6))
+	if slices.Contains(provinces, "Dubai") || slices.Contains(provinces, "114DNS") {
+		t.Fatalf("merged provinces=%v, want noisy non-CN labels excluded", provinces)
 	}
 }
 

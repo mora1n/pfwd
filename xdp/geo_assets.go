@@ -283,6 +283,8 @@ func buildGeoAssets(opts geoBuilderOptions) error {
 	if err != nil {
 		return err
 	}
+	v4Segments = normalizeGeoSegmentsV4(v4Segments, cityIndex)
+	v6Segments = normalizeGeoSegmentsV6(v6Segments, cityIndex)
 	client := &http.Client{Timeout: geoDownloadTimeout}
 	supplemental, err := collectAdysecSupplementalSegments(ctx, client, cityIndex)
 	if err != nil {
@@ -554,6 +556,80 @@ func mergeProvinceNames(sets ...map[string]struct{}) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func normalizeGeoSegmentsV4(segments []xdbScanSegmentV4, catalog cityMetaCatalog) []xdbScanSegmentV4 {
+	if len(segments) == 0 {
+		return nil
+	}
+	out := make([]xdbScanSegmentV4, 0, len(segments))
+	for _, segment := range segments {
+		normalized := normalizeCNSegment(segment.Province, segment.City, catalog, nil)
+		normalized.Start = segment.Start
+		normalized.End = segment.End
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func normalizeGeoSegmentsV6(segments []xdbScanSegmentV6, catalog cityMetaCatalog) []xdbScanSegmentV6 {
+	if len(segments) == 0 {
+		return nil
+	}
+	out := make([]xdbScanSegmentV6, 0, len(segments))
+	for _, segment := range segments {
+		out = append(out, xdbScanSegmentV6{
+			Province: normalizeGeoProvinceName(segment.Province, catalog),
+			Start:    segment.Start,
+			End:      segment.End,
+		})
+	}
+	return out
+}
+
+func normalizeGeoProvinceName(value string, catalog cityMetaCatalog) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\u0000", ""))
+	if invalidRegionPart(value) || value == "中国" || strings.EqualFold(value, "CN") || strings.EqualFold(value, "China") {
+		return geoHiddenCNProvinceName
+	}
+	if canonical, ok := catalog.ProvinceByNormalized[cityMetaProvinceKey(value)]; ok {
+		return canonical
+	}
+	for _, province := range extraCanonicalProvinceNames() {
+		if cityMetaProvinceKey(value) == cityMetaProvinceKey(province) {
+			return province
+		}
+	}
+	if province, _, ok := splitChineseProvinceCity(value, catalog); ok && province != "" {
+		return province
+	}
+	for _, province := range extraCanonicalProvinceNames() {
+		if strings.Contains(value, province) {
+			return province
+		}
+		short := normalizeCityMetaName(province)
+		if short != "" && strings.Contains(value, short) {
+			return province
+		}
+	}
+	for _, province := range catalog.ProvinceNamesByLength {
+		if strings.Contains(value, province) {
+			return province
+		}
+		short := normalizeCityMetaName(province)
+		if short != "" && strings.Contains(value, short) {
+			return province
+		}
+	}
+	return geoHiddenCNProvinceName
+}
+
+func extraCanonicalProvinceNames() []string {
+	return []string{
+		"香港特别行政区",
+		"澳门特别行政区",
+		"台湾省",
+	}
 }
 
 func collectGeoSegmentsV4(path string) ([]xdbScanSegmentV4, error) {

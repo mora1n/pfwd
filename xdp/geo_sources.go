@@ -817,13 +817,10 @@ func appendCNSegmentV4(out *geoSupplementalSegments, start, end uint32, province
 }
 
 func normalizeCNSegment(province, city string, catalog cityMetaCatalog, record *geoSourceRecord) xdbScanSegmentV4 {
-	province = strings.TrimSpace(province)
+	province = normalizeGeoProvinceName(province, catalog)
 	city = strings.TrimSpace(city)
-	if invalidRegionPart(province) || province == "中国" || strings.EqualFold(province, "CN") || strings.EqualFold(province, "China") {
+	if province == geoHiddenCNProvinceName {
 		return xdbScanSegmentV4{Province: geoHiddenCNProvinceName}
-	}
-	if canonical, ok := catalog.ProvinceByNormalized[cityMetaProvinceKey(province)]; ok {
-		province = canonical
 	}
 	if invalidRegionPart(city) {
 		return xdbScanSegmentV4{Province: province}
