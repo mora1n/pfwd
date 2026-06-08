@@ -147,11 +147,14 @@ pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
 ```bash
 pfwd whitelist-web status
 pfwd whitelist-web config show
+pfwd whitelist-web config reset
 pfwd whitelist-web route list
 pfwd whitelist-web service status
 ```
 
 如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。如果规则里不配置 `SSH 端口` / `SSH 选项`，`whitelist-web` 会直接依赖控制机系统 `ssh` 的默认行为与外部 `ssh_config`，需自行保证 SSH 已可连通。
+
+如果 `/etc/pfwd/whitelist-web.json` 为空或损坏，`pfwd whitelist-web config show/set` 与 TUI 会显式报错；可先执行 `pfwd whitelist-web config reset` 重建默认 skeleton，再重新配置。
 
 推荐把配置和服务管理直接放到 `pfwd` TUI：
 

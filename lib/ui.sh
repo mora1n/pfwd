@@ -5331,7 +5331,11 @@ ui_menu_whitelist_web_service_status() {
 
 ui_menu_whitelist_web_listener() {
     local config_json current_host current_port current_timeout
-    config_json="$(whitelist_web_config_json)"
+    if ! config_json="$(whitelist_web_config_json 2>&1)"; then
+        ui_error "$config_json"
+        ui_pause
+        return 0
+    fi
     current_host="$(jq -r '.listen_host // "127.0.0.1"' <<< "$config_json")"
     current_port="$(jq -r '.listen_port // 18080' <<< "$config_json")"
     current_timeout="$(jq -r '.request_timeout_sec // 8' <<< "$config_json")"

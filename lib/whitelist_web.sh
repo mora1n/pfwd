@@ -75,8 +75,31 @@ whitelist_web_init_config_if_missing() {
     fi
 }
 
+whitelist_web_validate_config_file() {
+    local file="$1"
+    [ -f "$file" ] || pfwd_die "whitelist-web 配置文件不存在：$file"
+    jq -e '
+      type == "object"
+      and ((.listen_host // "") | type == "string")
+      and ((.listen_host // "") != "")
+      and ((.listen_port // 0) | type == "number")
+      and ((.listen_port // 0) >= 1)
+      and ((.listen_port // 0) <= 65535)
+      and ((.request_timeout_sec // 0) | type == "number")
+      and ((.request_timeout_sec // 0) >= 1)
+      and ((.trusted_proxy_cidrs // []) | type == "array")
+      and ((.routes // []) | type == "array")
+    ' "$file" >/dev/null 2>&1 || pfwd_die "无效 whitelist-web 配置文件：$file"
+}
+
+whitelist_web_reset_config() {
+    mkdir -p "$(dirname "$PFWD_WHITELIST_WEB_CONFIG_FILE")"
+    whitelist_web_default_config_json | pfwd_write_atomic "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+}
+
 whitelist_web_config_json() {
     whitelist_web_init_config_if_missing
+    whitelist_web_validate_config_file "$PFWD_WHITELIST_WEB_CONFIG_FILE"
     jq '
       .listen_host = ((.listen_host // "") | tostring | if . == "" then "127.0.0.1" else . end)
       | .listen_port = ((.listen_port // 18080) | tonumber)
@@ -535,6 +558,11 @@ cmd_whitelist_web() {
                     [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web config show"
                     whitelist_web_config_show
                     ;;
+                reset)
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web config reset"
+                    whitelist_web_reset_config
+                    echo "whitelist-web 配置已重置"
+                    ;;
                 set)
                     local listen_host="" listen_port="" request_timeout_sec=""
                     while [ "$#" -gt 0 ]; do
@@ -550,7 +578,7 @@ cmd_whitelist_web() {
                     echo "whitelist-web 配置已更新"
                     ;;
                 *)
-                    pfwd_die "用法：pfwd whitelist-web config show|set ..."
+                    pfwd_die "用法：pfwd whitelist-web config show|reset|set ..."
                     ;;
             esac
             ;;

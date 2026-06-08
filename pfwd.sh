@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.18"
+PFWD_VERSION="0.2.19"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -317,7 +317,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
   pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
   pfwd whitelist-web init|status
-  pfwd whitelist-web config show|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
+  pfwd whitelist-web config show|reset|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
   pfwd whitelist-web trusted-proxy list|add|delete|clear ...
   pfwd whitelist-web route list|add|update|delete ...   # add/update 支持 [--ssh-port PORT] [--ssh-options '...']
   pfwd whitelist-web service status|start|stop|restart|enable|disable
