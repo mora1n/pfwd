@@ -525,7 +525,7 @@ service_update_download_bundle() {
     local staged_dir="$work_dir/staged"
     local optional_web_rel=""
 
-    mkdir -p "$staged_dir/lib" "$staged_dir/assets"
+    mkdir -p "$staged_dir/lib" "$staged_dir/assets" "$staged_dir/scripts"
     local _ source_rel __ ___
     while IFS=$'\t' read -r _ source_rel __ ___; do
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
