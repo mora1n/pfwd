@@ -97,6 +97,26 @@ pfwd-whitelist-web.service
 EOF
 }
 
+service_update_managed_unit_rows() {
+    cat <<'EOF'
+pfwd.service	runtime-manager
+pfwd.timer	runtime-timer
+pfwd-forward.service	forward-runtime
+pfwd-bbr.service	bbr-runtime
+pfwd-xdp.service	xdp-runtime
+pfwd-downmask-feed.service	downmask-feed
+pfwd-whitelist-web.service	whitelist-web
+EOF
+}
+
+service_update_optional_bundle_rows() {
+    local web_asset=""
+    web_asset="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
+    if [ -n "$web_asset" ]; then
+        printf '0755\t%s\tbin/pfwd-whitelist-web\twhitelist-web\n' "$web_asset"
+    fi
+}
+
 service_shortcut_rows() {
     printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH" "pfwd"
     printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH" "bbr.sh"
@@ -263,6 +283,26 @@ service_copy_optional_whitelist_web_from_dir() {
     [ -f "$source_path" ] || return 0
     target_path="$(service_install_target_path "bin/pfwd-whitelist-web")"
     install -m 0755 "$source_path" "$target_path"
+}
+
+service_update_installed_optional_rows() {
+    local mode source_rel install_rel digest_label target_path unit_name
+    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
+        [ -n "$source_rel" ] || continue
+        target_path="$(service_install_target_path "$install_rel")"
+        unit_name=""
+        case "$digest_label" in
+            whitelist-web) unit_name="pfwd-whitelist-web.service" ;;
+        esac
+        if [ -f "$target_path" ] || { [ -n "$unit_name" ] && service_unit_exists "$unit_name"; }; then
+            printf '%s\t%s\t%s\t%s\n' "$mode" "$source_rel" "$install_rel" "$digest_label"
+        fi
+    done < <(service_update_optional_bundle_rows)
+}
+
+service_update_bundle_rows() {
+    service_bundle_rows
+    service_update_installed_optional_rows
 }
 
 service_cleanup_legacy_install_artifacts() {
@@ -523,17 +563,12 @@ service_update_available_kb() {
 service_update_download_bundle() {
     local work_dir="$1"
     local staged_dir="$work_dir/staged"
-    local optional_web_rel=""
 
     mkdir -p "$staged_dir/lib" "$staged_dir/assets" "$staged_dir/scripts"
     local _ source_rel __ ___
     while IFS=$'\t' read -r _ source_rel __ ___; do
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
-    done < <(service_bundle_rows)
-    optional_web_rel="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
-    if [ -n "$optional_web_rel" ]; then
-        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$optional_web_rel" "$staged_dir/$optional_web_rel" 2>/dev/null || true
-    fi
+    done < <(service_update_bundle_rows)
 }
 
 service_update_validate_bundle() {
@@ -548,10 +583,7 @@ service_update_validate_bundle() {
         case "$source_rel" in
             *.sh) bash -n "$dir/$source_rel" || return 1 ;;
         esac
-    done < <(service_bundle_rows)
-    if [ -f "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)" ]; then
-        [ -x "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)" ] || chmod 0755 "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)"
-    fi
+    done < <(service_update_bundle_rows)
 }
 
 service_update_bundle_digest() {
@@ -568,7 +600,7 @@ service_update_bundle_digest() {
         esac
         [ -f "$digest_path" ] || pfwd_die "缺少更新产物用于生成摘要：$digest_path"
         payload="${payload}${digest_label} $(pfwd_file_checksum "$digest_path")"$'\n'
-    done < <(service_bundle_rows)
+    done < <(service_update_bundle_rows)
     printf '%s' "$payload" | pfwd_stdin_checksum
 }
 
@@ -585,34 +617,99 @@ service_update_capture_enabled_state() {
     fi
 }
 
-service_update_restore_enabled_state() {
-    local runtime_enabled="$1"
-    local timer_enabled="$2"
-    local guard_enabled="${3:-false}"
+service_update_capture_active_state() {
+    local unit="$1"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo false
+        return 0
+    fi
+    if systemctl is-active "$unit" >/dev/null 2>&1; then
+        echo true
+    else
+        echo false
+    fi
+}
+
+service_update_capture_service_states_json() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf '[]\n'
+        return 0
+    fi
+    local unit label enabled active
+    {
+        while IFS=$'\t' read -r unit label; do
+            [ -n "$unit" ] || continue
+            service_unit_exists "$unit" || continue
+            enabled="$(service_update_capture_enabled_state "$unit")"
+            active="$(service_update_capture_active_state "$unit")"
+            printf '%s\t%s\t%s\t%s\n' "$unit" "$label" "$enabled" "$active"
+        done < <(service_update_managed_unit_rows)
+    } | jq -Rsc '
+      split("\n")
+      | map(select(length > 0) | split("\t"))
+      | map({
+          unit: .[0],
+          label: .[1],
+          enabled: (.[2] == "true"),
+          active: (.[3] == "true")
+        })
+    '
+}
+
+service_update_restore_service_states() {
+    local states_json="$1"
 
     if ! command -v systemctl >/dev/null 2>&1; then
         return 0
     fi
 
     pfwd_run systemctl daemon-reload
-    if [ "$runtime_enabled" = "true" ]; then
-        pfwd_run systemctl enable "$(service_primary_runtime_unit)"
-    else
-        pfwd_run systemctl disable "$(service_primary_runtime_unit)" || true
+    jq -r '.[] | [.unit, (if .enabled then "true" else "false" end)] | @tsv' <<< "$states_json" |
+    while IFS=$'\t' read -r unit enabled; do
+        [ -n "$unit" ] || continue
+        if [ "$enabled" = "true" ]; then
+            pfwd_run systemctl enable "$unit"
+        else
+            pfwd_run systemctl disable "$unit" || true
+        fi
+    done
+    jq -r '.[] | [.unit, (if .active then "true" else "false" end)] | @tsv' <<< "$states_json" |
+    while IFS=$'\t' read -r unit active; do
+        [ -n "$unit" ] || continue
+        if [ "$active" = "true" ]; then
+            case "$unit" in
+                *.timer) pfwd_run systemctl start "$unit" ;;
+                *) pfwd_run systemctl restart "$unit" ;;
+            esac
+        else
+            pfwd_run systemctl stop "$unit" || true
+        fi
+    done
+}
+
+service_update_stop_active_services() {
+    local states_json="$1"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
     fi
-    if [ "$timer_enabled" = "true" ]; then
-        pfwd_run systemctl enable "$(service_timer_unit_name)"
-        pfwd_run systemctl start "$(service_timer_unit_name)"
-    else
-        pfwd_run systemctl stop "$(service_timer_unit_name)" || true
-        pfwd_run systemctl disable "$(service_timer_unit_name)" || true
-    fi
-    if [ "$guard_enabled" = "true" ]; then
-        pfwd_run systemctl enable "$(service_guard_unit_name)"
-    else
-        pfwd_run systemctl stop "$(service_guard_unit_name)" || true
-        pfwd_run systemctl disable "$(service_guard_unit_name)" || true
-    fi
+    jq -r '
+      map(select(.active == true))
+      | sort_by(
+          if .unit == "pfwd.timer" then 0
+          elif .unit == "pfwd.service" then 1
+          elif .unit == "pfwd-forward.service" then 2
+          elif .unit == "pfwd-bbr.service" then 3
+          elif .unit == "pfwd-xdp.service" then 4
+          elif .unit == "pfwd-downmask-feed.service" then 5
+          elif .unit == "pfwd-whitelist-web.service" then 6
+          else 99 end
+        )
+      | .[].unit
+    ' <<< "$states_json" |
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        pfwd_run systemctl stop "$unit" || true
+    done
 }
 
 service_update_backup_current() {
@@ -648,10 +745,13 @@ service_update_preflight_space() {
 
 service_update_apply_staged() {
     local work_dir="$1"
+    local states_json="${2:-[]}"
     local staged_dir="$work_dir/staged"
 
+    service_update_stop_active_services "$states_json"
     service_prepare_install_dirs
     service_copy_bundle_from_dir "$staged_dir"
+    service_copy_optional_whitelist_web_from_dir "$staged_dir"
     service_cleanup_legacy_install_artifacts
     service_write_shortcuts
 }

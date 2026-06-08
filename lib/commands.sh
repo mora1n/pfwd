@@ -122,24 +122,20 @@ cmd_update_check() {
 
 cmd_update_finalize_recover() {
     local work_dir="$1"
-    local runtime_enabled="$2"
-    local timer_enabled="$3"
-    local guard_enabled="$4"
+    local service_states_json="$2"
     local error_message="$5"
 
     service_update_rollback "$work_dir" || true
-    service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" "$guard_enabled" || true
+    service_update_restore_service_states "$service_states_json" || true
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
 
 cmd_update_finalize() {
-    local work_dir="" runtime_enabled="" timer_enabled="" guard_enabled="" from_version="" to_version=""
+    local work_dir="" service_states_json="[]" from_version="" to_version=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
-            --runtime-enabled) runtime_enabled="${2:-}"; shift 2 ;;
-            --timer-enabled) timer_enabled="${2:-}"; shift 2 ;;
-            --guard-enabled) guard_enabled="${2:-}"; shift 2 ;;
+            --service-states-json) service_states_json="${2:-[]}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
@@ -149,20 +145,20 @@ cmd_update_finalize() {
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
 
     if ! service_cleanup_legacy_install_artifacts; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "清理旧安装资产失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "清理旧安装资产失败"
     fi
     if ! service_write_unit_files; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "同步 systemd unit 失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "同步 systemd unit 失败"
     fi
-    if ! service_update_restore_enabled_state "$runtime_enabled" "$timer_enabled" "$guard_enabled"; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "恢复服务启用状态失败"
+    if ! service_update_restore_service_states "$service_states_json"; then
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "恢复服务状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$runtime_enabled" "$timer_enabled" "$guard_enabled" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
@@ -180,7 +176,7 @@ cmd_update() {
     done
 
     service_installation_present || pfwd_die "未检测到已安装的 pfwd，请先执行 pfwd install"
-    local work_dir staged_dir local_version remote_version runtime_enabled timer_enabled guard_enabled
+    local work_dir staged_dir local_version remote_version service_states_json
     work_dir="$(service_update_create_workdir)"
     staged_dir="$work_dir/staged"
 
@@ -221,23 +217,19 @@ cmd_update() {
 
     local_version="$(service_installed_version)"
     remote_version="$(service_read_version_from_file "$staged_dir/pfwd.sh")"
-    runtime_enabled="$(service_update_capture_enabled_state "$(service_primary_runtime_unit)")"
-    timer_enabled="$(service_update_capture_enabled_state "$(service_timer_unit_name)")"
-    guard_enabled="$(service_update_capture_enabled_state "$(service_guard_unit_name)")"
+    service_states_json="$(service_update_capture_service_states_json)"
 
     if ! service_update_backup_current "$work_dir"; then
         pfwd_die "备份当前安装失败；未应用更新；临时目录保留：$work_dir"
     fi
-    if ! service_update_apply_staged "$work_dir"; then
+    if ! service_update_apply_staged "$work_dir" "$service_states_json"; then
         service_update_rollback "$work_dir" || true
         pfwd_die "更新失败，已回滚；临时目录保留：$work_dir"
     fi
 
     if ! exec "$PFWD_INSTALL_DIR/pfwd.sh" __update_finalize \
         --work-dir "$work_dir" \
-        --runtime-enabled "$runtime_enabled" \
-        --timer-enabled "$timer_enabled" \
-        --guard-enabled "$guard_enabled" \
+        --service-states-json "$service_states_json" \
         --from-version "$local_version" \
         --to-version "$remote_version"; then
         service_update_rollback "$work_dir" || true
