@@ -28,6 +28,7 @@ import (
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed xdp_bpfel.o
@@ -35,7 +36,7 @@ var xdpBPFEL []byte
 
 const binaryVersion = "0.2.8"
 const dataplaneVersion = 2
-const mapABIVersion = 15
+const mapABIVersion = 16
 const auxStateVersion = 1
 const ratioScale = uint64(1_000_000)
 const maxRules = 4096
@@ -595,6 +596,12 @@ type connVal struct {
 	Pad8               [4]uint8
 	Packets            uint64
 	Bytes              uint64
+	LastSeenNS         uint64
+}
+
+type whitelistLeaseActivityRow struct {
+	Address    string `json:"address"`
+	LastSeenAt int64  `json:"last_seen_at"`
 }
 
 type reverseKey struct {
@@ -702,6 +709,8 @@ func run(args []string) error {
 		return runSnapshot(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "whitelist-lease-activity":
+		return runWhitelistLeaseActivity(args[1:])
 	case "version", "--version":
 		fmt.Println(binaryVersion)
 		return nil
@@ -901,6 +910,31 @@ func runStats(args []string) error {
 		return fmt.Errorf("stats 不接受额外参数")
 	}
 	return dumpStats(opts)
+}
+
+func runWhitelistLeaseActivity(args []string) error {
+	fs := flag.NewFlagSet("whitelist-lease-activity", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var opts statsOptions
+	fs.StringVar(&opts.StatusFile, "status-file", "", "status json")
+	fs.StringVar(&opts.StatsPin, "stats-pin", "/sys/fs/bpf/pfwd_stats", "bpffs stats map pin")
+	var ruleCounterPin string
+	var userCounterPin string
+	fs.StringVar(&ruleCounterPin, "rule-counter-pin", "/sys/fs/bpf/pfwd_rule_counters", "bpffs rule counter map pin")
+	fs.StringVar(&userCounterPin, "user-counter-pin", "/sys/fs/bpf/pfwd_user_counters", "bpffs user counter map pin")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("whitelist-lease-activity 不接受额外参数")
+	}
+	rows, err := whitelistLeaseActivity(runtimeMapPinsFromPaths(ruleCounterPin, userCounterPin, opts.StatsPin))
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(rows)
 }
 
 func applyRuntime(opts applyOptions) error {
@@ -4468,6 +4502,76 @@ func summarizeConnections(m *ebpf.Map) (*connSummary, error) {
 	return summary, nil
 }
 
+func connAddrString(value connVal) (string, error) {
+	addr16 := value.ClientAddr
+	if bytes.Equal(addr16[4:], make([]byte, 12)) {
+		v4 := [4]byte{addr16[0], addr16[1], addr16[2], addr16[3]}
+		return netip.AddrFrom4(v4).String(), nil
+	}
+	addr, ok := netip.AddrFromSlice(addr16[:])
+	if !ok {
+		return "", fmt.Errorf("无效 client_addr")
+	}
+	return addr.String(), nil
+}
+
+func whitelistLeaseActivity(pinLayout runtimeMapPins) ([]whitelistLeaseActivityRow, error) {
+	connMap, err := ebpf.LoadPinnedMap(pinLayout.Connections, nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []whitelistLeaseActivityRow{}, nil
+		}
+		return nil, fmt.Errorf("加载 pinned connections map 失败: %w", err)
+	}
+	defer connMap.Close()
+
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return nil, fmt.Errorf("读取 CLOCK_MONOTONIC 失败: %w", err)
+	}
+	nowMonoNS := uint64(ts.Nano())
+	nowEpoch := time.Now().Unix()
+
+	rows := map[string]int64{}
+	it := connMap.Iterate()
+	var key connKey
+	var value connVal
+	for it.Next(&key, &value) {
+		if value.LastSeenNS == 0 {
+			continue
+		}
+		address, err := connAddrString(value)
+		if err != nil {
+			continue
+		}
+		if value.LastSeenNS > nowMonoNS {
+			continue
+		}
+		ageSec := int64((nowMonoNS - value.LastSeenNS) / uint64(time.Second))
+		seen := nowEpoch - ageSec
+		if seen <= 0 {
+			continue
+		}
+		if current, ok := rows[address]; !ok || seen > current {
+			rows[address] = seen
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 connection map 失败: %w", err)
+	}
+	out := make([]whitelistLeaseActivityRow, 0, len(rows))
+	for address, lastSeen := range rows {
+		out = append(out, whitelistLeaseActivityRow{
+			Address:    address,
+			LastSeenAt: lastSeen,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Address < out[j].Address
+	})
+	return out, nil
+}
+
 func loadConnectionSummaryFromStatus(payload statusPayload) (*connSummary, error) {
 	pinLayout := runtimeMapPinsFromPaths(
 		firstNonEmpty(payload.RuleCounterPin, "/sys/fs/bpf/pfwd_rule_counters"),
@@ -4754,6 +4858,7 @@ func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE --state-file FILE [--status-file FILE --rule-counter-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd-xdp whitelist-lease-activity [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp geo-export --asset-dir DIR --mode all|provinces [--provinces CSV --ip-version 4|6|46]")
 	_, _ = fmt.Fprintln(file, "  pfwd-xdp city-export --asset-dir DIR --codes-file FILE")
 }

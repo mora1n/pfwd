@@ -93,6 +93,7 @@ pfwd.timer
 pfwd-bbr.service
 pfwd-xdp.service
 pfwd-downmask-feed.service
+pfwd-whitelist-web.service
 EOF
 }
 
@@ -109,6 +110,7 @@ service_bundle_rows() {
 
     printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
     printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
+    printf '0755\tscripts/pfwd_whitelist_lease_command.sh\tbin/%s\twhitelist-lease-command\n' "$(whitelist_web_restricted_command_script_name)"
     printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
     printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
     printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
@@ -133,6 +135,9 @@ service_missing_bundle_hint() {
         */assets/pfwd-city-cn-*)
             printf '请使用包含 city 资产的完整安装包，或使用已更新 bootstrap 的版本重新安装。\n'
             ;;
+        */assets/pfwd-whitelist-web-linux-*)
+            printf '请先构建 pfwd-whitelist-web 预编译资产，或使用包含该可选组件的完整源码/发布包。\n'
+            ;;
         *)
             return 0
             ;;
@@ -146,12 +151,15 @@ service_install_target_path() {
 service_prepare_install_dirs() {
     mkdir -p "$PFWD_INSTALL_DIR/lib" \
         "$PFWD_INSTALL_DIR/assets" \
+        "$PFWD_INSTALL_DIR/bin" \
         "$(dirname "$PFWD_BIN_PATH")" \
         "$(dirname "$PFWD_BBR_BIN_PATH")" \
         "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" \
         "$(dirname "$PFWD_XDP_BIN_PATH")" \
         "$(dirname "$PFWD_DOWNMASK_BIN_PATH")" \
+        "$(dirname "$PFWD_WHITELIST_WEB_BIN_PATH")" \
         "$PFWD_DOWNMASK_STATE_DIR" \
+        "$PFWD_WHITELIST_WEB_STATE_DIR" \
         "$PFWD_SYSTEMD_DIR"
 }
 
@@ -246,6 +254,17 @@ service_copy_bundle_from_dir() {
     done < <(service_bundle_rows)
 }
 
+service_copy_optional_whitelist_web_from_dir() {
+    local source_root="$1"
+    local asset_rel target_path source_path
+    asset_rel="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
+    [ -n "$asset_rel" ] || return 0
+    source_path="${source_root%/}/$asset_rel"
+    [ -f "$source_path" ] || return 0
+    target_path="$(service_install_target_path "bin/pfwd-whitelist-web")"
+    install -m 0755 "$source_path" "$target_path"
+}
+
 service_cleanup_legacy_install_artifacts() {
     rm -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" \
           "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
@@ -274,6 +293,7 @@ service_write_unit_files() {
     service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
     bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
     xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
+    whitelist_web_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-whitelist-web.service"
     if command -v downmask_write_feed_unit_if_needed >/dev/null 2>&1; then
         downmask_write_feed_unit_if_needed || true
     fi
@@ -284,6 +304,7 @@ service_install_files() {
     service_prepare_install_dirs
     service_verify_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
+    service_copy_optional_whitelist_web_from_dir "$PFWD_SCRIPT_DIR"
     service_cleanup_legacy_install_artifacts
     service_write_shortcuts
     service_write_unit_files
@@ -307,6 +328,9 @@ service_enable() {
     pfwd_run systemctl daemon-reload
     pfwd_run systemctl enable pfwd-xdp.service pfwd.timer
     pfwd_run systemctl start pfwd.timer
+    if [ -f "$PFWD_WHITELIST_WEB_CONFIG_FILE" ]; then
+        pfwd_run systemctl enable pfwd-whitelist-web.service || true
+    fi
 }
 
 service_unit_exists() {
@@ -341,8 +365,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -389,6 +413,7 @@ service_remove_binary_artifacts() {
     while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
         rm -f "$(service_install_target_path "$install_rel")"
     done < <(service_bundle_rows)
+    rm -f "$PFWD_WHITELIST_WEB_BIN_PATH"
 }
 
 service_remove_asset_artifacts() {
@@ -427,6 +452,7 @@ service_verify_removed() {
     for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" \
         "$PFWD_DOWNMASK_STATE_DIR" "$PFWD_DOWNMASK_STATUS_FILE" "$PFWD_DOWNMASK_BIN_PATH" \
+        "$PFWD_WHITELIST_WEB_CONFIG_FILE" "$PFWD_WHITELIST_WEB_BIN_PATH" "$PFWD_WHITELIST_WEB_STATE_DIR" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
         "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         "$PFWD_XDP_SK_LOOKUP_PIN_PATH" "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
@@ -441,6 +467,7 @@ service_verify_removed() {
         "$PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH" \
         "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" \
         "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" "$PFWD_WHITELIST_CITY_IPV4_FILE" \
+        "$PFWD_WHITELIST_LEASES_FILE" "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" \
         "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
         "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"; do
         [ ! -e "$path" ] || leftovers+=("$path")
@@ -496,12 +523,17 @@ service_update_available_kb() {
 service_update_download_bundle() {
     local work_dir="$1"
     local staged_dir="$work_dir/staged"
+    local optional_web_rel=""
 
     mkdir -p "$staged_dir/lib" "$staged_dir/assets"
     local _ source_rel __ ___
     while IFS=$'\t' read -r _ source_rel __ ___; do
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
     done < <(service_bundle_rows)
+    optional_web_rel="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
+    if [ -n "$optional_web_rel" ]; then
+        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$optional_web_rel" "$staged_dir/$optional_web_rel" 2>/dev/null || true
+    fi
 }
 
 service_update_validate_bundle() {
@@ -517,6 +549,9 @@ service_update_validate_bundle() {
             *.sh) bash -n "$dir/$source_rel" || return 1 ;;
         esac
     done < <(service_bundle_rows)
+    if [ -f "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)" ]; then
+        [ -x "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)" ] || chmod 0755 "$dir/assets/$(whitelist_web_asset_name 2>/dev/null || true)"
+    fi
 }
 
 service_update_bundle_digest() {

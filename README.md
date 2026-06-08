@@ -44,6 +44,7 @@ pfwd doctor
 ```bash
 ./xdp/build.sh
 ./downmask/build.sh
+./whitelist_web/build.sh
 ```
 
 打包（以 amd64 为例，arm64 替换为对应文件名）：
@@ -53,6 +54,7 @@ tar -czf pfwd.tar.gz \
   pfwd.sh bbr.sh lib/ \
   assets/pfwd-xdp-linux-amd64 \
   assets/pfwd-downmask-linux-amd64 \
+  assets/pfwd-whitelist-web-linux-amd64 \
   assets/pfwd-geo-cn-v4.bin assets/pfwd-geo-cn-v6.bin assets/pfwd-geo-meta.json \
   assets/pfwd-city-cn-meta.json assets/pfwd-city-cn-v4.bin
 ```
@@ -99,6 +101,8 @@ pfwd guard whitelist-cn all
 pfwd guard whitelist-cn select 广东省 江苏省
 pfwd guard whitelist-city add 湖南省 长沙市
 pfwd guard whitelist-custom add 203.0.113.5
+pfwd guard whitelist-lease add --address 198.51.100.8 --idle-ttl 2h --channel manual --note phone
+pfwd guard whitelist-lease list
 
 pfwd guard whitelist-port status --listen-port 41423
 pfwd guard whitelist-port-cn --listen-port 41423 select 浙江省
@@ -112,7 +116,74 @@ pfwd guard egress-whitelist-cn all
 pfwd guard egress-whitelist-custom add 203.0.113.0/24
 ```
 
-入口白名单的 `enabled` 是总开关。未配置端口覆盖时，端口继承全局国内 IP / 省份 / 市策略；配置端口覆盖后，仅该监听端口使用自己的国内 IP / 省份 / 市选择。入口自定义 CIDR 始终全局共享。`guard protocols --skip-port` 优先级更高，命中后跳过入口白名单和协议封锁。
+入口白名单的 `enabled` 是总开关。未配置端口覆盖时，端口继承全局国内 IP / 省份 / 市策略；配置端口覆盖后，仅该监听端口使用自己的国内 IP / 省份 / 市选择。入口自定义 CIDR 始终全局共享。`guard whitelist-lease` 维护的是全局临时 IP 白名单，对所有启用入口白名单的端口统一生效。`guard protocols --skip-port` 优先级更高，命中后跳过入口白名单和协议封锁。
+
+## 临时白名单 Web 入口
+
+控制机可以运行一个轻量 Web 服务：收到私密 URL 请求后，读取服务端观测到的来源公网 IP，并通过 SSH 调目标机上的 `pfwd guard whitelist-lease add` 添加全局临时入口白名单。
+
+构建：
+
+```bash
+./whitelist_web/build.sh
+```
+
+控制机配置示例：
+
+```json
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 18080,
+  "trusted_proxy_cidrs": ["127.0.0.1/32"],
+  "request_timeout_sec": 8,
+  "routes": [
+    {
+      "secret": "replace-with-random-secret",
+      "label": "phone",
+      "ssh_target": "root@target-host",
+      "idle_ttl": "2h",
+      "ssh_options": ["-F", "/home/user/.ssh/config"]
+    }
+  ]
+}
+```
+
+运行：
+
+```bash
+pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
+```
+
+如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。
+
+推荐把配置和服务管理直接放到 `pfwd` TUI：
+
+- `流量防护 -> 临时白名单 Web`
+- 可查看状态、修改监听地址/端口/超时、维护“可信反代 CIDR”、管理规则，以及启动/停止/重启/启停自启服务。
+
+SSH 权限边界建议收窄到只允许临时白名单租约命令。安装后的受限命令脚本路径为：
+
+```bash
+/usr/local/lib/pfwd/bin/pfwd-whitelist-lease-command
+```
+
+目标机 `authorized_keys` 示例：
+
+```text
+command="/usr/local/lib/pfwd/bin/pfwd-whitelist-lease-command",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAA... control-host
+```
+
+控制机 `ssh_options` 推荐指向专用 key / config，例如：
+
+```json
+["-F", "/home/user/.ssh/config", "-i", "/home/user/.ssh/pfwd-whitelist-web"]
+```
+
+规则中的 `label` 是唯一文本标识，会同时用于：
+
+- TUI 和配置展示
+- Web 接口返回 JSON 的 `label`
+- 目标机 `pfwd guard whitelist-lease add --note <label>` 的备注文本
 
 出口白名单限制转发目标解析出的 IP，同时限制宿主机全部非 loopback 出口流量。
 

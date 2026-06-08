@@ -4504,6 +4504,9 @@ ui_menu_guard() {
             6)
                 ui_menu_egress_whitelist
                 ;;
+            7)
+                ui_menu_whitelist_web
+                ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
         esac
@@ -5234,6 +5237,7 @@ ui_render_ingress_whitelist_menu_page() {
     ui_menu_item 4 "市白名单"
     ui_menu_item 5 "按端口配置"
     ui_menu_item 6 "入口自定义 CIDR"
+    ui_menu_item 7 "临时白名单"
     ui_menu_item 0 "返回"
 }
 
@@ -5265,6 +5269,375 @@ ui_menu_ingress_whitelist() {
                 ;;
             6)
                 ui_menu_whitelist_cidrs
+                ;;
+            7)
+                ui_menu_whitelist_leases
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_whitelist_web_status_rows() {
+    whitelist_web_status_rows
+}
+
+ui_print_whitelist_web_summary() {
+    ui_table_render $'项目\t值' "$(ui_whitelist_web_status_rows)" "2"
+}
+
+ui_whitelist_web_trusted_proxy_rows() {
+    whitelist_web_trusted_proxy_list
+}
+
+ui_print_whitelist_web_trusted_proxy_list() {
+    ui_table_render $'序号\t可信反代 CIDR' "$(ui_whitelist_web_trusted_proxy_rows)" "2"
+}
+
+ui_whitelist_web_route_rows() {
+    whitelist_web_route_rows
+}
+
+ui_print_whitelist_web_route_list() {
+    ui_table_render $'序号\t标签\tsecret\tSSH 目标\t空闲 TTL\tSSH 选项' "$(ui_whitelist_web_route_rows)" "2,4,6"
+}
+
+ui_render_whitelist_web_menu_page() {
+    ui_header "临时白名单 Web"
+    ui_notice_render
+    ui_print_whitelist_web_summary
+    echo
+    ui_menu_item 1 "服务状态"
+    ui_menu_item 2 "监听配置"
+    ui_menu_item 3 "可信反代 CIDR"
+    ui_menu_item 4 "规则列表"
+    ui_menu_item 5 "新增规则"
+    ui_menu_item 6 "修改规则"
+    ui_menu_item 7 "删除规则"
+    ui_menu_item 8 "服务启停"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist_web_service_status() {
+    ui_clear_screen
+    ui_header "临时白名单 Web - 服务状态"
+    ui_notice_render
+    ui_print_whitelist_web_summary
+    echo
+    ui_run cmd_whitelist_web service status
+    ui_pause
+}
+
+ui_menu_whitelist_web_listener() {
+    local config_json current_host current_port current_timeout
+    config_json="$(whitelist_web_config_json)"
+    current_host="$(jq -r '.listen_host // "127.0.0.1"' <<< "$config_json")"
+    current_port="$(jq -r '.listen_port // 18080' <<< "$config_json")"
+    current_timeout="$(jq -r '.request_timeout_sec // 8' <<< "$config_json")"
+
+    ui_form_set "临时白名单 Web - 监听配置" "可信反代 CIDR：只有来自这些反代 IP/CIDR 的请求，才信任 X-Real-IP / X-Forwarded-For；否则只认直连来源 IP。输入 0 返回上级菜单。"
+    ui_form_add_kv "当前监听地址" "$current_host:$current_port"
+    ui_form_add_kv "当前请求超时" "${current_timeout}s"
+    ui_form_read "监听地址" "$current_host" || { ui_form_reset; return 0; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
+    local listen_host="$UI_REPLY"
+    ui_form_add_kv "监听地址" "$listen_host"
+    ui_form_read "监听端口" "$current_port" || { ui_form_reset; return 0; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
+    local listen_port="$UI_REPLY"
+    ui_form_add_kv "监听端口" "$listen_port"
+    ui_form_read "请求超时(秒)" "$current_timeout" || { ui_form_reset; return 0; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
+    local request_timeout="$UI_REPLY"
+    ui_run cmd_whitelist_web config set --listen-host "$listen_host" --listen-port "$listen_port" --request-timeout-sec "$request_timeout"
+    ui_form_reset
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 监听配置已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_render_whitelist_web_trusted_proxy_menu_page() {
+    ui_header "临时白名单 Web - 可信反代 CIDR"
+    ui_notice_render
+    ui_print_whitelist_web_trusted_proxy_list
+    echo "说明：只有来自这些反代 IP/CIDR 的请求，才信任 X-Real-IP / X-Forwarded-For；否则只认直连来源 IP。"
+    echo
+    ui_menu_item 1 "添加 CIDR"
+    ui_menu_item 2 "删除 CIDR"
+    ui_menu_item 3 "清空 CIDR"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist_web_trusted_proxy() {
+    local count
+    while true; do
+        ui_render_page ui_render_whitelist_web_trusted_proxy_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_form_set "添加可信反代 CIDR" "输入一个 IPv4/IPv6 CIDR，或单个 IP。输入 0 返回上级菜单。"
+                ui_form_read "CIDR" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                [ -n "$UI_REPLY" ] || { ui_form_reset; ui_warn "必须提供 CIDR 或单个 IP"; ui_pause; continue; }
+                ui_run cmd_whitelist_web trusted-proxy add "$UI_REPLY"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "可信反代 CIDR 已添加" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            2)
+                count="$(whitelist_web_trusted_proxy_list | sed '/^$/d' | wc -l | tr -d ' ')"
+                if [ "$count" -eq 0 ]; then
+                    ui_warn "暂无可信反代 CIDR"
+                    ui_pause
+                    continue
+                fi
+                ui_render_page ui_render_whitelist_web_trusted_proxy_menu_page
+                ui_read "选择要删除的序号，可单/多/连续选择" || return 0
+                ui_multiselect_parse_indexes "$UI_REPLY" "$count" false || { ui_pause; continue; }
+                ui_run cmd_whitelist_web trusted-proxy delete $UI_REPLY
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "可信反代 CIDR 已删除" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_run cmd_whitelist_web trusted-proxy clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "可信反代 CIDR 已清空" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_render_whitelist_web_routes_page() {
+    ui_header "临时白名单 Web - 规则列表"
+    ui_notice_render
+    ui_print_whitelist_web_route_list
+    echo "说明：label 会同时用于界面展示、HTTP 返回和目标机临时白名单备注。"
+}
+
+ui_menu_whitelist_web_routes() {
+    ui_render_page ui_render_whitelist_web_routes_page
+    ui_pause
+}
+
+ui_whitelist_web_route_form() {
+    local title="$1" mode="$2" index="${3:-}"
+    local current_secret="" current_label="" current_target="" current_ttl="" current_opts=""
+    if [ -n "$index" ]; then
+        current_secret="$(whitelist_web_route_field "$index" secret)"
+        current_label="$(whitelist_web_route_field "$index" label)"
+        current_target="$(whitelist_web_route_field "$index" ssh_target)"
+        current_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
+        current_opts="$(whitelist_web_route_ssh_options_text "$index")"
+        [ -n "$current_secret$current_label$current_target$current_ttl$current_opts" ] || { ui_warn "规则序号不存在"; ui_pause; return 1; }
+    fi
+    ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。输入 0 返回上级菜单。"
+    [ -z "$index" ] || ui_form_add_kv "当前规则序号" "$index"
+    [ -z "$current_secret" ] || ui_form_add_kv "当前 secret" "$current_secret"
+    [ -z "$current_label" ] || ui_form_add_kv "当前标签" "$current_label"
+    [ -z "$current_target" ] || ui_form_add_kv "当前 SSH 目标" "$current_target"
+    [ -z "$current_ttl" ] || ui_form_add_kv "当前空闲 TTL" "$current_ttl"
+    [ -z "$current_opts" ] || ui_form_add_kv "当前 SSH 选项" "$current_opts"
+    ui_form_read "secret" "$current_secret" || { ui_form_reset; return 1; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+    local secret="$UI_REPLY"
+    ui_form_add_kv "secret" "$secret"
+    ui_form_read "标签" "$current_label" || { ui_form_reset; return 1; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+    local label="$UI_REPLY"
+    ui_form_add_kv "标签" "$label"
+    ui_form_read "SSH 目标" "$current_target" || { ui_form_reset; return 1; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+    local ssh_target="$UI_REPLY"
+    ui_form_add_kv "SSH 目标" "$ssh_target"
+    ui_form_read "空闲 TTL" "${current_ttl:-2h}" || { ui_form_reset; return 1; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+    local idle_ttl="$UI_REPLY"
+    ui_form_add_kv "空闲 TTL" "$idle_ttl"
+    ui_form_read "SSH 选项（空格分隔，留空表示无）" "$current_opts" || { ui_form_reset; return 1; }
+    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+    local ssh_options="$UI_REPLY"
+    if [ "$mode" = "add" ]; then
+        ui_run cmd_whitelist_web route add --secret "$secret" --label "$label" --ssh-target "$ssh_target" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+    else
+        ui_run cmd_whitelist_web route update --index "$index" --secret "$secret" --label "$label" --ssh-target "$ssh_target" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+    fi
+    ui_form_reset
+    return 0
+}
+
+ui_menu_whitelist_web_route_add() {
+    ui_whitelist_web_route_form "新增临时白名单 Web 规则" "add" || return 0
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 规则已添加" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_whitelist_web_route_update() {
+    local count
+    count="$(whitelist_web_route_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "暂无规则"
+        ui_pause
+        return 0
+    fi
+    ui_render_page ui_render_whitelist_web_routes_page
+    ui_read "选择要修改的规则序号（1-$count）" || return 0
+    [[ "$UI_REPLY" =~ ^[0-9]+$ ]] || { ui_warn "无效序号"; ui_pause; return 0; }
+    [ "$UI_REPLY" -ge 1 ] && [ "$UI_REPLY" -le "$count" ] || { ui_warn "序号超出范围"; ui_pause; return 0; }
+    ui_whitelist_web_route_form "修改临时白名单 Web 规则" "update" "$UI_REPLY" || return 0
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 规则已更新" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_menu_whitelist_web_route_delete() {
+    local count
+    count="$(whitelist_web_route_count)"
+    if [ "$count" -eq 0 ]; then
+        ui_warn "暂无规则"
+        ui_pause
+        return 0
+    fi
+    ui_render_page ui_render_whitelist_web_routes_page
+    ui_read "选择要删除的规则序号，可单/多/连续选择" || return 0
+    ui_multiselect_parse_indexes "$UI_REPLY" "$count" false || { ui_pause; return 0; }
+    ui_run cmd_whitelist_web route delete $UI_REPLY
+    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 规则已删除" "$UI_C_MENU_NUM"
+    ui_maybe_pause success
+}
+
+ui_render_whitelist_web_service_menu_page() {
+    ui_header "临时白名单 Web - 服务启停"
+    ui_notice_render
+    ui_print_whitelist_web_summary
+    echo
+    ui_menu_item 1 "启动服务"
+    ui_menu_item 2 "停止服务"
+    ui_menu_item 3 "重启服务"
+    ui_menu_item 4 "开启自启"
+    ui_menu_item 5 "关闭自启"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist_web_service() {
+    while true; do
+        ui_render_page ui_render_whitelist_web_service_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_run cmd_whitelist_web service start
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 服务已启动" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            2)
+                ui_run cmd_whitelist_web service stop
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 服务已停止" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_run cmd_whitelist_web service restart
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 服务已重启" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            4)
+                ui_run cmd_whitelist_web service enable
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 服务已设为开机自启" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            5)
+                ui_run cmd_whitelist_web service disable
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 服务已取消开机自启" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_menu_whitelist_web() {
+    whitelist_web_init_config_if_missing
+    while true; do
+        ui_render_page ui_render_whitelist_web_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1) ui_menu_whitelist_web_service_status ;;
+            2) ui_menu_whitelist_web_listener ;;
+            3) ui_menu_whitelist_web_trusted_proxy ;;
+            4) ui_menu_whitelist_web_routes ;;
+            5) ui_menu_whitelist_web_route_add ;;
+            6) ui_menu_whitelist_web_route_update ;;
+            7) ui_menu_whitelist_web_route_delete ;;
+            8) ui_menu_whitelist_web_service ;;
+            0) return 0 ;;
+            *) ui_warn "无效选择"; ui_pause ;;
+        esac
+    done
+}
+
+ui_whitelist_lease_rows() {
+    whitelist_lease_list_rows | while IFS=$'\t' read -r idx address ttl last_seen granted channel note; do
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$idx" "$address" "$(pfwd_format_duration_seconds "$ttl")" "$last_seen" "$granted" "$channel" "$note"
+    done
+}
+
+ui_print_whitelist_lease_list() {
+    ui_table_render $'序号\t地址\t空闲TTL\t最近命中(epoch)\t授权(epoch)\t来源\t备注' "$(ui_whitelist_lease_rows)" "2,3,4,5,6,7"
+}
+
+ui_render_whitelist_lease_menu_page() {
+    ui_header "入口临时白名单"
+    ui_notice_render
+    ui_print_whitelist_lease_list
+    echo
+    ui_menu_item 1 "添加临时白名单"
+    ui_menu_item 2 "删除临时白名单"
+    ui_menu_item 3 "清空临时白名单"
+    ui_menu_item 0 "返回"
+}
+
+ui_menu_whitelist_leases() {
+    local count
+    while true; do
+        ui_render_page ui_render_whitelist_lease_menu_page
+        ui_read "选择" || return 0
+        case "$UI_REPLY" in
+            1)
+                ui_form_set "添加临时白名单" "输入公网 IP 和空闲 TTL；该临时白名单对所有启用入口白名单的端口统一生效。"
+                ui_form_read "IP 地址" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                local lease_ip="$UI_REPLY"
+                ui_form_add_kv "IP 地址" "$lease_ip"
+                ui_form_read "空闲 TTL" "30m" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                local lease_ttl="$UI_REPLY"
+                ui_form_add_kv "空闲 TTL" "$lease_ttl"
+                ui_form_read "备注" "" || { ui_form_reset; continue; }
+                [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
+                ui_run cmd_guard_whitelist_lease add --address "$lease_ip" --idle-ttl "$lease_ttl" --channel manual --note "$UI_REPLY"
+                ui_form_reset
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口临时白名单已添加" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            2)
+                count="$(whitelist_lease_count)"
+                if [ "$count" -eq 0 ]; then
+                    ui_warn "暂无入口临时白名单"
+                    ui_pause
+                    continue
+                fi
+                ui_render_page ui_render_whitelist_lease_menu_page
+                ui_read "选择要删除的序号，可单/多/连续选择" || return 0
+                ui_multiselect_parse_indexes "$UI_REPLY" "$count" false || { ui_pause; continue; }
+                ui_run cmd_guard_whitelist_lease delete $UI_REPLY
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口临时白名单已删除" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
+                ;;
+            3)
+                ui_run cmd_guard_whitelist_lease clear
+                [ "$UI_STATUS" -eq 0 ] && ui_notice_set "入口临时白名单已清空" "$UI_C_MENU_NUM"
+                ui_maybe_pause success
                 ;;
             0) return 0 ;;
             *) ui_warn "无效选择"; ui_pause ;;
@@ -6117,6 +6490,7 @@ ui_render_guard_menu_page() {
     ui_menu_item 4 "跳过端口"
     ui_menu_item 5 "入口白名单"
     ui_menu_item 6 "出口白名单"
+    ui_menu_item 7 "临时白名单 Web"
     ui_menu_item 0 "返回"
 }
 

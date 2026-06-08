@@ -1022,16 +1022,27 @@ cmd_restart() {
 
 cmd_reconcile() {
     config_init >/dev/null
-    local before after now_minute need_refresh=false sent
+    local before after now_minute need_refresh=false sent activity_json leases_before leases_after
     if stats_apply_due_resets; then
         need_refresh=true
     fi
     now_minute="$(pfwd_now_minute)"
     before="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
+    leases_before="$(whitelist_lease_count)"
     config_disable_expired "$now_minute"
     config_disable_telegram_for_expired_users "$now_minute"
+    activity_json='[]'
+    if [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_XDP_RULE_COUNTER_PIN_PATH" ]; then
+        activity_json="$("$(forwarder_bin_path)" whitelist-lease-activity \
+          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
+          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
+          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" 2>/dev/null || printf '[]')"
+    fi
+    whitelist_lease_reconcile_activity "$activity_json"
+    whitelist_apply_runtime
+    leases_after="$(whitelist_lease_count)"
     after="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
-    if [ "$before" != "$after" ]; then
+    if [ "$before" != "$after" ] || [ "$leases_before" != "$leases_after" ]; then
         need_refresh=true
     fi
     if [ "$need_refresh" = "true" ]; then
@@ -1040,7 +1051,7 @@ cmd_reconcile() {
     fi
     sent="$(notify_reconcile_schedules)"
     downmask_reconcile_pull 2>/dev/null || true
-    echo "已同步：active_before=$before active_after=$after notify_sent=$sent"
+    echo "已同步：active_before=$before active_after=$after leases_before=$leases_before leases_after=$leases_after notify_sent=$sent"
 }
 
 cmd_notify_test() {
@@ -1161,7 +1172,9 @@ cmd_doctor() {
     if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
     if service_unit_exists pfwd-xdp.service; then echo "pfwd-xdp.service：已安装"; else echo "pfwd-xdp.service：未安装"; fi
     if service_unit_exists pfwd-downmask-feed.service; then echo "pfwd-downmask-feed.service：已安装"; else echo "pfwd-downmask-feed.service：未安装"; fi
+    if service_unit_exists pfwd-whitelist-web.service; then echo "pfwd-whitelist-web.service：已安装"; else echo "pfwd-whitelist-web.service：未安装"; fi
     if [ -x "$PFWD_DOWNMASK_BIN_PATH" ]; then echo "pfwd-downmask：$PFWD_DOWNMASK_BIN_PATH"; else echo "pfwd-downmask：缺失"; fi
+    if [ -x "$PFWD_WHITELIST_WEB_BIN_PATH" ]; then echo "pfwd-whitelist-web：$PFWD_WHITELIST_WEB_BIN_PATH"; else echo "pfwd-whitelist-web：缺失"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
     guard_render_status | while IFS=$'\t' read -r key value; do
@@ -1315,6 +1328,9 @@ cmd_guard() {
         whitelist-custom)
             cmd_guard_whitelist_custom "$@"
             ;;
+        whitelist-lease)
+            cmd_guard_whitelist_lease "$@"
+            ;;
         egress-whitelist)
             cmd_guard_egress_whitelist "$@"
             ;;
@@ -1325,7 +1341,7 @@ cmd_guard() {
             cmd_guard_egress_whitelist_custom "$@"
             ;;
         *)
-            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-cn|whitelist-city|whitelist-port|whitelist-port-cn|whitelist-port-city|whitelist-custom|egress-whitelist|egress-whitelist-cn|egress-whitelist-custom"
+            pfwd_die "用法：pfwd guard enable|disable|status|apply|remove|protocols|whitelist|whitelist-cn|whitelist-city|whitelist-port|whitelist-port-cn|whitelist-port-city|whitelist-custom|whitelist-lease|egress-whitelist|egress-whitelist-cn|egress-whitelist-custom"
             ;;
     esac
 }
@@ -1501,7 +1517,7 @@ cmd_guard_whitelist_check() {
         fi
     fi
 
-    local geo_allowed custom_allowed city_allowed allowed province matched_source city_label
+    local geo_allowed custom_allowed city_allowed allowed province matched_source city_label temp_lease_allowed="false"
     geo_allowed="$(jq -r '.geo_allowed' <<< "$output")"
     custom_allowed="$(jq -r '.custom_allowed' <<< "$output")"
     city_allowed="$(jq -r '.city_allowed // false' <<< "$output")"
@@ -1509,6 +1525,9 @@ cmd_guard_whitelist_check() {
     province="$(jq -r '.province // "-"' <<< "$output")"
     matched_source="$(jq -r '.matched_source' <<< "$output")"
     city_label="$(jq -r 'if ((.city_province // "") != "") and ((.city // "") != "") then (.city_province + "/" + .city) else "-" end' <<< "$output")"
+    if [ -n "$(whitelist_lease_find_by_address_json "$address")" ]; then
+        temp_lease_allowed="true"
+    fi
 
     if [ "$skip_hit" = "true" ]; then
         conclusion="放行"
@@ -1516,6 +1535,9 @@ cmd_guard_whitelist_check() {
     elif [ "$wl_enabled" != "true" ]; then
         conclusion="放行"
         reason="入口白名单未启用"
+    elif [ "$temp_lease_allowed" = "true" ]; then
+        conclusion="放行"
+        reason="命中入口临时白名单租约"
     elif [ "$allowed" = "true" ]; then
         conclusion="放行"
         if [ "$city_allowed" = "true" ]; then
@@ -1544,6 +1566,7 @@ cmd_guard_whitelist_check() {
     printf '省份\t%s\n' "$province"
     printf '城市\t%s\n' "$city_label"
     printf '入口白名单\t%s\n' "$(if [ "$wl_enabled" = "true" ]; then printf '开'; else printf '关'; fi)"
+    printf '临时白名单\t%s\n' "$(if [ "$temp_lease_allowed" = "true" ]; then printf '命中'; else printf '未命中'; fi)"
     printf '策略来源\t%s\n' "$policy_source"
     printf '国内 IP 策略\t%s\n' "$(if [ -n "$listen_port" ]; then whitelist_effective_cn_selection_summary_for_port "$listen_port"; else whitelist_cn_selection_summary; fi)"
     printf '市白名单\t%s\n' "$(if [ -n "$listen_port" ]; then whitelist_effective_city_selection_summary_for_port "$listen_port"; else whitelist_city_selection_summary; fi)"
@@ -1556,6 +1579,76 @@ cmd_guard_whitelist_check() {
     printf 'geo-check\t%s\n' "$(if [ "$geo_status" -eq 0 ]; then printf 'allow'; else printf 'deny'; fi)"
     printf '结论\t%s\n' "$conclusion"
     printf '原因\t%s\n' "$reason"
+}
+
+cmd_guard_whitelist_lease() {
+    config_init >/dev/null
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        list)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-lease list"
+            whitelist_lease_list_rows
+            ;;
+        status)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-lease status"
+            whitelist_lease_status_json | jq '.'
+            ;;
+        add)
+            local address="" idle_ttl_raw="30m" idle_ttl_sec note="" channel="manual"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --address) address="${2:-}"; shift 2 ;;
+                    --idle-ttl) idle_ttl_raw="${2:-}"; shift 2 ;;
+                    --note) note="${2:-}"; shift 2 ;;
+                    --channel) channel="${2:-}"; shift 2 ;;
+                    *) pfwd_die "未知选项：$1" ;;
+                esac
+            done
+            [ -n "$address" ] || pfwd_die "用法：pfwd guard whitelist-lease add --address IP [--idle-ttl 30m|2h|1d] [--note TEXT] [--channel web|manual|ssh]"
+            case "$channel" in
+                web|manual|ssh) ;;
+                *) pfwd_die "无效 channel：$channel；必须是 web/manual/ssh" ;;
+            esac
+            idle_ttl_sec="$(pfwd_parse_duration_seconds "$idle_ttl_raw")"
+            whitelist_lease_upsert "$address" "$idle_ttl_sec" "$note" "$channel"
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口临时白名单已添加：$(normalize_ip_literal_to_cidr "$address") idle_ttl=$(pfwd_format_duration_seconds "$idle_ttl_sec")"
+            ;;
+        delete)
+            local address="" indexes=()
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --address) address="${2:-}"; shift 2 ;;
+                    *)
+                        indexes+=("$1")
+                        shift
+                        ;;
+                esac
+            done
+            if [ -n "$address" ]; then
+                whitelist_lease_delete_by_address "$address"
+            elif [ "${#indexes[@]}" -gt 0 ]; then
+                whitelist_lease_delete_by_indexes "$(printf '%s\n' "${indexes[@]}")"
+            else
+                pfwd_die "用法：pfwd guard whitelist-lease delete <index...>|--address IP"
+            fi
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口临时白名单已删除"
+            ;;
+        clear)
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-lease clear"
+            whitelist_lease_clear_all
+            whitelist_apply_runtime
+            cmd_apply_guard_runtime
+            echo "入口临时白名单已清空"
+            ;;
+        *)
+            pfwd_die "用法：pfwd guard whitelist-lease list|status|add|delete|clear"
+            ;;
+    esac
 }
 
 cmd_guard_whitelist_city() {

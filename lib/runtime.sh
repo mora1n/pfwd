@@ -714,6 +714,9 @@ runtime_remove_whitelist_runtime_files() {
     rm -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" \
           "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
           "$PFWD_WHITELIST_CITY_IPV4_FILE" \
+          "$PFWD_WHITELIST_LEASES_FILE" \
+          "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" \
+          "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" \
           "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" \
           "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
           "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE" \

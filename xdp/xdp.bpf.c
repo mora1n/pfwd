@@ -180,6 +180,7 @@ struct pfwd_conn_val {
     __u8 pad8[4];
     __u64 packets;
     __u64 bytes;
+    __u64 last_seen_ns;
 };
 
 struct pfwd_reverse_key {
@@ -523,6 +524,7 @@ static __always_inline void record_new_tcp_state(struct pfwd_conn_val *conn, __u
         return;
     }
     conn->state = state;
+    conn->last_seen_ns = bpf_ktime_get_ns();
     if (state == PFWD_CONN_STATE_TCP_SYN_PENDING) {
         stat_inc(PFWD_STAT_TCP_PREWARMED);
     } else if (state == PFWD_CONN_STATE_TCP_ESTABLISHED) {
@@ -538,6 +540,7 @@ static __always_inline void mark_tcp_established(struct pfwd_conn_val *conn) {
         conn->state = PFWD_CONN_STATE_TCP_ESTABLISHED;
         stat_inc(PFWD_STAT_TCP_ESTABLISHED);
     }
+    conn->last_seen_ns = bpf_ktime_get_ns();
 }
 
 static __always_inline int tc_pull_data_min(struct __sk_buff *skb, __u32 len) {
@@ -1303,6 +1306,7 @@ static __always_inline void count_output(struct pfwd_conn_val *conn, __u64 bytes
     __u32 key = conn->rule_id;
     __u64 billed = 0;
 
+    conn->last_seen_ns = bpf_ktime_get_ns();
     if (!conn->billing_enabled && !conn->user_limit_enabled) {
         conn->bytes += bytes;
         conn->packets += packets;

@@ -102,7 +102,13 @@ PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE="${PFWD_EGRESS_WHITELIST_HOST_ALLOW_I
 PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE="${PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE:-$PFWD_EGRESS_WHITELIST_STATE_DIR/host_allow_ipv6.txt}"
 PFWD_SCRIPT_NAME="pfwd"
 PFWD_XDP_DATAPLANE_VERSION="${PFWD_XDP_DATAPLANE_VERSION:-2}"
-PFWD_XDP_MAP_ABI_VERSION="${PFWD_XDP_MAP_ABI_VERSION:-15}"
+PFWD_XDP_MAP_ABI_VERSION="${PFWD_XDP_MAP_ABI_VERSION:-16}"
+PFWD_WHITELIST_WEB_CONFIG_FILE="${PFWD_WHITELIST_WEB_CONFIG_FILE:-$PFWD_ETC_DIR/whitelist-web.json}"
+PFWD_WHITELIST_WEB_BIN_PATH="${PFWD_WHITELIST_WEB_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-whitelist-web}"
+PFWD_WHITELIST_WEB_STATE_DIR="${PFWD_WHITELIST_WEB_STATE_DIR:-$PFWD_STATE_DIR/whitelist_web}"
+PFWD_WHITELIST_LEASES_FILE="${PFWD_WHITELIST_LEASES_FILE:-$PFWD_WHITELIST_STATE_DIR/leases.json}"
+PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv4.txt}"
+PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv6.txt}"
 
 pfwd_die() {
     echo "错误：$*" >&2
@@ -162,6 +168,49 @@ pfwd_now_epoch() {
     date '+%s'
 }
 
+pfwd_parse_duration_seconds() {
+    local raw="$1"
+    local value unit seconds=0
+    raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$raw" ] || pfwd_die "时长不能为空"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+)(s|m|h|d)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            s) seconds="$value" ;;
+            m) seconds=$((value * 60)) ;;
+            h) seconds=$((value * 3600)) ;;
+            d) seconds=$((value * 86400)) ;;
+            *) pfwd_die "无效时长单位：$raw" ;;
+        esac
+        [ "$seconds" -ge 1 ] || pfwd_die "时长必须大于 0：$raw"
+        printf '%s\n' "$seconds"
+        return 0
+    fi
+    pfwd_die "无效时长：$raw；支持纯秒，或 30m/2h/1d"
+}
+
+pfwd_format_duration_seconds() {
+    local seconds="$1"
+    if [[ -z "$seconds" || ! "$seconds" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "-"
+        return 0
+    fi
+    if [ "$seconds" -gt 0 ] && [ $((seconds % 86400)) -eq 0 ]; then
+        printf '%sd\n' $((seconds / 86400))
+    elif [ "$seconds" -gt 0 ] && [ $((seconds % 3600)) -eq 0 ]; then
+        printf '%sh\n' $((seconds / 3600))
+    elif [ "$seconds" -gt 0 ] && [ $((seconds % 60)) -eq 0 ]; then
+        printf '%sm\n' $((seconds / 60))
+    else
+        printf '%ss\n' "$seconds"
+    fi
+}
+
 pfwd_join_lines() {
     local delimiter="${1:-}"
     awk -v delimiter="$delimiter" '
@@ -218,7 +267,7 @@ pfwd_stop_at_expired() {
 }
 
 pfwd_mkdirs() {
-    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_DOWNMASK_STATE_DIR"
+    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_WEB_STATE_DIR" "$PFWD_DOWNMASK_STATE_DIR"
 }
 
 forwarder_bin_path() {

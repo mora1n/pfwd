@@ -226,6 +226,7 @@ static struct bpf_sock *(*bpf_sk_lookup_tcp)(void *ctx, struct bpf_sock_tuple *t
 static struct bpf_sock *(*bpf_sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *)85;
 static long (*bpf_sk_release)(void *sock) = (void *)86;
 static long (*bpf_sk_assign)(void *ctx, void *sk, __u64 flags) = (void *)124;
+static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 static __always_inline __u16 bpf_ntohs(__u16 value) { return __builtin_bswap16(value); }

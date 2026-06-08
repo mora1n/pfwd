@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask service commands ui)
+PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask whitelist_web service commands ui)
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -110,11 +110,13 @@ pfwd_bootstrap_install() {
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$install_dir/assets" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$install_dir/assets" "$install_dir/bin" "$install_dir/scripts" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
     chmod +x "$install_dir/bbr.sh"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/scripts/pfwd_whitelist_lease_command.sh" "$install_dir/scripts/pfwd_whitelist_lease_command.sh"
+    chmod +x "$install_dir/scripts/pfwd_whitelist_lease_command.sh"
     xdp_asset="$(pfwd_bootstrap_xdp_asset_name)" || {
         echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
@@ -234,6 +236,7 @@ pfwd_main() {
         notify-delete) cmd_notify_delete "$@" ;;
         guard) cmd_guard "$@" ;;
         downmask) cmd_downmask "$@" ;;
+        whitelist-web) cmd_whitelist_web "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
@@ -299,6 +302,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd guard whitelist-port-cn --listen-port PORT all|off|select <省份...>
   pfwd guard whitelist-port-city --listen-port PORT list|status|add <省份> <城市...>|delete <序号...>|clear
   pfwd guard whitelist-custom list|add|clear|delete|update ...
+  pfwd guard whitelist-lease list|status|add|delete|clear ...
   pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
   pfwd guard egress-whitelist status
   pfwd guard egress-whitelist-cn list|status|all|off|select <省份...>
@@ -311,6 +315,12 @@ pfwd - XDP 端口转发管理脚本
   pfwd downmask ab-pull targets list|add|delete|update|clear ...
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
   pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
+  pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
+  pfwd whitelist-web init|status
+  pfwd whitelist-web config show|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
+  pfwd whitelist-web trusted-proxy list|add|delete|clear ...
+  pfwd whitelist-web route list|add|update|delete ...
+  pfwd whitelist-web service status|start|stop|restart|enable|disable
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]

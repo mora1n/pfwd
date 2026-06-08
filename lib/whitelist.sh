@@ -20,6 +20,18 @@ whitelist_city_runtime_ipv4_file() {
     printf '%s\n' "$PFWD_WHITELIST_CITY_IPV4_FILE"
 }
 
+whitelist_leases_file() {
+    printf '%s\n' "$PFWD_WHITELIST_LEASES_FILE"
+}
+
+whitelist_temp_allow_ipv4_file() {
+    printf '%s\n' "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE"
+}
+
+whitelist_temp_allow_ipv6_file() {
+    printf '%s\n' "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE"
+}
+
 whitelist_enabled() {
     jq -r '.settings.whitelist.enabled // false' "$PFWD_CONFIG_FILE"
 }
@@ -173,6 +185,48 @@ whitelist_custom_cidrs_json() {
     jq -c '.settings.whitelist.custom_cidrs // []' "$PFWD_CONFIG_FILE"
 }
 
+whitelist_lease_entries_json() {
+    local file
+    file="$(whitelist_leases_file)"
+    if [ ! -f "$file" ]; then
+        printf '[]\n'
+        return 0
+    fi
+    jq -c 'if type == "array" then . else [] end' "$file" 2>/dev/null || printf '[]\n'
+}
+
+whitelist_lease_entries_sorted_json() {
+    whitelist_lease_entries_json | jq -c '
+      map(
+        .address = (.address // "")
+        | .cidr = (.cidr // "")
+        | .channel = (.channel // "manual")
+        | .note = (.note // "")
+        | .idle_ttl_sec = ((.idle_ttl_sec // 0) | tonumber)
+        | .granted_at = ((.granted_at // 0) | tonumber)
+        | .last_seen_at = (if (.last_seen_at // null) == null then null else (.last_seen_at | tonumber) end)
+        | .last_active_at = (if (.last_seen_at // null) == null then (.granted_at // 0) else .last_seen_at end)
+      )
+      | sort_by(.address)
+    '
+}
+
+whitelist_lease_count() {
+    whitelist_lease_entries_json | jq -r 'length'
+}
+
+whitelist_lease_custom_cidrs_tsv() {
+    whitelist_lease_entries_sorted_json | jq -r '.[] | .cidr // empty'
+}
+
+whitelist_lease_find_by_address_json() {
+    local address="$1"
+    whitelist_lease_entries_json | jq -c --arg address "$address" '
+      map(select((.address // "") == $address))
+      | first // empty
+    '
+}
+
 whitelist_nonempty_line_count() {
     local file="$1"
     if [ -s "$file" ]; then
@@ -187,6 +241,8 @@ whitelist_entry_count() {
     total=$((total + $(whitelist_nonempty_line_count "$(whitelist_allow_ipv4_file)")))
     total=$((total + $(whitelist_nonempty_line_count "$(whitelist_allow_ipv6_file)")))
     total=$((total + $(whitelist_nonempty_line_count "$(whitelist_city_runtime_ipv4_file)")))
+    total=$((total + $(whitelist_nonempty_line_count "$(whitelist_temp_allow_ipv4_file)")))
+    total=$((total + $(whitelist_nonempty_line_count "$(whitelist_temp_allow_ipv6_file)")))
     echo "$total"
 }
 
@@ -846,11 +902,17 @@ whitelist_custom_cidr_by_index() {
 }
 
 whitelist_merge_runtime() {
-    local tmp_v4 tmp_v6
+    local tmp_v4 tmp_v6 tmp_lease_v4 tmp_lease_v6
     tmp_v4="$(mktemp)"
     tmp_v6="$(mktemp)"
+    tmp_lease_v4="$(mktemp)"
+    tmp_lease_v6="$(mktemp)"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv4_cidrs >> "$tmp_v4"
     whitelist_custom_cidrs_tsv | whitelist_filter_ipv6_cidrs >> "$tmp_v6"
+    whitelist_lease_custom_cidrs_tsv | whitelist_filter_ipv4_cidrs >> "$tmp_lease_v4"
+    whitelist_lease_custom_cidrs_tsv | whitelist_filter_ipv6_cidrs >> "$tmp_lease_v6"
+    cat "$tmp_lease_v4" >> "$tmp_v4"
+    cat "$tmp_lease_v6" >> "$tmp_v6"
     whitelist_materialize_city_runtime
 
     if [ -s "$tmp_v4" ]; then
@@ -863,7 +925,18 @@ whitelist_merge_runtime() {
     else
         : > "$(whitelist_allow_ipv6_file)"
     fi
-    rm -f "$tmp_v4" "$tmp_v6"
+    if [ -s "$tmp_lease_v4" ]; then
+        whitelist_write_allow_file "$tmp_lease_v4" > /dev/null 2>&1 || true
+        sort -u "$tmp_lease_v4" | pfwd_write_atomic "$(whitelist_temp_allow_ipv4_file)"
+    else
+        : > "$(whitelist_temp_allow_ipv4_file)"
+    fi
+    if [ -s "$tmp_lease_v6" ]; then
+        sort -u "$tmp_lease_v6" | pfwd_write_atomic "$(whitelist_temp_allow_ipv6_file)"
+    else
+        : > "$(whitelist_temp_allow_ipv6_file)"
+    fi
+    rm -f "$tmp_v4" "$tmp_v6" "$tmp_lease_v4" "$tmp_lease_v6"
 }
 
 whitelist_materialize_city_runtime() {
@@ -891,6 +964,7 @@ whitelist_prepare_runtime() {
         rm -f "$(whitelist_allow_ipv4_file)" "$(whitelist_allow_ipv6_file)" 2>/dev/null || true
         rm -f "$(whitelist_allow_ipv4_file).cn" "$(whitelist_allow_ipv6_file).cn" 2>/dev/null || true
         rm -f "$(whitelist_city_runtime_ipv4_file)" 2>/dev/null || true
+        rm -f "$(whitelist_temp_allow_ipv4_file)" "$(whitelist_temp_allow_ipv6_file)" 2>/dev/null || true
         return 0
     fi
 
@@ -926,6 +1000,10 @@ ipv6:
 $(cat "$(whitelist_allow_ipv6_file)" 2>/dev/null || true)
 city_ipv4:
 $(cat "$(whitelist_city_runtime_ipv4_file)" 2>/dev/null || true)
+temp_ipv4:
+$(cat "$(whitelist_temp_allow_ipv4_file)" 2>/dev/null || true)
+temp_ipv6:
+$(cat "$(whitelist_temp_allow_ipv6_file)" 2>/dev/null || true)
 EOF
 )"
     printf '%s' "$payload" | cksum | awk '{print $1}'
@@ -961,8 +1039,12 @@ whitelist_status_json() {
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
       --arg city_ipv4_file "$(whitelist_city_runtime_ipv4_file)" \
+      --arg temp_ipv4_file "$(whitelist_temp_allow_ipv4_file)" \
+      --arg temp_ipv6_file "$(whitelist_temp_allow_ipv6_file)" \
       --argjson entries "$(whitelist_entry_count)" \
       --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
+      --argjson lease_count "$(whitelist_lease_count)" \
+      --argjson leases "$(whitelist_lease_entries_sorted_json)" \
       --argjson city_count "$(whitelist_city_codes_count)" \
       --argjson port_policy_count "$(whitelist_port_policy_count)" \
       '{
@@ -975,8 +1057,12 @@ whitelist_status_json() {
         allow_ipv4_file: $allow_ipv4_file,
         allow_ipv6_file: $allow_ipv6_file,
         city_ipv4_file: $city_ipv4_file,
+        temp_ipv4_file: $temp_ipv4_file,
+        temp_ipv6_file: $temp_ipv6_file,
         entries: $entries,
         custom_cidrs_count: $custom_cidrs_count,
+        lease_count: $lease_count,
+        leases: $leases,
         city_count: $city_count,
         port_policy_count: $port_policy_count
       }'
@@ -1108,12 +1194,154 @@ whitelist_render_status() {
         ["市白名单", (if .enabled then .city_selection else "-" end)],
         ["端口覆盖", (if .enabled then ((.port_policy_count // 0) | tostring) else "-" end)],
         ["自定义 CIDR", (.custom_cidrs_count | tostring)],
+        ["临时白名单", (.lease_count | tostring)],
         ["白名单条目", (.entries | tostring)],
         ["IPv4 文件", .allow_ipv4_file],
+        ["临时 IPv4 文件", .temp_ipv4_file],
         ["市级 IPv4 文件", .city_ipv4_file],
-        ["IPv6 文件", .allow_ipv6_file]
+        ["IPv6 文件", .allow_ipv6_file],
+        ["临时 IPv6 文件", .temp_ipv6_file]
       ]
       | map(@tsv)
       | .[]
     ' <<< "$json"
+}
+
+whitelist_lease_save_json() {
+    local payload="$1"
+    mkdir -p "$(dirname "$(whitelist_leases_file)")"
+    printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$(whitelist_leases_file)"
+}
+
+whitelist_lease_upsert() {
+    local address="$1"
+    local idle_ttl_sec="$2"
+    local note="$3"
+    local channel="$4"
+    local now granted_at
+    local cidr payload
+    cidr="$(normalize_ip_literal_to_cidr "$address")"
+    address="${cidr%/*}"
+    now="$(pfwd_now_epoch)"
+    payload="$(
+      whitelist_lease_entries_json | jq -c \
+        --arg address "$address" \
+        --arg cidr "$cidr" \
+        --arg note "$note" \
+        --arg channel "$channel" \
+        --argjson idle_ttl_sec "$idle_ttl_sec" \
+        --argjson now "$now" '
+        (map(select((.address // "") != $address))) as $rest
+        | (map(select((.address // "") == $address)) | first // null) as $existing
+        | ($existing.last_seen_at // null) as $last_seen
+        | $rest + [{
+            address: $address,
+            cidr: $cidr,
+            idle_ttl_sec: $idle_ttl_sec,
+            granted_at: $now,
+            last_seen_at: $last_seen,
+            note: $note,
+            channel: $channel
+          }]
+      '
+    )"
+    whitelist_lease_save_json "$payload"
+}
+
+whitelist_lease_delete_by_address() {
+    local address="$1"
+    local payload
+    address="$(normalize_ip_literal_to_cidr "$address")"
+    address="${address%/*}"
+    payload="$(whitelist_lease_entries_json | jq -c --arg address "$address" '
+      map(select((.address // "") != $address))
+    ')"
+    whitelist_lease_save_json "$payload"
+}
+
+whitelist_lease_clear_all() {
+    whitelist_lease_save_json '[]'
+}
+
+whitelist_lease_delete_by_indexes() {
+    local indexes="$1"
+    local payload
+    [ -n "$indexes" ] || pfwd_die "缺少临时白名单序号"
+    payload="$(whitelist_lease_entries_sorted_json | jq -c --arg raw "$indexes" '
+      ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
+      | to_entries
+      | map(select((($wanted | index(.key + 1)) | not)))
+      | map(.value)
+    ')"
+    whitelist_lease_save_json "$payload"
+}
+
+whitelist_lease_list_rows() {
+    whitelist_lease_entries_sorted_json | jq -r '
+      to_entries[]
+      | [
+          ((.key + 1) | tostring),
+          (.value.address // "-"),
+          ((.value.idle_ttl_sec // 0) | tostring),
+          (if (.value.last_seen_at // null) == null then "-" else (.value.last_seen_at | tostring) end),
+          ((.value.granted_at // 0) | tostring),
+          (.value.channel // "-"),
+          (.value.note // "-")
+        ] | @tsv
+    '
+}
+
+whitelist_lease_status_json() {
+    jq -n \
+      --argjson count "$(whitelist_lease_count)" \
+      --argjson leases "$(whitelist_lease_entries_sorted_json)" \
+      '{
+        count: $count,
+        leases: $leases
+      }'
+}
+
+whitelist_lease_materialize_activity_json() {
+    local file="${1:-}"
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        jq -c 'if type == "array" then . else [] end' "$file" 2>/dev/null || printf '[]\n'
+    else
+        printf '[]\n'
+    fi
+}
+
+whitelist_lease_reconcile_activity() {
+    local activity_json="$1"
+    local now payload
+    now="$(pfwd_now_epoch)"
+    payload="$(
+      jq -nc \
+        --argjson leases "$(whitelist_lease_entries_json)" \
+        --argjson activity "$activity_json" \
+        --argjson now "$now" '
+        def activity_map:
+          reduce $activity[]? as $row ({};
+            if (($row.address // "") | length) == 0 then
+              .
+            else
+              .[$row.address] = (($row.last_seen_at // 0) | tonumber)
+            end
+          );
+        (activity_map) as $active
+        | ($leases // [])
+        | map(
+            .address = (.address // "")
+            | .idle_ttl_sec = ((.idle_ttl_sec // 0) | tonumber)
+            | .granted_at = ((.granted_at // 0) | tonumber)
+            | .last_seen_at =
+                (if ($active[.address] // 0) > 0 then ($active[.address]) else (.last_seen_at // null) end)
+          )
+        | map(
+            .last_active_at = (if (.last_seen_at // null) == null then .granted_at else .last_seen_at end)
+          )
+        | map(select((.last_active_at + .idle_ttl_sec) > $now))
+        | map(del(.last_active_at))
+      '
+    )"
+    whitelist_lease_save_json "$payload"
 }
