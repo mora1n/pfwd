@@ -34,10 +34,15 @@ pfwd doctor
 离线安装时，安装包至少需要包含：
 
 - `pfwd.sh`、`bbr.sh`、`lib/`
+- `scripts/pfwd_whitelist_lease_command.sh`
 - `assets/pfwd-xdp-linux-amd64` 或 `assets/pfwd-xdp-linux-arm64`
 - `assets/pfwd-downmask-linux-amd64` 或 `assets/pfwd-downmask-linux-arm64`
 - `assets/pfwd-geo-cn-v4.bin`、`assets/pfwd-geo-cn-v6.bin`、`assets/pfwd-geo-meta.json`
 - `assets/pfwd-city-cn-meta.json`、`assets/pfwd-city-cn-v4.bin`
+
+如果还要在控制机上启用临时白名单 Web 入口，离线包另外加入：
+
+- `assets/pfwd-whitelist-web-linux-amd64` 或 `assets/pfwd-whitelist-web-linux-arm64`
 
 构建资产：
 
@@ -51,13 +56,14 @@ pfwd doctor
 
 ```bash
 tar -czf pfwd.tar.gz \
-  pfwd.sh bbr.sh lib/ \
+  pfwd.sh bbr.sh lib/ scripts/ \
   assets/pfwd-xdp-linux-amd64 \
   assets/pfwd-downmask-linux-amd64 \
-  assets/pfwd-whitelist-web-linux-amd64 \
   assets/pfwd-geo-cn-v4.bin assets/pfwd-geo-cn-v6.bin assets/pfwd-geo-meta.json \
   assets/pfwd-city-cn-meta.json assets/pfwd-city-cn-v4.bin
 ```
+
+如需控制机 Web 入口，再追加 `assets/pfwd-whitelist-web-linux-amd64` 或对应 arm64 产物。
 
 目标机器解压后运行：
 
@@ -113,7 +119,7 @@ pfwd guard whitelist check --address 61.187.9.117 --listen-port 41422 --protocol
 
 pfwd guard egress-whitelist --enabled true
 pfwd guard egress-whitelist-cn all
-pfwd guard egress-whitelist-custom add 203.0.113.0/24
+pfwd guard egress-whitelist-custom add 204.0.113.0/24
 ```
 
 入口白名单的 `enabled` 是总开关。未配置端口覆盖时，端口继承全局国内 IP / 省份 / 市策略；配置端口覆盖后，仅该监听端口使用自己的国内 IP / 省份 / 市选择。入口自定义 CIDR 始终全局共享。`guard whitelist-lease` 维护的是全局临时 IP 白名单，对所有启用入口白名单的端口统一生效。`guard protocols --skip-port` 优先级更高，命中后跳过入口白名单和协议封锁。
@@ -122,39 +128,30 @@ pfwd guard egress-whitelist-custom add 203.0.113.0/24
 
 控制机可以运行一个轻量 Web 服务：收到私密 URL 请求后，读取服务端观测到的来源公网 IP，并通过 SSH 调目标机上的 `pfwd guard whitelist-lease add` 添加全局临时入口白名单。
 
-构建：
+最小使用流程：
 
 ```bash
 ./whitelist_web/build.sh
-```
-
-控制机配置示例：
-
-```json
-{
-  "listen_host": "127.0.0.1",
-  "listen_port": 18080,
-  "trusted_proxy_cidrs": ["127.0.0.1/32"],
-  "request_timeout_sec": 8,
-  "routes": [
-    {
-      "secret": "replace-with-random-secret",
-      "label": "phone",
-      "ssh_target": "root@target-host",
-      "idle_ttl": "2h",
-      "ssh_options": ["-F", "/home/user/.ssh/config"]
-    }
-  ]
-}
-```
-
-运行：
-
-```bash
+pfwd whitelist-web init
+pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 30
+pfwd whitelist-web trusted-proxy add 127.0.0.1/32
+pfwd whitelist-web trusted-proxy add ::1/128
+pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --idle-ttl 4h --ssh-options '-p 22 -i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes'
+pfwd whitelist-web service enable
+pfwd whitelist-web service start
 pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
 ```
 
-如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。
+常用检查命令：
+
+```bash
+pfwd whitelist-web status
+pfwd whitelist-web config show
+pfwd whitelist-web route list
+pfwd whitelist-web service status
+```
+
+如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。
 
 推荐把配置和服务管理直接放到 `pfwd` TUI：
 
