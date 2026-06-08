@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.17"
+PFWD_VERSION="0.2.18"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -319,7 +319,7 @@ pfwd - XDP 端口转发管理脚本
   pfwd whitelist-web init|status
   pfwd whitelist-web config show|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
   pfwd whitelist-web trusted-proxy list|add|delete|clear ...
-  pfwd whitelist-web route list|add|update|delete ...
+  pfwd whitelist-web route list|add|update|delete ...   # add/update 支持 [--ssh-port PORT] [--ssh-options '...']
   pfwd whitelist-web service status|start|stop|restart|enable|disable
   pfwd doctor [--bench]
   pfwd install

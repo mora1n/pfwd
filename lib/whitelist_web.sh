@@ -133,6 +133,13 @@ whitelist_web_validate_timeout() {
     [ "$value" -ge 1 ] || pfwd_die "request_timeout_sec 必须大于 0"
 }
 
+whitelist_web_validate_ssh_port() {
+    local value="$1"
+    [ -n "$value" ] || return 0
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "ssh_port 必须是 1-65535 的整数"
+    [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || pfwd_die "ssh_port 必须是 1-65535 的整数"
+}
+
 whitelist_web_validate_route() {
     local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4"
     whitelist_web_validate_secret "$secret"
@@ -286,11 +293,109 @@ whitelist_web_route_rows() {
     '
 }
 
+whitelist_web_route_ui_rows() {
+    local count index label secret ssh_target idle_ttl ssh_port ssh_options
+    count="$(whitelist_web_route_count)"
+    for ((index = 1; index <= count; index++)); do
+        label="$(whitelist_web_route_field "$index" label)"
+        secret="$(whitelist_web_route_field "$index" secret)"
+        ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
+        idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
+        ssh_port="$(whitelist_web_route_ssh_port "$index")"
+        ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$index" \
+            "${label:--}" \
+            "${secret:--}" \
+            "${ssh_target:--}" \
+            "${ssh_port:--}" \
+            "${idle_ttl:--}" \
+            "${ssh_options:--}"
+    done
+}
+
 whitelist_web_route_json_by_index() {
     local index="$1"
     whitelist_web_config_json | jq -c --argjson index "$index" '
       (.routes // [])[$index - 1] // empty
     '
+}
+
+whitelist_web_ssh_port_from_options_json() {
+    local options_json="${1:-[]}"
+    jq -r '
+      . as $options
+      | (
+          reduce range(0; ($options | length)) as $i (null;
+            if . != null then
+              .
+            elif ($options[$i] == "-p") then
+              ($options[$i + 1] // "")
+            elif (($options[$i] // "") | startswith("-p")) and ($options[$i] != "-p") then
+              ($options[$i][2:])
+            else
+              null
+            end
+          )
+        ) // ""
+    ' <<< "$options_json"
+}
+
+whitelist_web_ssh_options_without_port_json() {
+    local options_json="${1:-[]}"
+    jq -c '
+      . as $options
+      | reduce range(0; ($options | length)) as $i ([];
+          if ($options[$i] == "-p") then
+            .
+          elif ($i > 0) and ($options[$i - 1] == "-p") then
+            .
+          elif (($options[$i] // "") | startswith("-p")) and ($options[$i] != "-p") then
+            .
+          else
+            . + [$options[$i]]
+          end
+        )
+    ' <<< "$options_json"
+}
+
+whitelist_web_route_ssh_options_json() {
+    local index="$1"
+    whitelist_web_route_json_by_index "$index" | jq -c '(.ssh_options // [])'
+}
+
+whitelist_web_route_ssh_port() {
+    local index="$1"
+    whitelist_web_ssh_port_from_options_json "$(whitelist_web_route_ssh_options_json "$index")"
+}
+
+whitelist_web_route_ssh_options_text_without_port() {
+    local index="$1"
+    whitelist_web_ssh_options_without_port_json "$(whitelist_web_route_ssh_options_json "$index")" | jq -r 'join(" ")'
+}
+
+whitelist_web_build_ssh_options_json() {
+    local ssh_port="${1:-}" raw="${2:-}" parsed_json effective_port normalized_json
+    parsed_json="$(whitelist_web_parse_ssh_options_json "$raw")"
+    if jq -e '
+        . as $options
+        | any(range(0; ($options | length)); ($options[.] == "-p") and (($options[. + 1] // "") == ""))
+      ' >/dev/null 2>&1 <<< "$parsed_json"; then
+        pfwd_die "ssh_options 中的 -p 缺少端口值，请改用 --ssh-port PORT 或补齐端口"
+    fi
+    effective_port="$ssh_port"
+    if [ -z "$effective_port" ]; then
+        effective_port="$(whitelist_web_ssh_port_from_options_json "$parsed_json")"
+    fi
+    whitelist_web_validate_ssh_port "$effective_port"
+    normalized_json="$(whitelist_web_ssh_options_without_port_json "$parsed_json")"
+    if [ -n "$effective_port" ]; then
+        jq -c --arg port "$effective_port" '
+          ["-p", $port] + .
+        ' <<< "$normalized_json"
+        return 0
+    fi
+    printf '%s\n' "$normalized_json"
 }
 
 whitelist_web_route_add() {
@@ -326,9 +431,10 @@ whitelist_web_route_update() {
       --arg ssh_target "$ssh_target" \
       --arg idle_ttl "$idle_ttl" \
       --argjson ssh_options "$ssh_options_json" '
-      if (($index - 1) < 0) or (($index - 1) >= ((.routes // []) | length)) then
+      . as $config
+      | if (($index - 1) < 0) or (($index - 1) >= (($config.routes // []) | length)) then
         error("route 序号不存在")
-      elif any((.routes // [])[]; (.secret // "") == $secret and (.secret // "") != ((.routes[$index - 1].secret // ""))) then
+      elif any(($config.routes // [])[]; (.secret // "") == $secret and (.secret // "") != (($config.routes[$index - 1].secret // ""))) then
         error("route.secret 已存在")
       else
         .routes[$index - 1] = {
@@ -485,22 +591,24 @@ cmd_whitelist_web() {
                     whitelist_web_route_rows
                     ;;
                 add)
-                    local secret="" label="" ssh_target="" idle_ttl="" ssh_options_json='[]'
+                    local secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]'
                     while [ "$#" -gt 0 ]; do
                         case "$1" in
                             --secret) secret="${2:-}"; shift 2 ;;
                             --label) label="${2:-}"; shift 2 ;;
                             --ssh-target) ssh_target="${2:-}"; shift 2 ;;
                             --idle-ttl) idle_ttl="${2:-}"; shift 2 ;;
-                            --ssh-options) ssh_options_json="$(whitelist_web_parse_ssh_options_json "${2:-}")"; shift 2 ;;
+                            --ssh-port) ssh_port="${2:-}"; shift 2 ;;
+                            --ssh-options) ssh_options_raw="${2:-}"; shift 2 ;;
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
+                    ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
                     whitelist_web_route_add "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json"
                     echo "whitelist-web 规则已添加"
                     ;;
                 update)
-                    local index="" secret="" label="" ssh_target="" idle_ttl="" ssh_options_json='[]'
+                    local index="" secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]'
                     while [ "$#" -gt 0 ]; do
                         case "$1" in
                             --index) index="${2:-}"; shift 2 ;;
@@ -508,11 +616,13 @@ cmd_whitelist_web() {
                             --label) label="${2:-}"; shift 2 ;;
                             --ssh-target) ssh_target="${2:-}"; shift 2 ;;
                             --idle-ttl) idle_ttl="${2:-}"; shift 2 ;;
-                            --ssh-options) ssh_options_json="$(whitelist_web_parse_ssh_options_json "${2:-}")"; shift 2 ;;
+                            --ssh-port) ssh_port="${2:-}"; shift 2 ;;
+                            --ssh-options) ssh_options_raw="${2:-}"; shift 2 ;;
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
-                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd whitelist-web route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-options '...']"
+                    ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
+                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd whitelist-web route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-port PORT] [--ssh-options '...']"
                     whitelist_web_route_update "$index" "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json"
                     echo "whitelist-web 规则已更新"
                     ;;

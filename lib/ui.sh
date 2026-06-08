@@ -5296,11 +5296,11 @@ ui_print_whitelist_web_trusted_proxy_list() {
 }
 
 ui_whitelist_web_route_rows() {
-    whitelist_web_route_rows
+    whitelist_web_route_ui_rows
 }
 
 ui_print_whitelist_web_route_list() {
-    ui_table_render $'序号\t标签\tsecret\tSSH 目标\t空闲 TTL\tSSH 选项' "$(ui_whitelist_web_route_rows)" "2,4,6"
+    ui_table_render $'序号\t标签\tsecret\tSSH 目标\tSSH 端口\t空闲 TTL\tSSH 选项' "$(ui_whitelist_web_route_rows)" "2,4,7"
 }
 
 ui_render_whitelist_web_menu_page() {
@@ -5423,48 +5423,73 @@ ui_menu_whitelist_web_routes() {
 
 ui_whitelist_web_route_form() {
     local title="$1" mode="$2" index="${3:-}"
-    local current_secret="" current_label="" current_target="" current_ttl="" current_opts=""
+    local current_secret="" current_label="" current_target="" current_port="" current_ttl="" current_opts=""
+    local defaults_label="当前"
     if [ -n "$index" ]; then
         current_secret="$(whitelist_web_route_field "$index" secret)"
         current_label="$(whitelist_web_route_field "$index" label)"
         current_target="$(whitelist_web_route_field "$index" ssh_target)"
+        current_port="$(whitelist_web_route_ssh_port "$index")"
         current_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
-        current_opts="$(whitelist_web_route_ssh_options_text "$index")"
-        [ -n "$current_secret$current_label$current_target$current_ttl$current_opts" ] || { ui_warn "规则序号不存在"; ui_pause; return 1; }
+        current_opts="$(whitelist_web_route_ssh_options_text_without_port "$index")"
+        [ -n "$current_secret$current_label$current_target$current_ttl$current_opts$current_port" ] || { ui_warn "规则序号不存在"; ui_pause; return 1; }
+    elif [ "$(whitelist_web_route_count)" -gt 0 ]; then
+        defaults_label="默认"
+        current_target="$(whitelist_web_route_field 1 ssh_target)"
+        current_port="$(whitelist_web_route_ssh_port 1)"
+        current_opts="$(whitelist_web_route_ssh_options_text_without_port 1)"
     fi
-    ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。输入 0 返回上级菜单。"
-    [ -z "$index" ] || ui_form_add_kv "当前规则序号" "$index"
-    [ -z "$current_secret" ] || ui_form_add_kv "当前 secret" "$current_secret"
-    [ -z "$current_label" ] || ui_form_add_kv "当前标签" "$current_label"
-    [ -z "$current_target" ] || ui_form_add_kv "当前 SSH 目标" "$current_target"
-    [ -z "$current_ttl" ] || ui_form_add_kv "当前空闲 TTL" "$current_ttl"
-    [ -z "$current_opts" ] || ui_form_add_kv "当前 SSH 选项" "$current_opts"
-    ui_form_read "secret" "$current_secret" || { ui_form_reset; return 1; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
-    local secret="$UI_REPLY"
-    ui_form_add_kv "secret" "$secret"
-    ui_form_read "标签" "$current_label" || { ui_form_reset; return 1; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
-    local label="$UI_REPLY"
-    ui_form_add_kv "标签" "$label"
-    ui_form_read "SSH 目标" "$current_target" || { ui_form_reset; return 1; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
-    local ssh_target="$UI_REPLY"
-    ui_form_add_kv "SSH 目标" "$ssh_target"
-    ui_form_read "空闲 TTL" "${current_ttl:-2h}" || { ui_form_reset; return 1; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
-    local idle_ttl="$UI_REPLY"
-    ui_form_add_kv "空闲 TTL" "$idle_ttl"
-    ui_form_read "SSH 选项（空格分隔，留空表示无）" "$current_opts" || { ui_form_reset; return 1; }
-    [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
-    local ssh_options="$UI_REPLY"
-    if [ "$mode" = "add" ]; then
-        ui_run cmd_whitelist_web route add --secret "$secret" --label "$label" --ssh-target "$ssh_target" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
-    else
-        ui_run cmd_whitelist_web route update --index "$index" --secret "$secret" --label "$label" --ssh-target "$ssh_target" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
-    fi
-    ui_form_reset
-    return 0
+    local secret="$current_secret" label="$current_label" ssh_target="$current_target"
+    local ssh_port="$current_port" idle_ttl="${current_ttl:-2h}" ssh_options="$current_opts"
+    local error_notice=""
+
+    while true; do
+        ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。回车保留默认值；SSH 端口/SSH 选项输入 - 清空。若两者都为空，将直接依赖系统 ssh 默认行为，请自行在外部配置好 SSH 连通。输入 0 返回上级菜单。"
+        [ -n "$error_notice" ] && ui_notice_set "$error_notice" "$UI_C_ERROR"
+        [ -z "$index" ] || ui_form_add_kv "当前规则序号" "$index"
+        [ -z "$current_secret" ] || ui_form_add_kv "当前 secret" "$current_secret"
+        [ -z "$current_label" ] || ui_form_add_kv "当前标签" "$current_label"
+        [ -z "$current_target" ] || ui_form_add_kv "$defaults_label SSH 目标" "$current_target"
+        [ -z "$current_port" ] || ui_form_add_kv "$defaults_label SSH 端口" "$current_port"
+        [ -z "$current_ttl" ] || ui_form_add_kv "当前空闲 TTL" "$current_ttl"
+        [ -z "$current_opts" ] || ui_form_add_kv "$defaults_label SSH 选项" "$current_opts"
+        ui_form_read "secret" "$secret" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        secret="$UI_REPLY"
+        ui_form_add_kv "secret" "$secret"
+        ui_form_read "标签" "$label" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        label="$UI_REPLY"
+        ui_form_add_kv "标签" "$label"
+        ui_form_read "SSH 目标" "$ssh_target" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        ssh_target="$UI_REPLY"
+        ui_form_add_kv "SSH 目标" "$ssh_target"
+        ui_form_read "SSH 端口（输入 - 清空）" "$ssh_port" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        ssh_port="$UI_REPLY"
+        [ "$ssh_port" = "-" ] && ssh_port=""
+        ui_form_add_kv "SSH 端口" "$ssh_port"
+        ui_form_read "空闲 TTL" "$idle_ttl" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        idle_ttl="$UI_REPLY"
+        ui_form_add_kv "空闲 TTL" "$idle_ttl"
+        ui_form_read "SSH 选项（空格分隔；输入 - 清空）" "$ssh_options" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        ssh_options="$UI_REPLY"
+        [ "$ssh_options" = "-" ] && ssh_options=""
+
+        if [ "$mode" = "add" ]; then
+            ui_run_capture cmd_whitelist_web route add --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+        else
+            ui_run_capture cmd_whitelist_web route update --index "$index" --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+        fi
+        if [ "$UI_STATUS" -eq 0 ]; then
+            ui_form_reset
+            return 0
+        fi
+        error_notice="操作失败：${UI_REPLY%%$'\n'*}"
+    done
 }
 
 ui_menu_whitelist_web_route_add() {

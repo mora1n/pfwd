@@ -136,7 +136,7 @@ pfwd whitelist-web init
 pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 30
 pfwd whitelist-web trusted-proxy add 127.0.0.1/32
 pfwd whitelist-web trusted-proxy add ::1/128
-pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --idle-ttl 4h --ssh-options '-p 22 -i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes'
+pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes'
 pfwd whitelist-web service enable
 pfwd whitelist-web service start
 pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
@@ -151,7 +151,7 @@ pfwd whitelist-web route list
 pfwd whitelist-web service status
 ```
 
-如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。
+如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。如果规则里不配置 `SSH 端口` / `SSH 选项`，`whitelist-web` 会直接依赖控制机系统 `ssh` 的默认行为与外部 `ssh_config`，需自行保证 SSH 已可连通。
 
 推荐把配置和服务管理直接放到 `pfwd` TUI：
 
