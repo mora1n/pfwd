@@ -229,7 +229,7 @@ func loadConfig(path string) (config, error) {
 		cfg.ListenPort = 18080
 	}
 	if cfg.RequestTimeoutSec <= 0 {
-		cfg.RequestTimeoutSec = 8
+		cfg.RequestTimeoutSec = 30
 	}
 	if len(cfg.Routes) == 0 {
 		return config{}, errors.New("routes 不能为空")

@@ -5338,7 +5338,7 @@ ui_menu_whitelist_web_listener() {
     fi
     current_host="$(jq -r '.listen_host // "127.0.0.1"' <<< "$config_json")"
     current_port="$(jq -r '.listen_port // 18080' <<< "$config_json")"
-    current_timeout="$(jq -r '.request_timeout_sec // 8' <<< "$config_json")"
+    current_timeout="$(jq -r '.request_timeout_sec // 30' <<< "$config_json")"
 
     ui_form_set "临时白名单 Web - 监听配置" "可信反代 CIDR：只有来自这些反代 IP/CIDR 的请求，才信任 X-Real-IP / X-Forwarded-For；否则只认直连来源 IP。输入 0 返回上级菜单。"
     ui_form_add_kv "当前监听地址" "$current_host:$current_port"
@@ -5351,7 +5351,7 @@ ui_menu_whitelist_web_listener() {
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     local listen_port="$UI_REPLY"
     ui_form_add_kv "监听端口" "$listen_port"
-    ui_form_read "请求超时(秒)" "$current_timeout" || { ui_form_reset; return 0; }
+    ui_form_read "请求超时（秒，例如 30）" "$current_timeout" || { ui_form_reset; return 0; }
     [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 0; }
     local request_timeout="$UI_REPLY"
     ui_run cmd_whitelist_web config set --listen-host "$listen_host" --listen-port "$listen_port" --request-timeout-sec "$request_timeout"
@@ -5474,7 +5474,7 @@ ui_whitelist_web_route_form() {
         ssh_port="$UI_REPLY"
         [ "$ssh_port" = "-" ] && ssh_port=""
         ui_form_add_kv "SSH 端口" "$ssh_port"
-        ui_form_read "空闲 TTL" "$idle_ttl" || { ui_form_reset; return 1; }
+        ui_form_read "空闲 TTL（例如 30m / 2h / 1d）" "$idle_ttl" || { ui_form_reset; return 1; }
         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
         idle_ttl="$UI_REPLY"
         ui_form_add_kv "空闲 TTL" "$idle_ttl"
@@ -5530,8 +5530,12 @@ ui_menu_whitelist_web_route_delete() {
     ui_render_page ui_render_whitelist_web_routes_page
     ui_read "选择要删除的规则序号，可单/多/连续选择" || return 0
     ui_multiselect_parse_indexes "$UI_REPLY" "$count" false || { ui_pause; return 0; }
-    ui_run cmd_whitelist_web route delete $UI_REPLY
-    [ "$UI_STATUS" -eq 0 ] && ui_notice_set "临时白名单 Web 规则已删除" "$UI_C_MENU_NUM"
+    ui_run_capture cmd_whitelist_web route delete $UI_REPLY
+    if [ "$UI_STATUS" -eq 0 ]; then
+        ui_notice_set "临时白名单 Web 规则已删除" "$UI_C_MENU_NUM"
+    elif [ -n "$UI_REPLY" ]; then
+        ui_error_from_reply "删除临时白名单 Web 规则失败"
+    fi
     ui_maybe_pause success
 }
 
@@ -5633,12 +5637,12 @@ ui_menu_whitelist_leases() {
         ui_read "选择" || return 0
         case "$UI_REPLY" in
             1)
-                ui_form_set "添加临时白名单" "输入公网 IP 和空闲 TTL；该临时白名单对所有启用入口白名单的端口统一生效。"
+                ui_form_set "添加临时白名单" "输入公网 IP 和空闲 TTL（例如 30m / 2h / 1d）；该临时白名单对所有启用入口白名单的端口统一生效。"
                 ui_form_read "IP 地址" "" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 local lease_ip="$UI_REPLY"
                 ui_form_add_kv "IP 地址" "$lease_ip"
-                ui_form_read "空闲 TTL" "30m" || { ui_form_reset; continue; }
+                ui_form_read "空闲 TTL（例如 30m / 2h / 1d）" "30m" || { ui_form_reset; continue; }
                 [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; continue; }
                 local lease_ttl="$UI_REPLY"
                 ui_form_add_kv "空闲 TTL" "$lease_ttl"

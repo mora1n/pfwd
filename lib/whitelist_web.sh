@@ -62,7 +62,7 @@ whitelist_web_default_config_json() {
         listen_host: "127.0.0.1",
         listen_port: 18080,
         trusted_proxy_cidrs: [],
-        request_timeout_sec: 8,
+        request_timeout_sec: 30,
         routes: []
       }
     '
@@ -103,7 +103,7 @@ whitelist_web_config_json() {
     jq '
       .listen_host = ((.listen_host // "") | tostring | if . == "" then "127.0.0.1" else . end)
       | .listen_port = ((.listen_port // 18080) | tonumber)
-      | .request_timeout_sec = ((.request_timeout_sec // 8) | tonumber)
+      | .request_timeout_sec = ((.request_timeout_sec // 30) | tonumber)
       | .trusted_proxy_cidrs = ((.trusted_proxy_cidrs // []) | map(tostring))
       | .routes = (
           (.routes // [])
@@ -283,14 +283,21 @@ whitelist_web_trusted_proxy_add() {
 }
 
 whitelist_web_trusted_proxy_delete_by_indexes() {
-    local indexes="$1"
+    local indexes="$1" count raw
     [ -n "$indexes" ] || pfwd_die "缺少可信反代 CIDR 序号"
+    count="$(whitelist_web_trusted_proxy_list | sed '/^$/d' | wc -l | tr -d ' ')"
+    [ "$count" -gt 0 ] || pfwd_die "暂无可信反代 CIDR"
+    while IFS= read -r raw; do
+        [ -n "$raw" ] || continue
+        [[ "$raw" =~ ^[0-9]+$ ]] || pfwd_die "可信反代 CIDR 序号必须是正整数：$raw"
+        [ "$raw" -ge 1 ] && [ "$raw" -le "$count" ] || pfwd_die "可信反代 CIDR 序号不存在：$raw"
+    done <<< "$indexes"
     whitelist_web_config_json | jq --arg raw "$indexes" '
       ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
       | .trusted_proxy_cidrs = (
           (.trusted_proxy_cidrs // [])
           | to_entries
-          | map(select((($wanted | index(.key + 1)) | not)))
+          | map(select((((.key + 1) as $idx | ($wanted | index($idx))) | not)))
           | map(.value)
         )
     ' | whitelist_web_write_config_from_stdin
@@ -426,7 +433,7 @@ whitelist_web_route_add() {
     whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl"
     whitelist_web_config_json | jq \
       --arg secret "$secret" \
-      --arg label "$label" \
+      --arg route_label "$label" \
       --arg ssh_target "$ssh_target" \
       --arg idle_ttl "$idle_ttl" \
       --argjson ssh_options "$ssh_options_json" '
@@ -434,11 +441,11 @@ whitelist_web_route_add() {
         error("route.secret 已存在")
       else
         .routes = ((.routes // []) + [{
-          secret: $secret,
-          label: $label,
-          ssh_target: $ssh_target,
-          idle_ttl: $idle_ttl,
-          ssh_options: $ssh_options
+          "secret": $secret,
+          "label": $route_label,
+          "ssh_target": $ssh_target,
+          "idle_ttl": $idle_ttl,
+          "ssh_options": $ssh_options
         }])
       end
     ' | whitelist_web_write_config_from_stdin
@@ -450,7 +457,7 @@ whitelist_web_route_update() {
     whitelist_web_config_json | jq \
       --argjson index "$index" \
       --arg secret "$secret" \
-      --arg label "$label" \
+      --arg route_label "$label" \
       --arg ssh_target "$ssh_target" \
       --arg idle_ttl "$idle_ttl" \
       --argjson ssh_options "$ssh_options_json" '
@@ -461,25 +468,32 @@ whitelist_web_route_update() {
         error("route.secret 已存在")
       else
         .routes[$index - 1] = {
-          secret: $secret,
-          label: $label,
-          ssh_target: $ssh_target,
-          idle_ttl: $idle_ttl,
-          ssh_options: $ssh_options
+          "secret": $secret,
+          "label": $route_label,
+          "ssh_target": $ssh_target,
+          "idle_ttl": $idle_ttl,
+          "ssh_options": $ssh_options
         }
       end
     ' | whitelist_web_write_config_from_stdin
 }
 
 whitelist_web_route_delete_by_indexes() {
-    local indexes="$1"
+    local indexes="$1" count raw
     [ -n "$indexes" ] || pfwd_die "缺少规则序号"
+    count="$(whitelist_web_route_count)"
+    [ "$count" -gt 0 ] || pfwd_die "暂无规则"
+    while IFS= read -r raw; do
+        [ -n "$raw" ] || continue
+        [[ "$raw" =~ ^[0-9]+$ ]] || pfwd_die "规则序号必须是正整数：$raw"
+        [ "$raw" -ge 1 ] && [ "$raw" -le "$count" ] || pfwd_die "route 序号不存在：$raw"
+    done <<< "$indexes"
     whitelist_web_config_json | jq --arg raw "$indexes" '
       ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
       | .routes = (
           (.routes // [])
           | to_entries
-          | map(select((($wanted | index(.key + 1)) | not)))
+          | map(select((((.key + 1) as $idx | ($wanted | index($idx))) | not)))
           | map(.value)
         )
     ' | whitelist_web_write_config_from_stdin
