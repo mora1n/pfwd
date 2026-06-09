@@ -5462,6 +5462,9 @@ ui_whitelist_web_route_form() {
         current_target="$(whitelist_web_route_field 1 ssh_target)"
         current_port="$(whitelist_web_route_ssh_port 1)"
         current_opts="$(whitelist_web_route_ssh_options_text_without_port 1)"
+    else
+        defaults_label="默认"
+        current_opts="$(whitelist_web_recommended_ssh_options_text)"
     fi
     local secret="$current_secret" label="$current_label" ssh_target="$current_target"
     local ssh_port="$current_port" idle_ttl="${current_ttl:-2h}" ssh_options="$current_opts"

@@ -541,6 +541,10 @@ whitelist_web_route_ssh_options_text_without_port() {
     whitelist_web_ssh_options_without_port_json "$(whitelist_web_route_ssh_options_json "$index")" | jq -r 'join(" ")'
 }
 
+whitelist_web_recommended_ssh_options_text() {
+    printf '%s\n' "-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=30 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
+}
+
 whitelist_web_build_ssh_options_json() {
     local ssh_port="${1:-}" raw="${2:-}" parsed_json effective_port normalized_json
     parsed_json="$(whitelist_web_parse_ssh_options_json "$raw")"
