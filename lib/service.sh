@@ -656,6 +656,36 @@ service_update_capture_service_states_json() {
     '
 }
 
+service_update_legacy_service_states_json() {
+    local runtime_enabled="${1:-false}"
+    local timer_enabled="${2:-false}"
+    local guard_enabled="${3:-false}"
+    local xdp_enabled="false"
+
+    if [ "$runtime_enabled" = "true" ] || [ "$guard_enabled" = "true" ]; then
+        xdp_enabled="true"
+    fi
+
+    jq -cn \
+      --argjson xdp_enabled "$xdp_enabled" \
+      --argjson timer_enabled "$timer_enabled" '
+      [
+        {
+          unit: "pfwd-xdp.service",
+          label: "legacy-xdp-runtime",
+          enabled: $xdp_enabled,
+          active: false
+        },
+        {
+          unit: "pfwd.timer",
+          label: "legacy-runtime-timer",
+          enabled: $timer_enabled,
+          active: $timer_enabled
+        }
+      ]
+    '
+}
+
 service_update_restore_service_states() {
     local states_json="$1"
 

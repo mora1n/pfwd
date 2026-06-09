@@ -122,20 +122,31 @@ cmd_update_check() {
 
 cmd_update_finalize_recover() {
     local work_dir="$1"
-    local service_states_json="$2"
-    local error_message="$5"
+    local service_states_json="${2:-}"
+    local legacy_runtime_enabled="${3:-false}"
+    local legacy_timer_enabled="${4:-false}"
+    local legacy_guard_enabled="${5:-false}"
+    local error_message="${6:-更新失败}"
 
     service_update_rollback "$work_dir" || true
-    service_update_restore_service_states "$service_states_json" || true
+    if [ -n "$service_states_json" ] && [ "$service_states_json" != "[]" ]; then
+        service_update_restore_service_states "$service_states_json" || true
+    else
+        service_update_restore_service_states "$(service_update_legacy_service_states_json "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled")" || true
+    fi
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
 
 cmd_update_finalize() {
-    local work_dir="" service_states_json="[]" from_version="" to_version=""
+    local work_dir="" service_states_json="" from_version="" to_version=""
+    local legacy_runtime_enabled="false" legacy_timer_enabled="false" legacy_guard_enabled="false"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
-            --service-states-json) service_states_json="${2:-[]}"; shift 2 ;;
+            --service-states-json) service_states_json="${2:-}"; shift 2 ;;
+            --runtime-enabled) legacy_runtime_enabled="${2:-false}"; shift 2 ;;
+            --timer-enabled) legacy_timer_enabled="${2:-false}"; shift 2 ;;
+            --guard-enabled) legacy_guard_enabled="${2:-false}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
@@ -143,22 +154,27 @@ cmd_update_finalize() {
     done
 
     [ -n "$work_dir" ] || pfwd_die "缺少更新工作目录"
+    if [ -n "$service_states_json" ]; then
+        service_states_json="$(pfwd_require_json_output "update 服务状态" "$service_states_json")"
+    else
+        service_states_json="$(service_update_legacy_service_states_json "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled")"
+    fi
 
     if ! service_cleanup_legacy_install_artifacts; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "清理旧安装资产失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "清理旧安装资产失败"
     fi
     if ! service_write_unit_files; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "同步 systemd unit 失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "同步 systemd unit 失败"
     fi
     if ! service_update_restore_service_states "$service_states_json"; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "恢复服务状态失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "恢复服务状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
