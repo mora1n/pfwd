@@ -963,6 +963,32 @@ runtime_apply_compiled_runtime() {
     fw_cleanup_legacy_nft
 }
 
+runtime_apply_xdp_aux_runtime() {
+    local runtime_json xdp_runtime_json total_rules guard_required="false" host_egress_required="false"
+
+    if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
+        whitelist_prepare_runtime
+    fi
+
+    runtime_json="$(forwarder_runtime_json true)"
+    runtime_write_compiled_file "$runtime_json"
+    xdp_runtime_json="$(runtime_backend_json "$runtime_json" xdp)"
+    forwarder_write_xdp_runtime_file "$xdp_runtime_json"
+
+    total_rules="$(jq '.rules | length' <<< "$runtime_json")"
+    if runtime_xdp_guard_required "$runtime_json"; then
+        guard_required="true"
+    fi
+    if [ "$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")" = "true" ]; then
+        host_egress_required="true"
+    fi
+    if [ "$total_rules" = "0" ] && [ "$guard_required" != "true" ] && [ "$host_egress_required" != "true" ]; then
+        return 0
+    fi
+
+    runtime_apply_xdp_runtime "$xdp_runtime_json" || return 1
+}
+
 forwarder_render_xdp_config() {
     local runtime_json
     runtime_json="$(forwarder_runtime_json true)"

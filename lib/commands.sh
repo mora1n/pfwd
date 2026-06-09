@@ -1031,9 +1031,9 @@ cmd_restart() {
 
 cmd_reconcile() {
     config_init >/dev/null
-    local before after now_minute need_refresh=false sent activity_json leases_before leases_after
+    local before after now_minute need_full_refresh=false need_aux_refresh=false sent activity_json leases_before leases_after refresh_action="reuse"
     if stats_apply_due_resets; then
-        need_refresh=true
+        need_full_refresh=true
     fi
     now_minute="$(pfwd_now_minute)"
     before="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
@@ -1051,16 +1051,28 @@ cmd_reconcile() {
     whitelist_apply_runtime
     leases_after="$(whitelist_lease_count)"
     after="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
-    if [ "$before" != "$after" ] || [ "$leases_before" != "$leases_after" ]; then
-        need_refresh=true
+    if [ "$before" != "$after" ]; then
+        need_full_refresh=true
+    elif [ "$leases_before" != "$leases_after" ]; then
+        need_aux_refresh=true
     fi
-    if [ "$need_refresh" = "true" ]; then
+    if [ "$need_full_refresh" = "true" ]; then
         stats_rollup_current
         cmd_apply_forwarding_bundle
+        refresh_action="full"
+    elif [ "$need_aux_refresh" = "true" ]; then
+        if service_runtime_installed; then
+            stats_runtime_cache_clear
+            runtime_apply_xdp_aux_runtime
+            stats_runtime_cache_clear
+            refresh_action="xdp-aux"
+        else
+            refresh_action="skipped"
+        fi
     fi
     sent="$(notify_reconcile_schedules)"
     downmask_reconcile_pull 2>/dev/null || true
-    echo "已同步：active_before=$before active_after=$after leases_before=$leases_before leases_after=$leases_after notify_sent=$sent"
+    echo "已同步：active_before=$before active_after=$after leases_before=$leases_before leases_after=$leases_after refresh=$refresh_action notify_sent=$sent"
 }
 
 cmd_notify_test() {
