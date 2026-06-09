@@ -5468,7 +5468,7 @@ ui_whitelist_web_route_form() {
     local error_notice=""
 
     while true; do
-        ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。回车保留默认值；SSH 端口/SSH 选项输入 - 清空。若两者都为空，将直接依赖系统 ssh 默认行为，请自行在外部配置好 SSH 连通。输入 0 返回上级菜单。"
+        ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。SSH 目标建议填写 user@host；如果只填 IP/域名，将使用控制机当前系统用户。目标机首次接入前，还需先让控制机信任对应 host key。回车保留默认值；SSH 端口/SSH 选项输入 - 清空。若两者都为空，将直接依赖系统 ssh 默认行为，请自行在外部配置好 SSH 连通。输入 0 返回上级菜单。"
         [ -n "$error_notice" ] && ui_notice_set "$error_notice" "$UI_C_ERROR"
         [ -z "$index" ] || ui_form_add_kv "当前规则序号" "$index"
         [ -z "$current_secret" ] || ui_form_add_kv "当前 secret" "$current_secret"
@@ -5485,7 +5485,7 @@ ui_whitelist_web_route_form() {
         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
         label="$UI_REPLY"
         ui_form_add_kv "标签" "$label"
-        ui_form_read "SSH 目标" "$ssh_target" || { ui_form_reset; return 1; }
+        ui_form_read "SSH 目标（建议 user@host）" "$ssh_target" || { ui_form_reset; return 1; }
         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
         ssh_target="$UI_REPLY"
         ui_form_add_kv "SSH 目标" "$ssh_target"

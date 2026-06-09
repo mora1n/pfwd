@@ -174,6 +174,73 @@ whitelist_web_validate_route() {
     pfwd_parse_duration_seconds "$idle_ttl" >/dev/null
 }
 
+whitelist_web_ssh_target_user_hint() {
+    local ssh_target="$1"
+    case "$ssh_target" in
+        *@*) printf '%s\n' "ok" ;;
+        *) printf '%s\n' "missing_user" ;;
+    esac
+}
+
+whitelist_web_ssh_target_user_hint_text() {
+    local ssh_target="$1"
+    case "$(whitelist_web_ssh_target_user_hint "$ssh_target")" in
+        ok) printf '%s\n' "已包含 user@host" ;;
+        *) printf '%s\n' "建议填写 user@host；若只填 IP/域名，将使用控制机当前系统用户" ;;
+    esac
+}
+
+whitelist_web_known_hosts_file() {
+    local home_dir=""
+    home_dir="${HOME:-}"
+    if [ -n "$home_dir" ]; then
+        printf '%s/.ssh/known_hosts\n' "$home_dir"
+        return 0
+    fi
+    home_dir="$(getent passwd "$(id -un 2>/dev/null || true)" 2>/dev/null | cut -d: -f6)"
+    [ -n "$home_dir" ] || home_dir="/root"
+    printf '%s/.ssh/known_hosts\n' "$home_dir"
+}
+
+whitelist_web_route_host_key_trusted() {
+    local index="$1"
+    local ssh_target ssh_port host known_hosts
+    ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
+    ssh_port="$(whitelist_web_route_ssh_port "$index")"
+    known_hosts="$(whitelist_web_known_hosts_file)"
+    host="${ssh_target##*@}"
+    [ -n "$host" ] || {
+        printf '%s\n' "unknown"
+        return 0
+    }
+    [ -f "$known_hosts" ] || {
+        printf '%s\n' "missing"
+        return 0
+    }
+    if [ -n "$ssh_port" ]; then
+        if ssh-keygen -F "[$host]:$ssh_port" -f "$known_hosts" >/dev/null 2>&1; then
+            printf '%s\n' "trusted"
+        else
+            printf '%s\n' "missing"
+        fi
+        return 0
+    fi
+    if ssh-keygen -F "$host" -f "$known_hosts" >/dev/null 2>&1; then
+        printf '%s\n' "trusted"
+    else
+        printf '%s\n' "missing"
+    fi
+}
+
+whitelist_web_route_host_key_status_text() {
+    local state="$1"
+    case "$state" in
+        trusted) printf '%s\n' "已信任" ;;
+        missing) printf '%s\n' "缺少 known_hosts 条目" ;;
+        *) printf '%s\n' "未知" ;;
+    esac
+}
+
 whitelist_web_validate_trusted_proxy_list() {
     local file="$1"
     local raw
@@ -244,6 +311,66 @@ whitelist_web_status_rows() {
         ["配置文件", .config_file],
         ["二进制", .bin_path],
         ["受限命令脚本", .restricted_command]
+      ]
+      | map(@tsv)
+      | .[]
+    '
+}
+
+whitelist_web_route_check_json() {
+    local index="$1"
+    local count ssh_target ssh_port ssh_options idle_ttl host_key_state known_hosts user_hint
+    count="$(whitelist_web_route_count)"
+    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "规则序号必须是正整数：$index"
+    [ "$index" -ge 1 ] && [ "$index" -le "$count" ] || pfwd_die "route 序号不存在：$index"
+    ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
+    ssh_port="$(whitelist_web_route_ssh_port "$index")"
+    ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
+    idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
+    host_key_state="$(whitelist_web_route_host_key_trusted "$index")"
+    known_hosts="$(whitelist_web_known_hosts_file)"
+    user_hint="$(whitelist_web_ssh_target_user_hint "$ssh_target")"
+    jq -n \
+      --argjson index "$index" \
+      --arg secret "$(whitelist_web_route_field "$index" secret)" \
+      --arg label "$(whitelist_web_route_field "$index" label)" \
+      --arg ssh_target "$ssh_target" \
+      --arg ssh_port "$ssh_port" \
+      --arg ssh_options "$ssh_options" \
+      --arg idle_ttl "$idle_ttl" \
+      --arg known_hosts "$known_hosts" \
+      --arg host_key_state "$host_key_state" \
+      --arg user_hint "$user_hint" '
+      {
+        index: $index,
+        secret: $secret,
+        label: $label,
+        ssh_target: $ssh_target,
+        ssh_port: $ssh_port,
+        ssh_options: $ssh_options,
+        idle_ttl: $idle_ttl,
+        known_hosts_file: $known_hosts,
+        host_key_trusted: ($host_key_state == "trusted"),
+        host_key_state: $host_key_state,
+        ssh_target_user_hint: $user_hint
+      }
+    '
+}
+
+whitelist_web_route_check_rows() {
+    local index="$1"
+    whitelist_web_route_check_json "$index" | jq -r '
+      [
+        ["规则序号", (.index | tostring)],
+        ["标签", .label],
+        ["secret", .secret],
+        ["SSH 目标", .ssh_target],
+        ["SSH 目标提示", (if .ssh_target_user_hint == "ok" then "已包含 user@host" else "建议填写 user@host；若只填 IP/域名，将使用控制机当前系统用户" end)],
+        ["SSH 端口", (if .ssh_port == "" then "-" else .ssh_port end)],
+        ["SSH 选项", (if .ssh_options == "" then "-" else .ssh_options end)],
+        ["空闲 TTL", .idle_ttl],
+        ["known_hosts", .known_hosts_file],
+        ["Host Key", (if .host_key_state == "trusted" then "已信任" elif .host_key_state == "missing" then "缺少 known_hosts 条目" else "未知" end)]
       ]
       | map(@tsv)
       | .[]
@@ -642,6 +769,10 @@ cmd_whitelist_web() {
                     [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web route list"
                     whitelist_web_route_rows
                     ;;
+                check)
+                    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd whitelist-web route check <index>"
+                    whitelist_web_route_check_rows "$1"
+                    ;;
                 add)
                     local secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]'
                     while [ "$#" -gt 0 ]; do
@@ -684,7 +815,7 @@ cmd_whitelist_web() {
                     echo "whitelist-web 规则已删除"
                     ;;
                 *)
-                    pfwd_die "用法：pfwd whitelist-web route list|add|update|delete"
+                    pfwd_die "用法：pfwd whitelist-web route list|check|add|update|delete"
                     ;;
             esac
             ;;

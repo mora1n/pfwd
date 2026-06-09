@@ -421,7 +421,11 @@ func clientIPUnavailableResponse(format responseFormat, details string) response
 }
 
 func leasePushFailedResponse(format responseFormat, details string) responseModel {
-	return errorResponse(http.StatusBadGateway, format, "lease_push_failed", details, "临时白名单下发失败", "请稍后重试；如果持续失败，请联系管理员排查目标机 SSH 链路。")
+	summary := "请稍后重试；如果持续失败，请联系管理员排查目标机 SSH 链路。"
+	if strings.Contains(strings.ToLower(details), "host key verification failed") {
+		summary = "控制机尚未信任目标机 host key；请先补齐 known_hosts 后再重试。"
+	}
+	return errorResponse(http.StatusBadGateway, format, "lease_push_failed", details, "临时白名单下发失败", summary)
 }
 
 func errorResponse(status int, format responseFormat, code string, details string, title string, summary string) responseModel {

@@ -222,6 +222,32 @@ func TestServeHTTPLeasePushFailureJSONKeepsErrorDetails(t *testing.T) {
 	}
 }
 
+func TestServeHTTPLeasePushFailureHTMLShowsHostKeyHint(t *testing.T) {
+	srv := newTestServer(t, routeConfig{
+		Secret:    "secret",
+		Label:     "po0-sh",
+		SSHTarget: "root@example",
+		IdleTTL:   "4h",
+	})
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+		return errors.New("ssh 下发失败: exit status 255: Host key verification failed.")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/secret?format=html", nil)
+	req.RemoteAddr = "203.0.113.16:42311"
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "控制机尚未信任目标机 host key") {
+		t.Fatalf("body missing host key hint: %s", body)
+	}
+}
+
 func TestServeHTTPHTMLEscapesLabel(t *testing.T) {
 	srv := newTestServer(t, routeConfig{
 		Secret:    "secret",

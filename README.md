@@ -119,7 +119,7 @@ pfwd guard whitelist check --address 61.187.9.117 --listen-port 41422 --protocol
 
 pfwd guard egress-whitelist --enabled true
 pfwd guard egress-whitelist-cn all
-pfwd guard egress-whitelist-custom add 204.0.113.0/24
+pfwd guard egress-whitelist-custom add 208.0.115.0/24
 ```
 
 入口白名单的 `enabled` 是总开关。未配置端口覆盖时，端口继承全局国内 IP / 省份 / 市策略；配置端口覆盖后，仅该监听端口使用自己的国内 IP / 省份 / 市选择。入口自定义 CIDR 始终全局共享。`guard whitelist-lease` 维护的是全局临时 IP 白名单，对所有启用入口白名单的端口统一生效。`guard protocols --skip-port` 优先级更高，命中后跳过入口白名单和协议封锁。
@@ -149,10 +149,11 @@ pfwd whitelist-web status
 pfwd whitelist-web config show
 pfwd whitelist-web config reset
 pfwd whitelist-web route list
+pfwd whitelist-web route check 1
 pfwd whitelist-web service status
 ```
 
-如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。如果规则里不配置 `SSH 端口` / `SSH 选项`，`whitelist-web` 会直接依赖控制机系统 `ssh` 的默认行为与外部 `ssh_config`，需自行保证 SSH 已可连通。
+如果前面有反代，只有当 TCP peer 命中 `trusted_proxy_cidrs` 时才会信任 `X-Real-IP` / `X-Forwarded-For`；否则一律使用直连 peer IP。控制机走 systemd 时通常只需要 `service enable/start`；前台调试时才直接执行 `pfwd whitelist-web run --config ...`。如果规则里不配置 `SSH 端口` / `SSH 选项`，`whitelist-web` 会直接依赖控制机系统 `ssh` 的默认行为与外部 `ssh_config`，需自行保证 SSH 已可连通。`SSH 目标` 建议填写 `user@host`；如果只填 IP/域名，将使用控制机当前系统用户。目标机首次接入前，还需要先让控制机信任对应 host key；可用 `pfwd whitelist-web route check <index>` 检查当前规则是否缺少 `known_hosts` 条目。
 
 如果 `/etc/pfwd/whitelist-web.json` 为空或损坏，`pfwd whitelist-web config show/set` 与 TUI 会显式报错；可先执行 `pfwd whitelist-web config reset` 重建默认 skeleton，再重新配置。
 
