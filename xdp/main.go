@@ -2141,6 +2141,15 @@ func egressGeoPolicyChanged(current, next runtimeAuxState) bool {
 		!stringSlicesEqual(normalizeProvinceNames(current.EgressCNProvinces), normalizeProvinceNames(next.EgressCNProvinces))
 }
 
+func ingressWhitelistStateChanged(currentValid bool, current, next runtimeAuxState) bool {
+	geoAssetsChanged := !currentValid || !whitelistHashesEqual(current.GeoAssetHashes, next.GeoAssetHashes)
+	return !currentValid ||
+		current.WhitelistEnabled != next.WhitelistEnabled ||
+		!whitelistHashesEqual(current.WhitelistHashes, next.WhitelistHashes) ||
+		geoAssetsChanged ||
+		ingressGeoPolicyChanged(current, next)
+}
+
 func guardRuntimeCacheChanged(currentValid bool, current, next runtimeAuxState) bool {
 	return !currentValid ||
 		current.GuardEnabled != next.GuardEnabled ||
@@ -2167,11 +2176,7 @@ func applyIncrementalAuxState(
 
 	whitelistFiles := effectiveWhitelistFiles(runtimeData, opts)
 	geoAssetsChanged := !currentValid || !whitelistHashesEqual(current.GeoAssetHashes, nextState.GeoAssetHashes)
-	ingressWhitelistChanged := !currentValid ||
-		current.WhitelistEnabled != nextState.WhitelistEnabled ||
-		!whitelistHashesEqual(current.WhitelistHashes, nextState.WhitelistHashes) ||
-		geoAssetsChanged ||
-		ingressGeoPolicyChanged(current, nextState)
+	ingressWhitelistChanged := ingressWhitelistStateChanged(currentValid, current, nextState)
 	if ingressWhitelistChanged {
 		if err := clearIngressWhitelistMaps(objs.PFWDWhitelistV4, objs.PFWDWhitelistV6, objs.PFWDWhitelistCacheV4, objs.PFWDWhitelistCacheV6); err != nil {
 			return runtimeAuxState{}, nil, err

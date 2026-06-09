@@ -761,6 +761,70 @@ func TestGeoCheckHiddenCNUnknownOnlyAllowsAllMode(t *testing.T) {
 	}
 }
 
+func TestGeoCheckAllowsHangzhouCityCIDR(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := geoAssetMeta{
+		FormatVersion: geoAssetVersion,
+		BuiltAt:       time.Now().UTC().Format(time.RFC3339),
+		Provinces: []geoProvinceEntry{
+			{ID: 1, Name: "浙江省"},
+		},
+	}
+	metaContent, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, geoMetaAssetFile), metaContent, 0o644); err != nil {
+		t.Fatalf("write meta: %v", err)
+	}
+	if err := writeGeoAssetV4(filepath.Join(tmpDir, geoIPv4AssetFile), nil, 1); err != nil {
+		t.Fatalf("write empty v4 asset: %v", err)
+	}
+	if err := writeGeoAssetV6(filepath.Join(tmpDir, geoIPv6AssetFile), nil, 1); err != nil {
+		t.Fatalf("write empty v6 asset: %v", err)
+	}
+
+	cityPath := filepath.Join(tmpDir, "city.tsv")
+	if err := os.WriteFile(cityPath, []byte("330100\t浙江省\t杭州市\t115.192.0.0/13\n"), 0o644); err != nil {
+		t.Fatalf("write city cidr: %v", err)
+	}
+	emptyAllowPath := filepath.Join(tmpDir, "allow.txt")
+	if err := os.WriteFile(emptyAllowPath, nil, 0o644); err != nil {
+		t.Fatalf("write empty allow file: %v", err)
+	}
+
+	var out bytes.Buffer
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	err = geoCheck(geoCheckOptions{
+		AssetDir:      tmpDir,
+		Address:       "115.196.174.43",
+		Mode:          "off",
+		CityFile:      cityPath,
+		WhitelistFile: emptyAllowPath,
+		JSON:          true,
+	})
+	_ = w.Close()
+	os.Stdout = stdout
+	_, _ = io.Copy(&out, r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatalf("geoCheck(hangzhou city allow): %v output=%q", err, out.String())
+	}
+	var result geoCheckResult
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &result); err != nil {
+		t.Fatalf("unmarshal geoCheck json: %v output=%q", err, out.String())
+	}
+	if !result.Allowed || !result.CityAllowed || result.CustomAllowed || result.GeoAllowed ||
+		result.CityCode != "330100" || result.City != "杭州市" || result.MatchedSource != "city" {
+		t.Fatalf("geoCheck result=%+v, want Hangzhou city-only allow", result)
+	}
+}
+
 func TestAdysecIPMergeUnknownCNAndHiddenSubtract(t *testing.T) {
 	tmpDir := t.TempDir()
 	meta := `{
@@ -1654,6 +1718,95 @@ func TestGuardRuntimeCacheChanged(t *testing.T) {
 			got := guardRuntimeCacheChanged(tc.currentValid, tc.current, tc.next)
 			if got != tc.want {
 				t.Fatalf("guardRuntimeCacheChanged()=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIngressWhitelistStateChanged(t *testing.T) {
+	base := runtimeAuxState{
+		WhitelistEnabled: true,
+		WhitelistHashes: []whitelistContentHash{
+			{Path: "/var/lib/pfwd/whitelist/allow_ipv4.txt", Hash: "custom-v1"},
+		},
+		GeoAssetHashes: []whitelistContentHash{
+			{Path: "/usr/local/lib/pfwd/assets/pfwd-geo-meta.json", Hash: "geo-v1"},
+			{Path: "/usr/local/lib/pfwd/assets/pfwd-city-cn-v4.bin", Hash: "city-v1"},
+		},
+		IngressPolicies: []ingressPolicy{
+			{ID: 0, CNMode: "off", CNCityCodes: []string{"330100"}},
+		},
+	}
+	tests := []struct {
+		name         string
+		currentValid bool
+		next         runtimeAuxState
+		want         bool
+	}{
+		{
+			name:         "unchanged valid state reuses ingress whitelist maps",
+			currentValid: true,
+			next:         base,
+		},
+		{
+			name:         "invalid current state reloads ingress whitelist maps",
+			currentValid: false,
+			next:         base,
+			want:         true,
+		},
+		{
+			name:         "temporary custom whitelist expiry reloads ingress cache",
+			currentValid: true,
+			next: func() runtimeAuxState {
+				next := base
+				next.WhitelistHashes = []whitelistContentHash{
+					{Path: "/var/lib/pfwd/whitelist/allow_ipv4.txt", Hash: "custom-v2"},
+				}
+				return next
+			}(),
+			want: true,
+		},
+		{
+			name:         "city asset update reloads ingress cache",
+			currentValid: true,
+			next: func() runtimeAuxState {
+				next := base
+				next.GeoAssetHashes = []whitelistContentHash{
+					{Path: "/usr/local/lib/pfwd/assets/pfwd-geo-meta.json", Hash: "geo-v1"},
+					{Path: "/usr/local/lib/pfwd/assets/pfwd-city-cn-v4.bin", Hash: "city-v2"},
+				}
+				return next
+			}(),
+			want: true,
+		},
+		{
+			name:         "city policy update reloads ingress cache",
+			currentValid: true,
+			next: func() runtimeAuxState {
+				next := base
+				next.IngressPolicies = []ingressPolicy{
+					{ID: 0, CNMode: "off", CNCityCodes: []string{"330100", "330500"}},
+				}
+				return next
+			}(),
+			want: true,
+		},
+		{
+			name:         "egress-only update does not reload ingress cache",
+			currentValid: true,
+			next: func() runtimeAuxState {
+				next := base
+				next.EgressWhitelistHashes = []whitelistContentHash{{Path: "/tmp/egress", Hash: "abc"}}
+				return next
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ingressWhitelistStateChanged(tc.currentValid, base, tc.next)
+			if got != tc.want {
+				t.Fatalf("ingressWhitelistStateChanged()=%v, want %v", got, tc.want)
 			}
 		})
 	}
