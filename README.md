@@ -160,6 +160,8 @@ pfwd whitelist-web service status
 
 - `流量防护 -> 临时白名单 Web`
 - 可查看状态、修改监听地址/端口/超时、维护“可信反代 CIDR”、管理规则，以及启动/停止/重启/启停自启服务。
+- 在 `新增规则` / `修改规则` 的 `SSH 选项` 字段里，建议填写专用 key 和快速失败选项；SSH 端口优先单独填到 `SSH 端口`：
+  `-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=30 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1`
 
 SSH 权限边界建议收窄到只允许临时白名单租约命令。安装后的受限命令脚本路径为：
 
@@ -173,10 +175,19 @@ SSH 权限边界建议收窄到只允许临时白名单租约命令。安装后�
 command="/usr/local/lib/pfwd/bin/pfwd-whitelist-lease-command",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAA... control-host
 ```
 
-控制机 `ssh_options` 推荐指向专用 key / config，例如：
+控制机 `ssh_options` 建议至少包含专用 key 和快速失败选项；SSH 端口优先单独放到规则里的 `SSH 端口` / `--ssh-port`，例如：
 
 ```json
-["-F", "/home/user/.ssh/config", "-i", "/home/user/.ssh/pfwd-whitelist-web"]
+[
+  "-F", "/home/user/.ssh/config",
+  "-i", "/home/user/.ssh/pfwd-whitelist-web",
+  "-o", "IdentitiesOnly=yes",
+  "-o", "BatchMode=yes",
+  "-o", "ConnectTimeout=30",
+  "-o", "ConnectionAttempts=1",
+  "-o", "ServerAliveInterval=5",
+  "-o", "ServerAliveCountMax=1"
+]
 ```
 
 规则中的 `label` 是唯一文本标识，会同时用于：
