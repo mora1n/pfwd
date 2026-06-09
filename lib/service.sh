@@ -87,7 +87,6 @@ downmask_asset_name() {
 
 service_unit_names() {
     cat <<'EOF'
-pfwd-forward.service
 pfwd.service
 pfwd.timer
 pfwd-bbr.service
@@ -99,13 +98,12 @@ EOF
 
 service_update_managed_unit_rows() {
     cat <<'EOF'
-pfwd.service	runtime-manager
-pfwd.timer	runtime-timer
-pfwd-forward.service	forward-runtime
-pfwd-bbr.service	bbr-runtime
-pfwd-xdp.service	xdp-runtime
-pfwd-downmask-feed.service	downmask-feed
-pfwd-whitelist-web.service	whitelist-web
+pfwd.service	runtime-manager	false
+pfwd.timer	runtime-timer	true
+pfwd-bbr.service	bbr-runtime	true
+pfwd-xdp.service	xdp-runtime	true
+pfwd-downmask-feed.service	downmask-feed	true
+pfwd-whitelist-web.service	whitelist-web	true
 EOF
 }
 
@@ -405,8 +403,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd.service pfwd-forward.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -635,14 +633,14 @@ service_update_capture_service_states_json() {
         printf '[]\n'
         return 0
     fi
-    local unit label enabled active
+    local unit label enable_capable enabled active
     {
-        while IFS=$'\t' read -r unit label; do
+        while IFS=$'\t' read -r unit label enable_capable; do
             [ -n "$unit" ] || continue
             service_unit_exists "$unit" || continue
             enabled="$(service_update_capture_enabled_state "$unit")"
             active="$(service_update_capture_active_state "$unit")"
-            printf '%s\t%s\t%s\t%s\n' "$unit" "$label" "$enabled" "$active"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$unit" "$label" "$enable_capable" "$enabled" "$active"
         done < <(service_update_managed_unit_rows)
     } | jq -Rsc '
       split("\n")
@@ -650,8 +648,9 @@ service_update_capture_service_states_json() {
       | map({
           unit: .[0],
           label: .[1],
-          enabled: (.[2] == "true"),
-          active: (.[3] == "true")
+          enable_capable: (.[2] == "true"),
+          enabled: (.[3] == "true"),
+          active: (.[4] == "true")
         })
     '
 }
@@ -673,12 +672,14 @@ service_update_legacy_service_states_json() {
         {
           unit: "pfwd-xdp.service",
           label: "legacy-xdp-runtime",
+          enable_capable: true,
           enabled: $xdp_enabled,
           active: false
         },
         {
           unit: "pfwd.timer",
           label: "legacy-runtime-timer",
+          enable_capable: true,
           enabled: $timer_enabled,
           active: $timer_enabled
         }
@@ -694,7 +695,7 @@ service_update_restore_service_states() {
     fi
 
     pfwd_run systemctl daemon-reload
-    jq -r '.[] | [.unit, (if .enabled then "true" else "false" end)] | @tsv' <<< "$states_json" |
+    jq -r '.[] | select((.enable_capable // false) == true) | [.unit, (if .enabled then "true" else "false" end)] | @tsv' <<< "$states_json" |
     while IFS=$'\t' read -r unit enabled; do
         [ -n "$unit" ] || continue
         if [ "$enabled" = "true" ]; then
@@ -727,11 +728,10 @@ service_update_stop_active_services() {
       | sort_by(
           if .unit == "pfwd.timer" then 0
           elif .unit == "pfwd.service" then 1
-          elif .unit == "pfwd-forward.service" then 2
-          elif .unit == "pfwd-bbr.service" then 3
-          elif .unit == "pfwd-xdp.service" then 4
-          elif .unit == "pfwd-downmask-feed.service" then 5
-          elif .unit == "pfwd-whitelist-web.service" then 6
+          elif .unit == "pfwd-bbr.service" then 2
+          elif .unit == "pfwd-xdp.service" then 3
+          elif .unit == "pfwd-downmask-feed.service" then 4
+          elif .unit == "pfwd-whitelist-web.service" then 5
           else 99 end
         )
       | .[].unit

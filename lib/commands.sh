@@ -202,8 +202,9 @@ cmd_update() {
     if ! service_update_validate_bundle "$staged_dir"; then
         pfwd_die "更新包校验失败；临时目录保留：$work_dir"
     fi
-    if ! cmd_update_check "$work_dir"; then
-        local check_status="$?"
+    cmd_update_check "$work_dir"
+    local check_status="$?"
+    if [ "$check_status" -ne 0 ]; then
         if [ "$check_status" = "10" ]; then
             service_update_cleanup "$work_dir" >/dev/null 2>&1 || true
             return 0
