@@ -1292,7 +1292,7 @@ whitelist_lease_delete_by_indexes() {
     payload="$(whitelist_lease_entries_sorted_json | jq -c --arg raw "$indexes" '
       ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
       | to_entries
-      | map(select((($wanted | index(.key + 1)) | not)))
+      | map(. as $entry | select((($wanted | index(($entry.key + 1))) | not)))
       | map(.value)
     ')"
     whitelist_lease_save_json "$payload"

@@ -5655,9 +5655,9 @@ ui_render_whitelist_lease_menu_page() {
     ui_notice_render
     ui_print_whitelist_lease_list
     echo
-    ui_menu_item 1 "添加临时白名单"
-    ui_menu_item 2 "删除临时白名单"
-    ui_menu_item 3 "清空临时白名单"
+    ui_menu_item 1 "添加"
+    ui_menu_item 2 "删除"
+    ui_menu_item 3 "清空"
     ui_menu_item 0 "返回"
 }
 
