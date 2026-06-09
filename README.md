@@ -156,8 +156,6 @@ pfwd whitelist-web service status
 
 如果 `/etc/pfwd/whitelist-web.json` 为空或损坏，`pfwd whitelist-web config show/set` 与 TUI 会显式报错；可先执行 `pfwd whitelist-web config reset` 重建默认 skeleton，再重新配置。
 
-secret URL 默认会按请求类型返回不同响应：浏览器访问返回简洁 HTML 确认页，脚本/API 客户端继续返回 JSON。也可以显式附加 `?format=html` 或 `?format=json` 强制指定格式。
-
 推荐把配置和服务管理直接放到 `pfwd` TUI：
 
 - `流量防护 -> 临时白名单 Web`

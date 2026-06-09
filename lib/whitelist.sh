@@ -1040,24 +1040,35 @@ whitelist_apply_runtime() {
 }
 
 whitelist_status_json() {
+    local enabled cn_provinces cn_city_codes port_policies leases entries custom_cidrs_count lease_count city_count port_policy_count
+    enabled="$(jq -cn --arg value "$(whitelist_enabled)" '$value == "true"')"
+    cn_provinces="$(pfwd_capture_json_output "入口白名单省份配置" whitelist_cn_provinces_json)"
+    cn_city_codes="$(pfwd_capture_json_output "入口白名单市配置" whitelist_cn_city_codes_json)"
+    port_policies="$(pfwd_capture_json_output "入口白名单端口策略" whitelist_port_policies_json)"
+    leases="$(pfwd_capture_json_output "入口白名单临时租约" whitelist_lease_entries_sorted_json)"
+    entries="$(jq -cn --argjson value "$(whitelist_entry_count)" '$value')"
+    custom_cidrs_count="$(jq -cn --argjson value "$(whitelist_custom_cidrs_count)" '$value')"
+    lease_count="$(jq -cn --argjson value "$(whitelist_lease_count)" '$value')"
+    city_count="$(jq -cn --argjson value "$(whitelist_city_codes_count)" '$value')"
+    port_policy_count="$(jq -cn --argjson value "$(whitelist_port_policy_count)" '$value')"
     jq -n \
-      --argjson enabled "$(whitelist_enabled)" \
+      --argjson enabled "$enabled" \
       --arg cn_mode "$(whitelist_cn_mode)" \
-      --argjson cn_provinces "$(whitelist_cn_provinces_json)" \
-      --argjson cn_city_codes "$(whitelist_cn_city_codes_json)" \
-      --argjson port_policies "$(whitelist_port_policies_json)" \
+      --argjson cn_provinces "$cn_provinces" \
+      --argjson cn_city_codes "$cn_city_codes" \
+      --argjson port_policies "$port_policies" \
       --arg city_selection "$(whitelist_city_selection_summary)" \
       --arg allow_ipv4_file "$(whitelist_allow_ipv4_file)" \
       --arg allow_ipv6_file "$(whitelist_allow_ipv6_file)" \
       --arg city_ipv4_file "$(whitelist_city_runtime_ipv4_file)" \
       --arg temp_ipv4_file "$(whitelist_temp_allow_ipv4_file)" \
       --arg temp_ipv6_file "$(whitelist_temp_allow_ipv6_file)" \
-      --argjson entries "$(whitelist_entry_count)" \
-      --argjson custom_cidrs_count "$(whitelist_custom_cidrs_count)" \
-      --argjson lease_count "$(whitelist_lease_count)" \
-      --argjson leases "$(whitelist_lease_entries_sorted_json)" \
-      --argjson city_count "$(whitelist_city_codes_count)" \
-      --argjson port_policy_count "$(whitelist_port_policy_count)" \
+      --argjson entries "$entries" \
+      --argjson custom_cidrs_count "$custom_cidrs_count" \
+      --argjson lease_count "$lease_count" \
+      --argjson leases "$leases" \
+      --argjson city_count "$city_count" \
+      --argjson port_policy_count "$port_policy_count" \
       '{
         enabled: $enabled,
         cn_mode: $cn_mode,

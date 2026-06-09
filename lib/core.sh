@@ -295,6 +295,24 @@ pfwd_write_atomic() {
     mv "$tmp" "$target"
 }
 
+pfwd_require_json_output() {
+    local label="$1"
+    local payload="${2:-}"
+    [ -n "$payload" ] || pfwd_die "$label 未返回 JSON"
+    jq -e . >/dev/null 2>&1 <<< "$payload" || pfwd_die "$label 返回非 JSON"
+    printf '%s\n' "$payload"
+}
+
+pfwd_capture_json_output() {
+    local label="$1"
+    shift
+    local payload=""
+    if ! payload="$("$@")"; then
+        pfwd_die "$label 失败"
+    fi
+    pfwd_require_json_output "$label" "$payload"
+}
+
 pfwd_run() {
     if [ "${PFWD_DRY_RUN:-0}" = "1" ]; then
         local line="DRY-RUN:"

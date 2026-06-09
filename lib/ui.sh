@@ -5284,7 +5284,12 @@ ui_whitelist_web_status_rows() {
 }
 
 ui_print_whitelist_web_summary() {
-    ui_table_render $'项目\t值' "$(ui_whitelist_web_status_rows)" "2"
+    local rows
+    if ! rows="$(ui_whitelist_web_status_rows 2>&1)"; then
+        ui_error "$rows"
+        return 1
+    fi
+    ui_table_render $'项目\t值' "$rows" "2"
 }
 
 ui_whitelist_web_trusted_proxy_rows() {
@@ -5292,7 +5297,12 @@ ui_whitelist_web_trusted_proxy_rows() {
 }
 
 ui_print_whitelist_web_trusted_proxy_list() {
-    ui_table_render $'序号\t可信反代 CIDR' "$(ui_whitelist_web_trusted_proxy_rows)" "2"
+    local rows
+    if ! rows="$(ui_whitelist_web_trusted_proxy_rows 2>&1)"; then
+        ui_error "$rows"
+        return 1
+    fi
+    ui_table_render $'序号\t可信反代 CIDR' "$rows" "2"
 }
 
 ui_whitelist_web_route_rows() {
@@ -5300,7 +5310,12 @@ ui_whitelist_web_route_rows() {
 }
 
 ui_print_whitelist_web_route_list() {
-    ui_table_render $'序号\t标签\tsecret\tSSH 目标\tSSH 端口\t空闲 TTL\tSSH 选项' "$(ui_whitelist_web_route_rows)" "2,4,7"
+    local rows
+    if ! rows="$(ui_whitelist_web_route_rows 2>&1)"; then
+        ui_error "$rows"
+        return 1
+    fi
+    ui_table_render $'序号\t标签\tsecret\tSSH 目标\tSSH 端口\t空闲 TTL\tSSH 选项' "$rows" "2,4,7"
 }
 
 ui_render_whitelist_web_menu_page() {
@@ -5421,6 +5436,11 @@ ui_render_whitelist_web_routes_page() {
 }
 
 ui_menu_whitelist_web_routes() {
+    if ! whitelist_web_route_count >/dev/null 2>&1; then
+        ui_error "错误：$(whitelist_web_config_json 2>&1)"
+        ui_pause
+        return 0
+    fi
     ui_render_page ui_render_whitelist_web_routes_page
     ui_pause
 }
@@ -5504,7 +5524,11 @@ ui_menu_whitelist_web_route_add() {
 
 ui_menu_whitelist_web_route_update() {
     local count
-    count="$(whitelist_web_route_count)"
+    if ! count="$(whitelist_web_route_count 2>/dev/null)"; then
+        ui_error "错误：$(whitelist_web_config_json 2>&1)"
+        ui_pause
+        return 0
+    fi
     if [ "$count" -eq 0 ]; then
         ui_warn "暂无规则"
         ui_pause
@@ -5521,7 +5545,11 @@ ui_menu_whitelist_web_route_update() {
 
 ui_menu_whitelist_web_route_delete() {
     local count
-    count="$(whitelist_web_route_count)"
+    if ! count="$(whitelist_web_route_count 2>/dev/null)"; then
+        ui_error "错误：$(whitelist_web_config_json 2>&1)"
+        ui_pause
+        return 0
+    fi
     if [ "$count" -eq 0 ]; then
         ui_warn "暂无规则"
         ui_pause

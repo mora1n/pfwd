@@ -125,12 +125,15 @@ whitelist_web_config_json() {
 whitelist_web_write_config_json() {
     local payload="$1"
     mkdir -p "$(dirname "$PFWD_WHITELIST_WEB_CONFIG_FILE")"
+    [ -n "$payload" ] || pfwd_die "whitelist-web 配置写入内容为空"
+    payload="$(pfwd_require_json_output "whitelist-web 配置" "$payload")"
     printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$PFWD_WHITELIST_WEB_CONFIG_FILE"
 }
 
 whitelist_web_write_config_from_stdin() {
     local payload
     payload="$(cat)"
+    [ -n "$payload" ] || pfwd_die "whitelist-web 配置写入内容为空"
     whitelist_web_write_config_json "$payload"
 }
 
@@ -188,7 +191,8 @@ whitelist_web_config_show() {
 
 whitelist_web_status_json() {
     local config_json active_state enabled_state service_present bin_path route_count
-    config_json="$(whitelist_web_config_json)"
+    config_json="$(whitelist_web_config_json)" || return 1
+    config_json="$(pfwd_require_json_output "whitelist-web 配置" "$config_json")" || return 1
     route_count="$(jq -r '(.routes // []) | length' <<< "$config_json")"
     bin_path="$(whitelist_web_bin_path)"
     service_present="false"
@@ -304,11 +308,15 @@ whitelist_web_trusted_proxy_delete_by_indexes() {
 }
 
 whitelist_web_route_count() {
-    whitelist_web_config_json | jq -r '(.routes // []) | length'
+    local config_json
+    config_json="$(whitelist_web_config_json)" || return 1
+    jq -r '(.routes // []) | length' <<< "$config_json"
 }
 
 whitelist_web_route_rows() {
-    whitelist_web_config_json | jq -r '
+    local config_json
+    config_json="$(whitelist_web_config_json)" || return 1
+    jq -r '
       (.routes // [])
       | to_entries[]
       | [
@@ -320,7 +328,7 @@ whitelist_web_route_rows() {
           ((.value.ssh_options // []) | join(" "))
         ]
       | @tsv
-    '
+    ' <<< "$config_json"
 }
 
 whitelist_web_route_ui_rows() {
@@ -346,9 +354,11 @@ whitelist_web_route_ui_rows() {
 
 whitelist_web_route_json_by_index() {
     local index="$1"
-    whitelist_web_config_json | jq -c --argjson index "$index" '
+    local config_json
+    config_json="$(whitelist_web_config_json)" || return 1
+    jq -c --argjson index "$index" '
       (.routes // [])[$index - 1] // empty
-    '
+    ' <<< "$config_json"
 }
 
 whitelist_web_ssh_port_from_options_json() {
