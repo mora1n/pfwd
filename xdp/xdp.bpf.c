@@ -1786,10 +1786,6 @@ static __always_inline struct pfwd_rule_val *lookup_forward_rule_v4(
     return bpf_map_lookup_elem(&pfwd_rules, &key);
 }
 
-static __always_inline int protocol_guard_active(const struct pfwd_rule_val *rule) {
-    return rule && (rule->flags & PFWD_RULE_F_NEEDS_GUARD);
-}
-
 static __always_inline struct pfwd_settings *lookup_settings(void) {
     __u32 settings_key = 0;
     return bpf_map_lookup_elem(&pfwd_settings, &settings_key);
@@ -1859,8 +1855,7 @@ static __always_inline int inspect_xdp_tcp_flow(
     const __u8 saddr[16],
     const __u8 daddr[16],
     __be16 sport,
-    __be16 dport,
-    int guard_bypassed
+    __be16 dport
 ) {
     struct pfwd_flow_key flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
@@ -1868,12 +1863,6 @@ static __always_inline int inspect_xdp_tcp_flow(
     struct pfwd_guard_flow_val *stored_flow;
     int verdict;
 
-    if (!protocol_guard_active(rule)) {
-        return XDP_PASS;
-    }
-    if (guard_bypassed) {
-        return XDP_PASS;
-    }
     flow.family = family;
     flow.protocol = IPPROTO_TCP;
     flow.sport = sport;
@@ -1931,8 +1920,7 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     __be32 saddr,
     __be32 daddr,
     __be16 sport,
-    __be16 dport,
-    int guard_bypassed
+    __be16 dport
 ) {
     struct pfwd_flow_key_v4 flow = {};
     struct pfwd_guard_prefix_val next_prefix = {};
@@ -1940,12 +1928,6 @@ static __always_inline int inspect_xdp_tcp_flow_v4(
     struct pfwd_guard_flow_val *stored_flow;
     int verdict;
 
-    if (!protocol_guard_active(rule)) {
-        return XDP_PASS;
-    }
-    if (guard_bypassed) {
-        return XDP_PASS;
-    }
     flow.family = 4;
     flow.protocol = IPPROTO_TCP;
     flow.sport = sport;
@@ -2234,7 +2216,7 @@ static __always_inline int tc_local_forward_v4(
         }
         syn_only = tcp_syn_only(tcp);
         if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
-            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
@@ -2299,7 +2281,7 @@ static __always_inline int tc_local_forward_v6(
         }
         syn_only = tcp_syn_only(tcp);
         if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
-            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
         }
@@ -2743,7 +2725,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 }
                 syn_only = tcp_syn_only(tcp);
                 if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
-                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+                    if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
@@ -2922,7 +2904,7 @@ int pfwd_xdp(struct xdp_md *ctx) {
                 }
                 syn_only = tcp_syn_only(tcp);
                 if (!syn_only && !guard_bypassed && rule_needs_guard(rule)) {
-                    if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+                    if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
                         return XDP_DROP;
                     }
                 }
@@ -3151,7 +3133,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (tcp_syn_only(tcp)) {
                 return TC_ACT_OK;
             }
-            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow_v4(payload_start, data_end, rule, packet_len, ip4->saddr, ip4->daddr, sport, dport) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
@@ -3283,7 +3265,7 @@ int pfwd_ingress(struct __sk_buff *skb) {
             if (tcp_syn_only(tcp)) {
                 return TC_ACT_OK;
             }
-            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport, guard_bypassed) == XDP_DROP) {
+            if (inspect_xdp_tcp_flow(payload_start, data_end, rule, packet_len, 6, ip6->saddr, ip6->daddr, sport, dport) == XDP_DROP) {
                 return TC_ACT_SHOT;
             }
             return TC_ACT_OK;
