@@ -107,10 +107,10 @@ pfwd guard egress-whitelist-cn all
 ```bash
 ./whitelist_web/build.sh
 pfwd whitelist-web init
-pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 30
+pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
 pfwd whitelist-web trusted-proxy add 127.0.0.1/32
 pfwd whitelist-web trusted-proxy add ::1/128
-pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes'
+pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
 pfwd whitelist-web service enable
 pfwd whitelist-web service start
 pfwd whitelist-web route check 1
@@ -180,3 +180,13 @@ pfwd-bbr uninstall
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
+
+## Star History
+
+<a href="https://www.star-history.com/?type=date&repos=mora1n/pfwd">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mora1n/pfwd&type=date&legend=top-left" />
+ </picture>
+</a>

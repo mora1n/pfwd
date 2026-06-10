@@ -39,6 +39,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/install -d -m 0700 $PFWD_RUN_DIR
 ExecStart=$(whitelist_web_bin_path) run --config $PFWD_WHITELIST_WEB_CONFIG_FILE
 Restart=on-failure
 RestartSec=3s
@@ -62,7 +63,7 @@ whitelist_web_default_config_json() {
         listen_host: "127.0.0.1",
         listen_port: 18080,
         trusted_proxy_cidrs: [],
-        request_timeout_sec: 30,
+        request_timeout_sec: 10,
         routes: []
       }
     '
@@ -542,7 +543,7 @@ whitelist_web_route_ssh_options_text_without_port() {
 }
 
 whitelist_web_recommended_ssh_options_text() {
-    printf '%s\n' "-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=30 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
+    printf '%s\n' "-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C"
 }
 
 whitelist_web_build_ssh_options_json() {

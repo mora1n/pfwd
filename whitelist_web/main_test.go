@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -31,6 +35,46 @@ func decodeJSONResponse(t *testing.T, rec *httptest.ResponseRecorder) responsePa
 		t.Fatalf("json.Unmarshal() error = %v, body=%q", err, rec.Body.String())
 	}
 	return payload
+}
+
+func captureLogOutput(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+	}()
+	fn()
+	return buf.String()
+}
+
+func TestLoadConfigDefaultsRequestTimeoutToTenSeconds(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "whitelist-web.json")
+	content := `{
+		"listen_host": "127.0.0.1",
+		"listen_port": 18080,
+		"routes": [{
+			"secret": "secret",
+			"label": "po0-sh",
+			"ssh_target": "root@example",
+			"idle_ttl": "4h"
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.RequestTimeoutSec != 10 {
+		t.Fatalf("RequestTimeoutSec = %d, want 10", cfg.RequestTimeoutSec)
+	}
 }
 
 func TestServeHTTPSuccessJSONByDefault(t *testing.T) {
@@ -245,6 +289,35 @@ func TestServeHTTPLeasePushFailureHTMLShowsHostKeyHint(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "控制机尚未信任目标机 host key") {
 		t.Fatalf("body missing host key hint: %s", body)
+	}
+}
+
+func TestServeHTTPLogsTimingWithoutSecret(t *testing.T) {
+	srv := newTestServer(t, routeConfig{
+		Secret:    "very-secret-token",
+		Label:     "po0-sh",
+		SSHTarget: "root@example",
+		IdleTTL:   "4h",
+	})
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/very-secret-token", nil)
+	req.RemoteAddr = "203.0.113.17:42311"
+	rec := httptest.NewRecorder()
+
+	output := captureLogOutput(t, func() {
+		srv.ServeHTTP(rec, req)
+	})
+
+	for _, want := range []string{`label="po0-sh"`, "status=200", `code=""`, `observed_ip="203.0.113.17"`, "total_ms=", "ssh_ms="} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("log missing %q: %s", want, output)
+		}
+	}
+	if strings.Contains(output, "very-secret-token") {
+		t.Fatalf("log leaked route secret: %s", output)
 	}
 }
 

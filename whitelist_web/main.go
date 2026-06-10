@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -229,7 +230,7 @@ func loadConfig(path string) (config, error) {
 		cfg.ListenPort = 18080
 	}
 	if cfg.RequestTimeoutSec <= 0 {
-		cfg.RequestTimeoutSec = 30
+		cfg.RequestTimeoutSec = 10
 	}
 	if len(cfg.Routes) == 0 {
 		return config{}, errors.New("routes 不能为空")
@@ -273,31 +274,75 @@ func newServer(cfg config) (*server, error) {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	status := http.StatusInternalServerError
+	code := ""
+	routeLabel := ""
+	observedIP := ""
+	sshDuration := time.Duration(-1)
+	errorDetail := ""
+	write := func(resp responseModel) {
+		status = resp.Status
+		code = resp.Payload.Code
+		writeResponse(w, resp)
+	}
+	defer func() {
+		logWhitelistWebRequest(start, status, code, routeLabel, observedIP, sshDuration, errorDetail)
+	}()
+
 	format, err := negotiateResponseFormat(r)
 	if err != nil {
-		writeResponse(w, invalidFormatResponse(err.Error(), format))
+		errorDetail = err.Error()
+		write(invalidFormatResponse(err.Error(), format))
 		return
 	}
 	if r.Method != http.MethodGet {
-		writeResponse(w, methodNotAllowedResponse(format))
+		write(methodNotAllowedResponse(format))
 		return
 	}
 	secret := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
 	route, ok := s.routes[secret]
 	if !ok {
-		writeResponse(w, secretNotFoundResponse(format))
+		write(secretNotFoundResponse(format))
 		return
 	}
-	observedIP, err := s.observedIP(r)
+	routeLabel = strings.TrimSpace(route.RouteConfig.Label)
+	observedIP, err = s.observedIP(r)
 	if err != nil {
-		writeResponse(w, clientIPUnavailableResponse(format, err.Error()))
+		errorDetail = err.Error()
+		write(clientIPUnavailableResponse(format, err.Error()))
 		return
 	}
-	if err := s.pushLease(r.Context(), route, observedIP); err != nil {
-		writeResponse(w, leasePushFailedResponse(format, err.Error()))
+	sshStart := time.Now()
+	err = s.pushLease(r.Context(), route, observedIP)
+	sshDuration = time.Since(sshStart)
+	if err != nil {
+		errorDetail = err.Error()
+		write(leasePushFailedResponse(format, err.Error()))
 		return
 	}
-	writeResponse(w, successResponse(format, route, observedIP))
+	write(successResponse(format, route, observedIP))
+}
+
+func logWhitelistWebRequest(start time.Time, status int, code string, routeLabel string, observedIP string, sshDuration time.Duration, errorDetail string) {
+	sshMS := "not_run"
+	if sshDuration >= 0 {
+		sshMS = fmt.Sprintf("%d", sshDuration.Milliseconds())
+	}
+	totalMS := time.Since(start).Milliseconds()
+	if errorDetail == "" {
+		log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q total_ms=%d ssh_ms=%s", routeLabel, status, code, observedIP, totalMS, sshMS)
+		return
+	}
+	log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q total_ms=%d ssh_ms=%s error=%q", routeLabel, status, code, observedIP, totalMS, sshMS, compactLogDetail(errorDetail, 512))
+}
+
+func compactLogDetail(raw string, maxLen int) string {
+	detail := strings.Join(strings.Fields(raw), " ")
+	if maxLen <= 0 || len(detail) <= maxLen {
+		return detail
+	}
+	return detail[:maxLen] + "..."
 }
 
 func (s *server) observedIP(r *http.Request) (string, error) {
