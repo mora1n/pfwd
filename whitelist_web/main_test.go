@@ -14,6 +14,10 @@ import (
 	"testing"
 )
 
+func intPtr(value int) *int {
+	return &value
+}
+
 func newTestServer(t *testing.T, route routeConfig) *server {
 	t.Helper()
 	srv, err := newServer(config{
@@ -84,7 +88,7 @@ func TestServeHTTPSuccessJSONByDefault(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return nil
 	}
 
@@ -101,8 +105,35 @@ func TestServeHTTPSuccessJSONByDefault(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 	payload := decodeJSONResponse(t, rec)
-	if !payload.OK || payload.Format != "json" || payload.Label != "po0-sh" || payload.ObservedIP != "203.0.113.10" || payload.IdleTTL != "4h" {
+	if !payload.OK || payload.Format != "json" || payload.Label != "po0-sh" || payload.ObservedIP != "203.0.113.10" || payload.LeaseCIDR != "203.0.113.10/32" || payload.IdleTTL != "4h" {
 		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
+func TestServeHTTPSuccessJSONWithConfiguredIPv4Prefix(t *testing.T) {
+	srv := newTestServer(t, routeConfig{
+		Secret:        "secret",
+		Label:         "po0-sh",
+		SSHTarget:     "root@example",
+		IdleTTL:       "4h",
+		IPv4PrefixLen: intPtr(24),
+	})
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, observedIP string, leaseCIDR string) error {
+		if observedIP != "203.0.113.27" || leaseCIDR != "203.0.113.0/24" {
+			t.Fatalf("unexpected push args observedIP=%q leaseCIDR=%q", observedIP, leaseCIDR)
+		}
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/secret", nil)
+	req.RemoteAddr = "203.0.113.27:42311"
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	payload := decodeJSONResponse(t, rec)
+	if payload.LeaseCIDR != "203.0.113.0/24" {
+		t.Fatalf("LeaseCIDR = %q, want 203.0.113.0/24", payload.LeaseCIDR)
 	}
 }
 
@@ -113,7 +144,7 @@ func TestServeHTTPHTMLByAccept(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return nil
 	}
 
@@ -131,7 +162,7 @@ func TestServeHTTPHTMLByAccept(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want text/html", got)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"临时白名单已生效", "po0-sh", "203.0.113.11", "4h"} {
+	for _, want := range []string{"临时白名单已生效", "po0-sh", "203.0.113.11", "203.0.113.11/32", "4h"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q: %s", want, body)
 		}
@@ -145,7 +176,7 @@ func TestServeHTTPQueryFormatOverridesAccept(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return nil
 	}
 
@@ -218,7 +249,7 @@ func TestServeHTTPLeasePushFailureHTMLHidesRawError(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return errors.New("ssh 下发失败: sensitive backend detail")
 	}
 
@@ -247,7 +278,7 @@ func TestServeHTTPLeasePushFailureJSONKeepsErrorDetails(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return errors.New("ssh 下发失败: sensitive backend detail")
 	}
 
@@ -273,7 +304,7 @@ func TestServeHTTPLeasePushFailureHTMLShowsHostKeyHint(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return errors.New("ssh 下发失败: exit status 255: Host key verification failed.")
 	}
 
@@ -299,7 +330,7 @@ func TestServeHTTPLogsTimingWithoutSecret(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return nil
 	}
 
@@ -311,7 +342,7 @@ func TestServeHTTPLogsTimingWithoutSecret(t *testing.T) {
 		srv.ServeHTTP(rec, req)
 	})
 
-	for _, want := range []string{`label="po0-sh"`, "status=200", `code=""`, `observed_ip="203.0.113.17"`, "total_ms=", "ssh_ms="} {
+	for _, want := range []string{`label="po0-sh"`, "status=200", `code=""`, `observed_ip="203.0.113.17"`, `lease_cidr="203.0.113.17/32"`, "total_ms=", "ssh_ms="} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("log missing %q: %s", want, output)
 		}
@@ -328,7 +359,7 @@ func TestServeHTTPHTMLEscapesLabel(t *testing.T) {
 		SSHTarget: "root@example",
 		IdleTTL:   "4h",
 	})
-	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string) error {
+	srv.leasePusher = func(_ context.Context, _ compiledRoute, _ string, _ string) error {
 		return nil
 	}
 

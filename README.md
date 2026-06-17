@@ -91,7 +91,7 @@ pfwd guard whitelist --enabled true
 pfwd guard whitelist-cn all
 pfwd guard whitelist-city add 湖南省 长沙市
 pfwd guard whitelist-custom add 203.0.113.5
-pfwd guard whitelist-lease add --address 198.51.100.8 --idle-ttl 2h --channel manual --note phone
+pfwd guard whitelist-lease add --address 198.51.100.8 --ipv4-prefix-len 24 --idle-ttl 2h --channel manual --note phone
 pfwd guard whitelist check --address 61.187.9.117 --listen-port 41423 --protocol tcp
 
 pfwd guard whitelist-port-cn --listen-port 41423 select 浙江省
@@ -110,7 +110,7 @@ pfwd whitelist-web init
 pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
 pfwd whitelist-web trusted-proxy add 127.0.0.1/32
 pfwd whitelist-web trusted-proxy add ::1/128
-pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
+pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
 pfwd whitelist-web service enable
 pfwd whitelist-web service start
 pfwd whitelist-web route check 1
@@ -120,6 +120,7 @@ pfwd whitelist-web status
 要点：
 
 - `SSH 目标` 建议填写 `user@host`。
+- `放行范围` 基于当前访问来源 IP 计算；例如 `IPv4 /24` 会把 `203.0.113.27` 放宽成 `203.0.113.0/24`。
 - 目标机首次接入前，先让控制机信任对应 host key；可用 `pfwd whitelist-web route check <index>` 检查 `known_hosts` 状态。
 - TUI 入口：`流量防护 -> 临时白名单 Web`。
 

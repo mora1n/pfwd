@@ -104,7 +104,7 @@ whitelist_web_config_json() {
     jq '
       .listen_host = ((.listen_host // "") | tostring | if . == "" then "127.0.0.1" else . end)
       | .listen_port = ((.listen_port // 18080) | tonumber)
-      | .request_timeout_sec = ((.request_timeout_sec // 30) | tonumber)
+      | .request_timeout_sec = ((.request_timeout_sec // 10) | tonumber)
       | .trusted_proxy_cidrs = ((.trusted_proxy_cidrs // []) | map(tostring))
       | .routes = (
           (.routes // [])
@@ -117,6 +117,8 @@ whitelist_web_config_json() {
               | .ssh_target = ((.ssh_target // "") | tostring)
               | .idle_ttl = ((.idle_ttl // "") | tostring)
               | .ssh_options = ((.ssh_options // []) | map(tostring))
+              | .ipv4_prefix_len = ((.ipv4_prefix_len // 32) | tonumber)
+              | .ipv6_prefix_len = ((.ipv6_prefix_len // 128) | tonumber)
               | del(.note)
             )
         )
@@ -168,11 +170,13 @@ whitelist_web_validate_ssh_port() {
 }
 
 whitelist_web_validate_route() {
-    local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4"
+    local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4" ipv4_prefix_len="$5" ipv6_prefix_len="$6"
     whitelist_web_validate_secret "$secret"
     whitelist_web_validate_label "$label"
     [ -n "$ssh_target" ] || pfwd_die "ssh_target 不能为空"
     pfwd_parse_duration_seconds "$idle_ttl" >/dev/null
+    validate_ipv4_prefix_len "$ipv4_prefix_len" "ipv4_prefix_len"
+    validate_ipv6_prefix_len "$ipv6_prefix_len" "ipv6_prefix_len"
 }
 
 whitelist_web_ssh_target_user_hint() {
@@ -320,7 +324,7 @@ whitelist_web_status_rows() {
 
 whitelist_web_route_check_json() {
     local index="$1"
-    local count ssh_target ssh_port ssh_options idle_ttl host_key_state known_hosts user_hint
+    local count ssh_target ssh_port ssh_options idle_ttl host_key_state known_hosts user_hint ipv4_prefix_len ipv6_prefix_len
     count="$(whitelist_web_route_count)"
     [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "规则序号必须是正整数：$index"
     [ "$index" -ge 1 ] && [ "$index" -le "$count" ] || pfwd_die "route 序号不存在：$index"
@@ -328,6 +332,8 @@ whitelist_web_route_check_json() {
     ssh_port="$(whitelist_web_route_ssh_port "$index")"
     ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
     idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
+    ipv4_prefix_len="$(whitelist_web_route_ipv4_prefix_len "$index")"
+    ipv6_prefix_len="$(whitelist_web_route_ipv6_prefix_len "$index")"
     host_key_state="$(whitelist_web_route_host_key_trusted "$index")"
     known_hosts="$(whitelist_web_known_hosts_file)"
     user_hint="$(whitelist_web_ssh_target_user_hint "$ssh_target")"
@@ -339,6 +345,8 @@ whitelist_web_route_check_json() {
       --arg ssh_port "$ssh_port" \
       --arg ssh_options "$ssh_options" \
       --arg idle_ttl "$idle_ttl" \
+      --argjson ipv4_prefix_len "$ipv4_prefix_len" \
+      --argjson ipv6_prefix_len "$ipv6_prefix_len" \
       --arg known_hosts "$known_hosts" \
       --arg host_key_state "$host_key_state" \
       --arg user_hint "$user_hint" '
@@ -350,6 +358,8 @@ whitelist_web_route_check_json() {
         ssh_port: $ssh_port,
         ssh_options: $ssh_options,
         idle_ttl: $idle_ttl,
+        ipv4_prefix_len: $ipv4_prefix_len,
+        ipv6_prefix_len: $ipv6_prefix_len,
         known_hosts_file: $known_hosts,
         host_key_trusted: ($host_key_state == "trusted"),
         host_key_state: $host_key_state,
@@ -369,6 +379,7 @@ whitelist_web_route_check_rows() {
         ["SSH 目标提示", (if .ssh_target_user_hint == "ok" then "已包含 user@host" else "建议填写 user@host；若只填 IP/域名，将使用控制机当前系统用户" end)],
         ["SSH 端口", (if .ssh_port == "" then "-" else .ssh_port end)],
         ["SSH 选项", (if .ssh_options == "" then "-" else .ssh_options end)],
+        ["放行范围", ("IPv4 /" + (.ipv4_prefix_len | tostring) + ", IPv6 /" + (.ipv6_prefix_len | tostring))],
         ["空闲 TTL", .idle_ttl],
         ["known_hosts", .known_hosts_file],
         ["Host Key", (if .host_key_state == "trusted" then "已信任" elif .host_key_state == "missing" then "缺少 known_hosts 条目" else "未知" end)]
@@ -452,6 +463,7 @@ whitelist_web_route_rows() {
           (.value.label // "-"),
           (.value.secret // "-"),
           (.value.ssh_target // "-"),
+          ("IPv4 /" + (((.value.ipv4_prefix_len // 32) | tostring)) + ", IPv6 /" + (((.value.ipv6_prefix_len // 128) | tostring))),
           (.value.idle_ttl // "-"),
           ((.value.ssh_options // []) | join(" "))
         ]
@@ -460,7 +472,7 @@ whitelist_web_route_rows() {
 }
 
 whitelist_web_route_ui_rows() {
-    local count index label secret ssh_target idle_ttl ssh_port ssh_options
+    local count index label secret ssh_target idle_ttl ssh_port ssh_options scope
     count="$(whitelist_web_route_count)"
     for ((index = 1; index <= count; index++)); do
         label="$(whitelist_web_route_field "$index" label)"
@@ -469,12 +481,14 @@ whitelist_web_route_ui_rows() {
         idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
         ssh_port="$(whitelist_web_route_ssh_port "$index")"
         ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        scope="$(whitelist_web_route_scope_text "$index")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$index" \
             "${label:--}" \
             "${secret:--}" \
             "${ssh_target:--}" \
             "${ssh_port:--}" \
+            "${scope:--}" \
             "${idle_ttl:--}" \
             "${ssh_options:--}"
     done
@@ -542,6 +556,27 @@ whitelist_web_route_ssh_options_text_without_port() {
     whitelist_web_ssh_options_without_port_json "$(whitelist_web_route_ssh_options_json "$index")" | jq -r 'join(" ")'
 }
 
+whitelist_web_route_ipv4_prefix_len() {
+    local index="$1"
+    local value
+    value="$(whitelist_web_route_field "$index" ipv4_prefix_len)"
+    [ -n "$value" ] || value="32"
+    printf '%s\n' "$value"
+}
+
+whitelist_web_route_ipv6_prefix_len() {
+    local index="$1"
+    local value
+    value="$(whitelist_web_route_field "$index" ipv6_prefix_len)"
+    [ -n "$value" ] || value="128"
+    printf '%s\n' "$value"
+}
+
+whitelist_web_route_scope_text() {
+    local index="$1"
+    printf 'IPv4 /%s, IPv6 /%s\n' "$(whitelist_web_route_ipv4_prefix_len "$index")" "$(whitelist_web_route_ipv6_prefix_len "$index")"
+}
+
 whitelist_web_recommended_ssh_options_text() {
     printf '%s\n' "-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C"
 }
@@ -571,14 +606,16 @@ whitelist_web_build_ssh_options_json() {
 }
 
 whitelist_web_route_add() {
-    local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4" ssh_options_json="$5"
-    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl"
+    local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4" ssh_options_json="$5" ipv4_prefix_len="${6:-32}" ipv6_prefix_len="${7:-128}"
+    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
     whitelist_web_config_json | jq \
       --arg secret "$secret" \
       --arg route_label "$label" \
       --arg ssh_target "$ssh_target" \
       --arg idle_ttl "$idle_ttl" \
-      --argjson ssh_options "$ssh_options_json" '
+      --argjson ssh_options "$ssh_options_json" \
+      --argjson ipv4_prefix_len "$ipv4_prefix_len" \
+      --argjson ipv6_prefix_len "$ipv6_prefix_len" '
       if any((.routes // [])[]; (.secret // "") == $secret) then
         error("route.secret 已存在")
       else
@@ -587,22 +624,26 @@ whitelist_web_route_add() {
           "label": $route_label,
           "ssh_target": $ssh_target,
           "idle_ttl": $idle_ttl,
-          "ssh_options": $ssh_options
+          "ssh_options": $ssh_options,
+          "ipv4_prefix_len": $ipv4_prefix_len,
+          "ipv6_prefix_len": $ipv6_prefix_len
         }])
       end
     ' | whitelist_web_write_config_from_stdin
 }
 
 whitelist_web_route_update() {
-    local index="$1" secret="$2" label="$3" ssh_target="$4" idle_ttl="$5" ssh_options_json="$6"
-    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl"
+    local index="$1" secret="$2" label="$3" ssh_target="$4" idle_ttl="$5" ssh_options_json="$6" ipv4_prefix_len="${7:-32}" ipv6_prefix_len="${8:-128}"
+    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
     whitelist_web_config_json | jq \
       --argjson index "$index" \
       --arg secret "$secret" \
       --arg route_label "$label" \
       --arg ssh_target "$ssh_target" \
       --arg idle_ttl "$idle_ttl" \
-      --argjson ssh_options "$ssh_options_json" '
+      --argjson ssh_options "$ssh_options_json" \
+      --argjson ipv4_prefix_len "$ipv4_prefix_len" \
+      --argjson ipv6_prefix_len "$ipv6_prefix_len" '
       . as $config
       | if (($index - 1) < 0) or (($index - 1) >= (($config.routes // []) | length)) then
         error("route 序号不存在")
@@ -614,7 +655,9 @@ whitelist_web_route_update() {
           "label": $route_label,
           "ssh_target": $ssh_target,
           "idle_ttl": $idle_ttl,
-          "ssh_options": $ssh_options
+          "ssh_options": $ssh_options,
+          "ipv4_prefix_len": $ipv4_prefix_len,
+          "ipv6_prefix_len": $ipv6_prefix_len
         }
       end
     ' | whitelist_web_write_config_from_stdin
@@ -779,7 +822,7 @@ cmd_whitelist_web() {
                     whitelist_web_route_check_rows "$1"
                     ;;
                 add)
-                    local secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]'
+                    local secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]' ipv4_prefix_len="32" ipv6_prefix_len="128"
                     while [ "$#" -gt 0 ]; do
                         case "$1" in
                             --secret) secret="${2:-}"; shift 2 ;;
@@ -788,15 +831,17 @@ cmd_whitelist_web() {
                             --idle-ttl) idle_ttl="${2:-}"; shift 2 ;;
                             --ssh-port) ssh_port="${2:-}"; shift 2 ;;
                             --ssh-options) ssh_options_raw="${2:-}"; shift 2 ;;
+                            --ipv4-prefix-len) ipv4_prefix_len="${2:-}"; shift 2 ;;
+                            --ipv6-prefix-len) ipv6_prefix_len="${2:-}"; shift 2 ;;
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
                     ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
-                    whitelist_web_route_add "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json"
+                    whitelist_web_route_add "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
                     echo "whitelist-web 规则已添加"
                     ;;
                 update)
-                    local index="" secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]'
+                    local index="" secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]' ipv4_prefix_len="32" ipv6_prefix_len="128"
                     while [ "$#" -gt 0 ]; do
                         case "$1" in
                             --index) index="${2:-}"; shift 2 ;;
@@ -806,12 +851,14 @@ cmd_whitelist_web() {
                             --idle-ttl) idle_ttl="${2:-}"; shift 2 ;;
                             --ssh-port) ssh_port="${2:-}"; shift 2 ;;
                             --ssh-options) ssh_options_raw="${2:-}"; shift 2 ;;
+                            --ipv4-prefix-len) ipv4_prefix_len="${2:-}"; shift 2 ;;
+                            --ipv6-prefix-len) ipv6_prefix_len="${2:-}"; shift 2 ;;
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
                     ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
-                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd whitelist-web route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-port PORT] [--ssh-options '...']"
-                    whitelist_web_route_update "$index" "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json"
+                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd whitelist-web route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]"
+                    whitelist_web_route_update "$index" "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
                     echo "whitelist-web 规则已更新"
                     ;;
                 delete)

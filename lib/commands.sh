@@ -1538,7 +1538,7 @@ cmd_guard_whitelist_check() {
         fi
     fi
 
-    local geo_allowed custom_allowed city_allowed allowed province matched_source city_label temp_lease_allowed="false"
+    local geo_allowed custom_allowed city_allowed allowed province matched_source city_label temp_lease_allowed="false" temp_lease_json="" temp_lease_cidr="-"
     geo_allowed="$(jq -r '.geo_allowed' <<< "$output")"
     custom_allowed="$(jq -r '.custom_allowed' <<< "$output")"
     city_allowed="$(jq -r '.city_allowed // false' <<< "$output")"
@@ -1546,8 +1546,10 @@ cmd_guard_whitelist_check() {
     province="$(jq -r '.province // "-"' <<< "$output")"
     matched_source="$(jq -r '.matched_source' <<< "$output")"
     city_label="$(jq -r 'if ((.city_province // "") != "") and ((.city // "") != "") then (.city_province + "/" + .city) else "-" end' <<< "$output")"
-    if [ -n "$(whitelist_lease_find_by_address_json "$address")" ]; then
+    temp_lease_json="$(whitelist_lease_find_by_address_json "$address")"
+    if [ -n "$temp_lease_json" ]; then
         temp_lease_allowed="true"
+        temp_lease_cidr="$(jq -r '.cidr // "-"' <<< "$temp_lease_json")"
     fi
 
     if [ "$skip_hit" = "true" ]; then
@@ -1558,7 +1560,7 @@ cmd_guard_whitelist_check() {
         reason="入口白名单未启用"
     elif [ "$temp_lease_allowed" = "true" ]; then
         conclusion="放行"
-        reason="命中入口临时白名单租约"
+        reason="命中入口临时白名单租约：$temp_lease_cidr"
     elif [ "$allowed" = "true" ]; then
         conclusion="放行"
         if [ "$city_allowed" = "true" ]; then
@@ -1588,6 +1590,7 @@ cmd_guard_whitelist_check() {
     printf '城市\t%s\n' "$city_label"
     printf '入口白名单\t%s\n' "$(if [ "$wl_enabled" = "true" ]; then printf '开'; else printf '关'; fi)"
     printf '临时白名单\t%s\n' "$(if [ "$temp_lease_allowed" = "true" ]; then printf '命中'; else printf '未命中'; fi)"
+    printf '临时白名单范围\t%s\n' "$temp_lease_cidr"
     printf '策略来源\t%s\n' "$policy_source"
     printf '国内 IP 策略\t%s\n' "$(if [ -n "$listen_port" ]; then whitelist_effective_cn_selection_summary_for_port "$listen_port"; else whitelist_cn_selection_summary; fi)"
     printf '市白名单\t%s\n' "$(if [ -n "$listen_port" ]; then whitelist_effective_city_selection_summary_for_port "$listen_port"; else whitelist_city_selection_summary; fi)"
@@ -1616,26 +1619,30 @@ cmd_guard_whitelist_lease() {
             whitelist_lease_status_json | jq '.'
             ;;
         add)
-            local address="" idle_ttl_raw="30m" idle_ttl_sec note="" channel="manual"
+            local address="" idle_ttl_raw="30m" idle_ttl_sec note="" channel="manual" ipv4_prefix_len="32" ipv6_prefix_len="128"
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --address) address="${2:-}"; shift 2 ;;
                     --idle-ttl) idle_ttl_raw="${2:-}"; shift 2 ;;
                     --note) note="${2:-}"; shift 2 ;;
                     --channel) channel="${2:-}"; shift 2 ;;
+                    --ipv4-prefix-len) ipv4_prefix_len="${2:-}"; shift 2 ;;
+                    --ipv6-prefix-len) ipv6_prefix_len="${2:-}"; shift 2 ;;
                     *) pfwd_die "未知选项：$1" ;;
                 esac
             done
-            [ -n "$address" ] || pfwd_die "用法：pfwd guard whitelist-lease add --address IP [--idle-ttl 30m|2h|1d] [--note TEXT] [--channel web|manual|ssh]"
+            [ -n "$address" ] || pfwd_die "用法：pfwd guard whitelist-lease add --address IP [--ipv4-prefix-len N] [--ipv6-prefix-len N] [--idle-ttl 30m|2h|1d] [--note TEXT] [--channel web|manual|ssh]"
             case "$channel" in
                 web|manual|ssh) ;;
                 *) pfwd_die "无效 channel：$channel；必须是 web/manual/ssh" ;;
             esac
             idle_ttl_sec="$(pfwd_parse_duration_seconds "$idle_ttl_raw")"
-            whitelist_lease_upsert "$address" "$idle_ttl_sec" "$note" "$channel"
+            local lease_cidr
+            lease_cidr="$(whitelist_normalize_lease_cidr "$address" "$ipv4_prefix_len" "$ipv6_prefix_len")"
+            whitelist_lease_upsert "$address" "$idle_ttl_sec" "$note" "$channel" "$ipv4_prefix_len" "$ipv6_prefix_len"
             whitelist_apply_runtime
             cmd_apply_guard_runtime
-            echo "入口临时白名单已添加：$(normalize_ip_literal_to_cidr "$address") idle_ttl=$(pfwd_format_duration_seconds "$idle_ttl_sec")"
+            echo "入口临时白名单已添加：$lease_cidr idle_ttl=$(pfwd_format_duration_seconds "$idle_ttl_sec")"
             ;;
         delete)
             local address="" indexes=()

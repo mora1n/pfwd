@@ -5315,7 +5315,7 @@ ui_print_whitelist_web_route_list() {
         ui_error "$rows"
         return 1
     fi
-    ui_table_render $'序号\t标签\tsecret\tSSH 目标\tSSH 端口\t空闲 TTL\tSSH 选项' "$rows" "2,4,7"
+    ui_table_render $'序号\t标签\tsecret\tSSH 目标\tSSH 端口\t放行范围\t空闲 TTL\tSSH 选项' "$rows" "2,4,6,8"
 }
 
 ui_render_whitelist_web_menu_page() {
@@ -5353,7 +5353,7 @@ ui_menu_whitelist_web_listener() {
     fi
     current_host="$(jq -r '.listen_host // "127.0.0.1"' <<< "$config_json")"
     current_port="$(jq -r '.listen_port // 18080' <<< "$config_json")"
-    current_timeout="$(jq -r '.request_timeout_sec // 30' <<< "$config_json")"
+    current_timeout="$(jq -r '.request_timeout_sec // 10' <<< "$config_json")"
 
     ui_form_set "临时白名单 Web - 监听配置" "可信反代 CIDR：只有来自这些反代 IP/CIDR 的请求，才信任 X-Real-IP / X-Forwarded-For；否则只认直连来源 IP。输入 0 返回上级菜单。"
     ui_form_add_kv "当前监听地址" "$current_host:$current_port"
@@ -5432,7 +5432,7 @@ ui_render_whitelist_web_routes_page() {
     ui_header "临时白名单 Web - 规则列表"
     ui_notice_render
     ui_print_whitelist_web_route_list
-    echo "说明：label 会同时用于界面展示、HTTP 返回和目标机临时白名单备注。"
+    echo "说明：label 会同时用于界面展示、HTTP 返回和目标机临时白名单备注；放行范围表示“当前访问来源 IP”会被扩成的实际 CIDR。"
 }
 
 ui_menu_whitelist_web_routes() {
@@ -5447,7 +5447,7 @@ ui_menu_whitelist_web_routes() {
 
 ui_whitelist_web_route_form() {
     local title="$1" mode="$2" index="${3:-}"
-    local current_secret="" current_label="" current_target="" current_port="" current_ttl="" current_opts=""
+    local current_secret="" current_label="" current_target="" current_port="" current_ttl="" current_opts="" current_ipv4_prefix="" current_ipv6_prefix=""
     local defaults_label="当前"
     if [ -n "$index" ]; then
         current_secret="$(whitelist_web_route_field "$index" secret)"
@@ -5456,28 +5456,37 @@ ui_whitelist_web_route_form() {
         current_port="$(whitelist_web_route_ssh_port "$index")"
         current_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
         current_opts="$(whitelist_web_route_ssh_options_text_without_port "$index")"
-        [ -n "$current_secret$current_label$current_target$current_ttl$current_opts$current_port" ] || { ui_warn "规则序号不存在"; ui_pause; return 1; }
+        current_ipv4_prefix="$(whitelist_web_route_ipv4_prefix_len "$index")"
+        current_ipv6_prefix="$(whitelist_web_route_ipv6_prefix_len "$index")"
+        [ -n "$current_secret$current_label$current_target$current_ttl$current_opts$current_port$current_ipv4_prefix$current_ipv6_prefix" ] || { ui_warn "规则序号不存在"; ui_pause; return 1; }
     elif [ "$(whitelist_web_route_count)" -gt 0 ]; then
         defaults_label="默认"
         current_target="$(whitelist_web_route_field 1 ssh_target)"
         current_port="$(whitelist_web_route_ssh_port 1)"
         current_opts="$(whitelist_web_route_ssh_options_text_without_port 1)"
+        current_ipv4_prefix="$(whitelist_web_route_ipv4_prefix_len 1)"
+        current_ipv6_prefix="$(whitelist_web_route_ipv6_prefix_len 1)"
     else
         defaults_label="默认"
         current_opts="$(whitelist_web_recommended_ssh_options_text)"
+        current_ipv4_prefix="24"
+        current_ipv6_prefix="128"
     fi
     local secret="$current_secret" label="$current_label" ssh_target="$current_target"
     local ssh_port="$current_port" idle_ttl="${current_ttl:-2h}" ssh_options="$current_opts"
+    local ipv4_prefix_len="${current_ipv4_prefix:-24}" ipv6_prefix_len="${current_ipv6_prefix:-128}"
     local error_notice=""
 
     while true; do
-        ui_form_set "$title" "label 会写入目标机临时白名单备注；SSH 权限边界建议配合受限命令脚本。SSH 目标建议填写 user@host；如果只填 IP/域名，将使用控制机当前系统用户。目标机首次接入前，还需先让控制机信任对应 host key。回车保留默认值；SSH 端口/SSH 选项输入 - 清空。若两者都为空，将直接依赖系统 ssh 默认行为，请自行在外部配置好 SSH 连通。输入 0 返回上级菜单。"
+        ui_form_set "$title" "label 会写入目标机临时白名单备注；放行范围会基于当前访问来源 IP 按 IPv4/IPv6 前缀扩成 CIDR。SSH 权限边界建议配合受限命令脚本。SSH 目标建议填写 user@host；如果只填 IP/域名，将使用控制机当前系统用户。目标机首次接入前，还需先让控制机信任对应 host key。回车保留默认值；SSH 端口/SSH 选项输入 - 清空。若两者都为空，将直接依赖系统 ssh 默认行为，请自行在外部配置好 SSH 连通。输入 0 返回上级菜单。"
         [ -n "$error_notice" ] && ui_notice_set "$error_notice" "$UI_C_ERROR"
         [ -z "$index" ] || ui_form_add_kv "当前规则序号" "$index"
         [ -z "$current_secret" ] || ui_form_add_kv "当前 secret" "$current_secret"
         [ -z "$current_label" ] || ui_form_add_kv "当前标签" "$current_label"
         [ -z "$current_target" ] || ui_form_add_kv "$defaults_label SSH 目标" "$current_target"
         [ -z "$current_port" ] || ui_form_add_kv "$defaults_label SSH 端口" "$current_port"
+        [ -z "$current_ipv4_prefix" ] || ui_form_add_kv "$defaults_label IPv4 前缀" "/$current_ipv4_prefix"
+        [ -z "$current_ipv6_prefix" ] || ui_form_add_kv "$defaults_label IPv6 前缀" "/$current_ipv6_prefix"
         [ -z "$current_ttl" ] || ui_form_add_kv "当前空闲 TTL" "$current_ttl"
         [ -z "$current_opts" ] || ui_form_add_kv "$defaults_label SSH 选项" "$current_opts"
         ui_form_read "secret" "$secret" || { ui_form_reset; return 1; }
@@ -5497,6 +5506,14 @@ ui_whitelist_web_route_form() {
         ssh_port="$UI_REPLY"
         [ "$ssh_port" = "-" ] && ssh_port=""
         ui_form_add_kv "SSH 端口" "$ssh_port"
+        ui_form_read "IPv4 前缀长度（0-32；常用 24）" "$ipv4_prefix_len" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        ipv4_prefix_len="$UI_REPLY"
+        ui_form_add_kv "IPv4 前缀长度" "/$ipv4_prefix_len"
+        ui_form_read "IPv6 前缀长度（0-128；常用 128）" "$ipv6_prefix_len" || { ui_form_reset; return 1; }
+        [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
+        ipv6_prefix_len="$UI_REPLY"
+        ui_form_add_kv "IPv6 前缀长度" "/$ipv6_prefix_len"
         ui_form_read "空闲 TTL（例如 30m / 2h / 1d）" "$idle_ttl" || { ui_form_reset; return 1; }
         [ "$UI_EDIT_ABORTED" = "1" ] && { ui_form_reset; return 1; }
         idle_ttl="$UI_REPLY"
@@ -5507,9 +5524,9 @@ ui_whitelist_web_route_form() {
         [ "$ssh_options" = "-" ] && ssh_options=""
 
         if [ "$mode" = "add" ]; then
-            ui_run_capture cmd_whitelist_web route add --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+            ui_run_capture cmd_whitelist_web route add --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --ipv4-prefix-len "$ipv4_prefix_len" --ipv6-prefix-len "$ipv6_prefix_len" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
         else
-            ui_run_capture cmd_whitelist_web route update --index "$index" --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
+            ui_run_capture cmd_whitelist_web route update --index "$index" --secret "$secret" --label "$label" --ssh-target "$ssh_target" --ssh-port "$ssh_port" --ipv4-prefix-len "$ipv4_prefix_len" --ipv6-prefix-len "$ipv6_prefix_len" --idle-ttl "$idle_ttl" --ssh-options "$ssh_options"
         fi
         if [ "$UI_STATUS" -eq 0 ]; then
             ui_form_reset
@@ -5640,14 +5657,14 @@ ui_menu_whitelist_web() {
 }
 
 ui_whitelist_lease_rows() {
-    whitelist_lease_list_rows | while IFS=$'\t' read -r idx address ttl last_seen granted channel note; do
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-          "$idx" "$address" "$(pfwd_format_duration_seconds "$ttl")" "$last_seen" "$granted" "$channel" "$note"
+    whitelist_lease_list_rows | while IFS=$'\t' read -r idx address cidr ttl last_seen granted channel note; do
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$idx" "$address" "$cidr" "$(pfwd_format_duration_seconds "$ttl")" "$last_seen" "$granted" "$channel" "$note"
     done
 }
 
 ui_print_whitelist_lease_list() {
-    ui_table_render $'序号\t地址\t空闲TTL\t最近命中(epoch)\t授权(epoch)\t来源\t备注' "$(ui_whitelist_lease_rows)" "2,3,4,5,6,7"
+    ui_table_render $'序号\t最近地址\tCIDR\t空闲TTL\t最近命中(epoch)\t授权(epoch)\t来源\t备注' "$(ui_whitelist_lease_rows)" "2,3,4,5,6,7,8"
 }
 
 ui_render_whitelist_lease_menu_page() {

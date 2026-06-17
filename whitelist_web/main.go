@@ -18,11 +18,13 @@ import (
 )
 
 type routeConfig struct {
-	Secret     string   `json:"secret"`
-	Label      string   `json:"label"`
-	SSHTarget  string   `json:"ssh_target"`
-	IdleTTL    string   `json:"idle_ttl"`
-	SSHOptions []string `json:"ssh_options"`
+	Secret        string   `json:"secret"`
+	Label         string   `json:"label"`
+	SSHTarget     string   `json:"ssh_target"`
+	IdleTTL       string   `json:"idle_ttl"`
+	SSHOptions    []string `json:"ssh_options"`
+	IPv4PrefixLen *int     `json:"ipv4_prefix_len,omitempty"`
+	IPv6PrefixLen *int     `json:"ipv6_prefix_len,omitempty"`
 }
 
 type config struct {
@@ -34,15 +36,17 @@ type config struct {
 }
 
 type compiledRoute struct {
-	RouteConfig routeConfig
-	IdleTTL     string
+	RouteConfig   routeConfig
+	IdleTTL       string
+	IPv4PrefixLen int
+	IPv6PrefixLen int
 }
 
 type server struct {
 	cfg            config
 	routes         map[string]compiledRoute
 	trustedProxies []netip.Prefix
-	leasePusher    func(context.Context, compiledRoute, string) error
+	leasePusher    func(context.Context, compiledRoute, string, string) error
 }
 
 type responseFormat string
@@ -58,6 +62,7 @@ type responsePayload struct {
 	Code       string `json:"code,omitempty"`
 	Label      string `json:"label,omitempty"`
 	ObservedIP string `json:"observed_ip,omitempty"`
+	LeaseCIDR  string `json:"lease_cidr,omitempty"`
 	IdleTTL    string `json:"idle_ttl,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
@@ -160,6 +165,7 @@ var htmlPageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       <dl>
         {{if .Payload.Label}}<dt>标签</dt><dd>{{.Payload.Label}}</dd>{{end}}
         {{if .Payload.ObservedIP}}<dt>来源 IP</dt><dd>{{.Payload.ObservedIP}}</dd>{{end}}
+        {{if .Payload.LeaseCIDR}}<dt>放行范围</dt><dd>{{.Payload.LeaseCIDR}}</dd>{{end}}
         {{if .Payload.IdleTTL}}<dt>时效</dt><dd>{{.Payload.IdleTTL}}</dd>{{end}}
         {{if .Payload.Code}}<dt>状态码</dt><dd>{{.Payload.Code}}</dd>{{end}}
       </dl>
@@ -253,9 +259,25 @@ func newServer(cfg config) (*server, error) {
 		if strings.TrimSpace(route.IdleTTL) == "" {
 			return nil, fmt.Errorf("route %s 缺少 idle_ttl", route.Secret)
 		}
+		ipv4PrefixLen := 32
+		if route.IPv4PrefixLen != nil {
+			ipv4PrefixLen = *route.IPv4PrefixLen
+		}
+		if err := validateRoutePrefixLen(ipv4PrefixLen, 32, "route.ipv4_prefix_len"); err != nil {
+			return nil, err
+		}
+		ipv6PrefixLen := 128
+		if route.IPv6PrefixLen != nil {
+			ipv6PrefixLen = *route.IPv6PrefixLen
+		}
+		if err := validateRoutePrefixLen(ipv6PrefixLen, 128, "route.ipv6_prefix_len"); err != nil {
+			return nil, err
+		}
 		routes[route.Secret] = compiledRoute{
-			RouteConfig: route,
-			IdleTTL:     strings.TrimSpace(route.IdleTTL),
+			RouteConfig:   route,
+			IdleTTL:       strings.TrimSpace(route.IdleTTL),
+			IPv4PrefixLen: ipv4PrefixLen,
+			IPv6PrefixLen: ipv6PrefixLen,
 		}
 	}
 	trusted := make([]netip.Prefix, 0, len(cfg.TrustedProxyCIDRs))
@@ -279,6 +301,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	code := ""
 	routeLabel := ""
 	observedIP := ""
+	leaseCIDR := ""
 	sshDuration := time.Duration(-1)
 	errorDetail := ""
 	write := func(resp responseModel) {
@@ -287,7 +310,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeResponse(w, resp)
 	}
 	defer func() {
-		logWhitelistWebRequest(start, status, code, routeLabel, observedIP, sshDuration, errorDetail)
+		logWhitelistWebRequest(start, status, code, routeLabel, observedIP, leaseCIDR, sshDuration, errorDetail)
 	}()
 
 	format, err := negotiateResponseFormat(r)
@@ -313,28 +336,34 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		write(clientIPUnavailableResponse(format, err.Error()))
 		return
 	}
+	leaseCIDR, err = leaseCIDRForAddress(observedIP, route)
+	if err != nil {
+		errorDetail = err.Error()
+		write(internalConfigErrorResponse(format, err.Error()))
+		return
+	}
 	sshStart := time.Now()
-	err = s.pushLease(r.Context(), route, observedIP)
+	err = s.pushLease(r.Context(), route, observedIP, leaseCIDR)
 	sshDuration = time.Since(sshStart)
 	if err != nil {
 		errorDetail = err.Error()
 		write(leasePushFailedResponse(format, err.Error()))
 		return
 	}
-	write(successResponse(format, route, observedIP))
+	write(successResponse(format, route, observedIP, leaseCIDR))
 }
 
-func logWhitelistWebRequest(start time.Time, status int, code string, routeLabel string, observedIP string, sshDuration time.Duration, errorDetail string) {
+func logWhitelistWebRequest(start time.Time, status int, code string, routeLabel string, observedIP string, leaseCIDR string, sshDuration time.Duration, errorDetail string) {
 	sshMS := "not_run"
 	if sshDuration >= 0 {
 		sshMS = fmt.Sprintf("%d", sshDuration.Milliseconds())
 	}
 	totalMS := time.Since(start).Milliseconds()
 	if errorDetail == "" {
-		log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q total_ms=%d ssh_ms=%s", routeLabel, status, code, observedIP, totalMS, sshMS)
+		log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS)
 		return
 	}
-	log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q total_ms=%d ssh_ms=%s error=%q", routeLabel, status, code, observedIP, totalMS, sshMS, compactLogDetail(errorDetail, 512))
+	log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s error=%q", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS, compactLogDetail(errorDetail, 512))
 }
 
 func compactLogDetail(raw string, maxLen int) string {
@@ -388,7 +417,27 @@ func firstForwardedIP(raw string) string {
 	return ""
 }
 
-func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute, observedIP string) error {
+func validateRoutePrefixLen(prefixLen int, maxBits int, field string) error {
+	if prefixLen < 0 || prefixLen > maxBits {
+		return fmt.Errorf("%s 必须是 0-%d", field, maxBits)
+	}
+	return nil
+}
+
+func leaseCIDRForAddress(observedIP string, route compiledRoute) (string, error) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(observedIP))
+	if err != nil {
+		return "", fmt.Errorf("来源 IP 无效: %w", err)
+	}
+	prefixLen := route.IPv6PrefixLen
+	if addr.Is4() {
+		prefixLen = route.IPv4PrefixLen
+	}
+	prefix := netip.PrefixFrom(addr, prefixLen).Masked()
+	return prefix.String(), nil
+}
+
+func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute, observedIP string, _ string) error {
 	timeout := time.Duration(s.cfg.RequestTimeoutSec) * time.Second
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
@@ -397,6 +446,8 @@ func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute,
 	args = append(args, route.RouteConfig.SSHTarget,
 		"pfwd", "guard", "whitelist-lease", "add",
 		"--address", observedIP,
+		"--ipv4-prefix-len", fmt.Sprintf("%d", route.IPv4PrefixLen),
+		"--ipv6-prefix-len", fmt.Sprintf("%d", route.IPv6PrefixLen),
 		"--idle-ttl", route.IdleTTL,
 		"--channel", "web",
 		"--note", strings.TrimSpace(route.RouteConfig.Label),
@@ -409,11 +460,11 @@ func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute,
 	return nil
 }
 
-func (s *server) pushLease(parent context.Context, route compiledRoute, observedIP string) error {
+func (s *server) pushLease(parent context.Context, route compiledRoute, observedIP string, leaseCIDR string) error {
 	if s.leasePusher != nil {
-		return s.leasePusher(parent, route, observedIP)
+		return s.leasePusher(parent, route, observedIP, leaseCIDR)
 	}
-	return s.pushWhitelistLease(parent, route, observedIP)
+	return s.pushWhitelistLease(parent, route, observedIP, leaseCIDR)
 }
 
 func negotiateResponseFormat(r *http.Request) (responseFormat, error) {
@@ -432,12 +483,13 @@ func negotiateResponseFormat(r *http.Request) (responseFormat, error) {
 	return formatJSON, nil
 }
 
-func successResponse(format responseFormat, route compiledRoute, observedIP string) responseModel {
+func successResponse(format responseFormat, route compiledRoute, observedIP string, leaseCIDR string) responseModel {
 	payload := responsePayload{
 		OK:         true,
 		Format:     string(format),
 		Label:      route.RouteConfig.Label,
 		ObservedIP: observedIP,
+		LeaseCIDR:  leaseCIDR,
 		IdleTTL:    route.IdleTTL,
 	}
 	return responseModel{
@@ -463,6 +515,10 @@ func secretNotFoundResponse(format responseFormat) responseModel {
 
 func clientIPUnavailableResponse(format responseFormat, details string) responseModel {
 	return errorResponse(http.StatusBadRequest, format, "client_ip_unavailable", details, "无法识别来源 IP", "请检查直连来源 IP 或反代透传头是否正确。")
+}
+
+func internalConfigErrorResponse(format responseFormat, details string) responseModel {
+	return errorResponse(http.StatusInternalServerError, format, "internal_config_error", details, "服务端配置无效", "请联系管理员检查临时白名单 Web 配置。")
 }
 
 func leasePushFailedResponse(format responseFormat, details string) responseModel {

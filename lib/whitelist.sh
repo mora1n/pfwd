@@ -205,7 +205,17 @@ whitelist_lease_entries_sorted_json() {
     whitelist_lease_entries_json | jq -c '
       map(
         .address = (.address // "")
-        | .cidr = (.cidr // "")
+        | .cidr = (
+            if (.cidr // "") != "" then
+              .cidr
+            elif (.address // "") == "" then
+              ""
+            elif ((.address // "") | contains(":")) then
+              ((.address // "") + "/128")
+            else
+              ((.address // "") + "/32")
+            end
+          )
         | .channel = (.channel // "manual")
         | .note = (.note // "")
         | .idle_ttl_sec = ((.idle_ttl_sec // 0) | tonumber)
@@ -213,7 +223,7 @@ whitelist_lease_entries_sorted_json() {
         | .last_seen_at = (if (.last_seen_at // null) == null then null else (.last_seen_at | tonumber) end)
         | .last_active_at = (if (.last_seen_at // null) == null then (.granted_at // 0) else .last_seen_at end)
       )
-      | sort_by(.address)
+      | sort_by(.cidr, .address)
     '
 }
 
@@ -225,12 +235,56 @@ whitelist_lease_custom_cidrs_tsv() {
     whitelist_lease_entries_sorted_json | jq -r '.[] | .cidr // empty'
 }
 
+whitelist_normalize_lease_cidr() {
+    local address="$1" ipv4_prefix_len="${2:-32}" ipv6_prefix_len="${3:-128}"
+    validate_ipv4_prefix_len "$ipv4_prefix_len" "ipv4_prefix_len"
+    validate_ipv6_prefix_len "$ipv6_prefix_len" "ipv6_prefix_len"
+    python3 -c '
+import ipaddress
+import sys
+
+address = ipaddress.ip_address(sys.argv[1])
+ipv4_prefix_len = int(sys.argv[2])
+ipv6_prefix_len = int(sys.argv[3])
+prefix_len = ipv4_prefix_len if address.version == 4 else ipv6_prefix_len
+network = ipaddress.ip_network(f"{address}/{prefix_len}", strict=False)
+sys.stdout.write(network.with_prefixlen)
+' "$address" "$ipv4_prefix_len" "$ipv6_prefix_len" || pfwd_die "无法生成临时白名单 CIDR：$address"
+}
+
 whitelist_lease_find_by_address_json() {
     local address="$1"
-    whitelist_lease_entries_json | jq -c --arg address "$address" '
-      map(select((.address // "") == $address))
-      | first // empty
-    '
+    whitelist_lease_entries_sorted_json | python3 -c '
+import ipaddress
+import json
+import sys
+
+target = ipaddress.ip_address(sys.argv[1])
+try:
+    leases = json.load(sys.stdin)
+except Exception:
+    leases = []
+
+best = None
+best_prefix = -1
+for lease in leases or []:
+    cidr = str(lease.get("cidr") or "").strip()
+    if not cidr:
+        continue
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        continue
+    if network.version != target.version or target not in network:
+        continue
+    if network.prefixlen > best_prefix:
+        best = dict(lease)
+        best["cidr"] = network.with_prefixlen
+        best_prefix = network.prefixlen
+
+if best is not None:
+    json.dump(best, sys.stdout, separators=(",", ":"))
+' "$address"
 }
 
 whitelist_nonempty_line_count() {
@@ -1240,21 +1294,26 @@ whitelist_lease_upsert() {
     local idle_ttl_sec="$2"
     local note="$3"
     local channel="$4"
+    local ipv4_prefix_len="${5:-32}"
+    local ipv6_prefix_len="${6:-128}"
     local now granted_at
     local cidr payload
+    validate_ipv4_prefix_len "$ipv4_prefix_len" "ipv4_prefix_len"
+    validate_ipv6_prefix_len "$ipv6_prefix_len" "ipv6_prefix_len"
     cidr="$(normalize_ip_literal_to_cidr "$address")"
     address="${cidr%/*}"
+    cidr="$(whitelist_normalize_lease_cidr "$address" "$ipv4_prefix_len" "$ipv6_prefix_len")"
     now="$(pfwd_now_epoch)"
     payload="$(
-      whitelist_lease_entries_json | jq -c \
+      whitelist_lease_entries_sorted_json | jq -c \
         --arg address "$address" \
         --arg cidr "$cidr" \
         --arg note "$note" \
         --arg channel "$channel" \
         --argjson idle_ttl_sec "$idle_ttl_sec" \
         --argjson now "$now" '
-        (map(select((.address // "") != $address))) as $rest
-        | (map(select((.address // "") == $address)) | first // null) as $existing
+        (map(del(.last_active_at) | select((.cidr // "") != $cidr))) as $rest
+        | (map(select((.cidr // "") == $cidr)) | first // null) as $existing
         | ($existing.last_seen_at // null) as $last_seen
         | $rest + [{
             address: $address,
@@ -1270,15 +1329,25 @@ whitelist_lease_upsert() {
     whitelist_lease_save_json "$payload"
 }
 
-whitelist_lease_delete_by_address() {
-    local address="$1"
+whitelist_lease_delete_by_cidr() {
+    local cidr="$1"
     local payload
-    address="$(normalize_ip_literal_to_cidr "$address")"
-    address="${address%/*}"
-    payload="$(whitelist_lease_entries_json | jq -c --arg address "$address" '
-      map(select((.address // "") != $address))
+    [ -n "$cidr" ] || return 0
+    payload="$(whitelist_lease_entries_sorted_json | jq -c --arg cidr "$cidr" '
+      map(del(.last_active_at) | select((.cidr // "") != $cidr))
     ')"
     whitelist_lease_save_json "$payload"
+}
+
+whitelist_lease_delete_by_address() {
+    local address="$1"
+    local matched_json matched_cidr
+    address="$(normalize_ip_literal_to_cidr "$address")"
+    address="${address%/*}"
+    matched_json="$(whitelist_lease_find_by_address_json "$address")"
+    [ -n "$matched_json" ] || return 0
+    matched_cidr="$(jq -r '.cidr // empty' <<< "$matched_json")"
+    whitelist_lease_delete_by_cidr "$matched_cidr"
 }
 
 whitelist_lease_clear_all() {
@@ -1293,7 +1362,7 @@ whitelist_lease_delete_by_indexes() {
       ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
       | to_entries
       | map(. as $entry | select((($wanted | index(($entry.key + 1))) | not)))
-      | map(.value)
+      | map(.value | del(.last_active_at))
     ')"
     whitelist_lease_save_json "$payload"
 }
@@ -1304,6 +1373,7 @@ whitelist_lease_list_rows() {
       | [
           ((.key + 1) | tostring),
           (.value.address // "-"),
+          (.value.cidr // "-"),
           ((.value.idle_ttl_sec // 0) | tostring),
           (if (.value.last_seen_at // null) == null then "-" else (.value.last_seen_at | tostring) end),
           ((.value.granted_at // 0) | tostring),
@@ -1334,36 +1404,75 @@ whitelist_lease_materialize_activity_json() {
 
 whitelist_lease_reconcile_activity() {
     local activity_json="$1"
-    local now payload
+    local now payload leases_file activity_file
     now="$(pfwd_now_epoch)"
-    payload="$(
-      jq -nc \
-        --argjson leases "$(whitelist_lease_entries_json)" \
-        --argjson activity "$activity_json" \
-        --argjson now "$now" '
-        def activity_map:
-          reduce $activity[]? as $row ({};
-            if (($row.address // "") | length) == 0 then
-              .
-            else
-              .[$row.address] = (($row.last_seen_at // 0) | tonumber)
-            end
-          );
-        (activity_map) as $active
-        | ($leases // [])
-        | map(
-            .address = (.address // "")
-            | .idle_ttl_sec = ((.idle_ttl_sec // 0) | tonumber)
-            | .granted_at = ((.granted_at // 0) | tonumber)
-            | .last_seen_at =
-                (if ($active[.address] // 0) > 0 then ($active[.address]) else (.last_seen_at // null) end)
-          )
-        | map(
-            .last_active_at = (if (.last_seen_at // null) == null then .granted_at else .last_seen_at end)
-          )
-        | map(select((.last_active_at + .idle_ttl_sec) > $now))
-        | map(del(.last_active_at))
-      '
-    )"
+    leases_file="$(mktemp)"
+    activity_file="$(mktemp)"
+    whitelist_lease_entries_sorted_json > "$leases_file"
+    printf '%s\n' "$activity_json" > "$activity_file"
+    payload="$(python3 -c '
+import ipaddress
+import json
+import sys
+
+leases_path, activity_path, now_raw = sys.argv[1:4]
+now = int(now_raw)
+
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return []
+
+leases = load_json(leases_path) or []
+activity_rows = load_json(activity_path) or []
+parsed_activity = []
+for row in activity_rows:
+    address = str(row.get("address") or "").strip()
+    last_seen_at = int(row.get("last_seen_at") or 0)
+    if not address or last_seen_at <= 0:
+        continue
+    try:
+        parsed_activity.append((ipaddress.ip_address(address), address, last_seen_at))
+    except ValueError:
+        continue
+
+result = []
+for raw_lease in leases:
+    lease = dict(raw_lease)
+    cidr = str(lease.get("cidr") or "").strip()
+    if not cidr:
+        continue
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        continue
+    lease["cidr"] = network.with_prefixlen
+    lease["address"] = str(lease.get("address") or "")
+    lease["idle_ttl_sec"] = int(lease.get("idle_ttl_sec") or 0)
+    lease["granted_at"] = int(lease.get("granted_at") or 0)
+    last_seen_at = lease.get("last_seen_at")
+    lease["last_seen_at"] = None if last_seen_at is None else int(last_seen_at)
+
+    best_seen = lease["last_seen_at"] or 0
+    best_address = lease["address"]
+    for active_addr, active_text, seen_at in parsed_activity:
+        if active_addr.version != network.version:
+            continue
+        if active_addr in network and seen_at > best_seen:
+            best_seen = seen_at
+            best_address = active_text
+    if best_seen > 0:
+        lease["last_seen_at"] = best_seen
+        lease["address"] = best_address
+    last_active_at = lease["last_seen_at"] if lease["last_seen_at"] is not None else lease["granted_at"]
+    if (last_active_at + lease["idle_ttl_sec"]) > now:
+        lease.pop("last_active_at", None)
+        result.append(lease)
+
+json.dump(result, sys.stdout, separators=(",", ":"))
+' "$leases_file" "$activity_file" "$now")"
+    rm -f "$leases_file" "$activity_file"
     whitelist_lease_save_json "$payload"
 }

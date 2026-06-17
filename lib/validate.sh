@@ -364,6 +364,20 @@ normalize_ip_or_cidr() {
     esac
 }
 
+validate_prefix_len_range() {
+    local value="$1" max_bits="$2" label="$3"
+    [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "$label 必须是 0-$max_bits 的整数"
+    [ "$value" -ge 0 ] && [ "$value" -le "$max_bits" ] || pfwd_die "$label 必须是 0-$max_bits 的整数"
+}
+
+validate_ipv4_prefix_len() {
+    validate_prefix_len_range "$1" 32 "${2:-IPv4 前缀长度}"
+}
+
+validate_ipv6_prefix_len() {
+    validate_prefix_len_range "$1" 128 "${2:-IPv6 前缀长度}"
+}
+
 validate_reset_day() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "无效重置日：$value"
