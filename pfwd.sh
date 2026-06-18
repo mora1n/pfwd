@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.33"
+PFWD_VERSION="0.2.35"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -115,7 +115,7 @@ pfwd_bootstrap_cleanup_partial_install() {
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
 
     rm -f "$bin_path" "$bbr_bin_path" "$bbr_alias_path"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service; do
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service; do
         rm -f "$systemd_dir/$unit"
     done
     rm -rf "$install_dir"

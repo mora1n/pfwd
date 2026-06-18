@@ -309,13 +309,6 @@ service_cleanup_legacy_install_artifacts() {
           "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
 }
 
-service_cleanup_legacy_leaseweb_artifacts() {
-    rm -f "$PFWD_SYSTEMD_DIR/pfwd-whitelist-web.service" \
-          "$PFWD_INSTALL_DIR/bin/pfwd-whitelist-web" \
-          "$PFWD_INSTALL_DIR/assets/pfwd-whitelist-web-linux-amd64" \
-          "$PFWD_INSTALL_DIR/assets/pfwd-whitelist-web-linux-arm64"
-}
-
 service_verify_bundle_from_dir() {
     local source_root="$1"
     local _ source_rel __ ___
@@ -343,7 +336,6 @@ service_write_unit_files() {
     if command -v downmask_write_feed_unit_if_needed >/dev/null 2>&1; then
         downmask_write_feed_unit_if_needed || true
     fi
-    service_cleanup_legacy_leaseweb_artifacts
 }
 
 service_install_files() {
@@ -413,8 +405,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -794,7 +786,6 @@ service_update_apply_staged() {
     service_copy_bundle_from_dir "$staged_dir"
     service_copy_optional_leaseweb_from_dir "$staged_dir"
     service_cleanup_legacy_install_artifacts
-    service_cleanup_legacy_leaseweb_artifacts
     service_write_shortcuts
 }
 
