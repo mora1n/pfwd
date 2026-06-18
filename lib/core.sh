@@ -297,6 +297,33 @@ pfwd_write_atomic() {
     mv "$tmp" "$target"
 }
 
+pfwd_json_temp_file() {
+    mkdir -p "$PFWD_RUN_DIR"
+    mktemp "$PFWD_RUN_DIR/json.XXXXXX"
+}
+
+pfwd_json_to_temp_file() {
+    local payload="$1"
+    local tmp
+    tmp="$(pfwd_json_temp_file)"
+    printf '%s\n' "$payload" | jq '.' > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    printf '%s\n' "$tmp"
+}
+
+pfwd_json_array_to_temp_file() {
+    local payload="$1"
+    local tmp
+    tmp="$(pfwd_json_temp_file)"
+    printf '%s\n' "$payload" | jq 'if type == "array" then . else error("not array") end' > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    printf '%s\n' "$tmp"
+}
+
 pfwd_indexes_to_json() {
     local indexes="${1:-}"
     printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)'

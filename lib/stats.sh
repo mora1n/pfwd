@@ -196,12 +196,13 @@ stats_merge_snapshots_json() {
 
 stats_snapshot_from_nft_runtime() {
     local runtime_json="$1"
-    local nft_json
+    local nft_json runtime_file nft_file
     nft_json="$(fw_read_nft_counters 2>/dev/null || true)"
+    runtime_file="$(pfwd_json_to_temp_file "$runtime_json")" || return 1
     if [ -z "$nft_json" ]; then
-        jq -n --argjson runtime "$runtime_json" '
+        jq -n --slurpfile runtime "$runtime_file" '
           [
-            $runtime.rules[]? |
+            $runtime[0].rules[]? |
             {
               id: .id,
               user_id: .user_id,
@@ -215,15 +216,20 @@ stats_snapshot_from_nft_runtime() {
               dropped_packets: 0
             }
           ]'
+        rm -f "$runtime_file"
         return 0
     fi
 
+    nft_file="$(pfwd_json_to_temp_file "$nft_json")" || {
+        rm -f "$runtime_file"
+        return 1
+    }
     jq -n \
-      --argjson runtime "$runtime_json" \
-      --argjson nft "$nft_json" '
-      ($nft.nftables | map(select(.counter?)) | map({key: .counter.name, value: (.counter.bytes // 0)}) | from_entries) as $counters
+      --slurpfile runtime "$runtime_file" \
+      --slurpfile nft "$nft_file" '
+      ($nft[0].nftables | map(select(.counter?)) | map({key: .counter.name, value: (.counter.bytes // 0)}) | from_entries) as $counters
       | [
-          $runtime.rules[]? |
+          $runtime[0].rules[]? |
           (.id | gsub("-"; "_")) as $safe |
           {
             id: .id,
@@ -238,17 +244,19 @@ stats_snapshot_from_nft_runtime() {
             dropped_packets: 0
           }
         ]'
+    rm -f "$runtime_file" "$nft_file"
 }
 
 stats_usage_from_snapshot() {
     local snapshot="$1"
     local cfg_file="${2:-$PFWD_CONFIG_FILE}"
     local stats_file="${3:-$PFWD_STATS_FILE}"
-    local jq_filter
+    local jq_filter snapshot_file
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
     jq_filter="$(cat <<'EOF'
       def fstate($id): $state[0].forwards[$id] // {};
       def ustate($id): $state[0].users[$id] // {};
-      def snap_forward($id): ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
+      def snap_forward($id): ($snap[0] | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0});
       def current_seeded_one_way_display($f):
         seeded_one_way_display((fstate($f.id)); ($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1));
       def current_seeded_two_way_display($f):
@@ -321,14 +329,16 @@ stats_usage_from_snapshot() {
       }
 EOF
 )"
-    jq -n --slurpfile cfg "$cfg_file" --slurpfile state "$stats_file" --argjson snap "$snapshot" "$(stats_billing_jq_defs)
+    jq -n --slurpfile cfg "$cfg_file" --slurpfile state "$stats_file" --slurpfile snap "$snapshot_file" "$(stats_billing_jq_defs)
 $jq_filter"
+    rm -f "$snapshot_file"
 }
 
 stats_rollup_counters() {
     local snapshot="$1"
     stats_init >/dev/null
-    local jq_filter
+    local jq_filter snapshot_file
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
     jq_filter="$(cat <<'EOF'
       def current_seeded_one_way_display($old; $f):
         seeded_one_way_display($old; ($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1));
@@ -339,7 +349,7 @@ stats_rollup_counters() {
         | add // 0;
 
       . as $state
-      | reduce $snap[] as $f (.;
+      | reduce $snap[0][] as $f (.;
           ($state.forwards[$f.id] // {
             billing_used_bytes: 0,
             input_total_bytes: 0,
@@ -361,7 +371,7 @@ stats_rollup_counters() {
             output_base_bytes: $f.output_bytes
           })
         )
-      | reduce ($snap | group_by(.user_id)[]?) as $group (.;
+      | reduce ($snap[0] | group_by(.user_id)[]?) as $group (.;
           ($group[0].user_id) as $user_id |
           ($state.users[$user_id] // {
             billing_used_bytes: 0,
@@ -384,8 +394,9 @@ stats_rollup_counters() {
         )
 EOF
 )"
-    stats_update --argjson snap "$snapshot" --slurpfile cfg "$PFWD_CONFIG_FILE" "$(stats_billing_jq_defs)
+    stats_update --slurpfile snap "$snapshot_file" --slurpfile cfg "$PFWD_CONFIG_FILE" "$(stats_billing_jq_defs)
 $jq_filter"
+    rm -f "$snapshot_file"
 }
 
 stats_current_snapshot() {
@@ -470,14 +481,19 @@ stats_usage_json() {
 stats_rollup_needed() {
     local snapshot="$1"
     stats_init >/dev/null
-    jq -n --argjson snap "$snapshot" --slurpfile state "$PFWD_STATS_FILE" '
-      any($snap[]?;
+    local snapshot_file
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
+    jq -n --slurpfile snap "$snapshot_file" --slurpfile state "$PFWD_STATS_FILE" '
+      any($snap[0][]?;
         (
           (($state[0].forwards[.id].input_base_bytes // 0) != (.input_bytes // 0)) or
           (($state[0].forwards[.id].output_base_bytes // 0) != (.output_bytes // 0))
         )
       )
     ' | grep -qx 'true'
+    local status=$?
+    rm -f "$snapshot_file"
+    return "$status"
 }
 
 stats_rollup_current() {
@@ -491,12 +507,13 @@ stats_rollup_current() {
 }
 
 stats_set_user_used() {
-    local user_id used snapshot
+    local user_id used snapshot snapshot_file
     user_id="$(normalize_user_id "$1")"
     used="$2"
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
     local jq_filter
     jq_filter="$(cat <<'EOF'
       def current_seeded_one_way_display($old; $f):
@@ -504,10 +521,10 @@ stats_set_user_used() {
       def current_seeded_two_way_display($old; $f):
         seeded_two_way_display($old; ($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1));
       def snap_forward($fid):
-        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", traffic_ratio: 1, input_bytes: 0, output_bytes: 0});
-      ($snap | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
-      ($snap | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
-      ([ $snap[] | select(.user_id == $id) | .id ]) as $forward_ids |
+        ($snap[0] | map(select(.id == $fid)) | .[0] // {id: $fid, traffic_mode: "two-way", traffic_ratio: 1, input_bytes: 0, output_bytes: 0});
+      ($snap[0] | map(select(.user_id == $id)) | map(.input_bytes) | add // 0) as $input |
+      ($snap[0] | map(select(.user_id == $id)) | map(.output_bytes) | add // 0) as $output |
+      ([ $snap[0][] | select(.user_id == $id) | .id ]) as $forward_ids |
       .forwards |= (
         . as $forwards_state
         | reduce $forward_ids[] as $fid ($forwards_state;
@@ -536,23 +553,25 @@ stats_set_user_used() {
       })
 EOF
 )"
-    stats_update --arg id "$user_id" --argjson used "$used" --argjson snap "$snapshot" "$(stats_billing_jq_defs)
+    stats_update --arg id "$user_id" --argjson used "$used" --slurpfile snap "$snapshot_file" "$(stats_billing_jq_defs)
 $jq_filter"
+    rm -f "$snapshot_file"
 }
 
 stats_set_forward_used() {
     local forward_id="$1"
     local used="$2"
-    local snapshot
+    local snapshot snapshot_file
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
     snapshot="$(stats_current_snapshot)"
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
     local jq_filter
     jq_filter="$(cat <<'EOF'
       def current_seeded_one_way_display($old; $f):
         seeded_one_way_display($old; ($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1));
       def current_seeded_two_way_display($old; $f):
         seeded_two_way_display($old; ($f.traffic_mode // "two-way"); ($f.traffic_ratio // 1));
-      ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
+      ($snap[0] | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
       (.forwards[$id] // {}) as $old |
       (($f.input_bytes - ($old.input_base_bytes // 0)) | if . < 0 then $f.input_bytes else . end) as $in_delta |
       (($f.output_bytes - ($old.output_base_bytes // 0)) | if . < 0 then $f.output_bytes else . end) as $out_delta |
@@ -567,17 +586,19 @@ stats_set_forward_used() {
       })
 EOF
 )"
-    stats_update --arg id "$forward_id" --argjson used "$used" --argjson snap "$snapshot" "$(stats_billing_jq_defs)
+    stats_update --arg id "$forward_id" --argjson used "$used" --slurpfile snap "$snapshot_file" "$(stats_billing_jq_defs)
 $jq_filter"
+    rm -f "$snapshot_file"
 }
 
 stats_reset_forward_cycle() {
     local forward_id="$1"
-    local snapshot
+    local snapshot snapshot_file
     config_forward_exists "$forward_id" || pfwd_die "转发规则不存在：$forward_id"
     snapshot="$(stats_current_snapshot)"
-    stats_update --arg id "$forward_id" --argjson snap "$snapshot" '
-      ($snap | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
+    stats_update --arg id "$forward_id" --slurpfile snap "$snapshot_file" '
+      ($snap[0] | map(select(.id == $id)) | .[0] // {input_bytes: 0, output_bytes: 0}) as $f |
       (.forwards[$id] // {}) as $old |
       .forwards[$id] = ($old + {
         billing_used_bytes: 0,
@@ -589,17 +610,19 @@ stats_reset_forward_cycle() {
         output_base_bytes: ($f.output_bytes // 0)
       })
     '
+    rm -f "$snapshot_file"
 }
 
 stats_reset_user_cycle() {
-    local user_id snapshot
+    local user_id snapshot snapshot_file
     user_id="$(normalize_user_id "$1")"
     validate_user_id "$user_id"
     config_user_exists "$user_id" || pfwd_die "用户不存在：$user_id"
     snapshot="$(stats_current_snapshot)"
-    stats_update --arg id "$user_id" --argjson snap "$snapshot" --slurpfile cfg "$PFWD_CONFIG_FILE" '
+    snapshot_file="$(pfwd_json_array_to_temp_file "$snapshot")" || return 1
+    stats_update --arg id "$user_id" --slurpfile snap "$snapshot_file" --slurpfile cfg "$PFWD_CONFIG_FILE" '
       def row_for($fid):
-        ($snap | map(select(.id == $fid)) | .[0] // {id: $fid, input_bytes: 0, output_bytes: 0});
+        ($snap[0] | map(select(.id == $fid)) | .[0] // {id: $fid, input_bytes: 0, output_bytes: 0});
       ([ $cfg[0].forwards[]? | select(.user_id == $id) | .id ]) as $forward_ids |
       ([ $forward_ids[] | row_for(.) ]) as $rows |
       .forwards |= (
@@ -624,6 +647,7 @@ stats_reset_user_cycle() {
           output_base_bytes: ($rows | map(.output_bytes) | add // 0)
         })
     '
+    rm -f "$snapshot_file"
 }
 
 stats_set_user_reset_day() {

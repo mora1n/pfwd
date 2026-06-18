@@ -221,6 +221,20 @@ forwarder_runtime_status_json() {
     if ! jq -e . >/dev/null 2>&1 <<< "$xdp_status_json"; then
         xdp_status_json='{}'
     fi
+    local runtime_file xdp_runtime_file nft_runtime_file xdp_status_file
+    runtime_file="$(pfwd_json_to_temp_file "$runtime_json")" || return 1
+    xdp_runtime_file="$(pfwd_json_to_temp_file "$xdp_runtime_json")" || {
+        rm -f "$runtime_file"
+        return 1
+    }
+    nft_runtime_file="$(pfwd_json_to_temp_file "$nft_runtime_json")" || {
+        rm -f "$runtime_file" "$xdp_runtime_file"
+        return 1
+    }
+    xdp_status_file="$(pfwd_json_to_temp_file "$xdp_status_json")" || {
+        rm -f "$runtime_file" "$xdp_runtime_file" "$nft_runtime_file"
+        return 1
+    }
 
     jq -n \
       --arg backend "$backend" \
@@ -231,11 +245,16 @@ forwarder_runtime_status_json() {
       --argjson xdp_forward_applied "$xdp_forward_applied" \
       --argjson loopback_split_active "$loopback_split_active" \
       --arg hybrid_reason "$hybrid_reason" \
-      --argjson runtime "$runtime_json" \
-      --argjson xdp_runtime "$xdp_runtime_json" \
-      --argjson nft_runtime "$nft_runtime_json" \
-      --argjson xdp_status "$xdp_status_json" \
+      --slurpfile runtime "$runtime_file" \
+      --slurpfile xdp_runtime "$xdp_runtime_file" \
+      --slurpfile nft_runtime "$nft_runtime_file" \
+      --slurpfile xdp_status "$xdp_status_file" \
       --arg generated_at "$(pfwd_now_iso)" '
+      ($runtime[0]) as $runtime
+      | ($xdp_runtime[0]) as $xdp_runtime
+      | ($nft_runtime[0]) as $nft_runtime
+      | ($xdp_status[0]) as $xdp_status
+      |
       {
         applied: ($xdp_applied or $nft_applied),
         generated_at: $generated_at,
@@ -268,6 +287,9 @@ forwarder_runtime_status_json() {
         profile_counts: ($runtime.summary.profile_counts // $xdp_status.profile_counts // {}),
         xdp_status: $xdp_status
       }'
+    local status=$?
+    rm -f "$runtime_file" "$xdp_runtime_file" "$nft_runtime_file" "$xdp_status_file"
+    return "$status"
 }
 
 forwarder_write_status_file() {
@@ -320,7 +342,12 @@ forwarder_status_json() {
           }')"
     fi
     xdp_status_json="$(forwarder_xdp_status_json)"
-    jq --argjson xdp_status "$xdp_status_json" '.xdp_status = $xdp_status' <<< "$base_json"
+    local xdp_status_file
+    xdp_status_file="$(pfwd_json_to_temp_file "$xdp_status_json")" || return 1
+    jq --slurpfile xdp_status "$xdp_status_file" '.xdp_status = $xdp_status[0]' <<< "$base_json"
+    local status=$?
+    rm -f "$xdp_status_file"
+    return "$status"
 }
 
 forwarder_render_status() {

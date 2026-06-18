@@ -249,6 +249,7 @@ runtime_compiled_json() {
     fi
 
     local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json index_store_json persist_indexes="false"
+    local user_index_file="" rule_index_file=""
     local whitelist_policies_json="[]"
     local rules_tmp=""
     local -A whitelist_policy_id_by_port=()
@@ -284,6 +285,11 @@ runtime_compiled_json() {
     index_store_json="$(runtime_index_store_json "$config_file" "$persist_indexes")"
     user_index_json="$(jq '.current_users' <<< "$index_store_json")"
     rule_index_json="$(jq '.current_rules' <<< "$index_store_json")"
+    user_index_file="$(pfwd_json_to_temp_file "$user_index_json")" || return 1
+    rule_index_file="$(pfwd_json_to_temp_file "$rule_index_json")" || {
+        rm -f "$user_index_file"
+        return 1
+    }
     if command -v whitelist_runtime_policies_json >/dev/null 2>&1; then
         whitelist_policies_json="$(runtime_ingress_whitelist_policies_json "$config_file")"
         while IFS=$'\t' read -r policy_id listen_port; do
@@ -298,11 +304,11 @@ runtime_compiled_json() {
         user_index_by_id["$user_id"]="$user_index"
         user_limit_by_id["$user_id"]="$user_limit"
         user_billing_by_id["$user_id"]="$user_used"
-    done < <(jq -r --slurpfile stats "$PFWD_STATS_FILE" --argjson user_index "$user_index_json" '
+    done < <(jq -r --slurpfile stats "$PFWD_STATS_FILE" --slurpfile user_index "$user_index_file" '
       .users[]?
       | [
           .id,
-          ($user_index[.id] // 0),
+          ($user_index[0][.id] // 0),
           (.limits.traffic_bytes // 0),
           ($stats[0].users[.id].billing_used_bytes // 0)
         ] | @tsv
@@ -312,11 +318,11 @@ runtime_compiled_json() {
         [ -n "$rule_id" ] || continue
         rule_index_by_id["$rule_id"]="$rule_index"
         rule_billing_by_id["$rule_id"]="$rule_used"
-    done < <(jq -r --slurpfile stats "$PFWD_STATS_FILE" --argjson rule_index "$rule_index_json" '
+    done < <(jq -r --slurpfile stats "$PFWD_STATS_FILE" --slurpfile rule_index "$rule_index_file" '
       .forwards[]?
       | [
           .id,
-          ($rule_index[.id] // 0),
+          ($rule_index[0][.id] // 0),
           ($stats[0].forwards[.id].billing_used_bytes // 0)
         ] | @tsv
     ' "$config_file")
@@ -324,12 +330,12 @@ runtime_compiled_json() {
     users_json="$(jq -n \
       --slurpfile cfg "$config_file" \
       --slurpfile stats "$PFWD_STATS_FILE" \
-      --argjson user_index "$user_index_json" '
+      --slurpfile user_index "$user_index_file" '
       [
         $cfg[0].users[]? |
         {
           id: .id,
-          index: ($user_index[.id] // 0),
+          index: ($user_index[0][.id] // 0),
           traffic_limit_bytes: (.limits.traffic_bytes // 0),
           billing_used_base_bytes: ($stats[0].users[.id].billing_used_bytes // 0)
         }
@@ -491,22 +497,35 @@ runtime_compiled_json() {
       }
     ')"
 
+    local settings_file users_file rules_file
+    settings_file="$(pfwd_json_to_temp_file "$settings_json")" || return 1
+    users_file="$(pfwd_json_array_to_temp_file "$users_json")" || {
+        rm -f "$settings_file"
+        return 1
+    }
+    rules_file="$(pfwd_json_array_to_temp_file "$rules_json")" || {
+        rm -f "$settings_file" "$users_file"
+        return 1
+    }
+    local status=0
     jq -n \
       --arg generated_at "$(pfwd_now_iso)" \
-      --argjson settings "$settings_json" \
-      --argjson users "$users_json" \
-      --argjson rules "$rules_json" \
-      --argjson rule_index "$rule_index_json" \
-      --argjson user_index "$user_index_json" '
+      --slurpfile settings "$settings_file" \
+      --slurpfile users "$users_file" \
+      --slurpfile rules "$rules_file" \
+      --slurpfile rule_index "$rule_index_file" \
+      --slurpfile user_index "$user_index_file" '
       {
         generated_at: $generated_at,
-        settings: $settings,
-        users: $users,
-        rules: $rules,
-        rule_index: $rule_index,
-        user_index: $user_index
+        settings: $settings[0],
+        users: $users[0],
+        rules: $rules[0],
+        rule_index: $rule_index[0],
+        user_index: $user_index[0]
       }
-    ' | runtime_attach_metadata
+    ' | runtime_attach_metadata || status=$?
+    rm -f "$settings_file" "$users_file" "$rules_file" "$rule_index_file" "$user_index_file"
+    return "$status"
 }
 
 runtime_attach_metadata() {
@@ -768,9 +787,14 @@ runtime_stop_compiled_runtime() {
 runtime_merge_runtime_rules() {
     local base_runtime="$1"
     local extra_runtime="$2"
+    local extra_rules_file
+    extra_rules_file="$(pfwd_json_array_to_temp_file "$(jq '.rules // []' <<< "$extra_runtime")")" || return 1
     jq \
-      --argjson extra "$(jq '.rules // []' <<< "$extra_runtime")" \
-      '.rules += $extra | .rule_index = (reduce (.rules[]?) as $rule ({}; .[$rule.id] = $rule.index))' <<< "$base_runtime"
+      --slurpfile extra "$extra_rules_file" \
+      '.rules += $extra[0] | .rule_index = (reduce (.rules[]?) as $rule ({}; .[$rule.id] = $rule.index))' <<< "$base_runtime"
+    local status=$?
+    rm -f "$extra_rules_file"
+    return "$status"
 }
 
 runtime_apply_xdp_runtime() {

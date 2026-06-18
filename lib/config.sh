@@ -774,15 +774,15 @@ config_add_forward_batch() {
     [ -z "$default_rate" ] || default_rate="$(normalize_rate "$default_rate")"
     config_validate_forward_batch "$user_id" "$listen_ip" "$listen_ports" "$remote_host" "$remote_ports" "$stop_at" "$traffic_mode" "$protocol" "$traffic_ratio" "$mss_mode" "$mss_value" "$snat_mode" "$snat_source"
 
-    local count id now jq_forwards="[]" listen_port remote_port
+    local count id now forwards_tmp listen_port remote_port
     count="$(printf '%s\n' "$listen_ports" | sed '/^$/d' | wc -l | tr -d ' ')"
     now="$(pfwd_now_iso)"
+    forwards_tmp="$(mktemp "$PFWD_RUN_DIR/forwards.XXXXXX")"
 
-    while IFS=$'\t' read -r listen_port remote_port; do
+    if ! while IFS=$'\t' read -r listen_port remote_port; do
         [ -n "$listen_port" ] || continue
         id="$(pfwd_id fwd)"
-        jq_forwards="$(jq -c \
-          --argjson forwards "$jq_forwards" \
+        jq -cn \
           --arg id "$id" \
           --arg user_id "$user_id" \
           --arg listen_ip "$listen_ip" \
@@ -800,7 +800,7 @@ config_add_forward_batch() {
           --arg snat_source "$snat_source" \
           --arg default_rate "$default_rate" \
           --arg now "$now" '
-          $forwards + [{
+          {
             "id": $id,
             "user_id": $user_id,
             "listen_ip": $listen_ip,
@@ -824,12 +824,19 @@ config_add_forward_batch() {
               "rate": (if $default_rate == "" then null else $default_rate end)
             },
             "created_at": $now
-          }]
-        ' <<< '{}')"
+          }
+        ' >> "$forwards_tmp"
         echo "$id"
-    done < <(paste <(printf '%s\n' "$listen_ports") <(printf '%s\n' "$remote_ports"))
+    done < <(paste <(printf '%s\n' "$listen_ports") <(printf '%s\n' "$remote_ports")); then
+        rm -f "$forwards_tmp"
+        return 1
+    fi
 
-    config_update --argjson new_forwards "$jq_forwards" '.forwards += $new_forwards' >/dev/null
+    if ! config_update --slurpfile new_forwards "$forwards_tmp" '.forwards += $new_forwards' >/dev/null; then
+        rm -f "$forwards_tmp"
+        return 1
+    fi
+    rm -f "$forwards_tmp"
 }
 
 config_set_forward_enabled() {

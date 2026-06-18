@@ -100,7 +100,6 @@ pfwd guard egress-whitelist-cn all
 ## leaseweb
 
 ```bash
-./leaseweb/build.sh
 pfwd leaseweb init
 pfwd leaseweb config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
 pfwd leaseweb trusted-proxy add 127.0.0.1/32
@@ -115,7 +114,7 @@ pfwd leaseweb status
 要点：
 
 - `SSH 目标` 建议填写 `user@host`。
-- `放行范围` 基于当前访问来源 IP 计算；例如 `IPv4 /24` 会把 `203.0.113.27` 放宽成 `203.0.113.0/24`。
+- `放行范围` 基于当前访问来源 IP 计算；例如 `IPv4 /24` 会把 `211.1.111.27` 放宽成 `211.1.111.0/24`。
 - 目标机首次接入前，先让控制机信任对应 host key；可用 `pfwd leaseweb route check <index>` 检查 `known_hosts` 状态。
 - TUI 入口：`流量防护 -> leaseweb`。
 
