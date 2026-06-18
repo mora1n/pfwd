@@ -87,7 +87,7 @@ pfwd guard whitelist-cn all
 pfwd guard whitelist-city add 湖南省 长沙市
 pfwd guard whitelist-custom add 203.0.113.5
 pfwd guard whitelist-lease add --address 198.51.100.8 --ipv4-prefix-len 24 --idle-ttl 2h --channel manual --note phone
-pfwd guard whitelist check --address 61.187.9.117 --listen-port 41423 --protocol tcp
+pfwd guard whitelist check --address 62.187.9.117 --listen-port 41423 --protocol tcp
 
 pfwd guard whitelist-port-cn --listen-port 41423 select 浙江省
 pfwd guard whitelist-port-city --listen-port 41423 add 浙江省 杭州市
@@ -99,23 +99,39 @@ pfwd guard egress-whitelist-cn all
 
 ## leaseweb
 
+leaseweb 提供一个只负责“临时放行入口白名单”的 Web 控制器。访问私密链接后，控制机会通过 SSH 在目标机写入 `pfwd guard whitelist-lease` 规则。
+
+控制机初始化：
+
 ```bash
 pfwd leaseweb init
-pfwd leaseweb config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
+pfwd leaseweb config set --listen-host 127.0.0.1 --listen-port 18080 --request-timeout-sec 10
 pfwd leaseweb trusted-proxy add 127.0.0.1/32
 pfwd leaseweb trusted-proxy add ::1/128
-pfwd leaseweb route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-leaseweb -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
+pfwd leaseweb route add --secret '<secret>' --label '<label>' --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-leaseweb -o IdentitiesOnly=yes -o BatchMode=yes'
 pfwd leaseweb service enable
 pfwd leaseweb service start
+```
+
+目标机授权控制机密钥，建议使用受限命令：
+
+```bash
+install -d -m 700 /root/.ssh && printf '%s\n' 'command="/usr/local/lib/pfwd/bin/pfwd-lease-command",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAA... root@controller' >> /root/.ssh/authorized_keys
+```
+
+检查与访问：
+
+```bash
 pfwd leaseweb route check 1
 pfwd leaseweb status
+curl 'http://127.0.0.1:18080/<secret>?format=json'
 ```
 
 要点：
 
-- `SSH 目标` 建议填写 `user@host`。
-- `放行范围` 基于当前访问来源 IP 计算；例如 `IPv4 /24` 会把 `211.1.111.27` 放宽成 `211.1.111.0/24`。
-- 目标机首次接入前，先让控制机信任对应 host key；可用 `pfwd leaseweb route check <index>` 检查 `known_hosts` 状态。
+- `trusted-proxy` 只添加实际反代来源；否则来源 IP 会被识别成反代地址。
+- `ssh-target` 建议写完整 `user@host`，首次接入前先确认 host key 已信任。
+- `ipv4-prefix-len` 控制放行范围；例如 `/24` 会把 `203.0.113.27` 放宽成 `203.0.113.0/24`。
 - TUI 入口：`流量防护 -> leaseweb`。
 
 ## 下行伪装
