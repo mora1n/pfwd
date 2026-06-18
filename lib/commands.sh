@@ -61,119 +61,6 @@ cmd_apply_guard_runtime() {
     stats_runtime_cache_clear
 }
 
-cmd_guard_whitelist_lease_compact_error() {
-    local message="${1:-}"
-    message="$(printf '%s' "$message" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//; s/^错误：[[:space:]]*//')"
-    [ -n "$message" ] || message="未知错误"
-    printf '%s\n' "$message"
-}
-
-cmd_guard_whitelist_lease_backup_file() {
-    local source="$1" backup="$2"
-    mkdir -p "$(dirname "$backup")"
-    if [ -f "$source" ]; then
-        cp "$source" "$backup"
-    else
-        : > "${backup}.missing"
-    fi
-}
-
-cmd_guard_whitelist_lease_restore_file() {
-    local target="$1" backup="$2"
-    if [ -f "${backup}.missing" ]; then
-        rm -f "$target"
-        return 0
-    fi
-    if [ -f "$backup" ]; then
-        mkdir -p "$(dirname "$target")"
-        cp "$backup" "$target"
-    else
-        rm -f "$target"
-    fi
-}
-
-cmd_guard_whitelist_lease_backup_state() {
-    local backup_dir
-    backup_dir="$(mktemp -d "${PFWD_RUN_DIR}/whitelist-lease.XXXXXX")"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_CONFIG_FILE" "$backup_dir/config.json"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_LEASES_FILE" "$backup_dir/leases.json"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$backup_dir/allow_ipv4.txt"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_ALLOW_IPV6_FILE" "$backup_dir/allow_ipv6.txt"
-    cmd_guard_whitelist_lease_backup_file "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "$backup_dir/allow_ipv4.cn"
-    cmd_guard_whitelist_lease_backup_file "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" "$backup_dir/allow_ipv6.cn"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_CITY_IPV4_FILE" "$backup_dir/city_ipv4.tsv"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" "$backup_dir/temp_allow_ipv4.txt"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" "$backup_dir/temp_allow_ipv6.txt"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_FORWARDER_RUNTIME_FILE" "$backup_dir/runtime.json"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$backup_dir/runtime.xdp.json"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_XDP_STATUS_FILE" "$backup_dir/xdp.status.json"
-    cmd_guard_whitelist_lease_backup_file "$PFWD_FORWARDER_STATUS_FILE" "$backup_dir/forwarder.status.json"
-    printf '%s\n' "$backup_dir"
-}
-
-cmd_guard_whitelist_lease_restore_state() {
-    local backup_dir="$1"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_CONFIG_FILE" "$backup_dir/config.json"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_LEASES_FILE" "$backup_dir/leases.json"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$backup_dir/allow_ipv4.txt"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_ALLOW_IPV6_FILE" "$backup_dir/allow_ipv6.txt"
-    cmd_guard_whitelist_lease_restore_file "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "$backup_dir/allow_ipv4.cn"
-    cmd_guard_whitelist_lease_restore_file "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" "$backup_dir/allow_ipv6.cn"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_CITY_IPV4_FILE" "$backup_dir/city_ipv4.tsv"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" "$backup_dir/temp_allow_ipv4.txt"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" "$backup_dir/temp_allow_ipv6.txt"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_FORWARDER_RUNTIME_FILE" "$backup_dir/runtime.json"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$backup_dir/runtime.xdp.json"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_XDP_STATUS_FILE" "$backup_dir/xdp.status.json"
-    cmd_guard_whitelist_lease_restore_file "$PFWD_FORWARDER_STATUS_FILE" "$backup_dir/forwarder.status.json"
-}
-
-cmd_guard_whitelist_lease_cleanup_state_backup() {
-    local backup_dir="$1"
-    rm -rf "$backup_dir"
-}
-
-cmd_guard_whitelist_lease_mutate_and_apply() {
-    local mutation_fn="$1"
-    local backup_dir mutation_output apply_output rollback_output
-    shift
-
-    backup_dir="$(cmd_guard_whitelist_lease_backup_state)"
-    if ! mutation_output="$("$mutation_fn" "$@" 2>&1)"; then
-        cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-        pfwd_die "$(cmd_guard_whitelist_lease_compact_error "$mutation_output")"
-    fi
-    if ! apply_output="$(whitelist_apply_runtime 2>&1)"; then
-        cmd_guard_whitelist_lease_restore_state "$backup_dir"
-        cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-        pfwd_die "入口临时白名单运行态预处理失败，已回滚：$(cmd_guard_whitelist_lease_compact_error "$apply_output")"
-    fi
-
-    stats_runtime_cache_clear
-    if ! cmd_runtime_ready; then
-        cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-        return 0
-    fi
-    if apply_output="$(runtime_apply_xdp_aux_runtime 2>&1)"; then
-        stats_runtime_cache_clear
-        cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-        return 0
-    fi
-
-    stats_runtime_cache_clear
-    cmd_guard_whitelist_lease_restore_state "$backup_dir"
-    if rollback_output="$(runtime_apply_xdp_aux_runtime 2>&1)"; then
-        stats_runtime_cache_clear
-        cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-        pfwd_die "入口临时白名单增量应用失败，已回滚到变更前状态；未尝试全量 apply：$(cmd_guard_whitelist_lease_compact_error "$apply_output")"
-    fi
-
-    stats_runtime_cache_clear
-    cmd_guard_whitelist_lease_restore_state "$backup_dir"
-    cmd_guard_whitelist_lease_cleanup_state_backup "$backup_dir"
-    pfwd_die "入口临时白名单增量应用失败，且回滚重新应用也失败；未尝试全量 apply，请视情况手动执行 pfwd restart。原始错误：$(cmd_guard_whitelist_lease_compact_error "$apply_output")；回滚错误：$(cmd_guard_whitelist_lease_compact_error "$rollback_output")"
-}
-
 cmd_refresh_after_change() {
     stats_rollup_current
     cmd_apply_forwarding_bundle
@@ -1142,52 +1029,6 @@ cmd_restart() {
     echo "已重启运行态"
 }
 
-cmd_reconcile() {
-    config_init >/dev/null
-    local before after now_minute need_full_refresh=false need_aux_refresh=false sent activity_json leases_before leases_after refresh_action="reuse"
-    if stats_apply_due_resets; then
-        need_full_refresh=true
-    fi
-    now_minute="$(pfwd_now_minute)"
-    before="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
-    leases_before="$(whitelist_lease_count)"
-    config_disable_expired "$now_minute"
-    config_disable_telegram_for_expired_users "$now_minute"
-    activity_json='[]'
-    if [ -x "$(forwarder_bin_path)" ] && [ -f "$PFWD_XDP_RULE_COUNTER_PIN_PATH" ]; then
-        activity_json="$("$(forwarder_bin_path)" whitelist-lease-activity \
-          --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
-          --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
-          --stats-pin "$PFWD_XDP_STATS_PIN_PATH" 2>/dev/null || printf '[]')"
-    fi
-    whitelist_lease_reconcile_activity "$activity_json"
-    whitelist_apply_runtime
-    leases_after="$(whitelist_lease_count)"
-    after="$(jq '[.forwards[]? | select(.enabled == true)] | length' "$PFWD_CONFIG_FILE")"
-    if [ "$before" != "$after" ]; then
-        need_full_refresh=true
-    elif [ "$leases_before" != "$leases_after" ]; then
-        need_aux_refresh=true
-    fi
-    if [ "$need_full_refresh" = "true" ]; then
-        stats_rollup_current
-        cmd_apply_forwarding_bundle
-        refresh_action="full"
-    elif [ "$need_aux_refresh" = "true" ]; then
-        if service_runtime_installed; then
-            stats_runtime_cache_clear
-            runtime_apply_xdp_aux_runtime
-            stats_runtime_cache_clear
-            refresh_action="xdp-aux"
-        else
-            refresh_action="skipped"
-        fi
-    fi
-    sent="$(notify_reconcile_schedules)"
-    downmask_reconcile_pull 2>/dev/null || true
-    echo "已同步：active_before=$before active_after=$after leases_before=$leases_before leases_after=$leases_after refresh=$refresh_action notify_sent=$sent"
-}
-
 cmd_notify_test() {
     local user_id=""
     while [ "$#" -gt 0 ]; do
@@ -1423,6 +1264,8 @@ cmd_guard() {
             [ "$http" = "__KEEP__" ] && http="$(guard_block_http)"
             [ "$tls" = "__KEEP__" ] && tls="$(guard_block_tls)"
             [ "$socks" = "__KEEP__" ] && socks="$(guard_block_socks)"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             guard_config_set_protocols "$http" "$tls" "$socks"
             tmp_ports="$(mktemp)"
             if [ "$clear_skip_ports" != "true" ]; then
@@ -1438,7 +1281,7 @@ cmd_guard() {
             fi
             guard_config_set_protocol_skip_ports "$tmp_ports"
             rm -f "$tmp_ports"
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation none "guard 配置" "$backup_dir"
             echo "guard 配置已更新"
             ;;
         whitelist)
@@ -1534,6 +1377,8 @@ cmd_guard_whitelist() {
     if [ "$cn_mode" = "__KEEP__" ]; then
         cn_mode="$(whitelist_cn_mode)"
     fi
+    local backup_dir
+    backup_dir="$(cmd_guard_backup_state)"
     whitelist_config_set_state "$enabled" "$cn_mode"
 
     tmp_cidrs="$(mktemp)"
@@ -1548,8 +1393,7 @@ cmd_guard_whitelist() {
     whitelist_config_set_custom_cidrs "$tmp_cidrs"
     rm -f "$tmp_cidrs"
 
-    whitelist_apply_runtime
-    cmd_apply_guard_runtime
+    cmd_guard_finish_aux_mutation ingress "协议封锁 / 入口白名单" "$backup_dir"
     echo "协议封锁 / 入口白名单已更新"
 }
 
@@ -1812,8 +1656,9 @@ cmd_guard_whitelist_city() {
             ;;
         add)
             [ "$#" -ge 2 ] || pfwd_die "用法：pfwd guard whitelist-city add <省份序号|省份名|省份code> <城市序号|城市名|城市code...>"
-            local province_selector="$1" city_selector code tmp
+            local province_selector="$1" city_selector code tmp backup_dir
             shift
+            backup_dir="$(cmd_guard_backup_state)"
             tmp="$(mktemp)"
             whitelist_cn_city_codes_tsv > "$tmp"
             for city_selector in "$@"; do
@@ -1822,22 +1667,23 @@ cmd_guard_whitelist_city() {
             done
             whitelist_config_set_city_codes "$tmp"
             rm -f "$tmp"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口市白名单" "$backup_dir"
             echo "入口市白名单已更新"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-city delete <index...>"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_delete_city_codes_by_indexes "$(printf '%s\n' "$@")"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口市白名单" "$backup_dir"
             echo "入口市白名单已删除"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-city clear"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_clear_city_codes
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口市白名单" "$backup_dir"
             echo "入口市白名单已清空"
             ;;
         *)
@@ -1885,9 +1731,10 @@ cmd_guard_whitelist_port() {
                 esac
             done
             [ -n "$listen_port" ] || pfwd_die "用法：pfwd guard whitelist-port clear --listen-port PORT"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_clear_port_policy "$listen_port"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口覆盖" "$backup_dir"
             echo "入口白名单端口覆盖已清除：$listen_port"
             ;;
         *)
@@ -1915,27 +1762,29 @@ cmd_guard_whitelist_port_cn() {
     case "$sub" in
         all)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-port-cn --listen-port PORT all"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_config_apply_port_cn_selection "$listen_port" all
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 国内策略" "$backup_dir"
             echo "入口白名单端口 $listen_port 国内策略已更新为：国内IP"
             ;;
         off)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-port-cn --listen-port PORT off"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_config_apply_port_cn_selection "$listen_port" off
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 国内策略" "$backup_dir"
             echo "入口白名单端口 $listen_port 国内策略已关闭"
             ;;
         select)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-port-cn --listen-port PORT select <省份...>"
-            local tmp
+            local tmp backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             tmp="$(mktemp)"
             printf '%s\n' "$@" > "$tmp"
             whitelist_config_apply_port_cn_selection "$listen_port" provinces "$tmp"
             rm -f "$tmp"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 国内策略" "$backup_dir"
             echo "入口白名单端口 $listen_port 国内策略已更新为省份选择"
             ;;
         *)
@@ -1982,8 +1831,9 @@ cmd_guard_whitelist_port_city() {
             ;;
         add)
             [ "$#" -ge 2 ] || pfwd_die "用法：pfwd guard whitelist-port-city --listen-port PORT add <省份序号|省份名|省份code> <城市序号|城市名|城市code...>"
-            local province_selector="$1" city_selector code tmp
+            local province_selector="$1" city_selector code tmp backup_dir
             shift
+            backup_dir="$(cmd_guard_backup_state)"
             tmp="$(mktemp)"
             whitelist_effective_cn_city_codes_tsv_for_port "$listen_port" > "$tmp"
             for city_selector in "$@"; do
@@ -1992,22 +1842,23 @@ cmd_guard_whitelist_port_city() {
             done
             whitelist_config_set_port_city_codes "$listen_port" "$tmp"
             rm -f "$tmp"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 市白名单" "$backup_dir"
             echo "入口白名单端口 $listen_port 市白名单已更新"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-port-city --listen-port PORT delete <index...>"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_delete_port_city_codes_by_indexes "$listen_port" "$(printf '%s\n' "$@")"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 市白名单" "$backup_dir"
             echo "入口白名单端口 $listen_port 市白名单已删除"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-port-city --listen-port PORT clear"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_clear_port_city_codes "$listen_port"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单端口 $listen_port 市白名单" "$backup_dir"
             echo "入口白名单端口 $listen_port 市白名单已清空"
             ;;
         *)
@@ -2026,35 +1877,37 @@ cmd_guard_whitelist_custom() {
             whitelist_custom_cidrs_tsv
             ;;
         add)
-            local cidr="${1:-}"
+            local cidr="${1:-}" backup_dir
             [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom add <IPv4/IPv6 CIDR 或单个 IP>"
             cidr="$(normalize_ip_or_cidr "$cidr")"
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_append_custom_cidr "$cidr"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单自定义 CIDR" "$backup_dir"
             echo "入口白名单自定义 CIDR 已添加：$cidr"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-custom clear"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_clear_custom_cidrs
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单自定义 CIDR" "$backup_dir"
             echo "入口白名单自定义 CIDR 已清空"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-custom delete <index...>"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单自定义 CIDR" "$backup_dir"
             echo "入口白名单自定义 CIDR 已删除"
             ;;
         update)
-            local index="${1:-}" cidr="${2:-}"
+            local index="${1:-}" cidr="${2:-}" backup_dir
             [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard whitelist-custom update <index> <IPv4/IPv6 CIDR 或单个 IP>"
             cidr="$(normalize_ip_or_cidr "$cidr")"
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_replace_custom_cidr_by_index "$index" "$cidr"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单自定义 CIDR" "$backup_dir"
             echo "入口白名单自定义 CIDR 已更新：$index -> $cidr"
             ;;
         *)
@@ -2112,6 +1965,8 @@ cmd_guard_egress_whitelist() {
     if [ "$cn_mode" = "__KEEP__" ]; then
         cn_mode="$(egress_whitelist_cn_mode)"
     fi
+    local backup_dir
+    backup_dir="$(cmd_guard_backup_state)"
     egress_whitelist_config_set_state "$enabled" "$cn_mode"
 
     tmp_cidrs="$(mktemp)"
@@ -2126,11 +1981,7 @@ cmd_guard_egress_whitelist() {
     egress_whitelist_config_set_custom_cidrs "$tmp_cidrs"
     rm -f "$tmp_cidrs"
 
-    egress_whitelist_apply_runtime
-    if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-    fi
-    cmd_apply_guard_runtime
+    cmd_guard_finish_aux_mutation egress "出口白名单" "$backup_dir"
     echo "出口白名单已更新"
 }
 
@@ -2150,27 +2001,29 @@ cmd_guard_whitelist_cn() {
             ;;
         all)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn all"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_config_apply_cn_selection all
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单国内策略" "$backup_dir"
             echo "入口白名单国内策略已更新为：国内IP"
             ;;
         off)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard whitelist-cn off"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             whitelist_config_apply_cn_selection off
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单国内策略" "$backup_dir"
             echo "入口白名单国内策略已关闭"
             ;;
         select)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard whitelist-cn select <省份...>"
-            local tmp
+            local tmp backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             tmp="$(mktemp)"
             printf '%s\n' "$@" > "$tmp"
             whitelist_config_apply_cn_selection provinces "$tmp"
             rm -f "$tmp"
-            whitelist_apply_runtime
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation ingress "入口白名单国内策略" "$backup_dir"
             echo "入口白名单国内策略已更新为省份选择"
             ;;
         *)
@@ -2195,36 +2048,29 @@ cmd_guard_egress_whitelist_cn() {
             ;;
         all)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn all"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_config_apply_cn_selection all
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单国内策略" "$backup_dir"
             echo "出口白名单国内策略已更新为：国内IP"
             ;;
         off)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn off"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_config_apply_cn_selection off
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单国内策略" "$backup_dir"
             echo "出口白名单国内策略已关闭"
             ;;
         select)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard egress-whitelist-cn select <省份...>"
-            local tmp
+            local tmp backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             tmp="$(mktemp)"
             printf '%s\n' "$@" > "$tmp"
             egress_whitelist_config_apply_cn_selection provinces "$tmp"
             rm -f "$tmp"
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单国内策略" "$backup_dir"
             echo "出口白名单国内策略已更新为省份选择"
             ;;
         *)
@@ -2243,47 +2089,37 @@ cmd_guard_egress_whitelist_custom() {
             egress_whitelist_custom_cidrs_tsv
             ;;
         add)
-            local cidr="${1:-}"
+            local cidr="${1:-}" backup_dir
             [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom add <IPv4/IPv6 CIDR 或单个 IP>"
             cidr="$(normalize_ip_or_cidr "$cidr")"
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_append_custom_cidr "$cidr"
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单自定义 CIDR" "$backup_dir"
             echo "出口白名单自定义 CIDR 已添加：$cidr"
             ;;
         clear)
             [ "$#" -eq 0 ] || pfwd_die "用法：pfwd guard egress-whitelist-custom clear"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_clear_custom_cidrs
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单自定义 CIDR" "$backup_dir"
             echo "出口白名单自定义 CIDR 已清空"
             ;;
         delete)
             [ "$#" -ge 1 ] || pfwd_die "用法：pfwd guard egress-whitelist-custom delete <index...>"
+            local backup_dir
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_delete_custom_cidrs_by_indexes "$(printf '%s\n' "$@")"
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单自定义 CIDR" "$backup_dir"
             echo "出口白名单自定义 CIDR 已删除"
             ;;
         update)
-            local index="${1:-}" cidr="${2:-}"
+            local index="${1:-}" cidr="${2:-}" backup_dir
             [ -n "$index" ] && [ -n "$cidr" ] || pfwd_die "用法：pfwd guard egress-whitelist-custom update <index> <IPv4/IPv6 CIDR 或单个 IP>"
             cidr="$(normalize_ip_or_cidr "$cidr")"
+            backup_dir="$(cmd_guard_backup_state)"
             egress_whitelist_replace_custom_cidr_by_index "$index" "$cidr"
-            egress_whitelist_apply_runtime
-            if ! egress_whitelist_validate_config_file "$PFWD_CONFIG_FILE"; then
-                pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-            fi
-            cmd_apply_guard_runtime
+            cmd_guard_finish_aux_mutation egress "出口白名单自定义 CIDR" "$backup_dir"
             echo "出口白名单自定义 CIDR 已更新：$index -> $cidr"
             ;;
         *)

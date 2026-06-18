@@ -81,6 +81,32 @@ func TestLoadConfigDefaultsRequestTimeoutToTenSeconds(t *testing.T) {
 	}
 }
 
+func TestSSHOptionsWithControlMasterAddsDefaults(t *testing.T) {
+	controlDir := t.TempDir()
+	t.Setenv("PFWD_WHITELIST_WEB_CONTROL_DIR", controlDir)
+
+	got := sshOptionsWithControlMaster([]string{"-i", "/root/.ssh/key", "-o", "BatchMode=yes"})
+	joined := strings.Join(got, " ")
+
+	for _, want := range []string{"ControlMaster=auto", "ControlPersist=60s", "ControlPath=" + controlDir} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("ssh options missing %q: %v", want, got)
+		}
+	}
+}
+
+func TestSSHOptionsWithControlMasterRespectsExplicitControlPath(t *testing.T) {
+	got := sshOptionsWithControlMaster([]string{"-o", "ControlPath=/tmp/custom-%C"})
+	joined := strings.Join(got, " ")
+
+	if strings.Contains(joined, "ControlMaster=auto") {
+		t.Fatalf("ssh options should not inject control master when ControlPath is explicit: %v", got)
+	}
+	if !strings.Contains(joined, "ControlPath=/tmp/custom-%C") {
+		t.Fatalf("ssh options lost explicit ControlPath: %v", got)
+	}
+}
+
 func TestServeHTTPSuccessJSONByDefault(t *testing.T) {
 	srv := newTestServer(t, routeConfig{
 		Secret:    "secret",

@@ -24,6 +24,7 @@ pfwd_path() {
 PFWD_ETC_DIR="${PFWD_ETC_DIR:-$(pfwd_path etc/pfwd)}"
 PFWD_STATE_DIR="${PFWD_STATE_DIR:-$(pfwd_path var/lib/pfwd)}"
 PFWD_RUN_DIR="${PFWD_RUN_DIR:-$(pfwd_path run/pfwd)}"
+PFWD_RUNTIME_LOCK_FILE="${PFWD_RUNTIME_LOCK_FILE:-$PFWD_RUN_DIR/pfwd-runtime.lock}"
 PFWD_INSTALL_DIR="${PFWD_INSTALL_DIR:-$(pfwd_path usr/local/lib/pfwd)}"
 PFWD_BIN_PATH="${PFWD_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd)}"
 PFWD_BBR_BIN_PATH="${PFWD_BBR_BIN_PATH:-$(pfwd_path usr/local/bin/bbr.sh)}"
@@ -293,6 +294,38 @@ pfwd_write_atomic() {
     tmp="$(mktemp "${target}.tmp.XXXXXX")"
     cat > "$tmp"
     mv "$tmp" "$target"
+}
+
+pfwd_with_runtime_lock() {
+    local mode="${1:-wait}"
+    shift || true
+    [ "$#" -ge 1 ] || pfwd_die "pfwd_with_runtime_lock 需要命令"
+    mkdir -p "$(dirname "$PFWD_RUNTIME_LOCK_FILE")"
+    if [ "${PFWD_RUNTIME_LOCK_HELD:-0}" = "1" ]; then
+        "$@"
+        return
+    fi
+    case "$mode" in
+        wait)
+            (
+                flock -x 9
+                PFWD_RUNTIME_LOCK_HELD=1 "$@"
+            ) 9>"$PFWD_RUNTIME_LOCK_FILE"
+            ;;
+        try)
+            local status
+            (
+                flock -n -x 9 || exit 75
+                PFWD_RUNTIME_LOCK_HELD=1 "$@"
+            ) 9>"$PFWD_RUNTIME_LOCK_FILE"
+            status=$?
+            [ "$status" -ne 75 ] || return 75
+            return "$status"
+            ;;
+        *)
+            pfwd_die "未知运行态锁模式：$mode"
+            ;;
+    esac
 }
 
 pfwd_require_json_output() {

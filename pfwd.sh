@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask whitelist_web service commands ui)
+PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask whitelist_web service commands_guard commands commands_reconcile ui)
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -190,19 +190,18 @@ pfwd_load_libs_or_bootstrap() {
 
 pfwd_load_libs_or_bootstrap "${1:-help}"
 
-pfwd_main() {
-    if [ "${1:-}" != "uninstall" ]; then
-        service_ensure_shortcut
-    fi
+pfwd_command_lock_mode() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        reconcile) printf 'try\n' ;;
+        init|user|add|start|stop|delete|forward|expire|limit|user-forwards-limit|traffic|import|refresh|restart|notify-test|notify-enable|notify-schedule|notify-disable|notify-delete|guard|downmask|whitelist-web|install|update|uninstall|__forward_boot|__update_finalize)
+            printf 'wait\n'
+            ;;
+        *) printf 'none\n' ;;
+    esac
+}
 
-    if [ "$#" -eq 0 ]; then
-        if [ -t 0 ]; then
-            cmd_menu
-            return
-        fi
-        pfwd_die "请在交互式终端运行 pfwd，或使用 pfwd help 查看命令"
-    fi
-
+pfwd_dispatch() {
     local cmd="$1"
     shift || true
 
@@ -246,6 +245,41 @@ pfwd_main() {
         *)
             pfwd_die "未知命令：$cmd"
             ;;
+    esac
+}
+
+pfwd_main() {
+    if [ "${1:-}" != "uninstall" ]; then
+        service_ensure_shortcut
+    fi
+
+    if [ "$#" -eq 0 ]; then
+        if [ -t 0 ]; then
+            cmd_menu
+            return
+        fi
+        pfwd_die "请在交互式终端运行 pfwd，或使用 pfwd help 查看命令"
+    fi
+
+    local lock_mode
+    lock_mode="$(pfwd_command_lock_mode "${1:-}")"
+    case "$lock_mode" in
+        wait) pfwd_with_runtime_lock wait pfwd_dispatch "$@" ;;
+        try)
+            set +e
+            pfwd_with_runtime_lock try pfwd_dispatch "$@"
+            local status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+                if [ "$status" -eq 75 ]; then
+                    echo "已同步：refresh=skipped_locked"
+                    return 0
+                fi
+                return "$status"
+            fi
+            ;;
+        none) pfwd_dispatch "$@" ;;
+        *) pfwd_die "未知命令锁模式：$lock_mode" ;;
     esac
 }
 

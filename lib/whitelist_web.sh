@@ -39,7 +39,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/install -d -m 0700 $PFWD_RUN_DIR
+Environment=PFWD_WHITELIST_WEB_CONTROL_DIR=$PFWD_WHITELIST_WEB_STATE_DIR/control
+ExecStartPre=/usr/bin/install -d -m 0700 $PFWD_RUN_DIR $PFWD_WHITELIST_WEB_STATE_DIR/control
 ExecStart=$(whitelist_web_bin_path) run --config $PFWD_WHITELIST_WEB_CONFIG_FILE
 Restart=on-failure
 RestartSec=3s

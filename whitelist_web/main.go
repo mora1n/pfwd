@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -442,7 +443,7 @@ func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute,
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	args := append([]string{}, route.RouteConfig.SSHOptions...)
+	args := sshOptionsWithControlMaster(route.RouteConfig.SSHOptions)
 	args = append(args, route.RouteConfig.SSHTarget,
 		"pfwd", "guard", "whitelist-lease", "add",
 		"--address", observedIP,
@@ -458,6 +459,48 @@ func (s *server) pushWhitelistLease(parent context.Context, route compiledRoute,
 		return fmt.Errorf("ssh 下发失败: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func sshOptionsWithControlMaster(options []string) []string {
+	args := append([]string{}, options...)
+	if sshOptionConfigured(args, "ControlMaster") || sshOptionConfigured(args, "ControlPath") {
+		return args
+	}
+	controlDir := strings.TrimSpace(os.Getenv("PFWD_WHITELIST_WEB_CONTROL_DIR"))
+	if controlDir == "" {
+		controlDir = filepath.Join(os.TempDir(), "pfwd-whitelist-web-control")
+	}
+	if err := os.MkdirAll(controlDir, 0700); err != nil {
+		// Let ssh fail with a precise ControlPath error if the directory cannot be prepared.
+		log.Printf("whitelist-web ssh control dir prepare failed path=%q error=%q", controlDir, err.Error())
+	}
+	controlPath := filepath.Join(controlDir, "ssh-%C")
+	args = append(args,
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=60s",
+		"-o", "ControlPath="+controlPath,
+	)
+	return args
+}
+
+func sshOptionConfigured(options []string, name string) bool {
+	prefix := strings.ToLower(name) + "="
+	for i := 0; i < len(options); i++ {
+		opt := strings.TrimSpace(options[i])
+		lower := strings.ToLower(opt)
+		switch {
+		case lower == "-o":
+			if i+1 < len(options) && strings.HasPrefix(strings.ToLower(strings.TrimSpace(options[i+1])), prefix) {
+				return true
+			}
+			i++
+		case strings.HasPrefix(lower, "-o"+prefix):
+			return true
+		case strings.HasPrefix(lower, prefix):
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) pushLease(parent context.Context, route compiledRoute, observedIP string, leaseCIDR string) error {
