@@ -29,7 +29,7 @@ pfwd doctor
 ```bash
 ./xdp/build.sh
 ./downmask/build.sh
-./leaseweb/build.sh  # 仅控制机需要 leaseweb 时再构建
+./leaseweb/build.sh
 ```
 
 打包基础离线包：
@@ -39,14 +39,9 @@ tar -czf pfwd-amd64.tar.gz \
   pfwd.sh bbr.sh lib/ scripts/ \
   assets/pfwd-xdp-linux-amd64 \
   assets/pfwd-downmask-linux-amd64 \
+  assets/pfwd-leaseweb-linux-amd64 \
   assets/pfwd-geo-cn-v4.bin assets/pfwd-geo-cn-v6.bin assets/pfwd-geo-meta.json \
   assets/pfwd-city-cn-meta.json assets/pfwd-city-cn-v4.bin
-```
-
-如果控制机还要启用 leaseweb，再额外带上：
-
-```bash
-assets/pfwd-leaseweb-linux-amd64
 ```
 
 目标机安装：

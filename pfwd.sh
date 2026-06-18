@@ -58,6 +58,16 @@ pfwd_bootstrap_downmask_asset_name() {
     esac
 }
 
+pfwd_bootstrap_leaseweb_asset_name() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) echo "pfwd-leaseweb-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-leaseweb-linux-arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
 pfwd_bootstrap_root_prefix() {
     local prefix="${PFWD_ROOT_PREFIX:-/}"
     prefix="${prefix%/}"
@@ -105,7 +115,7 @@ pfwd_bootstrap_cleanup_partial_install() {
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
 
     rm -f "$bin_path" "$bbr_bin_path" "$bbr_alias_path"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service; do
+    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service; do
         rm -f "$systemd_dir/$unit"
     done
     rm -rf "$install_dir"
@@ -139,6 +149,15 @@ pfwd_bootstrap_install() {
             exit 1
         fi
         chmod +x "$install_dir/assets/$downmask_asset"
+    fi
+    local leaseweb_asset
+    if leaseweb_asset="$(pfwd_bootstrap_leaseweb_asset_name)"; then
+        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$leaseweb_asset" "$install_dir/assets/$leaseweb_asset"; then
+            echo "错误：缺少必需的 leaseweb 预编译资产：assets/$leaseweb_asset" >&2
+            echo "请补齐发布源中的该文件，或在源码仓库中先执行 ./leaseweb/build.sh 后再安装。" >&2
+            exit 1
+        fi
+        chmod +x "$install_dir/assets/$leaseweb_asset"
     fi
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v4.bin" "$install_dir/assets/pfwd-geo-cn-v4.bin"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v6.bin" "$install_dir/assets/pfwd-geo-cn-v6.bin"

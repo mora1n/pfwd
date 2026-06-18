@@ -376,6 +376,7 @@ service_enable() {
     pfwd_run systemctl enable pfwd-xdp.service pfwd.timer
     pfwd_run systemctl start pfwd.timer
     if [ -f "$PFWD_LEASEWEB_CONFIG_FILE" ]; then
+        [ -x "$PFWD_LEASEWEB_BIN_PATH" ] || pfwd_die "pfwd-leaseweb 二进制不存在：$PFWD_LEASEWEB_BIN_PATH"
         pfwd_run systemctl enable pfwd-leaseweb.service || true
     fi
 }
