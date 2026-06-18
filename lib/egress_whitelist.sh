@@ -515,13 +515,13 @@ egress_whitelist_apply_runtime() {
 
 egress_whitelist_status_json() {
     local enabled cn_provinces entries host_entries custom_cidrs_count
-    enabled="$(jq -cn --arg value "$(egress_whitelist_enabled)" '$value == "true"')"
+    enabled="$(egress_whitelist_enabled)"
     cn_provinces="$(pfwd_capture_json_output "出口白名单省份配置" egress_whitelist_cn_provinces_json)"
-    entries="$(jq -cn --argjson value "$(egress_whitelist_entry_count)" '$value')"
-    host_entries="$(jq -cn --argjson value "$(egress_whitelist_host_entry_count)" '$value')"
-    custom_cidrs_count="$(jq -cn --argjson value "$(egress_whitelist_custom_cidrs_count)" '$value')"
+    entries="$(egress_whitelist_entry_count)"
+    host_entries="$(egress_whitelist_host_entry_count)"
+    custom_cidrs_count="$(egress_whitelist_custom_cidrs_count)"
     jq -n \
-      --argjson enabled "$enabled" \
+      --arg enabled "$enabled" \
       --arg cn_mode "$(egress_whitelist_cn_mode)" \
       --argjson cn_provinces "$cn_provinces" \
       --arg allow_ipv4_file "$(egress_whitelist_allow_ipv4_file)" \
@@ -532,7 +532,7 @@ egress_whitelist_status_json() {
       --argjson host_entries "$host_entries" \
       --argjson custom_cidrs_count "$custom_cidrs_count" \
       '{
-        enabled: $enabled,
+        enabled: ($enabled == "true"),
         cn_mode: $cn_mode,
         cn_provinces: $cn_provinces,
         allow_ipv4_file: $allow_ipv4_file,

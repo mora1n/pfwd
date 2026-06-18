@@ -1386,25 +1386,30 @@ downmask_status_json() {
 }
 
 downmask_render_status() {
-    local json pull_mode iface date ratio rx tx debt action feed_tcp feed_udp ab_targets protocol_mode
+    local json downmask_fields pull_mode iface date ratio rx tx debt action feed_tcp feed_udp ab_targets protocol_mode
     local previous_date previous_ratio generated_at generation_source
     downmask_validate_configured_active_source
     json="$(downmask_status_json)"
-    pull_mode="$(jq -r '.config.pull_mode // "off"' <<< "$json")"
-    iface="$(jq -r '.day_state.iface // .config.iface // "-"' <<< "$json")"
-    date="$(jq -r '.day_state.date // "-"' <<< "$json")"
-    ratio="$(jq -r '.day_state.target_ratio // "-"' <<< "$json")"
-    previous_date="$(jq -r '.day_state.previous_date // "-"' <<< "$json")"
-    previous_ratio="$(jq -r '.day_state.previous_target_ratio // "-"' <<< "$json")"
-    generated_at="$(jq -r '.day_state.generated_at // "-"' <<< "$json")"
-    generation_source="$(jq -r '.day_state.generation_source // "-"' <<< "$json")"
-    rx="$(jq -r '.day_state.rx_accum // 0' <<< "$json")"
-    tx="$(jq -r '.day_state.tx_accum // 0' <<< "$json")"
-    action="$(jq -r '.day_state.last_action // "-"' <<< "$json")"
-    feed_tcp="$(jq -r '.feed.tcp_listening // false' <<< "$json")"
-    feed_udp="$(jq -r '.feed.udp_listening // false' <<< "$json")"
-    ab_targets="$(jq -r '.ab_targets | length' <<< "$json")"
-    protocol_mode="$(jq -r '.config.ab_pull.protocol_mode // "single"' <<< "$json")"
+    downmask_fields="$(jq -r '
+      [
+        (.config.pull_mode // "off"),
+        (.day_state.iface // .config.iface // "-"),
+        (.day_state.date // "-"),
+        (.day_state.target_ratio // "-"),
+        (.day_state.previous_date // "-"),
+        (.day_state.previous_target_ratio // "-"),
+        (.day_state.generated_at // "-"),
+        (.day_state.generation_source // "-"),
+        (.day_state.rx_accum // 0),
+        (.day_state.tx_accum // 0),
+        (.day_state.last_action // "-"),
+        (.feed.tcp_listening // false),
+        (.feed.udp_listening // false),
+        ((.ab_targets // []) | length),
+        (.config.ab_pull.protocol_mode // "single")
+      ] | map(tostring) | join("\u001f")
+    ' <<< "$json")"
+    IFS=$'\037' read -r pull_mode iface date ratio previous_date previous_ratio generated_at generation_source rx tx action feed_tcp feed_udp ab_targets protocol_mode <<< "$downmask_fields"
     debt="$(awk -v r="$ratio" -v tx="$tx" -v rx="$rx" 'BEGIN { if (r == "-") { print "-" } else { d = (r * tx) - rx; if (d < 0) d = 0; printf "%.0f", d } }')"
 
     printf 'pull_mode\t%s\n' "$pull_mode"

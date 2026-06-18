@@ -1058,7 +1058,7 @@ cmd_doctor() {
         esac
     done
     config_init >/dev/null
-    local forwarder_status xdp_status backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
+    local forwarder_status xdp_status doctor_status_fields backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
     local dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts
     local refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_aux_actions refresh_attach_timings
     local refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted
@@ -1066,33 +1066,48 @@ cmd_doctor() {
     stats_runtime_cache_clear
     forwarder_status="$(forwarder_status_json)"
     xdp_status="$(forwarder_xdp_status_json)"
-    backend="$(jq -r '.forwarding_backend // "none"' <<< "$forwarder_status")"
-    fallback_reason="$(jq -r '.fallback_reason // empty' <<< "$forwarder_status")"
-    hybrid_reason="$(jq -r '.hybrid_reason // empty' <<< "$forwarder_status")"
-    xdp_active_total="$(jq -r '.active_summary.total // 0' <<< "$xdp_status")"
-    xdp_tcp_prewarmed="$(jq -r '.active_summary.tcp_syn_pending // 0' <<< "$xdp_status")"
-    xdp_tcp_established="$(jq -r '.active_summary.tcp_established // 0' <<< "$xdp_status")"
-    xdp_udp_active="$(jq -r '.active_summary.udp // 0' <<< "$xdp_status")"
-    dataplane_version="$(jq -r '.dataplane_version // .xdp_status.dataplane_version // "-" ' <<< "$forwarder_status")"
-    map_abi_version="$(jq -r '.map_abi_version // .xdp_status.map_abi_version // "-" ' <<< "$forwarder_status")"
-    incremental_apply="$(jq -r '.xdp_status.incremental_apply // .incremental_apply // false' <<< "$forwarder_status")"
-    preserved_connections="$(jq -r '.xdp_status.preserved_connections // .preserved_connections // 0' <<< "$forwarder_status")"
-    invalidated_connections="$(jq -r '.xdp_status.invalidated_connections // .invalidated_connections // 0' <<< "$forwarder_status")"
-    profile_counts="$(jq -r '((.profile_counts // .xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $profiles | if $profiles == "" then "-" else $profiles end' <<< "$forwarder_status")"
-    refresh_mode="$(jq -r '.xdp_status.refresh_report.mode // .refresh_report.mode // "-"' <<< "$forwarder_status")"
-    refresh_total_ms="$(jq -r '.xdp_status.refresh_report.total_duration_ms // .refresh_report.total_duration_ms // "-"' <<< "$forwarder_status")"
-    refresh_reconcile_ms="$(jq -r '.xdp_status.refresh_report.reconcile_duration_ms // .refresh_report.reconcile_duration_ms // "-"' <<< "$forwarder_status")"
-    refresh_map_load_ms="$(jq -r '.xdp_status.refresh_report.map_load_duration_ms // .refresh_report.map_load_duration_ms // "-"' <<< "$forwarder_status")"
-    refresh_aux_actions="$(jq -r '((.xdp_status.refresh_report.aux_actions // []) | map(.component + "=" + .action + (if ((.changed_items // 0) > 0) then "(" + ((.changed_items | tostring)) + ")" else "" end)) | join(", ")) as $actions | if $actions == "" then "-" else $actions end' <<< "$forwarder_status")"
-    refresh_attach_timings="$(jq -r '((.xdp_status.refresh_report.attach_timings // []) | map(.component + "=" + ((.duration_ms | tostring)) + "ms") | join(", ")) as $timings | if $timings == "" then "-" else $timings end' <<< "$forwarder_status")"
-    refresh_rules_added="$(jq -r '.xdp_status.refresh_report.rules_added // .refresh_report.rules_added // 0' <<< "$forwarder_status")"
-    refresh_rules_updated="$(jq -r '.xdp_status.refresh_report.rules_updated // .refresh_report.rules_updated // 0' <<< "$forwarder_status")"
-    refresh_rules_deleted="$(jq -r '.xdp_status.refresh_report.rules_deleted // .refresh_report.rules_deleted // 0' <<< "$forwarder_status")"
-    refresh_users_added="$(jq -r '.xdp_status.refresh_report.users_added // .refresh_report.users_added // 0' <<< "$forwarder_status")"
-    refresh_users_updated="$(jq -r '.xdp_status.refresh_report.users_updated // .refresh_report.users_updated // 0' <<< "$forwarder_status")"
-    refresh_users_deleted="$(jq -r '.xdp_status.refresh_report.users_deleted // .refresh_report.users_deleted // 0' <<< "$forwarder_status")"
-    refresh_counters_preserved="$(jq -r '.xdp_status.refresh_report.counters_preserved // .refresh_report.counters_preserved // 0' <<< "$forwarder_status")"
-    refresh_counters_reset="$(jq -r '.xdp_status.refresh_report.counters_reset // .refresh_report.counters_reset // 0' <<< "$forwarder_status")"
+    doctor_status_fields="$(jq -rn --argjson f "$forwarder_status" --argjson x "$xdp_status" '
+      def rr: ($f.xdp_status.refresh_report // $f.refresh_report // {});
+      def profiles:
+        (($f.profile_counts // $f.xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $items
+        | if $items == "" then "-" else $items end;
+      def aux_actions:
+        ((rr.aux_actions // []) | map(.component + "=" + .action + (if ((.changed_items // 0) > 0) then "(" + ((.changed_items | tostring)) + ")" else "" end)) | join(", ")) as $items
+        | if $items == "" then "-" else $items end;
+      def attach_timings:
+        ((rr.attach_timings // []) | map(.component + "=" + ((.duration_ms | tostring)) + "ms") | join(", ")) as $items
+        | if $items == "" then "-" else $items end;
+      [
+        ($f.forwarding_backend // "none"),
+        ($f.fallback_reason // ""),
+        ($f.hybrid_reason // ""),
+        ($x.active_summary.total // 0),
+        ($x.active_summary.tcp_syn_pending // 0),
+        ($x.active_summary.tcp_established // 0),
+        ($x.active_summary.udp // 0),
+        ($f.dataplane_version // $f.xdp_status.dataplane_version // "-"),
+        ($f.map_abi_version // $f.xdp_status.map_abi_version // "-"),
+        ($f.xdp_status.incremental_apply // $f.incremental_apply // false),
+        ($f.xdp_status.preserved_connections // $f.preserved_connections // 0),
+        ($f.xdp_status.invalidated_connections // $f.invalidated_connections // 0),
+        profiles,
+        (rr.mode // "-"),
+        (rr.total_duration_ms // "-"),
+        (rr.reconcile_duration_ms // "-"),
+        (rr.map_load_duration_ms // "-"),
+        aux_actions,
+        attach_timings,
+        (rr.rules_added // 0),
+        (rr.rules_updated // 0),
+        (rr.rules_deleted // 0),
+        (rr.users_added // 0),
+        (rr.users_updated // 0),
+        (rr.users_deleted // 0),
+        (rr.counters_preserved // 0),
+        (rr.counters_reset // 0)
+      ] | map(tostring) | join("\u001f")
+    ')"
+    IFS=$'\037' read -r backend fallback_reason hybrid_reason xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_aux_actions refresh_attach_timings refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted refresh_counters_preserved refresh_counters_reset <<< "$doctor_status_fields"
     tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
     tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
     if [ -n "$tc_iface" ]; then
