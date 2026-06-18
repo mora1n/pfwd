@@ -57,7 +57,7 @@ func captureLogOutput(t *testing.T, fn func()) string {
 }
 
 func TestLoadConfigDefaultsRequestTimeoutToTenSeconds(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "whitelist-web.json")
+	configPath := filepath.Join(t.TempDir(), "leaseweb.json")
 	content := `{
 		"listen_host": "127.0.0.1",
 		"listen_port": 18080,
@@ -83,7 +83,7 @@ func TestLoadConfigDefaultsRequestTimeoutToTenSeconds(t *testing.T) {
 
 func TestSSHOptionsWithControlMasterAddsDefaults(t *testing.T) {
 	controlDir := t.TempDir()
-	t.Setenv("PFWD_WHITELIST_WEB_CONTROL_DIR", controlDir)
+	t.Setenv("PFWD_LEASEWEB_CONTROL_DIR", controlDir)
 
 	got := sshOptionsWithControlMaster([]string{"-i", "/root/.ssh/key", "-o", "BatchMode=yes"})
 	joined := strings.Join(got, " ")

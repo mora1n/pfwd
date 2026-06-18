@@ -184,7 +184,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("用法：pfwd-whitelist-web run --config /etc/pfwd/whitelist-web.json")
+		return fmt.Errorf("用法：pfwd-leaseweb run --config /etc/pfwd/leaseweb.json")
 	}
 	switch args[0] {
 	case "run":
@@ -361,10 +361,10 @@ func logWhitelistWebRequest(start time.Time, status int, code string, routeLabel
 	}
 	totalMS := time.Since(start).Milliseconds()
 	if errorDetail == "" {
-		log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS)
+		log.Printf("leaseweb request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS)
 		return
 	}
-	log.Printf("whitelist-web request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s error=%q", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS, compactLogDetail(errorDetail, 512))
+	log.Printf("leaseweb request label=%q status=%d code=%q observed_ip=%q lease_cidr=%q total_ms=%d ssh_ms=%s error=%q", routeLabel, status, code, observedIP, leaseCIDR, totalMS, sshMS, compactLogDetail(errorDetail, 512))
 }
 
 func compactLogDetail(raw string, maxLen int) string {
@@ -466,13 +466,13 @@ func sshOptionsWithControlMaster(options []string) []string {
 	if sshOptionConfigured(args, "ControlMaster") || sshOptionConfigured(args, "ControlPath") {
 		return args
 	}
-	controlDir := strings.TrimSpace(os.Getenv("PFWD_WHITELIST_WEB_CONTROL_DIR"))
+	controlDir := strings.TrimSpace(os.Getenv("PFWD_LEASEWEB_CONTROL_DIR"))
 	if controlDir == "" {
-		controlDir = filepath.Join(os.TempDir(), "pfwd-whitelist-web-control")
+		controlDir = filepath.Join(os.TempDir(), "pfwd-leaseweb-control")
 	}
 	if err := os.MkdirAll(controlDir, 0700); err != nil {
 		// Let ssh fail with a precise ControlPath error if the directory cannot be prepared.
-		log.Printf("whitelist-web ssh control dir prepare failed path=%q error=%q", controlDir, err.Error())
+		log.Printf("leaseweb ssh control dir prepare failed path=%q error=%q", controlDir, err.Error())
 	}
 	controlPath := filepath.Join(controlDir, "ssh-%C")
 	args = append(args,

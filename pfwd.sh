@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PFWD_VERSION="0.2.32"
+PFWD_VERSION="0.2.33"
 
 pfwd_detect_script_source() {
     local candidate=""
@@ -28,7 +28,15 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask whitelist_web service commands_guard commands commands_reconcile ui)
+PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask/core downmask/ab downmask/state downmask/public downmask/service downmask/commands leaseweb service commands/core commands/update commands/user commands/forward commands/notify commands/guard commands/reconcile commands/doctor ui/core ui/table ui/status ui/io ui/form ui/actions ui/format ui/install ui/data ui/print ui/select ui/guard_ports ui/menus_core ui/guard ui/leaseweb ui/whitelist ui/downmask ui/main)
+
+pfwd_lib_rel_path() {
+    printf 'lib/%s.sh\n' "$1"
+}
+
+pfwd_lib_path() {
+    printf '%s/%s.sh\n' "$PFWD_LIB_DIR" "$1"
+}
 
 pfwd_bootstrap_xdp_asset_name() {
     local arch
@@ -115,8 +123,8 @@ pfwd_bootstrap_install() {
     chmod +x "$install_dir/pfwd.sh"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
     chmod +x "$install_dir/bbr.sh"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/scripts/pfwd_whitelist_lease_command.sh" "$install_dir/scripts/pfwd_whitelist_lease_command.sh"
-    chmod +x "$install_dir/scripts/pfwd_whitelist_lease_command.sh"
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/scripts/pfwd_lease_command.sh" "$install_dir/scripts/pfwd_lease_command.sh"
+    chmod +x "$install_dir/scripts/pfwd_lease_command.sh"
     xdp_asset="$(pfwd_bootstrap_xdp_asset_name)" || {
         echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
@@ -149,7 +157,8 @@ pfwd_bootstrap_install() {
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
-        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/lib/$lib.sh" "$lib_dir/$lib.sh"
+        mkdir -p "$(dirname "$lib_dir/$lib.sh")"
+        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$(pfwd_lib_rel_path "$lib")" "$lib_dir/$lib.sh"
     done
 
     ln -sf "$install_dir/pfwd.sh" "$bin_path"
@@ -168,7 +177,7 @@ pfwd_load_libs_or_bootstrap() {
     local missing=()
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
-        [ -f "$PFWD_LIB_DIR/$lib.sh" ] || missing+=("$lib.sh")
+        [ -f "$(pfwd_lib_path "$lib")" ] || missing+=("$lib.sh")
     done
 
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -184,7 +193,7 @@ pfwd_load_libs_or_bootstrap() {
 
     for lib in "${PFWD_LIB_FILES[@]}"; do
         # shellcheck source=/dev/null
-        source "$PFWD_LIB_DIR/$lib.sh"
+        source "$(pfwd_lib_path "$lib")"
     done
 }
 
@@ -194,7 +203,7 @@ pfwd_command_lock_mode() {
     local cmd="${1:-}"
     case "$cmd" in
         reconcile) printf 'try\n' ;;
-        init|user|add|start|stop|delete|forward|expire|limit|user-forwards-limit|traffic|import|refresh|restart|notify-test|notify-enable|notify-schedule|notify-disable|notify-delete|guard|downmask|whitelist-web|install|update|uninstall|__forward_boot|__update_finalize)
+        init|user|add|start|stop|delete|forward|expire|limit|user-forwards-limit|traffic|import|refresh|restart|notify-test|notify-enable|notify-schedule|notify-disable|notify-delete|guard|downmask|leaseweb|install|update|uninstall|__forward_boot|__update_finalize)
             printf 'wait\n'
             ;;
         *) printf 'none\n' ;;
@@ -235,7 +244,7 @@ pfwd_dispatch() {
         notify-delete) cmd_notify_delete "$@" ;;
         guard) cmd_guard "$@" ;;
         downmask) cmd_downmask "$@" ;;
-        whitelist-web) cmd_whitelist_web "$@" ;;
+        leaseweb) cmd_leaseweb "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
@@ -349,12 +358,12 @@ pfwd - XDP 端口转发管理脚本
   pfwd downmask ab-pull targets list|add|delete|update|clear ...
   pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
   pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
-  pfwd whitelist-web run --config /etc/pfwd/whitelist-web.json
-  pfwd whitelist-web init|status
-  pfwd whitelist-web config show|reset|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
-  pfwd whitelist-web trusted-proxy list|add|delete|clear ...
-  pfwd whitelist-web route list|add|update|delete ...   # add/update 支持 [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]
-  pfwd whitelist-web service status|start|stop|restart|enable|disable
+  pfwd leaseweb run --config /etc/pfwd/leaseweb.json
+  pfwd leaseweb init|status
+  pfwd leaseweb config show|reset|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
+  pfwd leaseweb trusted-proxy list|add|delete|clear ...
+  pfwd leaseweb route list|add|update|delete ...   # add/update 支持 [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]
+  pfwd leaseweb service status|start|stop|restart|enable|disable
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]

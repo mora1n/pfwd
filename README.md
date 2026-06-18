@@ -29,7 +29,7 @@ pfwd doctor
 ```bash
 ./xdp/build.sh
 ./downmask/build.sh
-./whitelist_web/build.sh  # 仅控制机需要 whitelist-web 时再构建
+./leaseweb/build.sh  # 仅控制机需要 leaseweb 时再构建
 ```
 
 打包基础离线包：
@@ -43,10 +43,10 @@ tar -czf pfwd-amd64.tar.gz \
   assets/pfwd-city-cn-meta.json assets/pfwd-city-cn-v4.bin
 ```
 
-如果控制机还要启用临时白名单 Web 入口，再额外带上：
+如果控制机还要启用 leaseweb，再额外带上：
 
 ```bash
-assets/pfwd-whitelist-web-linux-amd64
+assets/pfwd-leaseweb-linux-amd64
 ```
 
 目标机安装：
@@ -102,27 +102,27 @@ pfwd guard egress-whitelist --enabled true
 pfwd guard egress-whitelist-cn all
 ```
 
-## 临时白名单 Web 入口
+## leaseweb
 
 ```bash
-./whitelist_web/build.sh
-pfwd whitelist-web init
-pfwd whitelist-web config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
-pfwd whitelist-web trusted-proxy add 127.0.0.1/32
-pfwd whitelist-web trusted-proxy add ::1/128
-pfwd whitelist-web route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
-pfwd whitelist-web service enable
-pfwd whitelist-web service start
-pfwd whitelist-web route check 1
-pfwd whitelist-web status
+./leaseweb/build.sh
+pfwd leaseweb init
+pfwd leaseweb config set --listen-host your-host-ip --listen-port 18080 --request-timeout-sec 10
+pfwd leaseweb trusted-proxy add 127.0.0.1/32
+pfwd leaseweb trusted-proxy add ::1/128
+pfwd leaseweb route add --secret '<随机secret>' --label your-label --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-leaseweb -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C'
+pfwd leaseweb service enable
+pfwd leaseweb service start
+pfwd leaseweb route check 1
+pfwd leaseweb status
 ```
 
 要点：
 
 - `SSH 目标` 建议填写 `user@host`。
 - `放行范围` 基于当前访问来源 IP 计算；例如 `IPv4 /24` 会把 `203.0.113.27` 放宽成 `203.0.113.0/24`。
-- 目标机首次接入前，先让控制机信任对应 host key；可用 `pfwd whitelist-web route check <index>` 检查 `known_hosts` 状态。
-- TUI 入口：`流量防护 -> 临时白名单 Web`。
+- 目标机首次接入前，先让控制机信任对应 host key；可用 `pfwd leaseweb route check <index>` 检查 `known_hosts` 状态。
+- TUI 入口：`流量防护 -> leaseweb`。
 
 ## 下行伪装
 

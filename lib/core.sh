@@ -104,9 +104,9 @@ PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE="${PFWD_EGRESS_WHITELIST_HOST_ALLOW_I
 PFWD_SCRIPT_NAME="pfwd"
 PFWD_XDP_DATAPLANE_VERSION="${PFWD_XDP_DATAPLANE_VERSION:-2}"
 PFWD_XDP_MAP_ABI_VERSION="${PFWD_XDP_MAP_ABI_VERSION:-16}"
-PFWD_WHITELIST_WEB_CONFIG_FILE="${PFWD_WHITELIST_WEB_CONFIG_FILE:-$PFWD_ETC_DIR/whitelist-web.json}"
-PFWD_WHITELIST_WEB_BIN_PATH="${PFWD_WHITELIST_WEB_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-whitelist-web}"
-PFWD_WHITELIST_WEB_STATE_DIR="${PFWD_WHITELIST_WEB_STATE_DIR:-$PFWD_STATE_DIR/whitelist_web}"
+PFWD_LEASEWEB_CONFIG_FILE="${PFWD_LEASEWEB_CONFIG_FILE:-$PFWD_ETC_DIR/leaseweb.json}"
+PFWD_LEASEWEB_BIN_PATH="${PFWD_LEASEWEB_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-leaseweb}"
+PFWD_LEASEWEB_STATE_DIR="${PFWD_LEASEWEB_STATE_DIR:-$PFWD_STATE_DIR/leaseweb}"
 PFWD_WHITELIST_LEASES_FILE="${PFWD_WHITELIST_LEASES_FILE:-$PFWD_WHITELIST_STATE_DIR/leases.json}"
 PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv4.txt}"
 PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv6.txt}"
@@ -268,7 +268,7 @@ pfwd_stop_at_expired() {
 }
 
 pfwd_mkdirs() {
-    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_WEB_STATE_DIR" "$PFWD_DOWNMASK_STATE_DIR"
+    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_LEASEWEB_STATE_DIR" "$PFWD_DOWNMASK_STATE_DIR"
 }
 
 forwarder_bin_path() {
@@ -291,9 +291,30 @@ forwarder_bin_path() {
 pfwd_write_atomic() {
     local target="$1"
     local tmp
+    mkdir -p "$(dirname "$target")"
     tmp="$(mktemp "${target}.tmp.XXXXXX")"
     cat > "$tmp"
     mv "$tmp" "$target"
+}
+
+pfwd_indexes_to_json() {
+    local indexes="${1:-}"
+    printf '%s\n' "$indexes" | jq -Rcs 'split("\n") | map(select(length > 0) | tonumber)'
+}
+
+pfwd_validate_indexes() {
+    local label="$1"
+    local indexes="$2"
+    local count="$3"
+    local raw
+
+    [ -n "$indexes" ] || pfwd_die "缺少${label}序号"
+    [ "$count" -gt 0 ] || pfwd_die "暂无${label}"
+    while IFS= read -r raw; do
+        [ -n "$raw" ] || continue
+        [[ "$raw" =~ ^[0-9]+$ ]] || pfwd_die "${label}序号必须是正整数：$raw"
+        [ "$raw" -ge 1 ] && [ "$raw" -le "$count" ] || pfwd_die "${label}序号不存在：$raw"
+    done <<< "$indexes"
 }
 
 pfwd_with_runtime_lock() {

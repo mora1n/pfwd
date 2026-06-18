@@ -20,7 +20,7 @@ service_installation_present() {
     [ -d "$PFWD_INSTALL_DIR/lib" ] || return 1
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
-        [ -f "$PFWD_INSTALL_DIR/lib/$lib.sh" ] || return 1
+        [ -f "$PFWD_INSTALL_DIR/$(pfwd_lib_rel_path "$lib")" ] || return 1
     done
 }
 
@@ -92,7 +92,7 @@ pfwd.timer
 pfwd-bbr.service
 pfwd-xdp.service
 pfwd-downmask-feed.service
-pfwd-whitelist-web.service
+pfwd-leaseweb.service
 EOF
 }
 
@@ -103,15 +103,15 @@ pfwd.timer	runtime-timer	true
 pfwd-bbr.service	bbr-runtime	true
 pfwd-xdp.service	xdp-runtime	true
 pfwd-downmask-feed.service	downmask-feed	true
-pfwd-whitelist-web.service	whitelist-web	true
+pfwd-leaseweb.service	leaseweb	true
 EOF
 }
 
 service_update_optional_bundle_rows() {
-    local web_asset=""
-    web_asset="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
-    if [ -n "$web_asset" ]; then
-        printf '0755\t%s\tbin/pfwd-whitelist-web\twhitelist-web\n' "$web_asset"
+    local leaseweb_asset=""
+    leaseweb_asset="assets/$(leaseweb_asset_name 2>/dev/null || true)"
+    if [ -n "$leaseweb_asset" ]; then
+        printf '0755\t%s\tbin/pfwd-leaseweb\tleaseweb\n' "$leaseweb_asset"
     fi
 }
 
@@ -128,7 +128,7 @@ service_bundle_rows() {
 
     printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
     printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
-    printf '0755\tscripts/pfwd_whitelist_lease_command.sh\tbin/%s\twhitelist-lease-command\n' "$(whitelist_web_restricted_command_script_name)"
+    printf '0755\tscripts/pfwd_lease_command.sh\tbin/%s\tlease-command\n' "$(leaseweb_restricted_command_script_name)"
     printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
     printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
     printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
@@ -137,7 +137,7 @@ service_bundle_rows() {
     printf '0644\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\n'
     printf '0644\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\n'
     for lib in "${PFWD_LIB_FILES[@]}"; do
-        printf '0644\tlib/%s.sh\tlib/%s.sh\tlib/%s.sh\n' "$lib" "$lib" "$lib"
+        printf '0644\t%s\t%s\t%s\n' "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")"
     done
 }
 
@@ -153,8 +153,8 @@ service_missing_bundle_hint() {
         */assets/pfwd-city-cn-*)
             printf '请使用包含 city 资产的完整安装包，或使用已更新 bootstrap 的版本重新安装。\n'
             ;;
-        */assets/pfwd-whitelist-web-linux-*)
-            printf '请先构建 pfwd-whitelist-web 预编译资产，或使用包含该可选组件的完整源码/发布包。\n'
+        */assets/pfwd-leaseweb-linux-*)
+            printf '请先构建 pfwd-leaseweb 预编译资产，或使用包含该可选组件的完整源码/发布包。\n'
             ;;
         *)
             return 0
@@ -175,9 +175,9 @@ service_prepare_install_dirs() {
         "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" \
         "$(dirname "$PFWD_XDP_BIN_PATH")" \
         "$(dirname "$PFWD_DOWNMASK_BIN_PATH")" \
-        "$(dirname "$PFWD_WHITELIST_WEB_BIN_PATH")" \
+        "$(dirname "$PFWD_LEASEWEB_BIN_PATH")" \
         "$PFWD_DOWNMASK_STATE_DIR" \
-        "$PFWD_WHITELIST_WEB_STATE_DIR" \
+        "$PFWD_LEASEWEB_STATE_DIR" \
         "$PFWD_SYSTEMD_DIR"
 }
 
@@ -265,6 +265,7 @@ service_copy_bundle_from_dir() {
             exit 1
         fi
         if [ "$source_path" != "$target_path" ]; then
+            mkdir -p "$(dirname "$target_path")"
             install -m "$mode" "$source_path" "$target_path"
         else
             chmod "$mode" "$target_path"
@@ -272,14 +273,14 @@ service_copy_bundle_from_dir() {
     done < <(service_bundle_rows)
 }
 
-service_copy_optional_whitelist_web_from_dir() {
+service_copy_optional_leaseweb_from_dir() {
     local source_root="$1"
     local asset_rel target_path source_path
-    asset_rel="assets/$(whitelist_web_asset_name 2>/dev/null || true)"
+    asset_rel="assets/$(leaseweb_asset_name 2>/dev/null || true)"
     [ -n "$asset_rel" ] || return 0
     source_path="${source_root%/}/$asset_rel"
     [ -f "$source_path" ] || return 0
-    target_path="$(service_install_target_path "bin/pfwd-whitelist-web")"
+    target_path="$(service_install_target_path "bin/pfwd-leaseweb")"
     install -m 0755 "$source_path" "$target_path"
 }
 
@@ -290,7 +291,7 @@ service_update_installed_optional_rows() {
         target_path="$(service_install_target_path "$install_rel")"
         unit_name=""
         case "$digest_label" in
-            whitelist-web) unit_name="pfwd-whitelist-web.service" ;;
+            leaseweb) unit_name="pfwd-leaseweb.service" ;;
         esac
         if [ -f "$target_path" ] || { [ -n "$unit_name" ] && service_unit_exists "$unit_name"; }; then
             printf '%s\t%s\t%s\t%s\n' "$mode" "$source_rel" "$install_rel" "$digest_label"
@@ -306,6 +307,13 @@ service_update_bundle_rows() {
 service_cleanup_legacy_install_artifacts() {
     rm -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" \
           "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
+}
+
+service_cleanup_legacy_leaseweb_artifacts() {
+    rm -f "$PFWD_SYSTEMD_DIR/pfwd-whitelist-web.service" \
+          "$PFWD_INSTALL_DIR/bin/pfwd-whitelist-web" \
+          "$PFWD_INSTALL_DIR/assets/pfwd-whitelist-web-linux-amd64" \
+          "$PFWD_INSTALL_DIR/assets/pfwd-whitelist-web-linux-arm64"
 }
 
 service_verify_bundle_from_dir() {
@@ -331,10 +339,11 @@ service_write_unit_files() {
     service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
     bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
     xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
-    whitelist_web_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-whitelist-web.service"
+    leaseweb_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-leaseweb.service"
     if command -v downmask_write_feed_unit_if_needed >/dev/null 2>&1; then
         downmask_write_feed_unit_if_needed || true
     fi
+    service_cleanup_legacy_leaseweb_artifacts
 }
 
 service_install_files() {
@@ -342,7 +351,7 @@ service_install_files() {
     service_prepare_install_dirs
     service_verify_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
-    service_copy_optional_whitelist_web_from_dir "$PFWD_SCRIPT_DIR"
+    service_copy_optional_leaseweb_from_dir "$PFWD_SCRIPT_DIR"
     service_cleanup_legacy_install_artifacts
     service_write_shortcuts
     service_write_unit_files
@@ -366,8 +375,8 @@ service_enable() {
     pfwd_run systemctl daemon-reload
     pfwd_run systemctl enable pfwd-xdp.service pfwd.timer
     pfwd_run systemctl start pfwd.timer
-    if [ -f "$PFWD_WHITELIST_WEB_CONFIG_FILE" ]; then
-        pfwd_run systemctl enable pfwd-whitelist-web.service || true
+    if [ -f "$PFWD_LEASEWEB_CONFIG_FILE" ]; then
+        pfwd_run systemctl enable pfwd-leaseweb.service || true
     fi
 }
 
@@ -403,8 +412,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service || true
+        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service pfwd-whitelist-web.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -451,7 +460,7 @@ service_remove_binary_artifacts() {
     while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
         rm -f "$(service_install_target_path "$install_rel")"
     done < <(service_bundle_rows)
-    rm -f "$PFWD_WHITELIST_WEB_BIN_PATH"
+    rm -f "$PFWD_LEASEWEB_BIN_PATH" "$PFWD_INSTALL_DIR/bin/pfwd-leaseweb"
 }
 
 service_remove_asset_artifacts() {
@@ -490,7 +499,7 @@ service_verify_removed() {
     for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" \
         "$PFWD_DOWNMASK_STATE_DIR" "$PFWD_DOWNMASK_STATUS_FILE" "$PFWD_DOWNMASK_BIN_PATH" \
-        "$PFWD_WHITELIST_WEB_CONFIG_FILE" "$PFWD_WHITELIST_WEB_BIN_PATH" "$PFWD_WHITELIST_WEB_STATE_DIR" \
+        "$PFWD_LEASEWEB_CONFIG_FILE" "$PFWD_LEASEWEB_BIN_PATH" "$PFWD_LEASEWEB_STATE_DIR" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
         "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         "$PFWD_XDP_SK_LOOKUP_PIN_PATH" "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
@@ -565,6 +574,7 @@ service_update_download_bundle() {
     mkdir -p "$staged_dir/lib" "$staged_dir/assets" "$staged_dir/scripts"
     local _ source_rel __ ___
     while IFS=$'\t' read -r _ source_rel __ ___; do
+        mkdir -p "$(dirname "$staged_dir/$source_rel")"
         pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
     done < <(service_update_bundle_rows)
 }
@@ -731,7 +741,7 @@ service_update_stop_active_services() {
           elif .unit == "pfwd-bbr.service" then 2
           elif .unit == "pfwd-xdp.service" then 3
           elif .unit == "pfwd-downmask-feed.service" then 4
-          elif .unit == "pfwd-whitelist-web.service" then 5
+          elif .unit == "pfwd-leaseweb.service" then 5
           else 99 end
         )
       | .[].unit
@@ -781,8 +791,9 @@ service_update_apply_staged() {
     service_update_stop_active_services "$states_json"
     service_prepare_install_dirs
     service_copy_bundle_from_dir "$staged_dir"
-    service_copy_optional_whitelist_web_from_dir "$staged_dir"
+    service_copy_optional_leaseweb_from_dir "$staged_dir"
     service_cleanup_legacy_install_artifacts
+    service_cleanup_legacy_leaseweb_artifacts
     service_write_shortcuts
 }
 

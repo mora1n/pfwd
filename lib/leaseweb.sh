@@ -1,47 +1,47 @@
 #!/usr/bin/env bash
 
-whitelist_web_asset_name() {
+leaseweb_asset_name() {
     local arch
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64) echo "pfwd-whitelist-web-linux-amd64" ;;
-        aarch64|arm64) echo "pfwd-whitelist-web-linux-arm64" ;;
+        x86_64|amd64) echo "pfwd-leaseweb-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-leaseweb-linux-arm64" ;;
         *) return 1 ;;
     esac
 }
 
-whitelist_web_local_asset_path() {
+leaseweb_local_asset_path() {
     local asset
-    asset="$(whitelist_web_asset_name)" || return 1
+    asset="$(leaseweb_asset_name)" || return 1
     printf '%s/assets/%s\n' "$PFWD_SCRIPT_DIR" "$asset"
 }
 
-whitelist_web_bin_path() {
-    if [ -x "$PFWD_WHITELIST_WEB_BIN_PATH" ]; then
-        printf '%s\n' "$PFWD_WHITELIST_WEB_BIN_PATH"
+leaseweb_bin_path() {
+    if [ -x "$PFWD_LEASEWEB_BIN_PATH" ]; then
+        printf '%s\n' "$PFWD_LEASEWEB_BIN_PATH"
         return 0
     fi
     local local_asset=""
-    local_asset="$(whitelist_web_local_asset_path 2>/dev/null || true)"
+    local_asset="$(leaseweb_local_asset_path 2>/dev/null || true)"
     if [ -n "$local_asset" ] && [ -x "$local_asset" ]; then
         printf '%s\n' "$local_asset"
         return 0
     fi
-    printf '%s\n' "$PFWD_WHITELIST_WEB_BIN_PATH"
+    printf '%s\n' "$PFWD_LEASEWEB_BIN_PATH"
 }
 
-whitelist_web_service_unit() {
+leaseweb_service_unit() {
     cat <<EOF
 [Unit]
-Description=pfwd whitelist web controller
+Description=pfwd leaseweb controller
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=PFWD_WHITELIST_WEB_CONTROL_DIR=$PFWD_WHITELIST_WEB_STATE_DIR/control
-ExecStartPre=/usr/bin/install -d -m 0700 $PFWD_RUN_DIR $PFWD_WHITELIST_WEB_STATE_DIR/control
-ExecStart=$(whitelist_web_bin_path) run --config $PFWD_WHITELIST_WEB_CONFIG_FILE
+Environment=PFWD_LEASEWEB_CONTROL_DIR=$PFWD_LEASEWEB_STATE_DIR/control
+ExecStartPre=/usr/bin/install -d -m 0700 $PFWD_RUN_DIR $PFWD_LEASEWEB_STATE_DIR/control
+ExecStart=$(leaseweb_bin_path) run --config $PFWD_LEASEWEB_CONFIG_FILE
 Restart=on-failure
 RestartSec=3s
 
@@ -50,15 +50,15 @@ WantedBy=multi-user.target
 EOF
 }
 
-whitelist_web_restricted_command_script_name() {
-    printf '%s\n' "pfwd-whitelist-lease-command"
+leaseweb_restricted_command_script_name() {
+    printf '%s\n' "pfwd-lease-command"
 }
 
-whitelist_web_restricted_command_install_path() {
-    printf '%s/%s\n' "$PFWD_INSTALL_DIR/bin" "$(whitelist_web_restricted_command_script_name)"
+leaseweb_restricted_command_install_path() {
+    printf '%s/%s\n' "$PFWD_INSTALL_DIR/bin" "$(leaseweb_restricted_command_script_name)"
 }
 
-whitelist_web_default_config_json() {
+leaseweb_default_config_json() {
     jq -n '
       {
         listen_host: "127.0.0.1",
@@ -70,16 +70,16 @@ whitelist_web_default_config_json() {
     '
 }
 
-whitelist_web_init_config_if_missing() {
-    mkdir -p "$(dirname "$PFWD_WHITELIST_WEB_CONFIG_FILE")"
-    if [ ! -f "$PFWD_WHITELIST_WEB_CONFIG_FILE" ]; then
-        whitelist_web_default_config_json | pfwd_write_atomic "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+leaseweb_init_config_if_missing() {
+    mkdir -p "$(dirname "$PFWD_LEASEWEB_CONFIG_FILE")"
+    if [ ! -f "$PFWD_LEASEWEB_CONFIG_FILE" ]; then
+        leaseweb_default_config_json | pfwd_write_atomic "$PFWD_LEASEWEB_CONFIG_FILE"
     fi
 }
 
-whitelist_web_validate_config_file() {
+leaseweb_validate_config_file() {
     local file="$1"
-    [ -f "$file" ] || pfwd_die "whitelist-web 配置文件不存在：$file"
+    [ -f "$file" ] || pfwd_die "leaseweb 配置文件不存在：$file"
     jq -e '
       type == "object"
       and ((.listen_host // "") | type == "string")
@@ -91,17 +91,17 @@ whitelist_web_validate_config_file() {
       and ((.request_timeout_sec // 0) >= 1)
       and ((.trusted_proxy_cidrs // []) | type == "array")
       and ((.routes // []) | type == "array")
-    ' "$file" >/dev/null 2>&1 || pfwd_die "无效 whitelist-web 配置文件：$file"
+    ' "$file" >/dev/null 2>&1 || pfwd_die "无效 leaseweb 配置文件：$file"
 }
 
-whitelist_web_reset_config() {
-    mkdir -p "$(dirname "$PFWD_WHITELIST_WEB_CONFIG_FILE")"
-    whitelist_web_default_config_json | pfwd_write_atomic "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+leaseweb_reset_config() {
+    mkdir -p "$(dirname "$PFWD_LEASEWEB_CONFIG_FILE")"
+    leaseweb_default_config_json | pfwd_write_atomic "$PFWD_LEASEWEB_CONFIG_FILE"
 }
 
-whitelist_web_config_json() {
-    whitelist_web_init_config_if_missing
-    whitelist_web_validate_config_file "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+leaseweb_config_json() {
+    leaseweb_init_config_if_missing
+    leaseweb_validate_config_file "$PFWD_LEASEWEB_CONFIG_FILE"
     jq '
       .listen_host = ((.listen_host // "") | tostring | if . == "" then "127.0.0.1" else . end)
       | .listen_port = ((.listen_port // 18080) | tonumber)
@@ -123,64 +123,64 @@ whitelist_web_config_json() {
               | del(.note)
             )
         )
-    ' "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+    ' "$PFWD_LEASEWEB_CONFIG_FILE"
 }
 
-whitelist_web_write_config_json() {
+leaseweb_write_config_json() {
     local payload="$1"
-    mkdir -p "$(dirname "$PFWD_WHITELIST_WEB_CONFIG_FILE")"
-    [ -n "$payload" ] || pfwd_die "whitelist-web 配置写入内容为空"
-    payload="$(pfwd_require_json_output "whitelist-web 配置" "$payload")"
-    printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$PFWD_WHITELIST_WEB_CONFIG_FILE"
+    mkdir -p "$(dirname "$PFWD_LEASEWEB_CONFIG_FILE")"
+    [ -n "$payload" ] || pfwd_die "leaseweb 配置写入内容为空"
+    payload="$(pfwd_require_json_output "leaseweb 配置" "$payload")"
+    printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$PFWD_LEASEWEB_CONFIG_FILE"
 }
 
-whitelist_web_write_config_from_stdin() {
+leaseweb_write_config_from_stdin() {
     local payload
     payload="$(cat)"
-    [ -n "$payload" ] || pfwd_die "whitelist-web 配置写入内容为空"
-    whitelist_web_write_config_json "$payload"
+    [ -n "$payload" ] || pfwd_die "leaseweb 配置写入内容为空"
+    leaseweb_write_config_json "$payload"
 }
 
-whitelist_web_validate_label() {
+leaseweb_validate_label() {
     local value="$1"
     [ -n "$value" ] || pfwd_die "label 不能为空"
 }
 
-whitelist_web_validate_secret() {
+leaseweb_validate_secret() {
     local value="$1"
     [ -n "$value" ] || pfwd_die "secret 不能为空"
     [[ "$value" =~ ^[A-Za-z0-9._~-]+$ ]] || pfwd_die "secret 仅允许字母、数字、点、下划线、短横线和波浪线"
 }
 
-whitelist_web_validate_listen_host() {
+leaseweb_validate_listen_host() {
     local value="$1"
     [ -n "$value" ] || pfwd_die "listen_host 不能为空"
 }
 
-whitelist_web_validate_timeout() {
+leaseweb_validate_timeout() {
     local value="$1"
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "request_timeout_sec 必须是正整数"
     [ "$value" -ge 1 ] || pfwd_die "request_timeout_sec 必须大于 0"
 }
 
-whitelist_web_validate_ssh_port() {
+leaseweb_validate_ssh_port() {
     local value="$1"
     [ -n "$value" ] || return 0
     [[ "$value" =~ ^[0-9]+$ ]] || pfwd_die "ssh_port 必须是 1-65535 的整数"
     [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || pfwd_die "ssh_port 必须是 1-65535 的整数"
 }
 
-whitelist_web_validate_route() {
+leaseweb_validate_route() {
     local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4" ipv4_prefix_len="$5" ipv6_prefix_len="$6"
-    whitelist_web_validate_secret "$secret"
-    whitelist_web_validate_label "$label"
+    leaseweb_validate_secret "$secret"
+    leaseweb_validate_label "$label"
     [ -n "$ssh_target" ] || pfwd_die "ssh_target 不能为空"
     pfwd_parse_duration_seconds "$idle_ttl" >/dev/null
     validate_ipv4_prefix_len "$ipv4_prefix_len" "ipv4_prefix_len"
     validate_ipv6_prefix_len "$ipv6_prefix_len" "ipv6_prefix_len"
 }
 
-whitelist_web_ssh_target_user_hint() {
+leaseweb_ssh_target_user_hint() {
     local ssh_target="$1"
     case "$ssh_target" in
         *@*) printf '%s\n' "ok" ;;
@@ -188,15 +188,15 @@ whitelist_web_ssh_target_user_hint() {
     esac
 }
 
-whitelist_web_ssh_target_user_hint_text() {
+leaseweb_ssh_target_user_hint_text() {
     local ssh_target="$1"
-    case "$(whitelist_web_ssh_target_user_hint "$ssh_target")" in
+    case "$(leaseweb_ssh_target_user_hint "$ssh_target")" in
         ok) printf '%s\n' "已包含 user@host" ;;
         *) printf '%s\n' "建议填写 user@host；若只填 IP/域名，将使用控制机当前系统用户" ;;
     esac
 }
 
-whitelist_web_known_hosts_file() {
+leaseweb_known_hosts_file() {
     local home_dir=""
     home_dir="${HOME:-}"
     if [ -n "$home_dir" ]; then
@@ -208,12 +208,12 @@ whitelist_web_known_hosts_file() {
     printf '%s/.ssh/known_hosts\n' "$home_dir"
 }
 
-whitelist_web_route_host_key_trusted() {
+leaseweb_route_host_key_trusted() {
     local index="$1"
     local ssh_target ssh_port host known_hosts
-    ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
-    ssh_port="$(whitelist_web_route_ssh_port "$index")"
-    known_hosts="$(whitelist_web_known_hosts_file)"
+    ssh_target="$(leaseweb_route_field "$index" ssh_target)"
+    ssh_port="$(leaseweb_route_ssh_port "$index")"
+    known_hosts="$(leaseweb_known_hosts_file)"
     host="${ssh_target##*@}"
     [ -n "$host" ] || {
         printf '%s\n' "unknown"
@@ -238,7 +238,7 @@ whitelist_web_route_host_key_trusted() {
     fi
 }
 
-whitelist_web_route_host_key_status_text() {
+leaseweb_route_host_key_status_text() {
     local state="$1"
     case "$state" in
         trusted) printf '%s\n' "已信任" ;;
@@ -247,7 +247,7 @@ whitelist_web_route_host_key_status_text() {
     esac
 }
 
-whitelist_web_validate_trusted_proxy_list() {
+leaseweb_validate_trusted_proxy_list() {
     local file="$1"
     local raw
     [ -f "$file" ] || return 0
@@ -258,34 +258,34 @@ whitelist_web_validate_trusted_proxy_list() {
     done < "$file"
 }
 
-whitelist_web_config_show() {
-    whitelist_web_config_json | jq '.'
+leaseweb_config_show() {
+    leaseweb_config_json | jq '.'
 }
 
-whitelist_web_status_json() {
+leaseweb_status_json() {
     local config_json active_state enabled_state service_present bin_path route_count
-    config_json="$(whitelist_web_config_json)" || return 1
-    config_json="$(pfwd_require_json_output "whitelist-web 配置" "$config_json")" || return 1
+    config_json="$(leaseweb_config_json)" || return 1
+    config_json="$(pfwd_require_json_output "leaseweb 配置" "$config_json")" || return 1
     route_count="$(jq -r '(.routes // []) | length' <<< "$config_json")"
-    bin_path="$(whitelist_web_bin_path)"
+    bin_path="$(leaseweb_bin_path)"
     service_present="false"
     active_state="unknown"
     enabled_state="unknown"
 
-    if service_unit_exists pfwd-whitelist-web.service; then
+    if service_unit_exists pfwd-leaseweb.service; then
         service_present="true"
         if command -v systemctl >/dev/null 2>&1; then
-            active_state="$(systemctl is-active pfwd-whitelist-web.service 2>/dev/null || true)"
-            enabled_state="$(systemctl is-enabled pfwd-whitelist-web.service 2>/dev/null || true)"
+            active_state="$(systemctl is-active pfwd-leaseweb.service 2>/dev/null || true)"
+            enabled_state="$(systemctl is-enabled pfwd-leaseweb.service 2>/dev/null || true)"
             [ -n "$active_state" ] || active_state="unknown"
             [ -n "$enabled_state" ] || enabled_state="unknown"
         fi
     fi
 
     jq -n \
-      --arg config_file "$PFWD_WHITELIST_WEB_CONFIG_FILE" \
+      --arg config_file "$PFWD_LEASEWEB_CONFIG_FILE" \
       --arg bin_path "$bin_path" \
-      --arg restricted_command "$(whitelist_web_restricted_command_install_path)" \
+      --arg restricted_command "$(leaseweb_restricted_command_install_path)" \
       --argjson config "$config_json" \
       --argjson route_count "$route_count" \
       --arg service_present "$service_present" \
@@ -304,8 +304,8 @@ whitelist_web_status_json() {
     '
 }
 
-whitelist_web_status_rows() {
-    whitelist_web_status_json | jq -r '
+leaseweb_status_rows() {
+    leaseweb_status_json | jq -r '
       [
         ["监听地址", (.config.listen_host + ":" + ((.config.listen_port // 0) | tostring))],
         ["请求超时", ((.config.request_timeout_sec // 0) | tostring) + "s"],
@@ -323,25 +323,25 @@ whitelist_web_status_rows() {
     '
 }
 
-whitelist_web_route_check_json() {
+leaseweb_route_check_json() {
     local index="$1"
     local count ssh_target ssh_port ssh_options idle_ttl host_key_state known_hosts user_hint ipv4_prefix_len ipv6_prefix_len
-    count="$(whitelist_web_route_count)"
+    count="$(leaseweb_route_count)"
     [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "规则序号必须是正整数：$index"
     [ "$index" -ge 1 ] && [ "$index" -le "$count" ] || pfwd_die "route 序号不存在：$index"
-    ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
-    ssh_port="$(whitelist_web_route_ssh_port "$index")"
-    ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
-    idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
-    ipv4_prefix_len="$(whitelist_web_route_ipv4_prefix_len "$index")"
-    ipv6_prefix_len="$(whitelist_web_route_ipv6_prefix_len "$index")"
-    host_key_state="$(whitelist_web_route_host_key_trusted "$index")"
-    known_hosts="$(whitelist_web_known_hosts_file)"
-    user_hint="$(whitelist_web_ssh_target_user_hint "$ssh_target")"
+    ssh_target="$(leaseweb_route_field "$index" ssh_target)"
+    ssh_port="$(leaseweb_route_ssh_port "$index")"
+    ssh_options="$(leaseweb_route_ssh_options_text_without_port "$index")"
+    idle_ttl="$(leaseweb_route_field "$index" idle_ttl)"
+    ipv4_prefix_len="$(leaseweb_route_ipv4_prefix_len "$index")"
+    ipv6_prefix_len="$(leaseweb_route_ipv6_prefix_len "$index")"
+    host_key_state="$(leaseweb_route_host_key_trusted "$index")"
+    known_hosts="$(leaseweb_known_hosts_file)"
+    user_hint="$(leaseweb_ssh_target_user_hint "$ssh_target")"
     jq -n \
       --argjson index "$index" \
-      --arg secret "$(whitelist_web_route_field "$index" secret)" \
-      --arg label "$(whitelist_web_route_field "$index" label)" \
+      --arg secret "$(leaseweb_route_field "$index" secret)" \
+      --arg label "$(leaseweb_route_field "$index" label)" \
       --arg ssh_target "$ssh_target" \
       --arg ssh_port "$ssh_port" \
       --arg ssh_options "$ssh_options" \
@@ -369,9 +369,9 @@ whitelist_web_route_check_json() {
     '
 }
 
-whitelist_web_route_check_rows() {
+leaseweb_route_check_rows() {
     local index="$1"
-    whitelist_web_route_check_json "$index" | jq -r '
+    leaseweb_route_check_json "$index" | jq -r '
       [
         ["规则序号", (.index | tostring)],
         ["标签", .label],
@@ -390,23 +390,23 @@ whitelist_web_route_check_rows() {
     '
 }
 
-whitelist_web_config_set_globals() {
+leaseweb_config_set_globals() {
     local listen_host="$1" listen_port="$2" request_timeout_sec="$3"
-    [ -n "$listen_host" ] && whitelist_web_validate_listen_host "$listen_host"
+    [ -n "$listen_host" ] && leaseweb_validate_listen_host "$listen_host"
     [ -n "$listen_port" ] && validate_port "$listen_port"
-    [ -n "$request_timeout_sec" ] && whitelist_web_validate_timeout "$request_timeout_sec"
-    whitelist_web_config_json | jq \
+    [ -n "$request_timeout_sec" ] && leaseweb_validate_timeout "$request_timeout_sec"
+    leaseweb_config_json | jq \
       --arg listen_host "$listen_host" \
       --argjson listen_port "${listen_port:-0}" \
       --argjson request_timeout_sec "${request_timeout_sec:-0}" '
       if $listen_host != "" then .listen_host = $listen_host else . end
       | if $listen_port > 0 then .listen_port = $listen_port else . end
       | if $request_timeout_sec > 0 then .request_timeout_sec = $request_timeout_sec else . end
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_trusted_proxy_list() {
-    whitelist_web_config_json | jq -r '
+leaseweb_trusted_proxy_list() {
+    leaseweb_config_json | jq -r '
       (.trusted_proxy_cidrs // [])
       | to_entries[]
       | [((.key + 1) | tostring), .value]
@@ -414,48 +414,42 @@ whitelist_web_trusted_proxy_list() {
     '
 }
 
-whitelist_web_trusted_proxy_clear() {
-    whitelist_web_config_json | jq '.trusted_proxy_cidrs = []' | whitelist_web_write_config_from_stdin
+leaseweb_trusted_proxy_clear() {
+    leaseweb_config_json | jq '.trusted_proxy_cidrs = []' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_trusted_proxy_add() {
+leaseweb_trusted_proxy_add() {
     local cidr
     cidr="$(normalize_ip_or_cidr "$1")"
-    whitelist_web_config_json | jq --arg cidr "$cidr" '
+    leaseweb_config_json | jq --arg cidr "$cidr" '
       .trusted_proxy_cidrs = (((.trusted_proxy_cidrs // []) + [$cidr]) | unique)
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_trusted_proxy_delete_by_indexes() {
-    local indexes="$1" count raw
-    [ -n "$indexes" ] || pfwd_die "缺少可信反代 CIDR 序号"
-    count="$(whitelist_web_trusted_proxy_list | sed '/^$/d' | wc -l | tr -d ' ')"
-    [ "$count" -gt 0 ] || pfwd_die "暂无可信反代 CIDR"
-    while IFS= read -r raw; do
-        [ -n "$raw" ] || continue
-        [[ "$raw" =~ ^[0-9]+$ ]] || pfwd_die "可信反代 CIDR 序号必须是正整数：$raw"
-        [ "$raw" -ge 1 ] && [ "$raw" -le "$count" ] || pfwd_die "可信反代 CIDR 序号不存在：$raw"
-    done <<< "$indexes"
-    whitelist_web_config_json | jq --arg raw "$indexes" '
-      ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
-      | .trusted_proxy_cidrs = (
+leaseweb_trusted_proxy_delete_by_indexes() {
+    local indexes="$1" count idxs_json
+    count="$(leaseweb_trusted_proxy_list | sed '/^$/d' | wc -l | tr -d ' ')"
+    pfwd_validate_indexes "可信反代 CIDR" "$indexes" "$count"
+    idxs_json="$(pfwd_indexes_to_json "$indexes")"
+    leaseweb_config_json | jq --argjson wanted "$idxs_json" '
+      .trusted_proxy_cidrs = (
           (.trusted_proxy_cidrs // [])
           | to_entries
           | map(select((((.key + 1) as $idx | ($wanted | index($idx))) | not)))
           | map(.value)
         )
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_route_count() {
+leaseweb_route_count() {
     local config_json
-    config_json="$(whitelist_web_config_json)" || return 1
+    config_json="$(leaseweb_config_json)" || return 1
     jq -r '(.routes // []) | length' <<< "$config_json"
 }
 
-whitelist_web_route_rows() {
+leaseweb_route_rows() {
     local config_json
-    config_json="$(whitelist_web_config_json)" || return 1
+    config_json="$(leaseweb_config_json)" || return 1
     jq -r '
       (.routes // [])
       | to_entries[]
@@ -472,17 +466,17 @@ whitelist_web_route_rows() {
     ' <<< "$config_json"
 }
 
-whitelist_web_route_ui_rows() {
+leaseweb_route_ui_rows() {
     local count index label secret ssh_target idle_ttl ssh_port ssh_options scope
-    count="$(whitelist_web_route_count)"
+    count="$(leaseweb_route_count)"
     for ((index = 1; index <= count; index++)); do
-        label="$(whitelist_web_route_field "$index" label)"
-        secret="$(whitelist_web_route_field "$index" secret)"
-        ssh_target="$(whitelist_web_route_field "$index" ssh_target)"
-        idle_ttl="$(whitelist_web_route_field "$index" idle_ttl)"
-        ssh_port="$(whitelist_web_route_ssh_port "$index")"
-        ssh_options="$(whitelist_web_route_ssh_options_text_without_port "$index")"
-        scope="$(whitelist_web_route_scope_text "$index")"
+        label="$(leaseweb_route_field "$index" label)"
+        secret="$(leaseweb_route_field "$index" secret)"
+        ssh_target="$(leaseweb_route_field "$index" ssh_target)"
+        idle_ttl="$(leaseweb_route_field "$index" idle_ttl)"
+        ssh_port="$(leaseweb_route_ssh_port "$index")"
+        ssh_options="$(leaseweb_route_ssh_options_text_without_port "$index")"
+        scope="$(leaseweb_route_scope_text "$index")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$index" \
             "${label:--}" \
@@ -495,16 +489,16 @@ whitelist_web_route_ui_rows() {
     done
 }
 
-whitelist_web_route_json_by_index() {
+leaseweb_route_json_by_index() {
     local index="$1"
     local config_json
-    config_json="$(whitelist_web_config_json)" || return 1
+    config_json="$(leaseweb_config_json)" || return 1
     jq -c --argjson index "$index" '
       (.routes // [])[$index - 1] // empty
     ' <<< "$config_json"
 }
 
-whitelist_web_ssh_port_from_options_json() {
+leaseweb_ssh_port_from_options_json() {
     local options_json="${1:-[]}"
     jq -r '
       . as $options
@@ -524,7 +518,7 @@ whitelist_web_ssh_port_from_options_json() {
     ' <<< "$options_json"
 }
 
-whitelist_web_ssh_options_without_port_json() {
+leaseweb_ssh_options_without_port_json() {
     local options_json="${1:-[]}"
     jq -c '
       . as $options
@@ -542,49 +536,49 @@ whitelist_web_ssh_options_without_port_json() {
     ' <<< "$options_json"
 }
 
-whitelist_web_route_ssh_options_json() {
+leaseweb_route_ssh_options_json() {
     local index="$1"
-    whitelist_web_route_json_by_index "$index" | jq -c '(.ssh_options // [])'
+    leaseweb_route_json_by_index "$index" | jq -c '(.ssh_options // [])'
 }
 
-whitelist_web_route_ssh_port() {
+leaseweb_route_ssh_port() {
     local index="$1"
-    whitelist_web_ssh_port_from_options_json "$(whitelist_web_route_ssh_options_json "$index")"
+    leaseweb_ssh_port_from_options_json "$(leaseweb_route_ssh_options_json "$index")"
 }
 
-whitelist_web_route_ssh_options_text_without_port() {
+leaseweb_route_ssh_options_text_without_port() {
     local index="$1"
-    whitelist_web_ssh_options_without_port_json "$(whitelist_web_route_ssh_options_json "$index")" | jq -r 'join(" ")'
+    leaseweb_ssh_options_without_port_json "$(leaseweb_route_ssh_options_json "$index")" | jq -r 'join(" ")'
 }
 
-whitelist_web_route_ipv4_prefix_len() {
+leaseweb_route_ipv4_prefix_len() {
     local index="$1"
     local value
-    value="$(whitelist_web_route_field "$index" ipv4_prefix_len)"
+    value="$(leaseweb_route_field "$index" ipv4_prefix_len)"
     [ -n "$value" ] || value="32"
     printf '%s\n' "$value"
 }
 
-whitelist_web_route_ipv6_prefix_len() {
+leaseweb_route_ipv6_prefix_len() {
     local index="$1"
     local value
-    value="$(whitelist_web_route_field "$index" ipv6_prefix_len)"
+    value="$(leaseweb_route_field "$index" ipv6_prefix_len)"
     [ -n "$value" ] || value="128"
     printf '%s\n' "$value"
 }
 
-whitelist_web_route_scope_text() {
+leaseweb_route_scope_text() {
     local index="$1"
-    printf 'IPv4 /%s, IPv6 /%s\n' "$(whitelist_web_route_ipv4_prefix_len "$index")" "$(whitelist_web_route_ipv6_prefix_len "$index")"
+    printf 'IPv4 /%s, IPv6 /%s\n' "$(leaseweb_route_ipv4_prefix_len "$index")" "$(leaseweb_route_ipv6_prefix_len "$index")"
 }
 
-whitelist_web_recommended_ssh_options_text() {
-    printf '%s\n' "-i /root/.ssh/pfwd-whitelist-web -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C"
+leaseweb_recommended_ssh_options_text() {
+    printf '%s\n' "-i /root/.ssh/pfwd-leaseweb -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o ControlMaster=auto -o ControlPersist=60s -o ControlPath=/run/pfwd/ssh-control-%C"
 }
 
-whitelist_web_build_ssh_options_json() {
+leaseweb_build_ssh_options_json() {
     local ssh_port="${1:-}" raw="${2:-}" parsed_json effective_port normalized_json
-    parsed_json="$(whitelist_web_parse_ssh_options_json "$raw")"
+    parsed_json="$(leaseweb_parse_ssh_options_json "$raw")"
     if jq -e '
         . as $options
         | any(range(0; ($options | length)); ($options[.] == "-p") and (($options[. + 1] // "") == ""))
@@ -593,10 +587,10 @@ whitelist_web_build_ssh_options_json() {
     fi
     effective_port="$ssh_port"
     if [ -z "$effective_port" ]; then
-        effective_port="$(whitelist_web_ssh_port_from_options_json "$parsed_json")"
+        effective_port="$(leaseweb_ssh_port_from_options_json "$parsed_json")"
     fi
-    whitelist_web_validate_ssh_port "$effective_port"
-    normalized_json="$(whitelist_web_ssh_options_without_port_json "$parsed_json")"
+    leaseweb_validate_ssh_port "$effective_port"
+    normalized_json="$(leaseweb_ssh_options_without_port_json "$parsed_json")"
     if [ -n "$effective_port" ]; then
         jq -c --arg port "$effective_port" '
           ["-p", $port] + .
@@ -606,10 +600,10 @@ whitelist_web_build_ssh_options_json() {
     printf '%s\n' "$normalized_json"
 }
 
-whitelist_web_route_add() {
+leaseweb_route_add() {
     local secret="$1" label="$2" ssh_target="$3" idle_ttl="$4" ssh_options_json="$5" ipv4_prefix_len="${6:-32}" ipv6_prefix_len="${7:-128}"
-    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
-    whitelist_web_config_json | jq \
+    leaseweb_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
+    leaseweb_config_json | jq \
       --arg secret "$secret" \
       --arg route_label "$label" \
       --arg ssh_target "$ssh_target" \
@@ -630,13 +624,13 @@ whitelist_web_route_add() {
           "ipv6_prefix_len": $ipv6_prefix_len
         }])
       end
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_route_update() {
+leaseweb_route_update() {
     local index="$1" secret="$2" label="$3" ssh_target="$4" idle_ttl="$5" ssh_options_json="$6" ipv4_prefix_len="${7:-32}" ipv6_prefix_len="${8:-128}"
-    whitelist_web_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
-    whitelist_web_config_json | jq \
+    leaseweb_validate_route "$secret" "$label" "$ssh_target" "$idle_ttl" "$ipv4_prefix_len" "$ipv6_prefix_len"
+    leaseweb_config_json | jq \
       --argjson index "$index" \
       --arg secret "$secret" \
       --arg route_label "$label" \
@@ -661,41 +655,35 @@ whitelist_web_route_update() {
           "ipv6_prefix_len": $ipv6_prefix_len
         }
       end
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_route_delete_by_indexes() {
-    local indexes="$1" count raw
-    [ -n "$indexes" ] || pfwd_die "缺少规则序号"
-    count="$(whitelist_web_route_count)"
-    [ "$count" -gt 0 ] || pfwd_die "暂无规则"
-    while IFS= read -r raw; do
-        [ -n "$raw" ] || continue
-        [[ "$raw" =~ ^[0-9]+$ ]] || pfwd_die "规则序号必须是正整数：$raw"
-        [ "$raw" -ge 1 ] && [ "$raw" -le "$count" ] || pfwd_die "route 序号不存在：$raw"
-    done <<< "$indexes"
-    whitelist_web_config_json | jq --arg raw "$indexes" '
-      ($raw | split("\n") | map(select(length > 0) | tonumber)) as $wanted
-      | .routes = (
+leaseweb_route_delete_by_indexes() {
+    local indexes="$1" count idxs_json
+    count="$(leaseweb_route_count)"
+    pfwd_validate_indexes "规则" "$indexes" "$count"
+    idxs_json="$(pfwd_indexes_to_json "$indexes")"
+    leaseweb_config_json | jq --argjson wanted "$idxs_json" '
+      .routes = (
           (.routes // [])
           | to_entries
           | map(select((((.key + 1) as $idx | ($wanted | index($idx))) | not)))
           | map(.value)
         )
-    ' | whitelist_web_write_config_from_stdin
+    ' | leaseweb_write_config_from_stdin
 }
 
-whitelist_web_route_field() {
+leaseweb_route_field() {
     local index="$1" field="$2"
-    whitelist_web_route_json_by_index "$index" | jq -r --arg field "$field" '.[$field] // ""'
+    leaseweb_route_json_by_index "$index" | jq -r --arg field "$field" '.[$field] // ""'
 }
 
-whitelist_web_route_ssh_options_text() {
+leaseweb_route_ssh_options_text() {
     local index="$1"
-    whitelist_web_route_json_by_index "$index" | jq -r '(.ssh_options // []) | join(" ")'
+    leaseweb_route_json_by_index "$index" | jq -r '(.ssh_options // []) | join(" ")'
 }
 
-whitelist_web_parse_ssh_options_json() {
+leaseweb_parse_ssh_options_json() {
     local raw="${1:-}"
     if [ -z "$raw" ]; then
         printf '[]\n'
@@ -707,28 +695,28 @@ whitelist_web_parse_ssh_options_json() {
     '
 }
 
-whitelist_web_service_action() {
+leaseweb_service_action() {
     local action="$1"
     command -v systemctl >/dev/null 2>&1 || pfwd_die "缺少 systemctl"
     case "$action" in
         status)
-            systemctl status pfwd-whitelist-web.service --no-pager
+            systemctl status pfwd-leaseweb.service --no-pager
             ;;
         start|stop|restart|enable|disable)
-            pfwd_run systemctl "$action" pfwd-whitelist-web.service
+            pfwd_run systemctl "$action" pfwd-leaseweb.service
             ;;
         *)
-            pfwd_die "未知 whitelist-web service 动作：$action"
+            pfwd_die "未知 leaseweb service 动作：$action"
             ;;
     esac
 }
 
-cmd_whitelist_web() {
+cmd_leaseweb() {
     local sub="${1:-}"
     shift || true
     case "$sub" in
         run)
-            local bin config_path="$PFWD_WHITELIST_WEB_CONFIG_FILE"
+            local bin config_path="$PFWD_LEASEWEB_CONFIG_FILE"
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --config) config_path="${2:-}"; shift 2 ;;
@@ -736,32 +724,32 @@ cmd_whitelist_web() {
                 esac
             done
             [ -n "$config_path" ] || pfwd_die "必须提供 --config"
-            [ -f "$config_path" ] || pfwd_die "whitelist-web 配置文件不存在：$config_path"
-            bin="$(whitelist_web_bin_path)"
-            [ -x "$bin" ] || pfwd_die "pfwd-whitelist-web 二进制不存在：$bin"
+            [ -f "$config_path" ] || pfwd_die "leaseweb 配置文件不存在：$config_path"
+            bin="$(leaseweb_bin_path)"
+            [ -x "$bin" ] || pfwd_die "pfwd-leaseweb 二进制不存在：$bin"
             exec "$bin" run --config "$config_path"
             ;;
         init)
-            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web init"
-            whitelist_web_init_config_if_missing
-            echo "whitelist-web 配置已就绪：$PFWD_WHITELIST_WEB_CONFIG_FILE"
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb init"
+            leaseweb_init_config_if_missing
+            echo "leaseweb 配置已就绪：$PFWD_LEASEWEB_CONFIG_FILE"
             ;;
         status)
-            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web status"
-            whitelist_web_status_rows
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb status"
+            leaseweb_status_rows
             ;;
         config)
             local action="${1:-show}"
             shift || true
             case "$action" in
                 show)
-                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web config show"
-                    whitelist_web_config_show
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb config show"
+                    leaseweb_config_show
                     ;;
                 reset)
-                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web config reset"
-                    whitelist_web_reset_config
-                    echo "whitelist-web 配置已重置"
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb config reset"
+                    leaseweb_reset_config
+                    echo "leaseweb 配置已重置"
                     ;;
                 set)
                     local listen_host="" listen_port="" request_timeout_sec=""
@@ -773,12 +761,12 @@ cmd_whitelist_web() {
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
-                    [ -n "$listen_host$listen_port$request_timeout_sec" ] || pfwd_die "用法：pfwd whitelist-web config set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]"
-                    whitelist_web_config_set_globals "$listen_host" "$listen_port" "$request_timeout_sec"
-                    echo "whitelist-web 配置已更新"
+                    [ -n "$listen_host$listen_port$request_timeout_sec" ] || pfwd_die "用法：pfwd leaseweb config set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]"
+                    leaseweb_config_set_globals "$listen_host" "$listen_port" "$request_timeout_sec"
+                    echo "leaseweb 配置已更新"
                     ;;
                 *)
-                    pfwd_die "用法：pfwd whitelist-web config show|reset|set ..."
+                    pfwd_die "用法：pfwd leaseweb config show|reset|set ..."
                     ;;
             esac
             ;;
@@ -787,26 +775,26 @@ cmd_whitelist_web() {
             shift || true
             case "$action" in
                 list)
-                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web trusted-proxy list"
-                    whitelist_web_trusted_proxy_list
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb trusted-proxy list"
+                    leaseweb_trusted_proxy_list
                     ;;
                 add)
-                    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd whitelist-web trusted-proxy add <CIDR|IP>"
-                    whitelist_web_trusted_proxy_add "$1"
+                    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd leaseweb trusted-proxy add <CIDR|IP>"
+                    leaseweb_trusted_proxy_add "$1"
                     echo "可信反代 CIDR 已添加"
                     ;;
                 delete)
-                    [ "$#" -ge 1 ] || pfwd_die "用法：pfwd whitelist-web trusted-proxy delete <index...>"
-                    whitelist_web_trusted_proxy_delete_by_indexes "$(printf '%s\n' "$@")"
+                    [ "$#" -ge 1 ] || pfwd_die "用法：pfwd leaseweb trusted-proxy delete <index...>"
+                    leaseweb_trusted_proxy_delete_by_indexes "$(printf '%s\n' "$@")"
                     echo "可信反代 CIDR 已删除"
                     ;;
                 clear)
-                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web trusted-proxy clear"
-                    whitelist_web_trusted_proxy_clear
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb trusted-proxy clear"
+                    leaseweb_trusted_proxy_clear
                     echo "可信反代 CIDR 已清空"
                     ;;
                 *)
-                    pfwd_die "用法：pfwd whitelist-web trusted-proxy list|add|delete|clear"
+                    pfwd_die "用法：pfwd leaseweb trusted-proxy list|add|delete|clear"
                     ;;
             esac
             ;;
@@ -815,12 +803,12 @@ cmd_whitelist_web() {
             shift || true
             case "$action" in
                 list)
-                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web route list"
-                    whitelist_web_route_rows
+                    [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb route list"
+                    leaseweb_route_rows
                     ;;
                 check)
-                    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd whitelist-web route check <index>"
-                    whitelist_web_route_check_rows "$1"
+                    [ "$#" -eq 1 ] || pfwd_die "用法：pfwd leaseweb route check <index>"
+                    leaseweb_route_check_rows "$1"
                     ;;
                 add)
                     local secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]' ipv4_prefix_len="32" ipv6_prefix_len="128"
@@ -837,9 +825,9 @@ cmd_whitelist_web() {
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
-                    ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
-                    whitelist_web_route_add "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
-                    echo "whitelist-web 规则已添加"
+                    ssh_options_json="$(leaseweb_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
+                    leaseweb_route_add "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
+                    echo "leaseweb 规则已添加"
                     ;;
                 update)
                     local index="" secret="" label="" ssh_target="" idle_ttl="" ssh_port="" ssh_options_raw="" ssh_options_json='[]' ipv4_prefix_len="32" ipv6_prefix_len="128"
@@ -857,29 +845,29 @@ cmd_whitelist_web() {
                             *) pfwd_die "未知选项：$1" ;;
                         esac
                     done
-                    ssh_options_json="$(whitelist_web_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
-                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd whitelist-web route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]"
-                    whitelist_web_route_update "$index" "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
-                    echo "whitelist-web 规则已更新"
+                    ssh_options_json="$(leaseweb_build_ssh_options_json "$ssh_port" "$ssh_options_raw")"
+                    [[ "$index" =~ ^[0-9]+$ ]] || pfwd_die "用法：pfwd leaseweb route update --index N --secret SECRET --label LABEL --ssh-target TARGET --idle-ttl TTL [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]"
+                    leaseweb_route_update "$index" "$secret" "$label" "$ssh_target" "$idle_ttl" "$ssh_options_json" "$ipv4_prefix_len" "$ipv6_prefix_len"
+                    echo "leaseweb 规则已更新"
                     ;;
                 delete)
-                    [ "$#" -ge 1 ] || pfwd_die "用法：pfwd whitelist-web route delete <index...>"
-                    whitelist_web_route_delete_by_indexes "$(printf '%s\n' "$@")"
-                    echo "whitelist-web 规则已删除"
+                    [ "$#" -ge 1 ] || pfwd_die "用法：pfwd leaseweb route delete <index...>"
+                    leaseweb_route_delete_by_indexes "$(printf '%s\n' "$@")"
+                    echo "leaseweb 规则已删除"
                     ;;
                 *)
-                    pfwd_die "用法：pfwd whitelist-web route list|check|add|update|delete"
+                    pfwd_die "用法：pfwd leaseweb route list|check|add|update|delete"
                     ;;
             esac
             ;;
         service)
             local action="${1:-status}"
             shift || true
-            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd whitelist-web service status|start|stop|restart|enable|disable"
-            whitelist_web_service_action "$action"
+            [ "$#" -eq 0 ] || pfwd_die "用法：pfwd leaseweb service status|start|stop|restart|enable|disable"
+            leaseweb_service_action "$action"
             ;;
         *)
-            pfwd_die "用法：pfwd whitelist-web run|init|status|config|trusted-proxy|route|service ..."
+            pfwd_die "用法：pfwd leaseweb run|init|status|config|trusted-proxy|route|service ..."
             ;;
     esac
 }
