@@ -15,6 +15,17 @@ forwarder_target_kind() {
     fi
 }
 
+forwarder_domain_target_requires_refresh() {
+    local target="${1:-}"
+    if [ "$(forwarder_target_kind "$target")" != "domain" ]; then
+        return 1
+    fi
+    case "${target,,}" in
+        localhost|localhost.localdomain|ip6-localhost|ip6-loopback) return 1 ;;
+    esac
+    return 0
+}
+
 forwarder_infer_ip_version() {
     local listen_ip="$1"
     local snat_mode="$2"
@@ -44,6 +55,121 @@ forwarder_protocol_rows() {
         tcp|udp) printf '%s\n' "$protocol" ;;
         *) pfwd_die "无效协议：$protocol" ;;
     esac
+}
+
+forwarder_domain_rules_present() {
+    config_init >/dev/null
+    local remote_host
+    while IFS= read -r remote_host; do
+        [ -n "$remote_host" ] || continue
+        if forwarder_domain_target_requires_refresh "$remote_host"; then
+            echo true
+            return 0
+        fi
+    done < <(jq -r '.forwards[]? | select(.enabled == true) | .remote_host' "$PFWD_CONFIG_FILE")
+    echo false
+}
+
+forwarder_domain_refresh_interval_seconds() {
+    config_init >/dev/null
+    local raw
+    raw="$(jq -r '.settings.domain_refresh_interval // ""' "$PFWD_CONFIG_FILE")"
+    [ -n "$raw" ] || {
+        echo 0
+        return 0
+    }
+    pfwd_parse_duration_seconds "$raw"
+}
+
+forwarder_domain_refresh_status_json() {
+    if [ -f "$PFWD_FORWARDER_STATUS_FILE" ]; then
+        jq '.' "$PFWD_FORWARDER_STATUS_FILE" 2>/dev/null || printf '{}\n'
+    else
+        printf '{}\n'
+    fi
+}
+
+forwarder_domain_refresh_last_checked_at() {
+    local status_json value
+    status_json="$(forwarder_domain_refresh_status_json)"
+    value="$(jq -r '.domain_refresh_checked_at // .generated_at // ""' <<< "$status_json" 2>/dev/null || true)"
+    printf '%s\n' "$value"
+}
+
+forwarder_domain_refresh_due() {
+    local interval_seconds="$1"
+    [ -n "$interval_seconds" ] || interval_seconds=0
+    [[ "$interval_seconds" =~ ^[0-9]+$ ]] || pfwd_die "domain_refresh_interval 秒数无效：$interval_seconds"
+    [ "$interval_seconds" -gt 0 ] || return 1
+
+    local last_checked now_epoch last_epoch
+    last_checked="$(forwarder_domain_refresh_last_checked_at)"
+    [ -n "$last_checked" ] || return 0
+
+    now_epoch="$(pfwd_now_epoch)"
+    last_epoch="$(date -u -d "$last_checked" '+%s' 2>/dev/null || true)"
+    [ -n "$last_epoch" ] || return 0
+    [ $((now_epoch - last_epoch)) -ge "$interval_seconds" ]
+}
+
+forwarder_update_domain_refresh_metadata() {
+    local checked_at="$1"
+    local interval_seconds="$2"
+    local domain_rules_present="$3"
+    local status_json
+
+    status_json="$(forwarder_status_json 2>/dev/null || printf '{}\n')"
+    status_json="$(jq \
+      --arg checked_at "$checked_at" \
+      --argjson interval_seconds "$interval_seconds" \
+      --argjson domain_rules_present "$domain_rules_present" '
+      .domain_refresh_checked_at = $checked_at
+      | .domain_refresh_interval_seconds = $interval_seconds
+      | .domain_rules_present = $domain_rules_present
+    ' <<< "$status_json")"
+    forwarder_write_status_file "$status_json"
+}
+
+forwarder_domain_refresh_hash_from_runtime_json() {
+    local runtime_json="${1:-}"
+    jq -c '
+      [
+        .rules[]?
+        | select(
+            (.remote_input | type == "string")
+            and ((.remote_input | ascii_downcase) != "localhost")
+            and ((.remote_input | ascii_downcase) != "localhost.localdomain")
+            and ((.remote_input | ascii_downcase) != "ip6-localhost")
+            and ((.remote_input | ascii_downcase) != "ip6-loopback")
+            and ((.remote_input | test("^[0-9]+(\\.[0-9]+){3}$") | not))
+            and ((.remote_input | contains(":")) | not)
+          )
+        | {
+            id,
+            listen_ip,
+            listen_port,
+            protocol,
+            remote_input,
+            resolved_target,
+            remote_port,
+            ip_version,
+            execution_class,
+            snat_mode,
+            snat_source,
+            mss_mode,
+            mss_value,
+            traffic_mode,
+            traffic_ratio,
+            whitelist_policy_id
+          }
+      ]
+      | sort_by(.id, .protocol, .ip_version, .resolved_target)
+    ' <<< "$runtime_json" | pfwd_stdin_checksum
+}
+
+forwarder_domain_refresh_hash_file() {
+    [ -f "$PFWD_FORWARDER_RUNTIME_FILE" ] || return 0
+    forwarder_domain_refresh_hash_from_runtime_json "$(jq -c '.' "$PFWD_FORWARDER_RUNTIME_FILE")"
 }
 
 FORWARDER_TSV_FIELDS=()
