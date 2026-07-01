@@ -6,28 +6,21 @@
 
 ## 安装
 
-运行环境需要：
+依赖：`iproute2` / `ip` / `tc`、`nftables`、`systemd`、`bpffs`。
 
-- `iproute2` / `ip` / `tc`
-- `nftables`
-- `systemd`
-- 挂载在 `/sys/fs/bpf` 的 bpffs
-
-Release 产物每个架构只有一个二进制：
-
-- `pfwd-linux-amd64`
-- `pfwd-linux-arm64`
-
-安装时把对应架构产物放到 `/usr/local/bin/pfwd`，然后执行：
+root 下执行：
 
 ```bash
-chmod 755 /usr/local/bin/pfwd
-pfwd install
-pfwd doctor
+curl -fsSL https://raw.githubusercontent.com/mora1n/pfwd/main/install.sh | sh
 ```
 
 ## 快速开始
 
+```bash
+pfwd
+```
+
+CLI:
 ```bash
 pfwd init
 pfwd user add alice
@@ -120,8 +113,6 @@ go build ./cmd/pfwd
 VERSION=v0.3.0 ./build.sh
 git diff --check
 ```
-
-`build.sh` 是开发/发布辅助脚本，不会被安装到运行时系统。Release workflow 在 `v*` tag 上注入 `version`、`commit` 和 `buildDate`。
 
 ## 许可证
 
