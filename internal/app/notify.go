@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
+
+type telegramSender func(context.Context, string, string, string) error
 
 func (a *App) runUserTelegram(args []string) error {
 	if len(args) == 0 {
@@ -74,6 +77,8 @@ func (a *App) runUserTelegram(args []string) error {
 
 func (a *App) runNotify(cmd string, args []string) error {
 	switch cmd {
+	case "notify-send":
+		return a.sendNotify(args)
 	case "notify-enable":
 		return a.toggleNotify(args, true)
 	case "notify-disable":
@@ -87,6 +92,27 @@ func (a *App) runNotify(cmd string, args []string) error {
 	default:
 		return fmt.Errorf("未知通知命令：%s", cmd)
 	}
+}
+
+func (a *App) sendNotify(args []string) error {
+	fs := flag.NewFlagSet("notify-send", flag.ContinueOnError)
+	userID := fs.String("user-id", "", "user id")
+	text := fs.String("text", "", "message text")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*userID) == "" {
+		return fmt.Errorf("必须提供 --user-id")
+	}
+	if strings.TrimSpace(*text) == "" {
+		return fmt.Errorf("必须提供 --text")
+	}
+	user := normalizeUserID(*userID)
+	if err := a.sendTelegramToUser(context.Background(), user, *text); err != nil {
+		return err
+	}
+	fmt.Printf("Telegram 消息已发送：%s\n", user)
+	return nil
 }
 
 func parseNotifyUser(args []string) (string, error) {
@@ -212,12 +238,41 @@ func (a *App) testNotify(args []string) error {
 			return fmt.Errorf("用户未配置 Telegram：%s", userID)
 		}
 		text := fmt.Sprintf("pfwd notify test\nuser: %s\nserver: %s", userID, tg.ServerName)
-		if err := sendTelegram(ctx, tg.BotToken, tg.ChatID, text); err != nil {
+		if err := a.sendTelegram(ctx, tg.BotToken, tg.ChatID, text); err != nil {
 			return err
 		}
 		fmt.Printf("Telegram 测试通知已发送：%s\n", userID)
 		return nil
 	})
+}
+
+func (a *App) sendTelegramToUser(ctx context.Context, userID, text string) error {
+	store, err := OpenStore(a.Paths.DBPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	cfg, err := loadConfig(ctx, store)
+	if err != nil {
+		return err
+	}
+	idx, ok := findUser(cfg, userID)
+	if !ok {
+		return fmt.Errorf("用户不存在：%s", userID)
+	}
+	tg := cfg.Users[idx].Telegram
+	if tg.BotToken == "" || tg.ChatID == "" {
+		return fmt.Errorf("用户未配置 Telegram：%s", userID)
+	}
+	return a.sendTelegram(ctx, tg.BotToken, tg.ChatID, text)
+}
+
+func (a *App) sendTelegram(ctx context.Context, token, chatID, text string) error {
+	sender := a.telegramSender
+	if sender == nil {
+		sender = sendTelegram
+	}
+	return sender(ctx, token, chatID, text)
 }
 
 func sendTelegram(ctx context.Context, token, chatID, text string) error {

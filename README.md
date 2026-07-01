@@ -24,6 +24,8 @@ pfwd
 
 也可以显式执行 `pfwd tui`。
 
+TUI 中添加/编辑转发会先选择用户，再逐步填写监听、远端、协议、SNAT、MSS、到期和限速等参数。
+
 CLI：
 
 ```bash
@@ -61,6 +63,8 @@ pfwd add \
 | 恢复转发 | `pfwd start <forward-id>` |
 | 删除转发 | `pfwd delete <forward-id>` |
 | 查看统计 | `pfwd stats --user-id alice` |
+| 配置 Telegram | `pfwd user telegram alice --bot-token TOKEN --chat-id CHAT_ID` |
+| 发送 Telegram 消息 | `pfwd notify-send --user-id alice --text "hello"` |
 | 刷新运行态 | `pfwd refresh` |
 | 重启运行态 | `pfwd restart` |
 | 查看运行态 | `pfwd render status` |

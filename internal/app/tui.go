@@ -21,10 +21,13 @@ const (
 	tuiUsers
 	tuiForwards
 	tuiStats
+	tuiNotify
 	tuiRuntime
 	tuiDoctor
 	tuiInput
 	tuiConfirm
+	tuiForwardWizard
+	tuiNotifyWizard
 )
 
 var (
@@ -59,16 +62,96 @@ type tuiConfirmState struct {
 	confirm  func(*tuiModel) error
 }
 
+type tuiForwardStep int
+
+const (
+	tuiForwardStepUser tuiForwardStep = iota
+	tuiForwardStepRemote
+	tuiForwardStepListenPort
+	tuiForwardStepListenIP
+	tuiForwardStepProtocol
+	tuiForwardStepComment
+	tuiForwardStepStopAt
+	tuiForwardStepTrafficMode
+	tuiForwardStepTrafficRatio
+	tuiForwardStepSNATMode
+	tuiForwardStepSNATSource
+	tuiForwardStepMSSMode
+	tuiForwardStepMSSValue
+	tuiForwardStepTrafficLimit
+	tuiForwardStepRate
+	tuiForwardStepReview
+)
+
+type tuiForwardWizardState struct {
+	edit         bool
+	forwardID    string
+	step         tuiForwardStep
+	value        string
+	userID       string
+	remoteHost   string
+	remotePort   uint16
+	listenIP     string
+	listenPort   uint16
+	protocol     string
+	comment      string
+	stopAt       string
+	trafficMode  string
+	trafficRatio string
+	snatMode     string
+	snatSource   string
+	mssMode      string
+	mssValue     string
+	trafficLimit string
+	rate         string
+}
+
+type tuiNotifyStep int
+
+const (
+	tuiNotifyStepToken tuiNotifyStep = iota
+	tuiNotifyStepChatID
+	tuiNotifyStepServerName
+	tuiNotifyStepEnabled
+	tuiNotifyStepInterval
+	tuiNotifyStepDaily
+	tuiNotifyStepMessage
+)
+
+type tuiNotifyWizardKind int
+
+const (
+	tuiNotifyConfigure tuiNotifyWizardKind = iota
+	tuiNotifySchedule
+	tuiNotifySend
+)
+
+type tuiNotifyWizardState struct {
+	kind       tuiNotifyWizardKind
+	step       tuiNotifyStep
+	value      string
+	userID     string
+	botToken   string
+	chatID     string
+	serverName string
+	enabled    bool
+	interval   string
+	daily      string
+	message    string
+}
+
 type tuiModel struct {
-	app     *App
-	cfg     Config
-	stats   StatsState
-	mode    tuiView
-	cursor  int
-	input   tuiInputState
-	confirm tuiConfirmState
-	status  string
-	err     string
+	app           *App
+	cfg           Config
+	stats         StatsState
+	mode          tuiView
+	cursor        int
+	input         tuiInputState
+	confirm       tuiConfirmState
+	forwardWizard tuiForwardWizardState
+	notifyWizard  tuiNotifyWizardState
+	status        string
+	err           string
 }
 
 func (a *App) runTUI() error {
@@ -109,6 +192,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateForwards(key)
 	case tuiStats:
 		return m.updateStats(key)
+	case tuiNotify:
+		return m.updateNotify(key)
 	case tuiRuntime:
 		return m.updateRuntime(key)
 	case tuiDoctor:
@@ -117,6 +202,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateInput(key)
 	case tuiConfirm:
 		return m.updateConfirm(key)
+	case tuiForwardWizard:
+		return m.updateForwardWizard(key)
+	case tuiNotifyWizard:
+		return m.updateNotifyWizard(key)
 	default:
 		return m, nil
 	}
@@ -132,6 +221,8 @@ func (m tuiModel) View() string {
 		return m.viewForwards()
 	case tuiStats:
 		return m.viewStats()
+	case tuiNotify:
+		return m.viewNotify()
 	case tuiRuntime:
 		return m.viewRuntime()
 	case tuiDoctor:
@@ -140,6 +231,10 @@ func (m tuiModel) View() string {
 		return m.viewInput()
 	case tuiConfirm:
 		return m.viewConfirm()
+	case tuiForwardWizard:
+		return m.viewForwardWizard()
+	case tuiNotifyWizard:
+		return m.viewNotifyWizard()
 	default:
 		return m.viewHome()
 	}
@@ -149,10 +244,10 @@ func (m tuiModel) updateHome(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if quit, cmd := tuiShouldQuit(key); quit {
 		return m, cmd
 	}
-	if moved, ok := m.moveCursor(key, 6); ok {
+	if moved, ok := m.moveCursor(key, 7); ok {
 		return moved, nil
 	}
-	idx, ok := m.choice(key, 6)
+	idx, ok := m.choice(key, 7)
 	if !ok {
 		return m, nil
 	}
@@ -169,8 +264,10 @@ func (m tuiModel) updateHome(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 3:
 		m.mode = tuiStats
 	case 4:
-		m.mode = tuiRuntime
+		m.mode = tuiNotify
 	case 5:
+		m.mode = tuiRuntime
+	case 6:
 		m.mode = tuiDoctor
 	}
 	return m, nil
@@ -180,8 +277,9 @@ func (m tuiModel) viewHome() string {
 	rows := []tuiRow{
 		{text: "状态", hint: "DB / socket / 规则摘要", detail: "查看 SQLite 运行态和基础对象数量。"},
 		{text: "用户", hint: "查看、添加、删除", detail: "管理用户；删除前需要确认。"},
-		{text: "转发规则", hint: "查看、添加、启停、删除", detail: "管理常用转发规则，高级字段继续使用 CLI。"},
+		{text: "转发规则", hint: "查看、添加、编辑、启停、删除", detail: "管理转发规则及 SNAT/MSS/限速等高级字段。"},
 		{text: "统计", hint: "总量和规则用量", detail: "查看 billing/input/output 统计摘要。"},
+		{text: "通知", hint: "Telegram 配置、发送、计划", detail: "配置用户 Telegram，发送测试或手动消息。"},
 		{text: "运行态", hint: "refresh / restart / status", detail: "编译并应用运行态，或查看 render status 摘要。"},
 		{text: "诊断", hint: "doctor", detail: "运行 DB 化诊断。"},
 	}
@@ -273,15 +371,11 @@ func (m tuiModel) updateForwards(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return moved, nil
 	}
 	if key.String() == "a" {
-		return m.inputPrompt("添加转发", "格式：user remote listen_port [protocol] [comment]，例：alice example.com:443 25001 tcp web", tuiForwards, func(m *tuiModel, value string) error {
-			return m.addForward(value)
-		}), nil
+		return m.startAddForwardWizard(), nil
 	}
 	if m.cursor >= len(forwards) {
 		if m.enterKey(key) {
-			return m.inputPrompt("添加转发", "格式：user remote listen_port [protocol] [comment]", tuiForwards, func(m *tuiModel, value string) error {
-				return m.addForward(value)
-			}), nil
+			return m.startAddForwardWizard(), nil
 		}
 		return m, nil
 	}
@@ -298,6 +392,8 @@ func (m tuiModel) updateForwards(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.confirmPrompt("删除转发", fmt.Sprintf("确认删除转发 %s？", fwd.ID), "Y 确认 • 其它键取消", tuiForwards, func(m *tuiModel) error {
 			return m.deleteForward(fwd.ID)
 		}), nil
+	case "e":
+		return m.startEditForwardWizard(fwd), nil
 	}
 	return m, nil
 }
@@ -311,12 +407,12 @@ func (m tuiModel) viewForwards() string {
 		}
 		rows = append(rows, tuiRow{
 			text:   fmt.Sprintf("%s  %s:%d -> %s  %s", fwd.ID, fwd.ListenIP, fwd.ListenPort, formatRemote(fwd.RemoteHost, fwd.RemotePort), state),
-			hint:   fmt.Sprintf("user=%s proto=%s", fwd.UserID, fwd.Protocol),
-			detail: "Space/Enter 启停；d 删除；a 添加。",
+			hint:   forwardTUIHint(fwd),
+			detail: "Space/Enter 启停；e 编辑；d 删除；a 添加。",
 		})
 	}
-	rows = append(rows, tuiRow{text: "添加转发", hint: "user remote listen_port [protocol] [comment]", detail: "高级字段如 SNAT/MSS/限速继续使用 CLI。"})
-	return m.renderRows("转发规则", rows, "a 添加 • Space/Enter 启停 • d 删除 • h/0/Esc 返回 • q 退出")
+	rows = append(rows, tuiRow{text: "添加转发", hint: "先选择用户，再逐步填写参数", detail: "向导包含 SNAT/MSS/到期/限速等高级选项。"})
+	return m.renderRows("转发规则", rows, "a 添加 • e 编辑 • Space/Enter 启停 • d 删除 • h/0/Esc 返回 • q 退出")
 }
 
 func (m tuiModel) updateStats(key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -519,8 +615,25 @@ func (m tuiModel) renderRowsBody(rows []tuiRow) string {
 	if len(rows) == 0 {
 		return tuiHelpStyle.Render("暂无数据") + "\n"
 	}
+	const visibleRows = 14
+	start, end := 0, len(rows)
+	if len(rows) > visibleRows {
+		start = m.cursor - visibleRows/2
+		if start < 0 {
+			start = 0
+		}
+		end = start + visibleRows
+		if end > len(rows) {
+			end = len(rows)
+			start = end - visibleRows
+		}
+	}
 	var b strings.Builder
-	for i, row := range rows {
+	if start > 0 {
+		fmt.Fprintf(&b, "  %s\n", tuiHelpStyle.Render(fmt.Sprintf("... 上方 %d 项", start)))
+	}
+	for i := start; i < end; i++ {
+		row := rows[i]
 		prefix := "  "
 		line := fmt.Sprintf("%s%d. %s", prefix, i+1, row.text)
 		if row.hint != "" {
@@ -533,6 +646,9 @@ func (m tuiModel) renderRowsBody(rows []tuiRow) string {
 		if i == m.cursor && row.detail != "" {
 			b.WriteString("    " + tuiHelpStyle.Render(row.detail) + "\n")
 		}
+	}
+	if end < len(rows) {
+		fmt.Fprintf(&b, "  %s\n", tuiHelpStyle.Render(fmt.Sprintf("... 下方 %d 项", len(rows)-end)))
 	}
 	return b.String()
 }
@@ -713,82 +829,6 @@ func (m *tuiModel) deleteUser(id string) error {
 		return err
 	}
 	m.status = "用户已删除：" + id
-	m.err = ""
-	return nil
-}
-
-func (m *tuiModel) addForward(value string) error {
-	fields := strings.Fields(value)
-	if len(fields) < 3 {
-		return fmt.Errorf("格式：user remote listen_port [protocol] [comment]")
-	}
-	userID := normalizeUserID(fields[0])
-	remoteHost, remotePorts, err := parseHostPortSpec(fields[1])
-	if err != nil {
-		return err
-	}
-	if len(remotePorts) != 1 {
-		return fmt.Errorf("TUI 添加转发一次只支持一个远端端口")
-	}
-	listenPort, err := parsePort(fields[2])
-	if err != nil {
-		return err
-	}
-	protocol := "tcp_udp"
-	if len(fields) >= 4 {
-		protocol = fields[3]
-	}
-	if err := validateProtocol(protocol); err != nil {
-		return err
-	}
-	comment := ""
-	if len(fields) >= 5 {
-		comment = strings.Join(fields[4:], " ")
-	}
-	if err := m.withStore(func(ctx context.Context, store *Store) error {
-		cfg, err := loadConfig(ctx, store)
-		if err != nil {
-			return err
-		}
-		if _, ok := findUser(cfg, userID); !ok {
-			return fmt.Errorf("用户不存在：%s", userID)
-		}
-		for _, existing := range cfg.Forwards {
-			if existing.ListenPort == listenPort && protocolsConflict(protocol, existing.Protocol) {
-				return fmt.Errorf("监听端口已配置冲突协议：%d", listenPort)
-			}
-		}
-		id, err := randomID("fwd")
-		if err != nil {
-			return err
-		}
-		cfg.Forwards = append(cfg.Forwards, Forward{
-			ID:           id,
-			UserID:       userID,
-			ListenIP:     cfg.Settings.DefaultListenIP,
-			ListenPort:   listenPort,
-			RemoteHost:   remoteHost,
-			RemotePort:   remotePorts[0],
-			Protocol:     protocol,
-			Enabled:      true,
-			TrafficMode:  "two-way",
-			TrafficRatio: 1,
-			Comment:      ptrString(comment),
-			Net:          NetConfig{SNATMode: "masquerade"},
-			CreatedAt:    nowISO(),
-		})
-		if err := saveConfig(ctx, store, cfg); err != nil {
-			return err
-		}
-		if err := m.app.refresh(ctx, store, false); err != nil {
-			return err
-		}
-		m.cfg = cfg
-		return nil
-	}); err != nil {
-		return err
-	}
-	m.status = "转发已添加"
 	m.err = ""
 	return nil
 }

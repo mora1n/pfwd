@@ -9,12 +9,12 @@ import (
 const (
 	keyConfig          = "config_json"
 	keyStats           = "stats_json"
-	keyRuntime         = "runtime_json"
-	keyRuntimeXDP      = "runtime_xdp_json"
-	keyRuntimeNFT      = "runtime_nft_json"
+	keyRuntime         = "runtime"
+	keyRuntimeXDP      = "runtime_xdp"
+	keyRuntimeNFT      = "runtime_nft"
 	keyRenderedNFT     = "rendered_nft"
-	keyForwarderStatus = "forwarder_status_json"
-	keyXDPStatus       = "xdp_status_json"
+	keyForwarderStatus = "forwarder_status"
+	keyXDPStatus       = "xdp_status"
 )
 
 func loadConfig(ctx context.Context, store *Store) (Config, error) {

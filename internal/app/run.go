@@ -11,8 +11,9 @@ import (
 )
 
 type App struct {
-	Build BuildInfo
-	Paths Paths
+	Build          BuildInfo
+	Paths          Paths
+	telegramSender telegramSender
 }
 
 func Run(args []string, build BuildInfo) error {
@@ -100,7 +101,7 @@ func (a *App) run(args []string) error {
 		return a.runUpdate(args)
 	case "uninstall":
 		return a.runUninstall(args)
-	case "notify-test", "notify-enable", "notify-schedule", "notify-disable", "notify-delete":
+	case "notify-send", "notify-test", "notify-enable", "notify-schedule", "notify-disable", "notify-delete":
 		return a.runNotify(cmd, args)
 	default:
 		return fmt.Errorf("未知命令：%s", cmd)
@@ -134,44 +135,94 @@ func isTerminal(fd uintptr) bool {
 }
 
 func (a *App) printHelp(w io.Writer) {
-	fmt.Fprintln(w, `pfwd - Go 单二进制端口转发管理工具
+	fmt.Fprintln(w, "pfwd - Go 单二进制端口转发管理工具")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "用法：pfwd [command] [options]")
+	fmt.Fprintln(w)
+	for _, section := range helpSections() {
+		fmt.Fprintln(w, section.title+"：")
+		for _, row := range section.rows {
+			fmt.Fprintf(w, "  %-64s %s\n", row.command, row.detail)
+		}
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w, "运行时不再写入 /run/pfwd/*.json；配置、统计、运行态和状态都保存在 pfwd.db。")
+}
 
-用法：
-  pfwd
-  pfwd tui
-  pfwd init
-  pfwd user add <username>
-  pfwd user list
-  pfwd user delete <username> [--cascade]
-  pfwd add --user-id ID --remote HOST:PORT[,PORT]|HOST:START-END --listen-port PORT[,PORT]|START-END [--listen-ip IP] [--protocol tcp|udp|tcp_udp] [--traffic-mode one-way|two-way] [--traffic-ratio 1.0] [--comment TEXT] [--mss-clamp|--mss VALUE] [--masquerade|--snat-source IP]
-  pfwd list [--user-id ID]
-  pfwd start <forward_id>
-  pfwd stop <forward_id>
-  pfwd delete <forward_id>
-  pfwd stats [--user-id ID|--forward-id ID]
-  pfwd export [file]
-  pfwd import <file>
-  pfwd render [config|stats|forwarder|xdp|nft|status|units]
-  pfwd refresh
-  pfwd restart
-  pfwd reconcile
-  pfwd daemon [--socket PATH] [--db PATH]
-  pfwd service status|reload [--socket PATH]
-  pfwd store get|put [--socket PATH|--db PATH] --key KEY
-  pfwd xdp apply|remove|status|snapshot|stats ...
-  pfwd doctor
-  pfwd install
-  pfwd update [--yes]
-  pfwd uninstall
+type helpSection struct {
+	title string
+	rows  []helpRow
+}
 
-环境变量：
-  PFWD_ROOT_PREFIX       测试/安装根目录前缀。默认：/
-  PFWD_DB_FILE           覆盖 SQLite 数据库路径。默认：/var/lib/pfwd/pfwd.db
-  PFWD_SERVICE_SOCKET    覆盖本地 Unix socket 路径。默认：/run/pfwd/pfwd.sock
-  PFWD_RELEASE_ASSET_BASE_URL 覆盖 GitHub Release 下载基址。
-  PFWD_DRY_RUN           设置为 1 时只打印会修改系统的命令。
+type helpRow struct {
+	command string
+	detail  string
+}
 
-运行时不再写入 /run/pfwd/*.json；配置、统计、运行态和状态都保存在 pfwd.db。`)
+func helpSections() []helpSection {
+	return []helpSection{
+		{title: "基础", rows: []helpRow{
+			{command: "pfwd", detail: "打开交互式 TUI。"},
+			{command: "pfwd tui", detail: "显式打开交互式 TUI。"},
+			{command: "pfwd init", detail: "初始化 SQLite 数据库和默认配置。"},
+			{command: "pfwd version", detail: "显示版本、commit 和构建时间。"},
+			{command: "pfwd help|-h|--help", detail: "显示本帮助。"},
+		}},
+		{title: "用户", rows: []helpRow{
+			{command: "pfwd user add <username>", detail: "创建用户。"},
+			{command: "pfwd user list", detail: "列出用户。"},
+			{command: "pfwd user delete <username> [--cascade]", detail: "删除用户；有关联转发时需 --cascade。"},
+			{command: "pfwd user telegram <username>|--all --bot-token TOKEN --chat-id CHAT_ID [--server-name NAME] [--enabled true|false]", detail: "配置 Telegram 通知。"},
+			{command: "pfwd user-forwards-limit --user-id ID [--traffic BYTES|--traffic-mode MODE|--rate RATE]", detail: "设置用户级转发默认限制。"},
+		}},
+		{title: "转发", rows: []helpRow{
+			{command: "pfwd add --user-id ID --remote HOST:PORT --listen-port PORT [options]", detail: "添加转发；支持端口列表/范围。"},
+			{command: "pfwd forward set <forward_id> [options]", detail: "编辑转发规则字段。"},
+			{command: "pfwd list [--user-id ID]", detail: "列出转发规则。"},
+			{command: "pfwd start <forward_id>", detail: "启用转发规则并刷新运行态。"},
+			{command: "pfwd stop <forward_id>", detail: "停用转发规则并刷新运行态。"},
+			{command: "pfwd delete <forward_id>", detail: "删除转发规则并刷新运行态。"},
+			{command: "pfwd expire <forward_id> [--stop-at TIME|--clear]", detail: "设置或清除规则到期时间。"},
+			{command: "pfwd limit <forward_id> [--traffic BYTES|--traffic-mode MODE|--traffic-ratio N|--rate RATE]", detail: "设置规则流量统计、倍率和限速。"},
+		}},
+		{title: "统计和流量", rows: []helpRow{
+			{command: "pfwd stats [--user-id ID|--forward-id ID]", detail: "查看用户或规则流量统计。"},
+			{command: "pfwd traffic reset [--user-id ID|--forward-id ID] [--used BYTES]", detail: "重置或写入统计用量。"},
+		}},
+		{title: "Telegram 通知", rows: []helpRow{
+			{command: "pfwd notify-send --user-id ID --text TEXT", detail: "向用户配置的 Telegram chat 主动发送一条消息。"},
+			{command: "pfwd notify-test --user-id ID", detail: "发送测试通知。"},
+			{command: "pfwd notify-enable --user-id ID", detail: "启用该用户通知。"},
+			{command: "pfwd notify-disable --user-id ID", detail: "停用该用户通知。"},
+			{command: "pfwd notify-delete --user-id ID", detail: "删除该用户 Telegram 配置。"},
+			{command: "pfwd notify-schedule --user-id ID [--interval-minutes N|--clear-interval] [--daily-time HH:MM|--clear-daily]", detail: "配置计划通知。"},
+		}},
+		{title: "运行态和服务", rows: []helpRow{
+			{command: "pfwd render [config|stats|forwarder|xdp|nft|status|units]", detail: "渲染配置、运行态、nftables 或 systemd unit。"},
+			{command: "pfwd refresh", detail: "编译并应用当前运行态。"},
+			{command: "pfwd restart", detail: "重新应用运行态。"},
+			{command: "pfwd reconcile", detail: "执行守护进程周期 reconcile。"},
+			{command: "pfwd daemon [--socket PATH] [--db PATH]", detail: "以前台方式运行单进程守护服务。"},
+			{command: "pfwd service status|reload [--socket PATH]", detail: "通过 Unix socket 查询或触发服务动作。"},
+			{command: "pfwd store get|put [--socket PATH|--db PATH] --key KEY", detail: "读写 SQLite runtime_state 键。"},
+			{command: "pfwd xdp apply|remove|status|snapshot|stats ...", detail: "XDP helper 子命令。"},
+			{command: "pfwd doctor", detail: "运行本地诊断。"},
+		}},
+		{title: "导入导出和安装", rows: []helpRow{
+			{command: "pfwd export [file]", detail: "导出配置和统计。"},
+			{command: "pfwd import <file>", detail: "导入配置和统计。"},
+			{command: "pfwd install", detail: "安装二进制、state dir 和 pfwd.service。"},
+			{command: "pfwd update [--yes]", detail: "从 GitHub Release 更新当前安装。"},
+			{command: "pfwd uninstall", detail: "卸载服务和运行时文件。"},
+		}},
+		{title: "环境变量", rows: []helpRow{
+			{command: "PFWD_ROOT_PREFIX", detail: "测试/安装根目录前缀；默认 /。"},
+			{command: "PFWD_DB_FILE", detail: "覆盖 SQLite 数据库路径；默认 /var/lib/pfwd/pfwd.db。"},
+			{command: "PFWD_SERVICE_SOCKET", detail: "覆盖 Unix socket 路径；默认 /run/pfwd/pfwd.sock。"},
+			{command: "PFWD_RELEASE_ASSET_BASE_URL", detail: "覆盖 GitHub Release 下载基址。"},
+			{command: "PFWD_DRY_RUN", detail: "设置为 1 时只打印会修改系统的命令。"},
+		}},
+	}
 }
 
 func (a *App) runUser(args []string) error {

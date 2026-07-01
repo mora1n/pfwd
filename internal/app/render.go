@@ -176,8 +176,8 @@ func (a *App) runDoctor(args []string) error {
 		fmt.Printf("stats_users: %d\n", len(stats.Users))
 		fmt.Printf("stats_forwards: %d\n", len(stats.Forwards))
 		fmt.Println("runtime_state: db")
-		for _, key := range []string{keyConfig, keyStats, keyRuntime, keyRuntimeXDP, keyRuntimeNFT, keyRenderedNFT, keyForwarderStatus, keyXDPStatus} {
-			_, ok, err := store.GetRaw(ctx, key)
+		for _, row := range runtimeStateDoctorRows() {
+			_, ok, err := store.GetRaw(ctx, row.key)
 			if err != nil {
 				return err
 			}
@@ -185,10 +185,28 @@ func (a *App) runDoctor(args []string) error {
 			if ok {
 				status = "present"
 			}
-			fmt.Printf("%s: %s\n", key, status)
+			fmt.Printf("%s: %s\n", row.label, status)
 		}
 		return nil
 	})
+}
+
+type runtimeStateDoctorRow struct {
+	label string
+	key   string
+}
+
+func runtimeStateDoctorRows() []runtimeStateDoctorRow {
+	return []runtimeStateDoctorRow{
+		{label: "config", key: keyConfig},
+		{label: "stats", key: keyStats},
+		{label: "runtime", key: keyRuntime},
+		{label: "runtime_xdp", key: keyRuntimeXDP},
+		{label: "runtime_nft", key: keyRuntimeNFT},
+		{label: "rendered_nft", key: keyRenderedNFT},
+		{label: "forwarder_status", key: keyForwarderStatus},
+		{label: "xdp_status", key: keyXDPStatus},
+	}
 }
 
 func (a *App) serviceUnit() string {
@@ -305,7 +323,22 @@ func (a *App) runInstall(args []string) error {
 	}
 	_ = runCommand("systemctl", "daemon-reload")
 	_ = runCommand("systemctl", "enable", "--now", "pfwd.service")
-	fmt.Printf("已安装：%s\n", a.Paths.BinPath)
+	fmt.Printf(`
+pfwd installed successfully.
+
+Installed files:
+  binary:        %s
+  state dir:     %s
+  database:      %s
+  systemd unit:  %s
+
+Service:
+  name:          pfwd.service
+  status:        systemctl status pfwd.service
+
+Next step:
+  pfwd
+`, a.Paths.BinPath, a.Paths.StateDir, a.Paths.DBPath, filepath.Join(a.Paths.SystemdDir, "pfwd.service"))
 	return nil
 }
 

@@ -40,4 +40,3 @@ chmod 755 "$tmp"
 mv "$tmp" "$install_path"
 
 "$install_path" install
-"$install_path" doctor
