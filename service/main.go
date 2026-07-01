@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -24,11 +23,10 @@ import (
 )
 
 const (
-	defaultDBPath            = "/var/lib/pfwd/sqlite.db"
+	defaultDBPath            = "/var/lib/pfwd/pfwd.db"
 	defaultSocketPath        = "/run/pfwd/pfwd.sock"
-	defaultPFWDBinPath       = "/usr/local/bin/pfwd"
 	defaultReconcileInterval = 60 * time.Second
-	schemaVersion            = "1"
+	schemaVersion            = "2"
 )
 
 type dbHandle struct {
@@ -48,7 +46,6 @@ type daemonStatus struct {
 	ReloadedAt    string                     `json:"reloaded_at,omitempty"`
 	DBPath        string                     `json:"db_path"`
 	SocketPath    string                     `json:"socket_path"`
-	PFWDBin       string                     `json:"pfwd_bin"`
 	SchemaVersion string                     `json:"schema_version"`
 	Components    map[string]componentStatus `json:"components"`
 }
@@ -56,21 +53,30 @@ type daemonStatus struct {
 type daemonConfig struct {
 	SocketPath        string
 	DBPath            string
-	PFWDBin           string
 	ReconcileInterval time.Duration
+	CommandRunner     CommandRunner
 }
 
 type server struct {
 	socketPath        string
 	dbPath            string
-	pfwdBin           string
 	reconcileInterval time.Duration
+	commandRunner     CommandRunner
 	startedAt         string
 
 	mu        sync.Mutex
 	status    daemonStatus
 	reloadMu  sync.Mutex
 	commandMu sync.Mutex
+}
+
+type CommandRunner func(ctx context.Context, args ...string) (string, error)
+
+type DaemonConfig struct {
+	SocketPath        string
+	DBPath            string
+	ReconcileInterval time.Duration
+	CommandRunner     CommandRunner
 }
 
 type storeRequest struct {
@@ -83,14 +89,7 @@ type storeResponse struct {
 	Value json.RawMessage `json:"value"`
 }
 
-func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-}
-
-func run(args []string) error {
+func Run(args []string) error {
 	cmd := "help"
 	if len(args) > 0 {
 		cmd = args[0]
@@ -106,7 +105,7 @@ func run(args []string) error {
 	case "store":
 		return runStore(args)
 	case "version":
-		fmt.Println("pfwd-service 0.1.0")
+		fmt.Println("pfwd service")
 		return nil
 	case "help", "-h", "--help":
 		printHelp()
@@ -204,31 +203,28 @@ func runStorePut(args []string, reader io.Reader) error {
 }
 
 func printHelp() {
-	fmt.Println(`pfwd-service
+	fmt.Println(`pfwd service
 
 用法：
-  pfwd-service daemon [--socket PATH] [--db PATH] [--pfwd-bin PATH]
-  pfwd-service status [--socket PATH]
-  pfwd-service reload [--socket PATH]
-  pfwd-service store get [--socket PATH|--db PATH] --key KEY
-  pfwd-service store put [--socket PATH|--db PATH] --key KEY
-  pfwd-service version`)
+  pfwd daemon [--socket PATH] [--db PATH]
+  pfwd service status [--socket PATH]
+  pfwd service reload [--socket PATH]
+  pfwd store get [--socket PATH|--db PATH] --key KEY
+  pfwd store put [--socket PATH|--db PATH] --key KEY`)
 }
 
 func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	socketPath := fs.String("socket", defaultSocketPath, "Unix socket path")
 	dbPath := fs.String("db", defaultDBPath, "SQLite DB path")
-	pfwdBin := fs.String("pfwd-bin", defaultPFWDBinPath, "pfwd shell entrypoint path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serve(ctx, daemonConfig{
+	return Serve(ctx, DaemonConfig{
 		SocketPath:        *socketPath,
 		DBPath:            *dbPath,
-		PFWDBin:           *pfwdBin,
 		ReconcileInterval: defaultReconcileInterval,
 	})
 }
@@ -252,7 +248,6 @@ func runStatus(args []string) error {
 	fmt.Printf("reloaded_at: %s\n", status.ReloadedAt)
 	fmt.Printf("db: %s\n", status.DBPath)
 	fmt.Printf("socket: %s\n", status.SocketPath)
-	fmt.Printf("pfwd_bin: %s\n", status.PFWDBin)
 	fmt.Printf("schema_version: %s\n", status.SchemaVersion)
 	for _, name := range []string{"sqlite", "runtime", "reconcile"} {
 		c, ok := status.Components[name]
@@ -284,7 +279,7 @@ func runReload(args []string) error {
 	return nil
 }
 
-func serve(ctx context.Context, cfg daemonConfig) error {
+func Serve(ctx context.Context, cfg DaemonConfig) error {
 	cfg = normalizeDaemonConfig(cfg)
 	s := newServer(cfg)
 	if err := s.reload(); err != nil {
@@ -334,33 +329,29 @@ func serve(ctx context.Context, cfg daemonConfig) error {
 	}
 }
 
-func normalizeDaemonConfig(cfg daemonConfig) daemonConfig {
+func normalizeDaemonConfig(cfg DaemonConfig) DaemonConfig {
 	if strings.TrimSpace(cfg.SocketPath) == "" {
 		cfg.SocketPath = defaultSocketPath
 	}
 	if strings.TrimSpace(cfg.DBPath) == "" {
 		cfg.DBPath = defaultDBPath
 	}
-	if strings.TrimSpace(cfg.PFWDBin) == "" {
-		cfg.PFWDBin = defaultPFWDBinPath
-	}
 	return cfg
 }
 
-func newServer(cfg daemonConfig) *server {
+func newServer(cfg DaemonConfig) *server {
 	startedAt := nowISO()
 	return &server{
 		socketPath:        cfg.SocketPath,
 		dbPath:            cfg.DBPath,
-		pfwdBin:           cfg.PFWDBin,
 		reconcileInterval: cfg.ReconcileInterval,
+		commandRunner:     cfg.CommandRunner,
 		startedAt:         startedAt,
 		status: daemonStatus{
 			OK:         true,
 			StartedAt:  startedAt,
 			DBPath:     cfg.DBPath,
 			SocketPath: cfg.SocketPath,
-			PFWDBin:    cfg.PFWDBin,
 			Components: map[string]componentStatus{
 				"sqlite":    component("starting", "initializing sqlite", nil),
 				"runtime":   component("pending", "startup refresh pending", nil),
@@ -390,7 +381,6 @@ func (s *server) reload() error {
 	s.status.ReloadedAt = nowISO()
 	s.status.DBPath = s.dbPath
 	s.status.SocketPath = s.socketPath
-	s.status.PFWDBin = s.pfwdBin
 	s.status.SchemaVersion = version
 	if s.status.Components == nil {
 		s.status.Components = make(map[string]componentStatus)
@@ -479,8 +469,8 @@ func (s *server) runReconcileLoop(ctx context.Context) {
 }
 
 func (s *server) runPFWDCommand(ctx context.Context, componentName string, args ...string) error {
-	if strings.TrimSpace(s.pfwdBin) == "" {
-		err := errors.New("pfwd-bin 为空")
+	if s.commandRunner == nil {
+		err := errors.New("daemon command runner 未配置")
 		s.updateComponent(componentName, component("error", "", err))
 		return err
 	}
@@ -488,13 +478,8 @@ func (s *server) runPFWDCommand(ctx context.Context, componentName string, args 
 	s.commandMu.Lock()
 	defer s.commandMu.Unlock()
 	s.updateComponent(componentName, component("running", commandLabel, nil))
-	cmd := exec.CommandContext(ctx, s.pfwdBin, args...)
-	cmd.Env = append(os.Environ(),
-		"PFWD_SERVICE_SOCKET="+s.socketPath,
-		"PFWD_DB_FILE="+s.dbPath,
-	)
-	output, err := cmd.CombinedOutput()
-	message := strings.TrimSpace(string(output))
+	message, err := s.commandRunner(ctx, args...)
+	message = strings.TrimSpace(message)
 	if err != nil {
 		if message != "" {
 			err = fmt.Errorf("%w: %s", err, message)
@@ -608,7 +593,8 @@ func (db *dbHandle) init(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS forwards(id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS traffic_state(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS runtime_state(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
-		`INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '` + schemaVersion + `')`,
+		`INSERT INTO meta(key, value) VALUES('schema_version', '` + schemaVersion + `')
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {

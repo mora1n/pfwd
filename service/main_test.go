@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"bytes"
@@ -17,7 +17,7 @@ import (
 
 func TestOpenDBInitializesSchema(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(filepath.Join(dir, "sqlite.db"))
+	db, err := openDB(filepath.Join(dir, "pfwd.db"))
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -34,9 +34,9 @@ func TestOpenDBInitializesSchema(t *testing.T) {
 func TestDaemonStatusAndReload(t *testing.T) {
 	dir := t.TempDir()
 	socketPath := filepath.Join(dir, "pfwd.sock")
-	dbPath := filepath.Join(dir, "sqlite.db")
-	pfwdBin, logPath := writeFakePFWD(t, dir, 0)
-	cancel, errCh := startTestDaemon(t, socketPath, dbPath, pfwdBin, 0)
+	dbPath := filepath.Join(dir, "pfwd.db")
+	logPath := filepath.Join(dir, "pfwd.log")
+	cancel, errCh := startTestDaemon(t, socketPath, dbPath, logPath, 0)
 	data, err := socketRequest(http.MethodGet, socketPath, "/v1/status")
 	if err != nil {
 		t.Fatalf("status: %v", err)
@@ -61,7 +61,7 @@ func TestDaemonStatusAndReload(t *testing.T) {
 
 func TestStorePutAndGet(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "sqlite.db")
+	dbPath := filepath.Join(dir, "pfwd.db")
 	if err := runStorePut([]string{"--db", dbPath, "--key", "config_json"}, bytes.NewBufferString(`{"ok":true}`)); err != nil {
 		t.Fatalf("store put: %v", err)
 	}
@@ -82,9 +82,9 @@ func TestStorePutAndGet(t *testing.T) {
 func TestSocketStorePutAndGet(t *testing.T) {
 	dir := t.TempDir()
 	socketPath := filepath.Join(dir, "pfwd.sock")
-	dbPath := filepath.Join(dir, "sqlite.db")
-	pfwdBin, _ := writeFakePFWD(t, dir, 0)
-	cancel, errCh := startTestDaemon(t, socketPath, dbPath, pfwdBin, 0)
+	dbPath := filepath.Join(dir, "pfwd.db")
+	logPath := filepath.Join(dir, "pfwd.log")
+	cancel, errCh := startTestDaemon(t, socketPath, dbPath, logPath, 0)
 	if err := runStorePut([]string{"--socket", socketPath, "--key", "config_json"}, bytes.NewBufferString(`{"from":"socket"}`)); err != nil {
 		t.Fatalf("socket store put: %v", err)
 	}
@@ -109,9 +109,9 @@ func TestSocketStorePutAndGet(t *testing.T) {
 func TestDaemonRunsBootRefreshAndPeriodicReconcile(t *testing.T) {
 	dir := t.TempDir()
 	socketPath := filepath.Join(dir, "pfwd.sock")
-	dbPath := filepath.Join(dir, "sqlite.db")
-	pfwdBin, logPath := writeFakePFWD(t, dir, 0)
-	cancel, errCh := startTestDaemon(t, socketPath, dbPath, pfwdBin, 25*time.Millisecond)
+	dbPath := filepath.Join(dir, "pfwd.db")
+	logPath := filepath.Join(dir, "pfwd.log")
+	cancel, errCh := startTestDaemon(t, socketPath, dbPath, logPath, 25*time.Millisecond)
 	waitForLogCount(t, logPath, "refresh", 1)
 	waitForLogCount(t, logPath, "reconcile", 1)
 	cancel()
@@ -125,32 +125,32 @@ func TestDaemonRunsBootRefreshAndPeriodicReconcile(t *testing.T) {
 	}
 }
 
-func startTestDaemon(t *testing.T, socketPath, dbPath, pfwdBin string, reconcileInterval time.Duration) (context.CancelFunc, <-chan error) {
+func startTestDaemon(t *testing.T, socketPath, dbPath, logPath string, reconcileInterval time.Duration) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- serve(ctx, daemonConfig{
+		errCh <- Serve(ctx, DaemonConfig{
 			SocketPath:        socketPath,
 			DBPath:            dbPath,
-			PFWDBin:           pfwdBin,
 			ReconcileInterval: reconcileInterval,
+			CommandRunner: func(_ context.Context, args ...string) (string, error) {
+				if len(args) > 0 {
+					f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+					if err != nil {
+						return "", err
+					}
+					defer f.Close()
+					_, err = fmt.Fprintln(f, args[0])
+					return strings.Join(args, " ") + " ok", err
+				}
+				return "", nil
+			},
 		})
 	}()
 	waitForSocket(t, socketPath)
 	t.Cleanup(cancel)
 	return cancel, errCh
-}
-
-func writeFakePFWD(t *testing.T, dir string, exitCode int) (string, string) {
-	t.Helper()
-	logPath := filepath.Join(dir, "pfwd.log")
-	binPath := filepath.Join(dir, "pfwd")
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$1\" >> %q\nexit %d\n", logPath, exitCode)
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake pfwd: %v", err)
-	}
-	return binPath, logPath
 }
 
 func waitForLogCount(t *testing.T, logPath, entry string, want int) {

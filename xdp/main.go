@@ -1,4 +1,4 @@
-package main
+package xdp
 
 import (
 	"bytes"
@@ -397,14 +397,7 @@ type reverseKey struct {
 	TargetAddr [16]byte
 }
 
-func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "pfwd-xdp: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func run(args []string) error {
+func Run(args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
@@ -601,7 +594,7 @@ func applyRuntime(opts applyOptions) error {
 		if err := applyIncrementalRuntime(currentStatus, runtimeData, opts, iface, configHash); err == nil {
 			return nil
 		} else if !opts.Quiet {
-			fmt.Fprintf(os.Stderr, "pfwd-xdp: incremental apply 失败，执行 full reattach: %v\n", err)
+			fmt.Fprintf(os.Stderr, "pfwd xdp: incremental apply 失败，执行 full reattach: %v\n", err)
 		}
 	}
 	fullStartedAt := time.Now().UTC()
@@ -639,33 +632,33 @@ func applyRuntime(opts applyOptions) error {
 	recordAttachTiming(&attachTimings, "xdp", xdpAttachStart)
 	statusStart := time.Now()
 	payload := statusPayload{
-		Applied:            true,
-		BinaryVersion:      binaryVersion,
-		AppliedAt:          time.Now().UTC().Format(time.RFC3339),
-		Interface:          iface.Name,
-		InterfaceIndex:     iface.Index,
-		XDPEffective:       xdpEffective,
-		XDPAttachKind:      xdpKind,
-		XDPReason:          xdpReason,
-		RuntimeFile:        opts.RuntimeFile,
-		StateFile:          opts.StateFile,
-		ConfigHash:         configHash,
-		RuntimeEpoch:       configHash,
-		DataplaneVersion:   dataplaneVersion,
-		MapABIVersion:      mapABIVersion,
-		IncrementalApply:   false,
-		ReattachReason:     "full-reattach",
-		ProfileCounts:      profileCounts(runtimeData),
-		Rules:              len(runtimeData.Rules),
-		Users:              len(runtimeData.Users),
-		XDPPin:             opts.XDPPin,
-		LoopbackPin:        opts.LoopbackPin,
-		SkLookupPin:        opts.SkLookupPin,
-		RuleCounterPin:     opts.RuleCounterPin,
-		UserCounterPin:     opts.UserCounterPin,
-		StatsPin:           opts.StatsPin,
-		ActiveSummary:      &connSummary{},
-		PreservedConnections: 0,
+		Applied:                true,
+		BinaryVersion:          binaryVersion,
+		AppliedAt:              time.Now().UTC().Format(time.RFC3339),
+		Interface:              iface.Name,
+		InterfaceIndex:         iface.Index,
+		XDPEffective:           xdpEffective,
+		XDPAttachKind:          xdpKind,
+		XDPReason:              xdpReason,
+		RuntimeFile:            opts.RuntimeFile,
+		StateFile:              opts.StateFile,
+		ConfigHash:             configHash,
+		RuntimeEpoch:           configHash,
+		DataplaneVersion:       dataplaneVersion,
+		MapABIVersion:          mapABIVersion,
+		IncrementalApply:       false,
+		ReattachReason:         "full-reattach",
+		ProfileCounts:          profileCounts(runtimeData),
+		Rules:                  len(runtimeData.Rules),
+		Users:                  len(runtimeData.Users),
+		XDPPin:                 opts.XDPPin,
+		LoopbackPin:            opts.LoopbackPin,
+		SkLookupPin:            opts.SkLookupPin,
+		RuleCounterPin:         opts.RuleCounterPin,
+		UserCounterPin:         opts.UserCounterPin,
+		StatsPin:               opts.StatsPin,
+		ActiveSummary:          &connSummary{},
+		PreservedConnections:   0,
 		InvalidatedConnections: 0,
 	}
 	if summary, err := summarizeConnections(objs.PFWDConnections); err == nil {
@@ -993,7 +986,7 @@ func runtimeSemanticHash(runtimeData *runtimeFile) (string, error) {
 	}
 	payload := struct {
 		Settings runtimeSettings `json:"settings"`
-		Rules    []runtimeRule    `json:"rules"`
+		Rules    []runtimeRule   `json:"rules"`
 	}{
 		Settings: settings,
 		Rules:    rules,
@@ -1585,15 +1578,15 @@ func pinnedRuntimeMapsCompatible(opts applyOptions) bool {
 	}
 	pinLayout := runtimeMapPinsFromApplyOptions(opts)
 	pins := map[string]string{
-		"pfwd_settings":             pinLayout.Settings,
-		"pfwd_rules":                pinLayout.Rules,
-		"pfwd_connections":          pinLayout.Connections,
-		"pfwd_reverse":              pinLayout.Reverse,
-		"pfwd_rule_counters":        pinLayout.RuleCounter,
-		"pfwd_rule_reply_counters":  pinLayout.RuleReplyCounter,
-		"pfwd_rule_drop_counters":   pinLayout.RuleDropCounter,
-		"pfwd_user_counters":        pinLayout.UserCounter,
-		"pfwd_stats":                pinLayout.Stats,
+		"pfwd_settings":            pinLayout.Settings,
+		"pfwd_rules":               pinLayout.Rules,
+		"pfwd_connections":         pinLayout.Connections,
+		"pfwd_reverse":             pinLayout.Reverse,
+		"pfwd_rule_counters":       pinLayout.RuleCounter,
+		"pfwd_rule_reply_counters": pinLayout.RuleReplyCounter,
+		"pfwd_rule_drop_counters":  pinLayout.RuleDropCounter,
+		"pfwd_user_counters":       pinLayout.UserCounter,
+		"pfwd_stats":               pinLayout.Stats,
 	}
 	for name, path := range pins {
 		mapSpec := spec.Maps[name]
@@ -2014,9 +2007,9 @@ func usageError() error {
 
 func printUsage(file *os.File) {
 	_, _ = fmt.Fprintln(file, "用法：")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --xdp-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp remove --status-file FILE --xdp-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp status --status-file FILE")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp snapshot --runtime-file FILE [--status-file FILE --rule-counter-pin PATH]")
-	_, _ = fmt.Fprintln(file, "  pfwd-xdp stats [--status-file FILE --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd xdp apply --runtime-file FILE --state-file FILE --status-file FILE --iface IFACE --xdp-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd xdp remove --status-file FILE --xdp-pin PATH [--rule-counter-pin PATH --user-counter-pin PATH --stats-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd xdp status --status-file FILE")
+	_, _ = fmt.Fprintln(file, "  pfwd xdp snapshot --runtime-file FILE [--status-file FILE --rule-counter-pin PATH]")
+	_, _ = fmt.Fprintln(file, "  pfwd xdp stats [--status-file FILE --stats-pin PATH]")
 }
