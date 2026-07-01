@@ -72,7 +72,7 @@ cmd_doctor() {
     config_init >/dev/null
     local forwarder_status xdp_status doctor_status_fields backend fallback_reason hybrid_reason tc_iface tc_ifb tc_mode xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active
     local dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts
-    local refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_aux_actions refresh_attach_timings
+    local refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_attach_timings
     local refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted
     local refresh_counters_preserved refresh_counters_reset
     stats_runtime_cache_clear
@@ -82,9 +82,6 @@ cmd_doctor() {
       def rr: ($f.xdp_status.refresh_report // $f.refresh_report // {});
       def profiles:
         (($f.profile_counts // $f.xdp_status.profile_counts // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", ")) as $items
-        | if $items == "" then "-" else $items end;
-      def aux_actions:
-        ((rr.aux_actions // []) | map(.component + "=" + .action + (if ((.changed_items // 0) > 0) then "(" + ((.changed_items | tostring)) + ")" else "" end)) | join(", ")) as $items
         | if $items == "" then "-" else $items end;
       def attach_timings:
         ((rr.attach_timings // []) | map(.component + "=" + ((.duration_ms | tostring)) + "ms") | join(", ")) as $items
@@ -107,7 +104,6 @@ cmd_doctor() {
         (rr.total_duration_ms // "-"),
         (rr.reconcile_duration_ms // "-"),
         (rr.map_load_duration_ms // "-"),
-        aux_actions,
         attach_timings,
         (rr.rules_added // 0),
         (rr.rules_updated // 0),
@@ -119,7 +115,7 @@ cmd_doctor() {
         (rr.counters_reset // 0)
       ] | map(tostring) | join("\u001f")
     ')"
-    IFS=$'\037' read -r backend fallback_reason hybrid_reason xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_aux_actions refresh_attach_timings refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted refresh_counters_preserved refresh_counters_reset <<< "$doctor_status_fields"
+    IFS=$'\037' read -r backend fallback_reason hybrid_reason xdp_active_total xdp_tcp_prewarmed xdp_tcp_established xdp_udp_active dataplane_version map_abi_version incremental_apply preserved_connections invalidated_connections profile_counts refresh_mode refresh_total_ms refresh_reconcile_ms refresh_map_load_ms refresh_attach_timings refresh_rules_added refresh_rules_updated refresh_rules_deleted refresh_users_added refresh_users_updated refresh_users_deleted refresh_counters_preserved refresh_counters_reset <<< "$doctor_status_fields"
     tc_iface="$(fw_tc_state_read_iface 2>/dev/null || true)"
     tc_ifb="$(fw_tc_ifb_name 2>/dev/null || true)"
     if [ -n "$tc_iface" ]; then
@@ -129,7 +125,9 @@ cmd_doctor() {
     else
         tc_mode="disabled"
     fi
-    echo "配置文件：$PFWD_CONFIG_FILE"
+    echo "SQLite：$PFWD_DB_FILE"
+    echo "配置 cache：$PFWD_CONFIG_FILE"
+    echo "状态 cache：$PFWD_STATS_FILE"
     jq -e . "$PFWD_CONFIG_FILE" >/dev/null && echo "配置 JSON：正常"
     echo "数据面：$backend"
     if [ -n "$fallback_reason" ]; then
@@ -146,7 +144,6 @@ cmd_doctor() {
     echo "xdp.refresh_total_ms：$refresh_total_ms"
     echo "xdp.refresh_map_load_ms：$refresh_map_load_ms"
     echo "xdp.refresh_reconcile_ms：$refresh_reconcile_ms"
-    echo "xdp.refresh_aux_actions：$refresh_aux_actions"
     echo "xdp.refresh_attach_timings：$refresh_attach_timings"
     echo "xdp.rules_added：$refresh_rules_added"
     echo "xdp.rules_updated：$refresh_rules_updated"
@@ -168,29 +165,12 @@ cmd_doctor() {
     if [ -n "$tc_iface" ]; then echo "tc.iface：$tc_iface"; fi
     if [ -n "$tc_ifb" ] && [ "$tc_mode" = "bidirectional-ifb" ]; then echo "tc.ifb：$tc_ifb"; fi
     if command -v systemctl >/dev/null 2>&1; then echo "systemctl：正常"; else echo "systemctl：缺失"; fi
-    if guard_binary_exists; then echo "guard：$(guard_bin_path)"; else echo "guard：缺失"; fi
+    if [ -x "$PFWD_SERVICE_BIN_PATH" ]; then echo "pfwd-service：$PFWD_SERVICE_BIN_PATH"; else echo "pfwd-service：缺失"; fi
+    echo "Unix socket：$PFWD_SERVICE_SOCKET"
     echo "运行态安装：$(service_runtime_status_label)"
-    if service_unit_exists pfwd.timer; then echo "pfwd.timer：已安装"; else echo "pfwd.timer：未安装"; fi
-    if service_unit_exists pfwd-bbr.service; then echo "pfwd-bbr.service：已安装"; else echo "pfwd-bbr.service：未安装"; fi
-    if service_unit_exists pfwd-xdp.service; then echo "pfwd-xdp.service：已安装"; else echo "pfwd-xdp.service：未安装"; fi
-    if service_unit_exists pfwd-downmask-feed.service; then echo "pfwd-downmask-feed.service：已安装"; else echo "pfwd-downmask-feed.service：未安装"; fi
-    if service_unit_exists pfwd-leaseweb.service; then echo "pfwd-leaseweb.service：已安装"; else echo "pfwd-leaseweb.service：未安装"; fi
-    if [ -x "$PFWD_DOWNMASK_BIN_PATH" ]; then echo "pfwd-downmask：$PFWD_DOWNMASK_BIN_PATH"; else echo "pfwd-downmask：缺失"; fi
-    if [ -x "$PFWD_LEASEWEB_BIN_PATH" ]; then echo "pfwd-leaseweb：$PFWD_LEASEWEB_BIN_PATH"; else echo "pfwd-leaseweb：缺失"; fi
+    if service_unit_exists pfwd.service; then echo "pfwd.service：已安装"; else echo "pfwd.service：未安装"; fi
     echo "转发数量：$(jq '.forwards | length' "$PFWD_CONFIG_FILE")"
     echo "用户数量：$(jq '.users | length' "$PFWD_CONFIG_FILE")"
-    guard_render_status | while IFS=$'\t' read -r key value; do
-        printf 'guard.%s：%s\n' "$key" "$value"
-    done
-    whitelist_render_status | while IFS=$'\t' read -r key value; do
-        printf 'guard_whitelist.%s：%s\n' "$key" "$value"
-    done
-    egress_whitelist_render_status | while IFS=$'\t' read -r key value; do
-        printf 'guard_egress_whitelist.%s：%s\n' "$key" "$value"
-    done
-    downmask_render_status | while IFS=$'\t' read -r key value; do
-        printf 'downmask.%s：%s\n' "$key" "$value"
-    done
     if [ "$include_bench" = "true" ]; then
         cmd_doctor_benchmarks
     else

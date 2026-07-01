@@ -1,21 +1,5 @@
 #!/usr/bin/env bash
 
-ui_render_guard_menu_page() {
-    ui_header "流量防护"
-    ui_notice_render
-    ui_print_guard_summary
-    echo
-    ui_menu_item 1 "启用 guard"
-    ui_menu_item 2 "停用 guard"
-    ui_menu_item 3 "设置封锁协议"
-    ui_menu_item 4 "跳过端口"
-    ui_menu_item 5 "入口白名单"
-    ui_menu_item 6 "出口白名单"
-    ui_menu_item 7 "临时白名单 Web"
-    ui_menu_item 0 "返回"
-}
-
-
 ui_render_main_menu_page() {
     ui_title
     ui_notice_render
@@ -25,11 +9,9 @@ ui_render_main_menu_page() {
     ui_menu_item 2 "转发管理"
     ui_menu_item 3 "流量管理"
     ui_menu_item 4 "Telegram 通知"
-    ui_menu_item 5 "下行伪装"
-    ui_menu_item 6 "流量防护"
-    ui_menu_item 7 "配置导入导出"
-    ui_menu_item 8 "更新"
-    ui_menu_item 9 "重启服务"
+    ui_menu_item 5 "配置导入导出"
+    ui_menu_item 6 "更新"
+    ui_menu_item 7 "重启服务"
     ui_menu_item u "卸载"
     ui_menu_item 0 "退出"
 }
@@ -129,11 +111,11 @@ ui_render_export_import_menu_page() {
 ui_menu_uninstall() {
     ui_clear_screen
     ui_header "卸载"
-    echo "步骤 1：停用 pfwd XDP boot restore，只停止并禁用 pfwd-xdp.service。"
-    if ui_confirm_text "yes" "输入 yes 确认停用 pfwd-xdp.service，留空跳过"; then
+    echo "步骤 1：停用 pfwd.service。"
+    if ui_confirm_text "yes" "输入 yes 确认停用 pfwd.service，留空跳过"; then
         ui_run service_disable_forwarder
     else
-        ui_warn "已跳过停用 pfwd-xdp.service"
+        ui_warn "已跳过停用 pfwd.service"
     fi
     echo
     echo "步骤 2：完整卸载 pfwd 脚本、systemd、XDP 状态、配置和状态。"
@@ -168,11 +150,9 @@ cmd_menu() {
             2) ui_menu_forwards ;;
             3) ui_menu_expire_limit ;;
             4) ui_menu_telegram ;;
-            5) ui_menu_downmask ;;
-            6) ui_menu_guard ;;
-            7) ui_menu_export_import ;;
-            8) ui_menu_update ;;
-            9) ui_menu_restart_runtime ;;
+            5) ui_menu_export_import ;;
+            6) ui_menu_update ;;
+            7) ui_menu_restart_runtime ;;
             u) ui_menu_uninstall ;;
             0) break ;;
             *) ui_warn "无效选择"; ui_pause ;;

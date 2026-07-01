@@ -243,9 +243,10 @@ ui_table_pad_cell() {
 
 ui_table_total_width_value() {
     local -n widths_ref="$1"
-    local total=1 i
+    local total=0 i
     for i in "${!widths_ref[@]}"; do
-        total=$((total + widths_ref[$i] + 3))
+        total=$((total + widths_ref[$i]))
+        [ "$i" -eq 0 ] || total=$((total + 2))
     done
     UI_WIDTH_RESULT="$total"
 }
@@ -305,24 +306,6 @@ ui_table_fit_widths() {
 }
 
 
-ui_table_print_border() {
-    local left="$1"
-    local middle="$2"
-    local right="$3"
-    shift 3
-    local widths=("$@")
-    local line="$left" i
-    for i in "${!widths[@]}"; do
-        line+="$(ui_repeat_char "─" "$((widths[$i] + 2))")"
-        if [ "$i" -lt $((${#widths[@]} - 1)) ]; then
-            line+="$middle"
-        fi
-    done
-    line+="$right"
-    ui_print_line "$line" "$UI_C_DIM"
-}
-
-
 ui_table_print_row() {
     local widths_name="$1"
     local cells_name="$2"
@@ -331,7 +314,7 @@ ui_table_print_row() {
     local -n widths_ref="$widths_name"
     local -n cells_ref="$cells_name"
     local -n headers_ref="$headers_name"
-    local line="│" i
+    local line="" i
     for i in "${!widths_ref[@]}"; do
         local cell rendered pad
         cell="${cells_ref[$i]:-}"
@@ -352,25 +335,13 @@ ui_table_print_row() {
             UI_CELL_COLOR="$(ui_forward_state_color "$display_state")"
             ui_display_width_value "$rendered"
             rendered="$(ui_apply_color "$UI_CELL_COLOR" "$rendered")"
-        elif [ -z "$code" ] && [ "${headers_ref[$i]:-}" = "值" ] && [ "${headers_ref[0]:-}" = "项目" ]; then
-            UI_CELL_COLOR=""
-            local guard_label="" guard_state=""
-            guard_label="${cells_ref[0]:-}"
-            guard_state="$(ui_guard_summary_state "$guard_label" "$cell")"
-            if [ -n "$guard_state" ]; then
-                rendered="$(ui_forward_state_text "$guard_state")"
-                UI_CELL_COLOR="$(ui_forward_state_color "$guard_state")"
-                ui_display_width_value "$rendered"
-                rendered="$(ui_apply_color "$UI_CELL_COLOR" "$rendered")"
-            fi
         fi
-        line+=" "
+        [ "$i" -eq 0 ] || line+="  "
         line+="$rendered"
         if [ "$UI_WIDTH_RESULT" -lt "${widths_ref[$i]}" ]; then
             printf -v pad '%*s' "$((widths_ref[$i] - UI_WIDTH_RESULT))" ''
             line+="$pad"
         fi
-        line+=" │"
     done
     if [ -n "$code" ]; then
         ui_print_line "$line" "$code"
@@ -410,12 +381,9 @@ ui_table_render() {
 
     term_width="$(ui_term_width)"
     ui_table_fit_widths widths "$shrink_csv" "$term_width"
-    ui_table_print_border "┌" "┬" "┐" "${widths[@]}"
     ui_table_print_row widths headers headers "$UI_C_BRIGHT"
-    ui_table_print_border "├" "┼" "┤" "${widths[@]}"
     for line in "${row_lines[@]}"; do
         IFS=$'\t' read -r -a cells <<< "$line"
         ui_table_print_row widths cells headers
     done
-    ui_table_print_border "└" "┴" "┘" "${widths[@]}"
 }

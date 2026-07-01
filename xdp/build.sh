@@ -8,8 +8,6 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 
 cd "$SCRIPT_DIR"
 
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go run -tags geobuild . --asset-dir "$ROOT_DIR/assets"
-
 install_if_changed() {
     local source="$1"
     local target="$2"

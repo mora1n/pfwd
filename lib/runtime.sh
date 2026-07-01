@@ -20,46 +20,6 @@ runtime_iface() {
     forwarder_iface
 }
 
-runtime_protocol_filters_enabled() {
-    forwarder_protocol_filters_enabled
-}
-
-runtime_guard_ingress_mode() {
-    forwarder_guard_ingress_mode
-}
-
-runtime_whitelist_files_json() {
-    forwarder_whitelist_files_json
-}
-
-runtime_egress_whitelist_files_json() {
-    forwarder_egress_whitelist_files_json
-}
-
-runtime_protocol_skip_ports_json() {
-    forwarder_protocol_skip_ports_json
-}
-
-runtime_whitelist_cn_mode() {
-    whitelist_cn_mode
-}
-
-runtime_whitelist_cn_provinces_json() {
-    whitelist_cn_provinces_json
-}
-
-runtime_ingress_whitelist_policies_json() {
-    whitelist_runtime_policies_json "${1:-$PFWD_CONFIG_FILE}"
-}
-
-runtime_egress_whitelist_cn_mode() {
-    egress_whitelist_cn_mode
-}
-
-runtime_egress_whitelist_cn_provinces_json() {
-    egress_whitelist_cn_provinces_json
-}
-
 runtime_rule_execution_class() {
     local resolved_target="$1"
     case "$resolved_target" in
@@ -190,7 +150,6 @@ runtime_rule_json_line() {
     local user_limit="$5"
     local billing_used="$6"
     local user_billing_used="$7"
-    local whitelist_policy_id="${8:-0}"
 
     local comment_json snat_source_json mss_mode_json mss_value_json fallback_reason_json loopback_local
     comment_json="null"
@@ -233,8 +192,7 @@ runtime_rule_json_line() {
     printf '"execution_class":%s,' "$(pfwd_json_escape "$execution_class")"
     printf '"fallback_reason":%s,' "$fallback_reason_json"
     printf '"counter_owner":%s,' "$(pfwd_json_escape "$counter_owner")"
-    printf '"loopback_local":%s,' "$loopback_local"
-    printf '"whitelist_policy_id":%s' "$whitelist_policy_id"
+    printf '"loopback_local":%s' "$loopback_local"
     printf '}\n'
 }
 
@@ -250,11 +208,9 @@ runtime_compiled_json() {
 
     local now_minute rows rules_json="[]" users_json settings_json rule_index_json user_index_json index_store_json persist_indexes="false"
     local user_index_file="" rule_index_file=""
-    local whitelist_policies_json="[]"
     local rules_tmp=""
-    local -A whitelist_policy_id_by_port=()
     local -A user_limit_by_id=() user_index_by_id=() rule_index_by_id=() rule_billing_by_id=() user_billing_by_id=()
-    local -A resolve_rows_cache=() resolve_error_cache=() egress_allow_cache=() egress_error_cache=()
+    local -A resolve_rows_cache=() resolve_error_cache=()
     now_minute="$(pfwd_now_minute)"
 
     rows="$(jq -r --arg now "$now_minute" '
@@ -290,15 +246,6 @@ runtime_compiled_json() {
         rm -f "$user_index_file"
         return 1
     }
-    if command -v whitelist_runtime_policies_json >/dev/null 2>&1; then
-        whitelist_policies_json="$(runtime_ingress_whitelist_policies_json "$config_file")"
-        while IFS=$'\t' read -r policy_id listen_port; do
-            [ -n "$policy_id" ] || continue
-            [ -n "$listen_port" ] || continue
-            whitelist_policy_id_by_port["$listen_port"]="$policy_id"
-        done < <(jq -r '.[] | select(.source == "port") | [.id, .listen_port] | @tsv' <<< "$whitelist_policies_json")
-    fi
-
     while IFS=$'\t' read -r user_id user_index user_limit user_used; do
         [ -n "$user_id" ] || continue
         user_index_by_id["$user_id"]="$user_index"
@@ -342,21 +289,6 @@ runtime_compiled_json() {
       ]
     ')"
 
-    local guard_enabled whitelist_state egress_whitelist_state host_egress_state protocol_filters_enabled
-    guard_enabled="$(jq -r '.settings.guard.enabled // false' "$config_file")"
-    whitelist_state="false"
-    if [ "$guard_enabled" = "true" ] && command -v whitelist_enabled >/dev/null 2>&1 && [ "$(whitelist_enabled)" = "true" ]; then
-        whitelist_state="true"
-    fi
-    egress_whitelist_state="false"
-    host_egress_state="false"
-    if command -v egress_whitelist_enabled >/dev/null 2>&1 && [ "$(egress_whitelist_enabled "$config_file")" = "true" ]; then
-        egress_whitelist_state="true"
-        egress_whitelist_prepare_runtime "$config_file"
-        host_egress_state="true"
-    fi
-    protocol_filters_enabled="$(runtime_protocol_filters_enabled)"
-
     if [ -n "$rows" ]; then
         rules_tmp="$(mktemp "${PFWD_RUN_DIR}/compiled.rules.XXXXXX")"
         : > "$rules_tmp"
@@ -381,9 +313,8 @@ runtime_compiled_json() {
             rule_limit="${FORWARDER_TSV_FIELDS[14]:-0}"
             [ -n "$listen_port" ] || continue
 
-            local ip_versions target_rows ipver proto family resolved_ip family_ipver user_limit user_index rule_index billing_used user_billing_used whitelist_policy_id
+            local ip_versions target_rows ipver proto family resolved_ip family_ipver user_limit user_index rule_index billing_used user_billing_used
             local execution_class backend_reason counter_owner
-            whitelist_policy_id="${whitelist_policy_id_by_port[$listen_port]:-0}"
             ip_versions="$(runtime_infer_ip_version "$listen_ip" "$snat_mode" "$snat_source")"
             user_limit="${user_limit_by_id[$user_id]:-0}"
             user_index="${user_index_by_id[$user_id]:-0}"
@@ -408,21 +339,6 @@ runtime_compiled_json() {
                     fi
                     continue
                 fi
-                if [ "$egress_whitelist_state" = "true" ]; then
-                    if [[ ! -v egress_allow_cache["$resolve_cache_key"] ]]; then
-                        if egress_whitelist_assert_target_rows_allowed "$remote_host" "$target_rows"; then
-                            egress_allow_cache["$resolve_cache_key"]="true"
-                            egress_error_cache["$resolve_cache_key"]=""
-                        else
-                            egress_allow_cache["$resolve_cache_key"]="false"
-                            egress_error_cache["$resolve_cache_key"]="$EGRESS_WHITELIST_LAST_ERROR"
-                        fi
-                    fi
-                    if [ "${egress_allow_cache[$resolve_cache_key]}" != "true" ]; then
-                        pfwd_die "出口白名单拒绝转发规则：$id ${egress_error_cache[$resolve_cache_key]}"
-                    fi
-                fi
-
                 while IFS= read -r proto; do
                     [ -n "$proto" ] || continue
                     while IFS='|' read -r family _ resolved_ip; do
@@ -441,7 +357,7 @@ runtime_compiled_json() {
                           "$remote_port" "$family_ipver" "$comment" "$snat_mode" "$snat_source" \
                           "$mss_mode" "$mss_value" "$traffic_mode" "$traffic_ratio" \
                           "$execution_class" "$backend_reason" "$counter_owner" \
-                          "$rule_limit" "${user_limit:-0}" "$billing_used" "$user_billing_used" "$whitelist_policy_id" >> "$rules_tmp"
+                          "$rule_limit" "${user_limit:-0}" "$billing_used" "$user_billing_used" >> "$rules_tmp"
                     done <<< "$target_rows"
                 done < <(runtime_protocol_rows "$protocol")
             done <<< "$ip_versions"
@@ -453,47 +369,9 @@ runtime_compiled_json() {
     fi
 
     settings_json="$(jq -n \
-      --arg iface "$(runtime_iface)" \
-      --arg guard_ingress_mode "$(runtime_guard_ingress_mode)" \
-      --arg geo_asset_dir "$PFWD_ASSETS_DIR" \
-      --arg ingress_cn_mode "$(runtime_whitelist_cn_mode)" \
-      --argjson ingress_cn_provinces "$(runtime_whitelist_cn_provinces_json)" \
-      --arg egress_cn_mode "$(runtime_egress_whitelist_cn_mode)" \
-      --argjson egress_cn_provinces "$(runtime_egress_whitelist_cn_provinces_json)" \
-      --argjson guard_enabled "$guard_enabled" \
-      --argjson whitelist_enabled "$whitelist_state" \
-      --argjson egress_whitelist_enabled "$egress_whitelist_state" \
-      --argjson block_http "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_http // false' "$config_file"; else echo false; fi)" \
-      --argjson block_tls "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_tls // false' "$config_file"; else echo false; fi)" \
-      --argjson block_socks "$(if [ "$protocol_filters_enabled" = "true" ]; then jq -r '.settings.guard.block_socks // false' "$config_file"; else echo false; fi)" \
-      --argjson skip_ports "$(runtime_protocol_skip_ports_json)" \
-      --argjson files "$(runtime_whitelist_files_json)" \
-      --argjson ingress_policies "$whitelist_policies_json" \
-      --argjson egress_files "$(runtime_egress_whitelist_files_json)" \
-      --arg host_egress_allow_ipv4_file "$(egress_whitelist_host_allow_ipv4_file)" \
-      --arg host_egress_allow_ipv6_file "$(egress_whitelist_host_allow_ipv6_file)" \
-      --argjson host_egress_enabled "$host_egress_state" '
+      --arg iface "$(runtime_iface)" '
       {
-        interface: $iface,
-        guard_ingress_mode: $guard_ingress_mode,
-        guard_enabled: $guard_enabled,
-        whitelist_enabled: $whitelist_enabled,
-        egress_whitelist_enabled: $egress_whitelist_enabled,
-        host_egress_enabled: $host_egress_enabled,
-        geo_asset_dir: $geo_asset_dir,
-        ingress_cn_mode: $ingress_cn_mode,
-        ingress_cn_provinces: $ingress_cn_provinces,
-        egress_cn_mode: $egress_cn_mode,
-        egress_cn_provinces: $egress_cn_provinces,
-        block_http: $block_http,
-        block_tls: $block_tls,
-        block_socks: $block_socks,
-        protocol_skip_ports: $skip_ports,
-        whitelist_files: $files,
-        ingress_whitelist_policies: $ingress_policies,
-        egress_whitelist_files: $egress_files,
-        host_egress_allow_ipv4_file: $host_egress_allow_ipv4_file,
-        host_egress_allow_ipv6_file: $host_egress_allow_ipv6_file
+        interface: $iface
       }
     ')"
 
@@ -541,15 +419,13 @@ runtime_attach_metadata() {
               [
                 (if (($rule.snat_mode // "masquerade") == "snat") then "fixed_snat" else empty end),
                 (if ((($rule.mss_mode // "") != "") and (($rule.mss_mode // "none") != "none")) then "mss" else empty end),
-                (if (($rule.traffic_limit_bytes // 0) > 0 or ($rule.user_limit_bytes // 0) > 0) then "metered" else empty end),
-                (if ((.settings.guard_enabled // false) == true and ($rule.protocol == "tcp")) then "guard" else empty end)
+                (if (($rule.traffic_limit_bytes // 0) > 0 or ($rule.user_limit_bytes // 0) > 0) then "metered" else empty end)
               ] | unique
             ) as $flags
           | $rule
           | .feature_flags = $flags
           | .feature_profile = (
-              if ($flags | index("guard")) then "guarded_nat"
-              elif (($flags | index("fixed_snat")) or ($flags | index("mss"))) then "rewrite_nat"
+              if (($flags | index("fixed_snat")) or ($flags | index("mss"))) then "rewrite_nat"
               elif ($flags | index("metered")) then "metered_nat"
               else "basic_nat"
               end
@@ -616,14 +492,6 @@ runtime_write_backend_file() {
     printf '%s\n' "$runtime_json" | jq '.' | pfwd_write_atomic "$target"
 }
 
-runtime_xdp_guard_required() {
-    local runtime_json="$1"
-    jq -e '
-      (.settings.guard_enabled == true)
-      and ((.settings.whitelist_enabled == true) or (.settings.block_http == true) or (.settings.block_tls == true) or (.settings.block_socks == true))
-    ' >/dev/null <<< "$runtime_json"
-}
-
 runtime_xdp_forward_rule_count() {
     local runtime_json="$1"
     jq '[.rules[]? | select(.execution_class == "xdp")] | length' <<< "$runtime_json"
@@ -651,10 +519,6 @@ forwarder_split_runtime_json() {
     FORWARDER_SPLIT_NFT_RUNTIME_JSON="$(runtime_backend_json "$runtime_json" nft)"
 }
 
-forwarder_xdp_guard_required() {
-    runtime_xdp_guard_required "$@"
-}
-
 forwarder_xdp_forward_rule_count() {
     runtime_xdp_forward_rule_count "$@"
 }
@@ -676,8 +540,6 @@ runtime_remove_xdp_runtime() {
         pfwd_run "$(forwarder_bin_path)" remove \
           --status-file "$PFWD_XDP_STATUS_FILE" \
           --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
-          --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
-          --host-egress-pin "$PFWD_XDP_HOST_EGRESS_PIN_PATH" \
           --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
           --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
           --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
@@ -687,24 +549,12 @@ runtime_remove_xdp_runtime() {
 }
 
 runtime_remove_link_pins() {
-    rm -f "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" \
-          "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" "$PFWD_XDP_SK_LOOKUP_PIN_PATH" || true
+    rm -f "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" "$PFWD_XDP_SK_LOOKUP_PIN_PATH" || true
 }
 
 runtime_remove_pinned_state() {
     rm -f "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
-          "$PFWD_XDP_REVERSE_PIN_PATH" "$PFWD_XDP_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_V6_PIN_PATH" \
-          "$PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH" \
-          "$PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH" \
-          "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH" \
-          "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH" \
-          "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
-          "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" \
-          "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" \
-          "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
-          "$PFWD_XDP_INGRESS_GEO_V4_PIN_PATH" "$PFWD_XDP_INGRESS_GEO_V6_PIN_PATH" \
-          "$PFWD_XDP_INGRESS_CITY_V4_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH" \
-          "$PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH" \
+          "$PFWD_XDP_REVERSE_PIN_PATH" \
           "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" || true
 }
 
@@ -729,21 +579,8 @@ runtime_remove_runtime_artifacts() {
     runtime_remove_runtime_files
 }
 
-runtime_remove_whitelist_runtime_files() {
-    rm -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" \
-          "$PFWD_WHITELIST_ALLOW_IPV6_FILE" \
-          "$PFWD_WHITELIST_CITY_IPV4_FILE" \
-          "$PFWD_WHITELIST_LEASES_FILE" \
-          "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" \
-          "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" \
-          "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" \
-          "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
-          "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE" \
-          "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE" || true
-}
-
 runtime_remove_runtime_state_dirs() {
-    rm -rf "$PFWD_GUARD_STATE_DIR" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_EGRESS_WHITELIST_STATE_DIR"
+    rm -rf "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")"
 }
 
 runtime_clear_nft_runtime() {
@@ -770,7 +607,7 @@ runtime_reset_runtime_files() {
 }
 
 runtime_write_stopped_status() {
-    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,xdp_guard_rules_count:0,nft_rules_count:0,interface:"",protocol_guard:false,whitelist_enabled:false,egress_whitelist_enabled:false,host_egress_enabled:false,host_egress_backend:"off"}')"
+    forwarder_write_status_file "$(jq -n '{applied:false,forwarding_backend:"none",xdp_applied:false,xdp_forward_applied:false,nft_applied:false,loopback_via_nft:false,loopback_split_active:false,rules:0,xdp_candidate_rules_count:0,xdp_rules_count:0,nft_rules_count:0,interface:""}')"
 }
 
 runtime_stop_compiled_runtime() {
@@ -779,7 +616,6 @@ runtime_stop_compiled_runtime() {
     runtime_remove_pinned_state
     runtime_clear_nft_runtime
     runtime_clear_accounting_runtime
-    fw_cleanup_legacy_nft || true
     runtime_reset_runtime_files
     runtime_write_stopped_status
 }
@@ -799,13 +635,12 @@ runtime_merge_runtime_rules() {
 
 runtime_apply_xdp_runtime() {
     local runtime_json="$1"
-    local total_rules xdp_forward_rules guard_mode iface xdp_status host_egress_enabled
+    local total_rules xdp_forward_rules iface xdp_status
 
     runtime_reset_xdp_apply_state
     total_rules="$(jq '.rules | length' <<< "$runtime_json")"
     xdp_forward_rules="$(runtime_xdp_forward_rule_count "$runtime_json")"
-    host_egress_enabled="$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")"
-    if [ "$total_rules" = "0" ] && ! runtime_xdp_guard_required "$runtime_json" && [ "$host_egress_enabled" != "true" ]; then
+    if [ "$xdp_forward_rules" = "0" ]; then
         runtime_remove_xdp_runtime
         RUNTIME_XDP_STATUS_JSON='{"applied":false}'
         return 0
@@ -820,11 +655,6 @@ runtime_apply_xdp_runtime() {
         return 1
     fi
 
-    guard_mode="ingress"
-    if [ "$xdp_forward_rules" -gt 0 ]; then
-        guard_mode="full"
-    fi
-
     xdp_status="$(
       "$(forwarder_bin_path)" apply \
         --runtime-file "$PFWD_FORWARDER_XDP_RUNTIME_FILE" \
@@ -832,14 +662,11 @@ runtime_apply_xdp_runtime() {
         --status-file "$PFWD_XDP_STATUS_FILE" \
         --iface "$iface" \
         --xdp-pin "$PFWD_XDP_LINK_PIN_PATH" \
-        --ingress-pin "$PFWD_XDP_INGRESS_PIN_PATH" \
-        --host-egress-pin "$PFWD_XDP_HOST_EGRESS_PIN_PATH" \
         --loopback-pin "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         --sk-lookup-pin "$PFWD_XDP_SK_LOOKUP_PIN_PATH" \
         --rule-counter-pin "$PFWD_XDP_RULE_COUNTER_PIN_PATH" \
         --user-counter-pin "$PFWD_XDP_USER_COUNTER_PIN_PATH" \
         --stats-pin "$PFWD_XDP_STATS_PIN_PATH" \
-        --guard-mode "$guard_mode" \
         --quiet 2>&1
     )" || {
         RUNTIME_XDP_ERROR="$xdp_status"
@@ -875,24 +702,10 @@ runtime_backend_label() {
             printf '%s\n' "nft-only"
         fi
     elif [ "$xdp_applied" = "true" ]; then
-        printf '%s\n' "guard-only"
+        printf '%s\n' "xdp-runtime"
     else
         printf '%s\n' "none"
     fi
-}
-
-runtime_host_egress_backend() {
-    local backend="$1"
-    local host_egress_enabled="$2"
-    if [ "$host_egress_enabled" != "true" ]; then
-        printf '%s\n' "off"
-        return 0
-    fi
-    case "$backend" in
-        xdp-only|hybrid|guard-only) printf '%s\n' "tc" ;;
-        nft-only|nft-fallback|none) printf '%s\n' "nft" ;;
-        *) printf '%s\n' "off" ;;
-    esac
 }
 
 runtime_loopback_split_active() {
@@ -914,7 +727,7 @@ runtime_loopback_split_active() {
 runtime_apply_compiled_runtime() {
     local runtime_json="$1"
     local xdp_runtime_json nft_runtime_json nft_applied="false" backend fallback_reason=""
-    local xdp_candidate_rules=0 total_rules=0 guard_required="false" host_egress_required="false" host_egress_backend="off"
+    local xdp_candidate_rules=0 total_rules=0
 
     runtime_write_compiled_file "$runtime_json"
     forwarder_split_runtime_json "$runtime_json"
@@ -925,13 +738,7 @@ runtime_apply_compiled_runtime() {
 
     total_rules="$(jq '.rules | length' <<< "$runtime_json")"
     xdp_candidate_rules="$(runtime_xdp_forward_rule_count "$xdp_runtime_json")"
-    if runtime_xdp_guard_required "$runtime_json"; then
-        guard_required="true"
-    fi
-    if [ "$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")" = "true" ]; then
-        host_egress_required="true"
-    fi
-    if [ "$total_rules" = "0" ] && [ "$guard_required" != "true" ] && [ "$host_egress_required" != "true" ]; then
+    if [ "$total_rules" = "0" ]; then
         forwarder_stop_runtime
         return 0
     fi
@@ -939,7 +746,7 @@ runtime_apply_compiled_runtime() {
     if [ "$total_rules" -gt 0 ]; then
         forwarder_ensure_ip_forwarding
     fi
-    if [ "$total_rules" -gt 0 ] || [ "$guard_required" = "true" ] || [ "$host_egress_required" = "true" ]; then
+    if [ "$xdp_candidate_rules" -gt 0 ]; then
         if ! runtime_apply_xdp_runtime "$xdp_runtime_json"; then
             if [ "$xdp_candidate_rules" -gt 0 ]; then
                 nft_runtime_json="$(runtime_merge_runtime_rules "$nft_runtime_json" "$xdp_runtime_json")"
@@ -964,10 +771,8 @@ runtime_apply_compiled_runtime() {
     fi
 
     backend="$(runtime_backend_label "$RUNTIME_XDP_FORWARD_APPLIED" "$nft_applied" "$RUNTIME_XDP_APPLIED" "$RUNTIME_XDP_ERROR")"
-    host_egress_backend="$(runtime_host_egress_backend "$backend" "$host_egress_required")"
-    runtime_json="$(jq --arg backend "$host_egress_backend" '.settings.host_egress_backend = $backend' <<< "$runtime_json")"
 
-    if [ "$total_rules" -gt 0 ] || [ "$host_egress_backend" = "nft" ]; then
+    if [ "$total_rules" -gt 0 ]; then
         fw_apply_accounting_runtime "$runtime_json"
     else
         runtime_clear_accounting_runtime
@@ -984,33 +789,6 @@ runtime_apply_compiled_runtime() {
         hybrid_reason="loopback-split"
     fi
     forwarder_write_status_file "$(forwarder_runtime_status_json "$backend" "$runtime_json" "$xdp_runtime_json" "$nft_runtime_json" "$fallback_reason" "$RUNTIME_XDP_ERROR" "$RUNTIME_XDP_APPLIED" "$nft_applied" "${RUNTIME_XDP_STATUS_JSON:-{}}" "$RUNTIME_XDP_FORWARD_APPLIED" "$loopback_split_active" "$hybrid_reason")"
-    fw_cleanup_legacy_nft
-}
-
-runtime_apply_xdp_aux_runtime() {
-    local runtime_json xdp_runtime_json total_rules guard_required="false" host_egress_required="false"
-
-    if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
-        whitelist_prepare_runtime
-    fi
-
-    runtime_json="$(forwarder_runtime_json true)"
-    runtime_write_compiled_file "$runtime_json"
-    xdp_runtime_json="$(runtime_backend_json "$runtime_json" xdp)"
-    forwarder_write_xdp_runtime_file "$xdp_runtime_json"
-
-    total_rules="$(jq '.rules | length' <<< "$runtime_json")"
-    if runtime_xdp_guard_required "$runtime_json"; then
-        guard_required="true"
-    fi
-    if [ "$(jq -r '.settings.host_egress_enabled // false' <<< "$runtime_json")" = "true" ]; then
-        host_egress_required="true"
-    fi
-    if [ "$total_rules" = "0" ] && [ "$guard_required" != "true" ] && [ "$host_egress_required" != "true" ]; then
-        return 0
-    fi
-
-    runtime_apply_xdp_runtime "$xdp_runtime_json" || return 1
 }
 
 forwarder_render_xdp_config() {

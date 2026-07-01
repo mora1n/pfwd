@@ -38,43 +38,6 @@ fw_cleanup_nft_table() {
     pfwd_run nft delete table "$family" "$table"
 }
 
-fw_cleanup_legacy_nft() {
-    command -v nft >/dev/null 2>&1 || return 0
-    config_init >/dev/null
-
-    local nft_family nft_table forward_table current_account_pair current_forward_pair pairs seen="" pair family table
-    nft_family="$(jq -r '.settings.nft_family // "inet"' "$PFWD_CONFIG_FILE")"
-    nft_table="$(jq -r '.settings.nft_table // "pfwd"' "$PFWD_CONFIG_FILE")"
-    forward_table="$(jq -r '.settings.forward_table // "port_forward"' "$PFWD_CONFIG_FILE")"
-    current_account_pair="${nft_family}:${nft_table}"
-    current_forward_pair="${nft_family}:${forward_table}"
-
-    pairs=(
-        "inet:pfwd"
-        "inet:port_forward"
-        "ip:port_forward"
-        "ip6:port_forward"
-        "$nft_family:$nft_table"
-        "inet:$forward_table"
-        "ip:$forward_table"
-        "ip6:$forward_table"
-    )
-
-    for pair in "${pairs[@]}"; do
-        [ -n "$pair" ] || continue
-        if [ "$pair" = "$current_account_pair" ] || [ "$pair" = "$current_forward_pair" ]; then
-            continue
-        fi
-        case " $seen " in
-            *" $pair "*) continue ;;
-        esac
-        seen="$seen $pair"
-        family="${pair%%:*}"
-        table="${pair#*:}"
-        fw_cleanup_nft_table "$family" "$table"
-    done
-}
-
 fw_counter_names() {
     local id="$1"
     local safe="${id//-/_}"
@@ -213,262 +176,6 @@ fw_validate_render_file() {
     rm -f "$validate_file"
 }
 
-fw_host_egress_enabled() {
-    local runtime_json="$1"
-    jq -e '(.settings.host_egress_enabled // false) == true and (.settings.host_egress_backend // "off") == "nft"' >/dev/null <<< "$runtime_json"
-}
-
-fw_host_egress_allow_v4_set_name() {
-    printf '%s\n' "pfwd_host_egress_allow_v4"
-}
-
-fw_host_egress_allow_v6_set_name() {
-    printf '%s\n' "pfwd_host_egress_allow_v6"
-}
-
-fw_render_interval_set_elements() {
-    local file_path="$1"
-    local first=1 line
-    [ -f "$file_path" ] || return 0
-    while IFS= read -r line; do
-        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-        [ -n "$line" ] || continue
-        [ "$first" -eq 1 ] || printf ', '
-        printf '%s' "$line"
-        first=0
-    done < <(
-        python3 - "$file_path" <<'PY'
-import ipaddress
-import sys
-
-path = sys.argv[1]
-networks = []
-
-with open(path, "r", encoding="utf-8") as fh:
-    for raw in fh:
-        line = raw.strip()
-        if not line:
-            continue
-        networks.append(ipaddress.ip_network(line, strict=False))
-
-for network in ipaddress.collapse_addresses(networks):
-    print(network)
-PY
-    )
-}
-
-fw_render_interval_set_elements_from_stdin() {
-    local ip_version="${1:-}"
-    python3 -c '
-import ipaddress
-import sys
-
-want = sys.argv[1]
-networks = []
-
-for raw in sys.stdin:
-    line = raw.strip()
-    if not line or line.startswith("#"):
-        continue
-    if "\t" in line:
-        line = line.split("\t")[-1].strip()
-    network = ipaddress.ip_network(line, strict=False)
-    if want in ("4", "6") and network.version != int(want):
-        continue
-    networks.append(network)
-
-first = True
-for network in ipaddress.collapse_addresses(networks):
-    if not first:
-        print(", ", end="")
-    print(network, end="")
-    first = False
-' "$ip_version"
-}
-
-fw_render_host_egress_objects() {
-    local runtime_json="$1"
-    local host_v4_file host_v6_file
-    host_v4_file="$(jq -r '.settings.host_egress_allow_ipv4_file // empty' <<< "$runtime_json")"
-    host_v6_file="$(jq -r '.settings.host_egress_allow_ipv6_file // empty' <<< "$runtime_json")"
-
-    echo "  set $(fw_host_egress_allow_v4_set_name) {"
-    echo "    type ipv4_addr"
-    echo "    flags interval"
-    printf '    elements = { '
-    fw_render_interval_set_elements "$host_v4_file"
-    echo ' }'
-    echo "  }"
-    echo
-
-    echo "  set $(fw_host_egress_allow_v6_set_name) {"
-    echo "    type ipv6_addr"
-    echo "    flags interval"
-    printf '    elements = { '
-    fw_render_interval_set_elements "$host_v6_file"
-    echo ' }'
-    echo "  }"
-    echo
-}
-
-fw_render_host_egress_chain() {
-    echo "  chain output_host_egress {"
-    echo "    type filter hook output priority filter - 10; policy accept;"
-    echo '    oifname "lo" counter accept'
-    echo '    ct state established,related counter accept'
-    echo "    ip daddr @$(fw_host_egress_allow_v4_set_name) counter accept"
-    echo "    ip6 daddr @$(fw_host_egress_allow_v6_set_name) counter accept"
-    echo '    meta nfproto ipv4 counter drop comment "pfwd host egress whitelist drop v4"'
-    echo '    meta nfproto ipv6 counter drop comment "pfwd host egress whitelist drop v6"'
-    echo "  }"
-}
-
-fw_ingress_whitelist_enabled() {
-    local runtime_json="$1"
-    jq -e '(.settings.whitelist_enabled // false) == true' >/dev/null <<< "$runtime_json"
-}
-
-fw_ingress_whitelist_set_name() {
-    local ipver="$1"
-    local policy_id="$2"
-    printf 'pfwd_ingress_allow_v%s_%s' "$ipver" "$policy_id"
-}
-
-fw_ingress_whitelist_policy_rows() {
-    local runtime_json="$1"
-    jq -c '
-      . as $runtime
-      | ($runtime.settings.ingress_whitelist_policies // []) as $policies
-      | ($policies | map((.id // 0))) as $known
-      | (
-          [$policies[]?]
-          + (
-              [$runtime.rules[]? | (.whitelist_policy_id // 0)]
-              | unique
-              | map(select(($known | index(.)) | not) | {
-                  id: .,
-                  source: "synthetic",
-                  cn_mode: "off",
-                  cn_provinces: [],
-                  cn_city_codes: []
-                })
-            )
-        )
-      | unique_by(.id // 0)
-      | sort_by(.id // 0)
-      | .[]
-    ' <<< "$runtime_json"
-}
-
-fw_ingress_whitelist_policy_cidrs() {
-    local runtime_json="$1"
-    local policy_json="$2"
-    local ipver="$3"
-    local file mode provinces asset_dir bin city_count tmp_codes
-
-    jq -r '.settings.whitelist_files // [] | .[]' <<< "$runtime_json" |
-    while IFS= read -r file; do
-        [ -n "$file" ] || continue
-        [ -f "$file" ] && cat "$file"
-    done
-
-    mode="$(jq -r '.cn_mode // "off"' <<< "$policy_json")"
-    asset_dir="$(jq -r '.settings.geo_asset_dir // empty' <<< "$runtime_json")"
-    case "$mode" in
-        all|provinces)
-            bin="$(forwarder_bin_path)"
-            [ -x "$bin" ] || pfwd_die "缺少 XDP 辅助程序：$bin"
-            provinces="$(jq -r '(.cn_provinces // []) | join(",")' <<< "$policy_json")"
-            "$bin" geo-export \
-              --asset-dir "$asset_dir" \
-              --mode "$mode" \
-              --provinces "$provinces" \
-              --ip-version "$ipver"
-            ;;
-    esac
-
-    if [ "$ipver" = "4" ]; then
-        city_count="$(jq -r '(.cn_city_codes // []) | length' <<< "$policy_json")"
-        if [ "$city_count" -gt 0 ]; then
-            bin="$(forwarder_bin_path)"
-            [ -x "$bin" ] || pfwd_die "缺少 XDP 辅助程序：$bin"
-            tmp_codes="$(mktemp)"
-            jq -r '.cn_city_codes // [] | .[]' <<< "$policy_json" > "$tmp_codes"
-            if ! "$bin" city-export \
-              --asset-dir "$asset_dir" \
-              --codes-file "$tmp_codes" | awk -F '\t' 'NF >= 4 {print $4}'; then
-                rm -f "$tmp_codes"
-                return 1
-            fi
-            rm -f "$tmp_codes"
-        fi
-    fi
-}
-
-fw_render_ingress_whitelist_sets() {
-    local runtime_json="$1"
-    fw_ingress_whitelist_enabled "$runtime_json" || return 0
-
-    local policy_json policy_id ipver elements
-    while IFS= read -r policy_json; do
-        [ -n "$policy_json" ] || continue
-        policy_id="$(jq -r '.id // 0' <<< "$policy_json")"
-        for ipver in 4 6; do
-            echo "  set $(fw_ingress_whitelist_set_name "$ipver" "$policy_id") {"
-            echo "    type ipv${ipver}_addr"
-            echo "    flags interval"
-            elements="$(fw_ingress_whitelist_policy_cidrs "$runtime_json" "$policy_json" "$ipver" |
-              fw_render_interval_set_elements_from_stdin "$ipver")"
-            if [ -n "$elements" ]; then
-                printf '    elements = { %s }\n' "$elements"
-            fi
-            echo "  }"
-            echo
-        done
-    done < <(fw_ingress_whitelist_policy_rows "$runtime_json")
-}
-
-fw_render_ingress_whitelist_chain() {
-    local runtime_json="$1"
-    fw_ingress_whitelist_enabled "$runtime_json" || return 0
-
-    echo "  chain ingress_whitelist {"
-    echo "    type filter hook prerouting priority dstnat - 10; policy accept;"
-    jq -r '
-      (.settings.protocol_skip_ports // []) as $skip
-      | [
-          .rules[]?
-          | select((.listen_port as $port | ($skip | index($port)) | not))
-          | (.protocol // "tcp") as $raw_proto
-          | (if $raw_proto == "tcp_udp" then ["tcp", "udp"][] else $raw_proto end) as $proto
-          | {
-              proto: $proto,
-              ipver: ((.ip_version // 4) | tostring),
-              port: (.listen_port | tonumber),
-              policy: ((.whitelist_policy_id // 0) | tostring)
-            }
-        ]
-      | unique_by([.proto, .ipver, .port])
-      | sort_by(.ipver, .proto, .port)
-      | .[]
-      | [.proto, .ipver, (.port | tostring), .policy]
-      | @tsv
-    ' <<< "$runtime_json" |
-    while IFS=$'\t' read -r proto ipver port policy_id; do
-        [ -n "$proto" ] || continue
-        case "$ipver" in
-            4)
-                echo "    $proto dport $port ip saddr != @$(fw_ingress_whitelist_set_name 4 "$policy_id") counter drop comment \"pfwd ingress whitelist\""
-                ;;
-            6)
-                echo "    $proto dport $port ip6 saddr != @$(fw_ingress_whitelist_set_name 6 "$policy_id") counter drop comment \"pfwd ingress whitelist\""
-                ;;
-        esac
-    done
-    echo "  }"
-    echo
-}
-
 fw_render_runtime_to_stdout() {
     local runtime_json="$1"
     local table family
@@ -508,9 +215,6 @@ fw_render_runtime_to_stdout() {
     done < <(fw_runtime_rule_rows "$runtime_json")
 
     echo "table $family $table {"
-    fw_render_ingress_whitelist_sets "$runtime_json"
-    fw_render_ingress_whitelist_chain "$runtime_json"
-
     echo "    chain prerouting {"
     echo "        type nat hook prerouting priority dstnat; policy accept;"
     for ipver in 4 6; do
@@ -608,10 +312,6 @@ fw_render_nft_objects() {
     local users_json stats_file
     stats_file="$PFWD_STATS_FILE"
     users_json="$(jq -c '.users // []' <<< "$runtime_json")"
-
-    if fw_host_egress_enabled "$runtime_json"; then
-        fw_render_host_egress_objects "$runtime_json"
-    fi
 
     jq -r --argjson users "$users_json" --slurpfile stats "$stats_file" '
       $users[]
@@ -733,10 +433,6 @@ fw_render_accounting_to_stdout() {
     table="$(fw_table)"
     echo "table $family $table {"
     fw_render_nft_objects "$runtime_json"
-    if fw_host_egress_enabled "$runtime_json"; then
-        fw_render_host_egress_chain
-        echo
-    fi
     fw_render_prerouting_count_chain "$runtime_json"
     fw_render_postrouting_count_chain "$runtime_json"
     echo "}"

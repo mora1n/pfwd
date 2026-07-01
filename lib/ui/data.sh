@@ -182,12 +182,21 @@ ui_main_user_rows() {
 }
 
 
+ui_main_forward_count() {
+    local data="$1"
+    jq -r '.forwards | length' <<< "$data"
+}
+
+
 ui_main_forward_rows() {
     local data="$1"
-    jq -r '
+    local limit="${2:-0}"
+    [[ "$limit" =~ ^[0-9]+$ ]] || limit=0
+    jq -r --argjson limit "$limit" '
       . as $data
       | .forwards
       | sort_by(.user_id, .listen_port, .id)
+      | (if $limit > 0 then .[:$limit] else . end)
       | .[]?
       | . as $forward
       | (($data.users | map(select(.id == $forward.user_id)) | .[0].limits.rate) // null) as $user_rate

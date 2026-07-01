@@ -1,12 +1,21 @@
 # pfwd
 
-`pfwd` 是一个 XDP 优先的端口转发管理工具，覆盖转发规则、流量统计、入口/出口白名单、协议封锁、下行伪装和系统调优。
+`pfwd` 是一个 XDP 优先的端口转发管理工具，覆盖用户、转发规则、流量统计、到期/限额管理和 Telegram 通知。
 
 完整命令面以 `pfwd help` 为准。
 
 ## 安装
 
-运行环境需要 `jq`、`iproute2` / `ip` / `tc`、`systemd`、`curl` 或 `wget`，以及挂载在 `/sys/fs/bpf` 的 bpffs。只有自己构建资产时才需要 Go、clang 和 eBPF 工具链。
+运行环境需要：
+
+- `jq`
+- `iproute2` / `ip` / `tc`
+- `nftables`
+- `systemd`
+- `curl` 或 `wget`
+- 挂载在 `/sys/fs/bpf` 的 bpffs
+
+只有自己构建资产时才需要 Go、clang 和 eBPF 工具链。
 
 ### 在线安装
 
@@ -19,29 +28,25 @@ wget -qO- https://raw.githubusercontent.com/mora1n/pfwd/main/pfwd.sh | bash -s -
 ```bash
 pfwd doctor
 /usr/local/lib/pfwd/bin/pfwd-xdp version
-/usr/local/lib/pfwd/bin/pfwd-downmask version
+/usr/local/lib/pfwd/bin/pfwd-service version
 ```
 
-### 离线安装（amd64 示例）
+### 离线安装
 
 先在打包机生成资产：
 
 ```bash
 ./xdp/build.sh
-./downmask/build.sh
-./leaseweb/build.sh
+./service/build.sh
 ```
 
-打包基础离线包：
+打包 amd64 离线包：
 
 ```bash
 tar -czf pfwd-amd64.tar.gz \
-  pfwd.sh bbr.sh lib/ scripts/ \
+  pfwd.sh lib/ service/ xdp/ \
   assets/pfwd-xdp-linux-amd64 \
-  assets/pfwd-downmask-linux-amd64 \
-  assets/pfwd-leaseweb-linux-amd64 \
-  assets/pfwd-geo-cn-v4.bin assets/pfwd-geo-cn-v6.bin assets/pfwd-geo-meta.json \
-  assets/pfwd-city-cn-meta.json assets/pfwd-city-cn-v4.bin
+  assets/pfwd-service-linux-amd64
 ```
 
 目标机安装：
@@ -76,116 +81,85 @@ pfwd add \
   --snat-source 198.51.100.10
 ```
 
-## 流量防护
-
-```bash
-pfwd guard enable
-pfwd guard protocols --https true --socks true --skip-port 25001
-
-pfwd guard whitelist --enabled true
-pfwd guard whitelist-cn all
-pfwd guard whitelist-city add 湖南省 长沙市
-pfwd guard whitelist-custom add 203.0.113.5
-pfwd guard whitelist-lease add --address 198.51.100.8 --ipv4-prefix-len 24 --idle-ttl 2h --channel manual --note phone
-pfwd guard whitelist check --address 62.187.9.117 --listen-port 41423 --protocol tcp
-
-pfwd guard whitelist-port-cn --listen-port 41423 select 浙江省
-pfwd guard whitelist-port-city --listen-port 41423 add 浙江省 杭州市
-pfwd guard whitelist-port clear --listen-port 41423
-
-pfwd guard egress-whitelist --enabled true
-pfwd guard egress-whitelist-cn all
-```
-
-## leaseweb
-
-leaseweb 提供一个只负责“临时放行入口白名单”的 Web 控制器。访问私密链接后，控制机会通过 SSH 在目标机写入 `pfwd guard whitelist-lease` 规则。
-
-控制机初始化：
-
-```bash
-pfwd leaseweb init
-pfwd leaseweb config set --listen-host 127.0.0.1 --listen-port 18080 --request-timeout-sec 10
-pfwd leaseweb trusted-proxy add 127.0.0.1/32
-pfwd leaseweb trusted-proxy add ::1/128
-pfwd leaseweb route add --secret '<secret>' --label '<label>' --ssh-target 'root@target-host' --ssh-port 22 --ipv4-prefix-len 24 --ipv6-prefix-len 128 --idle-ttl 4h --ssh-options '-i /root/.ssh/pfwd-leaseweb -o IdentitiesOnly=yes -o BatchMode=yes'
-pfwd leaseweb service enable
-pfwd leaseweb service start
-```
-
-目标机授权控制机密钥，建议使用受限命令：
-
-```bash
-install -d -m 700 /root/.ssh && printf '%s\n' 'command="/usr/local/lib/pfwd/bin/pfwd-lease-command",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAA... root@controller' >> /root/.ssh/authorized_keys
-```
-
-检查与访问：
-
-```bash
-pfwd leaseweb route check 1
-pfwd leaseweb status
-curl 'http://127.0.0.1:18080/<secret>?format=json'
-```
-
-要点：
-
-- `trusted-proxy` 只添加实际反代来源；否则来源 IP 会被识别成反代地址。
-- `ssh-target` 建议写完整 `user@host`，首次接入前先确认 host key 已信任。
-- `ipv4-prefix-len` 控制放行范围；例如 `/24` 会把 `203.0.113.27` 放宽成 `203.0.113.0/24`。
-- TUI 入口：`流量防护 -> leaseweb`。
-
-## 下行伪装
-
-公网下载模式：
-
-```bash
-pfwd downmask policy --pull-mode public --iface eth0
-pfwd downmask public --active-source cloudflare_dynamic --speed-limit 4M
-pfwd downmask status
-```
-
-A/B 机模式：
-
-```bash
-TOKEN="$(openssl rand -hex 16)"
-
-pfwd downmask policy --pull-mode ab --iface eth0
-pfwd downmask ab-pull --protocol-mode parallel --remote-port 5301 --token "$TOKEN" --speed-limit 4M
-pfwd downmask ab-pull targets add --host 10.0.0.2 --weight 3 --tcp-enabled true --udp-enabled true
-
-pfwd downmask ab-feed --tcp-enabled true --bind-ip 10.0.0.2 --tcp-port 5301 --token "$TOKEN"
-pfwd downmask seed generate --size 1GB
-pfwd downmask status
-```
-
 ## 常用命令
 
 | 场景 | 命令 |
 | --- | --- |
-| 进入菜单 | `pfwd` |
+| 进入 TUI | `pfwd` |
+| 初始化本机状态 | `pfwd init` |
 | 添加用户 | `pfwd user add alice` |
+| 删除用户 | `pfwd user delete alice` |
 | 添加转发 | `pfwd add --user-id alice --remote example.com:443 --listen-port 25001 --protocol tcp` |
 | 查看转发 | `pfwd list` |
+| 暂停转发 | `pfwd stop <forward-id>` |
+| 恢复转发 | `pfwd start <forward-id>` |
+| 删除转发 | `pfwd delete <forward-id>` |
 | 查看统计 | `pfwd stats --user-id alice` |
+| 设置到期时间 | `pfwd expire set --forward-id <forward-id> --stop-at 2026-08-01` |
+| 设置限额 | `pfwd limit set --forward-id <forward-id> --traffic 100GB` |
 | 刷新运行态 | `pfwd refresh` |
 | 重启运行态 | `pfwd restart` |
-| 查看防护 | `pfwd guard status` |
-| 查看下行伪装 | `pfwd downmask status` |
+| 查看运行态 | `pfwd render status` |
+| 查看本地服务 | `pfwd service status` |
 | 诊断 | `pfwd doctor` |
+| 卸载 | `pfwd uninstall` |
 
-## 系统调优
+## 运行时状态
 
-```bash
-pfwd-bbr status
-pfwd-bbr optimize relay --egress-rate 100mbit --ingress-rate 100mbit --tc-iface eth0
-pfwd-bbr reset
+pfwd 使用单一 SQLite 数据库保存控制面配置和统计状态：
+
+```text
+/var/lib/pfwd/sqlite.db
 ```
 
-## 卸载
+本地 daemon 默认监听 Unix socket：
+
+```text
+/run/pfwd/pfwd.sock
+```
+
+shell 命令会从 SQLite 同步出运行时缓存文件，再生成 XDP/nft/tc 运行态。这些缓存文件位于 `/run/pfwd/`，重启后可由数据库重新生成。
+
+主要路径：
+
+| 路径 | 用途 |
+| --- | --- |
+| `/usr/local/bin/pfwd` | 命令入口 |
+| `/usr/local/lib/pfwd/` | 安装目录 |
+| `/usr/local/lib/pfwd/bin/pfwd-xdp` | XDP helper |
+| `/usr/local/lib/pfwd/bin/pfwd-service` | SQLite/socket daemon |
+| `/var/lib/pfwd/sqlite.db` | 单一持久化数据库 |
+| `/run/pfwd/pfwd.sock` | 本地 Unix socket |
+| `/run/pfwd/config.json` | 运行时配置缓存 |
+| `/run/pfwd/stats.json` | 运行时统计缓存 |
+| `/run/pfwd/runtime.json` | 已编译转发运行态 |
+
+## systemd
+
+安装后只写入一个长驻服务：
+
+| Unit | 作用 |
+| --- | --- |
+| `pfwd.service` | 本地 SQLite/socket daemon；启动时恢复转发运行态；每 60 秒执行 reconcile |
+
+查看服务：
 
 ```bash
-pfwd uninstall
-pfwd-bbr uninstall
+systemctl status pfwd.service
+pfwd service status
+```
+
+## 开发验证
+
+常用本地验证：
+
+```bash
+bash -n pfwd.sh lib/*.sh lib/commands/*.sh lib/ui/*.sh
+./service/build.sh
+cd service && GOFLAGS='' CGO_ENABLED=0 go test .
+./xdp/build.sh
+cd xdp && GOFLAGS='' CGO_ENABLED=0 go test .
+git diff --check
 ```
 
 ## 许可证

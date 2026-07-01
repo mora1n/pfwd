@@ -2,7 +2,8 @@
 
 cmd_init() {
     config_init
-    echo "已初始化：$PFWD_CONFIG_FILE"
+    stats_init
+    echo "已初始化：$PFWD_DB_FILE"
 }
 
 
@@ -60,15 +61,6 @@ cmd_apply_firewall_tc_runtime() {
 }
 
 
-cmd_apply_guard_runtime() {
-    config_init >/dev/null
-    stats_runtime_cache_clear
-    cmd_runtime_ready || return 0
-    forwarder_apply_runtime
-    stats_runtime_cache_clear
-}
-
-
 cmd_refresh_after_change() {
     stats_rollup_current
     cmd_apply_forwarding_bundle
@@ -111,23 +103,11 @@ cmd_render() {
         forwarder) forwarder_render_config ;;
         nft) fw_render_nft ;;
         tc) fw_render_tc ;;
-        guard) guard_render_status ;;
-        downmask) downmask_status_json | jq '.' ;;
         units)
             echo "# pfwd.service"
             service_manager_unit
-            echo "# pfwd.timer"
-            service_timer_unit
-            echo "# pfwd-bbr.service"
-            bbr_service_unit
-            echo "# pfwd-xdp.service"
-            guard_service_unit
-            if [ -f "$(downmask_feed_unit_path)" ]; then
-                echo "# pfwd-downmask-feed.service"
-                cat "$(downmask_feed_unit_path)"
-            fi
             ;;
-        *) pfwd_die "用法：pfwd render [forwarder|status|nft|tc|guard|downmask|units]" ;;
+        *) pfwd_die "用法：pfwd render [forwarder|status|xdp|nft|tc|units]" ;;
     esac
 }
 
@@ -142,7 +122,6 @@ cmd_refresh() {
     config_init >/dev/null
     stats_rollup_current
     cmd_apply_forwarding_bundle
-    downmask_reload_feed_service 2>/dev/null || true
     echo "已刷新"
 }
 
@@ -154,6 +133,60 @@ cmd_restart() {
     cmd_runtime_ready || return 0
     forwarder_stop_runtime
     cmd_apply_forwarding_bundle
-    downmask_reload_feed_service 2>/dev/null || true
     echo "已重启运行态"
+}
+
+
+cmd_service() {
+    local action="${1:-}"
+    [ -n "$action" ] || pfwd_die "用法：pfwd service status|reload|daemon [--socket PATH] [--db PATH] [--pfwd-bin PATH]"
+    shift || true
+
+    local socket_path="$PFWD_SERVICE_SOCKET"
+    local db_path="$PFWD_DB_FILE"
+    local pfwd_bin_path="$PFWD_BIN_PATH"
+    local passthrough=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --socket)
+                [ "$#" -ge 2 ] || pfwd_die "--socket 需要路径"
+                socket_path="$2"
+                shift 2
+                ;;
+            --db)
+                [ "$#" -ge 2 ] || pfwd_die "--db 需要路径"
+                db_path="$2"
+                shift 2
+                ;;
+            --pfwd-bin)
+                [ "$#" -ge 2 ] || pfwd_die "--pfwd-bin 需要路径"
+                pfwd_bin_path="$2"
+                shift 2
+                ;;
+            *)
+                passthrough+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [ "${#passthrough[@]}" -eq 0 ] || pfwd_die "未知 service 参数：${passthrough[*]}"
+
+    local bin_path
+    bin_path="$(service_bin_path)"
+    [ -x "$bin_path" ] || pfwd_die "pfwd-service 不可执行：$bin_path；请先执行 ./service/build.sh 或 pfwd install"
+
+    case "$action" in
+        daemon)
+            exec "$bin_path" daemon --socket "$socket_path" --db "$db_path" --pfwd-bin "$pfwd_bin_path"
+            ;;
+        status)
+            "$bin_path" status --socket "$socket_path"
+            ;;
+        reload)
+            "$bin_path" reload --socket "$socket_path"
+            ;;
+        *)
+            pfwd_die "用法：pfwd service status|reload|daemon [--socket PATH] [--db PATH] [--pfwd-bin PATH]"
+            ;;
+    esac
 }

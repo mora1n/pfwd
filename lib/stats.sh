@@ -17,14 +17,34 @@ PFWD_STATS_XDP_STATUS_CACHE=""
 PFWD_STATS_RUNTIME_XDP_CACHE=""
 PFWD_STATS_RUNTIME_NFT_CACHE=""
 
+stats_store_load() {
+    pfwd_service_store_get stats_json 2>/dev/null
+}
+
+stats_store_save_file() {
+    local file="$1"
+    jq '.' "$file" | pfwd_service_store_put stats_json
+}
+
+stats_sync_cache_from_store() {
+    local payload
+    payload="$(stats_store_load)" || return 1
+    printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$PFWD_STATS_FILE"
+}
+
 stats_init() {
     [ "$PFWD_STATS_INITIALIZED" = "1" ] && [ -f "$PFWD_STATS_FILE" ] && return 0
     pfwd_require_jq
     pfwd_mkdirs
-    if [ ! -f "$PFWD_STATS_FILE" ]; then
-        stats_default_json | jq '.' | pfwd_write_atomic "$PFWD_STATS_FILE"
+    if ! stats_sync_cache_from_store; then
+        if [ ! -f "$PFWD_STATS_FILE" ]; then
+            stats_default_json | jq '.' | pfwd_write_atomic "$PFWD_STATS_FILE"
+        fi
+        stats_validate_file "$PFWD_STATS_FILE"
+        stats_store_save_file "$PFWD_STATS_FILE"
     fi
     stats_validate_file "$PFWD_STATS_FILE"
+    stats_store_save_file "$PFWD_STATS_FILE"
     PFWD_STATS_INITIALIZED=1
 }
 
@@ -49,6 +69,7 @@ stats_update() {
     jq "${args[@]}" "$filter" "$PFWD_STATS_FILE" > "$tmp"
     stats_validate_file "$tmp"
     mv "$tmp" "$PFWD_STATS_FILE"
+    stats_store_save_file "$PFWD_STATS_FILE"
     PFWD_STATS_INITIALIZED=1
 }
 
@@ -442,7 +463,7 @@ stats_current_snapshot() {
             rm -f "$snapshot_error"
             if [ "$snapshot_status" -ne 0 ] && [ -f "$PFWD_XDP_STATUS_FILE" ] && [ "$(jq -r '.applied // false' "$PFWD_XDP_STATUS_FILE" 2>/dev/null || echo false)" = "true" ]; then
                 if [[ "$PFWD_STATS_LAST_SNAPSHOT_ERROR" == *"doesn't consume all data"* ]]; then
-                    pfwd_die "读取 XDP 计数失败：pfwd-xdp 与当前 pinned counter map ABI 不匹配，请使用包含 assets/$(guard_asset_name) 的完整安装包重新安装后再执行 restart"
+                    pfwd_die "读取 XDP 计数失败：pfwd-xdp 与当前 pinned counter map ABI 不匹配，请使用包含当前 pfwd-xdp 资产的完整安装包重新安装后再执行 restart"
                 fi
                 pfwd_die "读取 XDP 计数失败：${PFWD_STATS_LAST_SNAPSHOT_ERROR:-pfwd-xdp snapshot exit=$snapshot_status}"
             fi

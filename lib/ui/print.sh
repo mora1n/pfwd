@@ -76,121 +76,20 @@ ui_print_main_user_summary() {
 ui_render_forward_groups() {
     local rows="$1"
     local headers_tsv="$2"
+    local shrink_csv="$3"
     local empty_text="$4"
-    local current_user="" line user first_group=true
-    local enabled="" col3="" col4="" col5="" col6="" col7="" col8="" col9="" col10="" col11="" col12=""
-    local group_rows="" group_headers="" group_shrink="" row_buffer=""
 
     if [ -z "$rows" ]; then
         ui_print_line "$empty_text"
         return 0
     fi
-
-    ui_render_forward_group_block() {
-        local block_user="$1"
-        local block_rows="$2"
-        local block_headers="$3"
-        local block_shrink="$4"
-        local block_line="" block_enabled="" block_user_id=""
-        local block_col3="" block_col4="" block_col5="" block_col6="" block_col7="" block_col8="" block_col9="" block_col10="" block_col11="" block_col12=""
-        local block_display_state=""
-        local render_rows=""
-
-        [ -n "$block_rows" ] || return 0
-        ui_print_line "用户：$block_user" "$UI_C_HEADER"
-        while IFS= read -r block_line; do
-            [ -n "$block_line" ] || continue
-            IFS=$'\t' read -r block_enabled block_user_id block_col3 block_col4 block_col5 block_col6 block_col7 block_col8 block_col9 block_col10 block_col11 block_col12 <<< "$block_line"
-            case "$headers_tsv" in
-                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
-                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(format_ratio "$block_col8")"$'\t'"$(ui_display_or_dash "$block_col9")"$'\n'
-                    ;;
-                $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
-                    render_rows+="$block_enabled"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col6"$'\t'"$block_col7"$'\t'"$(format_ratio "$block_col8")"$'\t'"$(ui_format_rate "$block_col9")"$'\t'"$(ui_display_or_dash "$block_col10")"$'\n'
-                    ;;
-                $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
-                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\t'"$block_col8"$'\t'"$(format_ratio "$block_col9")"$'\t'"$block_col10"$'\t'"$block_col11"$'\t'"$(ui_display_or_dash "$block_col12")"$'\n'
-                    ;;
-                $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-                    render_rows+="#$block_enabled"$'\t'"$block_col6"$'\t'"$block_col3"$'\t'"$block_col4"$'\t'"$block_col5"$'\t'"$block_col7"$'\n'
-                    ;;
-                *)
-                    ui_forward_line "$block_enabled" "$block_line" "$col7"
-                    continue
-                    ;;
-            esac
-        done <<< "$block_rows"
-        render_rows="${render_rows%$'\n'}"
-        ui_table_render "$block_headers" "$render_rows" "$block_shrink"
-    }
-
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        IFS=$'\t' read -r _ user _ <<< "$line"
-        if [ -z "$current_user" ] || [ "$user" != "$current_user" ]; then
-            if [ "$first_group" = "false" ]; then
-                case "$headers_tsv" in
-                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
-                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
-                        group_shrink="2,3,4,5,6,7,8"
-                        ;;
-                    $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
-                        group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注'
-                        group_shrink="2,3,4,5,6,7,8,9"
-                        ;;
-                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
-                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
-                        group_shrink="3,4,6,7,8,9,10,11"
-                        ;;
-                    $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-                        group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
-                        group_shrink="3,4,6"
-                        ;;
-                    *)
-                        group_headers=""
-                        group_shrink=""
-                        ;;
-                esac
-                ui_render_forward_group_block "$current_user" "$group_rows" "$group_headers" "$group_shrink"
-                printf '\n'
-            fi
-            current_user="$user"
-            first_group=false
-            group_rows=""
-        fi
-        group_rows+="$line"$'\n'
-    done <<< "$rows"
-
-    group_rows="${group_rows%$'\n'}"
-    case "$headers_tsv" in
-        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t备注')
-            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t备注'
-            group_shrink="2,3,4,5,6,7,8"
-            ;;
-        $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注')
-            group_headers=$'状态\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注'
-            group_shrink="2,3,4,5,6,7,8,9"
-            ;;
-        $'序号\t用户\t监听\t目标\t协议\t状态\t到期\t模式\t倍率\tMSS\tSNAT\t备注')
-            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期\t模式\t倍率\tMSS\tSNAT\t备注'
-            group_shrink="3,4,6,7,8,9,10,11"
-            ;;
-        $'序号\t用户\t监听\t目标\t协议\t状态\t到期')
-            group_headers=$'序号\t状态\t监听\t目标\t协议\t到期'
-            group_shrink="3,4,6"
-            ;;
-        *)
-            group_headers=""
-            group_shrink=""
-            ;;
-    esac
-    ui_render_forward_group_block "$current_user" "$group_rows" "$group_headers" "$group_shrink"
+    ui_table_render "$headers_tsv" "$rows" "$shrink_csv"
 }
 
 
 ui_print_main_forward_summary() {
     local data="$1"
-    local rows=""
+    local rows="" limit total shown
     ui_print_line "当前转发" "$UI_C_HEADER"
 
     if ! jq -e '.forwards | length > 0' <<< "$data" >/dev/null; then
@@ -198,14 +97,21 @@ ui_print_main_forward_summary() {
         return
     fi
 
+    limit="${UI_MAIN_FORWARD_SUMMARY_LIMIT:-40}"
+    [[ "$limit" =~ ^[0-9]+$ ]] || limit=40
+    total="$(ui_main_forward_count "$data")"
     while IFS=$'\t' read -r enabled user listen_ip listen_port remote_host remote_port input_bytes output_bytes stop_at ratio rate comment; do
         local remote_text listen_text
         remote_text="$(ui_format_remote "$remote_host" "$remote_port")"
         listen_text="$(ui_format_listen_compact "$listen_ip" "$listen_port")"
         rows+="$enabled"$'\t'"$user"$'\t'"$listen_text"$'\t'"$remote_text"$'\t'"$(ui_format_bytes_or_dash "$input_bytes")"$'\t'"$(ui_format_bytes_or_dash "$output_bytes")"$'\t'"$(ui_display_or_dash "$stop_at")"$'\t'"$(format_ratio "$ratio")"$'\t'"$(ui_format_rate "$rate")"$'\t'"$(ui_display_or_dash "$comment")"$'\n'
-    done < <(ui_main_forward_rows "$data")
+    done < <(ui_main_forward_rows "$data" "$limit")
     rows="${rows%$'\n'}"
     ui_render_forward_groups "$rows" $'状态\t用户\t监听\t目标\t上行\t下行\t到期\t倍率\t限速\t备注' "4,10,2,7,3" "$(ui_empty_forwards_text)"
+    if [ "$limit" -gt 0 ] && [ "$total" -gt "$limit" ]; then
+        shown="$limit"
+        ui_print_line "已显示 $shown/$total 条；进入转发管理查看完整列表。" "$UI_C_DIM"
+    fi
 }
 
 

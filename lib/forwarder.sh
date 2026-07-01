@@ -159,8 +159,7 @@ forwarder_domain_refresh_hash_from_runtime_json() {
             mss_mode,
             mss_value,
             traffic_mode,
-            traffic_ratio,
-            whitelist_policy_id
+            traffic_ratio
           }
       ]
       | sort_by(.id, .protocol, .ip_version, .resolved_target)
@@ -255,63 +254,6 @@ forwarder_iface() {
     ip route show default 2>/dev/null | awk '{print $5; exit}'
 }
 
-forwarder_protocol_filters_enabled() {
-    if [ "$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")" != "true" ]; then
-        echo false
-    elif [ "$(jq -r '.settings.guard.block_http // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
-       [ "$(jq -r '.settings.guard.block_tls // false' "$PFWD_CONFIG_FILE")" = "true" ] ||
-       [ "$(jq -r '.settings.guard.block_socks // false' "$PFWD_CONFIG_FILE")" = "true" ]; then
-        echo true
-    else
-        echo false
-    fi
-}
-
-forwarder_guard_ingress_mode() {
-    echo tc
-}
-
-forwarder_whitelist_files_json() {
-    local files=()
-    if [ "$(jq -r '.settings.guard.enabled // false' "$PFWD_CONFIG_FILE")" = "true" ] &&
-       command -v whitelist_enabled >/dev/null 2>&1 &&
-       [ "$(whitelist_enabled)" = "true" ]; then
-        if [ -f "$PFWD_WHITELIST_ALLOW_IPV4_FILE" ]; then
-            files+=("$PFWD_WHITELIST_ALLOW_IPV4_FILE")
-        fi
-        if [ -f "$PFWD_WHITELIST_ALLOW_IPV6_FILE" ]; then
-            files+=("$PFWD_WHITELIST_ALLOW_IPV6_FILE")
-        fi
-    fi
-    if [ "${#files[@]}" -eq 0 ]; then
-        printf '[]\n'
-        return 0
-    fi
-    printf '%s\n' "${files[@]}" | jq -R . | jq -s .
-}
-
-forwarder_egress_whitelist_files_json() {
-    local files=()
-    if command -v egress_whitelist_enabled >/dev/null 2>&1 &&
-       [ "$(egress_whitelist_enabled)" = "true" ]; then
-        if [ -f "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE" ]; then
-            files+=("$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE")
-        fi
-        if [ -f "$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE" ]; then
-            files+=("$PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE")
-        fi
-    fi
-    if [ "${#files[@]}" -eq 0 ]; then
-        printf '[]\n'
-        return 0
-    fi
-    printf '%s\n' "${files[@]}" | jq -R . | jq -s .
-}
-
-forwarder_protocol_skip_ports_json() {
-    jq -c '.settings.guard.protocol_skip_ports // []' "$PFWD_CONFIG_FILE"
-}
-
 forwarder_render_config() {
     forwarder_runtime_json true | jq '.'
 }
@@ -322,9 +264,9 @@ forwarder_ensure_ip_forwarding() {
         ui_emit_dry_run "DRY-RUN: sysctl -w net.ipv6.conf.all.forwarding=1"
         return 0
     fi
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    { echo 1 > /proc/sys/net/ipv4/ip_forward; } 2>/dev/null || true
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+    { echo 1 > /proc/sys/net/ipv6/conf/all/forwarding; } 2>/dev/null || true
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
 }
 
@@ -396,14 +338,8 @@ forwarder_runtime_status_json() {
         rules: ($runtime.rules | length),
         xdp_candidate_rules_count: ([$runtime.rules[]? | select(.execution_class == "xdp")] | length),
         xdp_rules_count: ($xdp_runtime.rules | length),
-        xdp_guard_rules_count: ((if ($runtime.settings.guard_enabled // false) then 1 else 0 end)),
         nft_rules_count: ($nft_runtime.rules | length),
         interface: ($runtime.settings.interface // ""),
-        protocol_guard: ($runtime.settings.guard_enabled // false),
-        whitelist_enabled: ($runtime.settings.whitelist_enabled // false),
-        egress_whitelist_enabled: ($runtime.settings.egress_whitelist_enabled // false),
-        host_egress_enabled: ($runtime.settings.host_egress_enabled // false),
-        host_egress_backend: ($runtime.settings.host_egress_backend // "off"),
         dataplane_version: ($runtime.dataplane_version // $xdp_status.dataplane_version // null),
         map_abi_version: ($runtime.map_abi_version // $xdp_status.map_abi_version // null),
         incremental_apply: ($xdp_status.incremental_apply // false),
@@ -450,14 +386,8 @@ forwarder_status_json() {
             rules: 0,
             xdp_candidate_rules_count: 0,
             xdp_rules_count: 0,
-            xdp_guard_rules_count: 0,
             nft_rules_count: 0,
             interface: "",
-            protocol_guard: false,
-            whitelist_enabled: false,
-            egress_whitelist_enabled: false,
-            host_egress_enabled: false,
-            host_egress_backend: "off",
             dataplane_version: null,
             map_abi_version: null,
             incremental_apply: false,
@@ -490,10 +420,6 @@ forwarder_render_status() {
         ["生效规则", (.rules | tostring)],
         ["XDP 候选规则", ((.xdp_candidate_rules_count // 0) | tostring)],
         ["XDP 规则", (.xdp_rules_count | tostring)],
-        ["Guard 数据面", (if (.xdp_guard_rules_count // 0) > 0 then "开" else "关" end)],
-        ["入口白名单", (if (.whitelist_enabled // false) then "开" else "关" end)],
-        ["出口白名单", (if (.egress_whitelist_enabled // false) then "开" else "关" end)],
-        ["宿主机出口白名单", (if (.host_egress_enabled // false) then (.host_egress_backend // "开") else "关" end)],
         ["nft 规则", (.nft_rules_count | tostring)],
         ["绑定网卡", (.interface // "-")],
         ["dataplane", ((.dataplane_version // .xdp_status.dataplane_version // "-") | tostring)],
@@ -535,9 +461,6 @@ forwarder_apply_runtime() {
     pfwd_debug "forwarder_apply_runtime start"
     config_init >/dev/null
     forwarder_validate_config
-    if command -v whitelist_prepare_runtime >/dev/null 2>&1; then
-        whitelist_prepare_runtime
-    fi
 
     runtime_json="$(forwarder_runtime_json true)"
     runtime_apply_compiled_runtime "$runtime_json"
@@ -558,20 +481,4 @@ forwarder_validate_config() {
       and (.forwards | type == "array")
       and (.users | type == "array")
     ' "$PFWD_CONFIG_FILE" >/dev/null || pfwd_die "无效 pfwd 配置文件：$PFWD_CONFIG_FILE"
-}
-
-forwarder_service_unit() {
-    cat <<EOF
-[Unit]
-Description=pfwd XDP/nft runtime restore
-After=network-online.target nftables.service systemd-sysctl.service ufw.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$PFWD_BIN_PATH __forward_boot
-
-[Install]
-WantedBy=multi-user.target
-EOF
 }

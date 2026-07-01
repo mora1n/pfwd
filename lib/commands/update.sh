@@ -33,16 +33,11 @@ cmd_update_check() {
 cmd_update_finalize_recover() {
     local work_dir="$1"
     local service_states_json="${2:-}"
-    local legacy_runtime_enabled="${3:-false}"
-    local legacy_timer_enabled="${4:-false}"
-    local legacy_guard_enabled="${5:-false}"
-    local error_message="${6:-更新失败}"
+    local error_message="${3:-更新失败}"
 
     service_update_rollback "$work_dir" || true
     if [ -n "$service_states_json" ] && [ "$service_states_json" != "[]" ]; then
         service_update_restore_service_states "$service_states_json" || true
-    else
-        service_update_restore_service_states "$(service_update_legacy_service_states_json "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled")" || true
     fi
     pfwd_die "$error_message；已回滚；临时目录保留：$work_dir"
 }
@@ -50,14 +45,10 @@ cmd_update_finalize_recover() {
 
 cmd_update_finalize() {
     local work_dir="" service_states_json="" from_version="" to_version=""
-    local legacy_runtime_enabled="false" legacy_timer_enabled="false" legacy_guard_enabled="false"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --work-dir) work_dir="${2:-}"; shift 2 ;;
             --service-states-json) service_states_json="${2:-}"; shift 2 ;;
-            --runtime-enabled) legacy_runtime_enabled="${2:-false}"; shift 2 ;;
-            --timer-enabled) legacy_timer_enabled="${2:-false}"; shift 2 ;;
-            --guard-enabled) legacy_guard_enabled="${2:-false}"; shift 2 ;;
             --from-version) from_version="${2:-}"; shift 2 ;;
             --to-version) to_version="${2:-}"; shift 2 ;;
             *) pfwd_die "未知选项：$1" ;;
@@ -68,24 +59,20 @@ cmd_update_finalize() {
     if [ -n "$service_states_json" ]; then
         service_states_json="$(pfwd_require_json_output "update 服务状态" "$service_states_json")"
     else
-        service_states_json="$(service_update_legacy_service_states_json "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled")"
-    fi
-
-    if ! service_cleanup_legacy_install_artifacts; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "清理旧安装资产失败"
+        service_states_json="[]"
     fi
     if ! service_write_unit_files; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "同步 systemd unit 失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "同步 systemd unit 失败"
     fi
     if ! service_update_restore_service_states "$service_states_json"; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "恢复服务状态失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "恢复服务状态失败"
     fi
     if ! cmd_apply_runtime; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "应用更新后的运行态失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "应用更新后的运行态失败"
     fi
 
     if ! service_update_cleanup "$work_dir"; then
-        cmd_update_finalize_recover "$work_dir" "$service_states_json" "$legacy_runtime_enabled" "$legacy_timer_enabled" "$legacy_guard_enabled" "更新已完成，但清理临时文件失败"
+        cmd_update_finalize_recover "$work_dir" "$service_states_json" "更新已完成，但清理临时文件失败"
     fi
 
     echo "更新完成：$from_version -> $to_version"
@@ -109,7 +96,7 @@ cmd_update() {
     staged_dir="$work_dir/staged"
 
     if ! service_update_download_bundle "$work_dir"; then
-        pfwd_die "下载更新包失败；请确认更新源包含必需的 pfwd-xdp/pfwd-downmask 预编译资产。临时目录保留：$work_dir"
+        pfwd_die "下载更新包失败；请确认更新源包含必需的 pfwd-xdp/pfwd-service 预编译资产。临时目录保留：$work_dir"
     fi
     if ! service_update_validate_bundle "$staged_dir"; then
         pfwd_die "更新包校验失败；临时目录保留：$work_dir"
@@ -173,15 +160,6 @@ cmd_install() {
     service_enable
     cmd_apply_runtime
     echo "已安装：$PFWD_BIN_PATH"
-    echo "BBR 管理入口：$PFWD_BBR_ALIAS_BIN_PATH"
-}
-
-
-cmd_forward_boot() {
-    config_init >/dev/null
-    forwarder_validate_config
-    cmd_apply_forwarding_bundle
-    echo "boot restore complete"
 }
 
 
@@ -195,5 +173,5 @@ cmd_uninstall() {
     service_purge_state || uninstall_status=1
     service_verify_removed || uninstall_status=1
     [ "$uninstall_status" -eq 0 ] || return "$uninstall_status"
-    echo "已卸载 pfwd；若需卸载 BBR 调优，请另外执行：$PFWD_BBR_ALIAS_BIN_PATH uninstall"
+    echo "已卸载 pfwd"
 }

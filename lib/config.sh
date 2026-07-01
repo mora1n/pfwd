@@ -13,75 +13,7 @@ config_default_json() {
       "interface": ""
     },
     "default_listen_ip": "::",
-    "default_random_port_range": "20000-30000",
-    "guard": {
-      "enabled": false,
-      "tc_interface": "",
-      "block_http": false,
-      "block_tls": false,
-      "block_socks": false,
-      "protocol_skip_ports": []
-    },
-    "whitelist": {
-      "enabled": false,
-      "include_cn": true,
-      "cn_mode": "all",
-      "cn_provinces": [],
-      "cn_city_codes": [],
-      "custom_cidrs": [],
-      "port_policies": [],
-      "runtime_hash": ""
-    },
-    "egress_whitelist": {
-      "enabled": false,
-      "include_cn": true,
-      "cn_mode": "all",
-      "cn_provinces": [],
-      "custom_cidrs": [],
-      "runtime_hash": ""
-    },
-    "downmask": {
-      "iface": "",
-      "min_ratio": 1.5,
-      "max_ratio": 2.8,
-      "time_window_start": "",
-      "time_window_end": "",
-      "max_jitter_seconds": 900,
-      "min_deficit_bytes": 20971520,
-      "max_bytes_per_run": 838860800,
-      "pull_mode": "off",
-      "public": {
-        "speed_limit": "4M",
-        "active_source": "cloudflare_dynamic",
-        "custom_sources": []
-      },
-      "ab_pull": {
-        "protocol": "tcp",
-        "protocol_mode": "parallel",
-        "tcp_enabled": true,
-        "udp_enabled": true,
-        "remote_host": "",
-        "remote_port": 0,
-        "local_ip": "",
-        "token": "",
-        "speed_limit": "4M",
-        "timeout_seconds": 1200,
-        "parallel_limit": 2,
-        "speed_jitter_percent": 12,
-        "bytes_jitter_percent": 18,
-        "targets": []
-      },
-      "ab_feed": {
-        "tcp_enabled": false,
-        "udp_enabled": false,
-        "bind_ip": "0.0.0.0",
-        "tcp_port": 0,
-        "udp_port": 0,
-        "token": "",
-        "seed_file": "/var/lib/pfwd/downmask/seed.bin",
-        "udp_payload_bytes": 1200
-      }
-    }
+    "default_random_port_range": "20000-30000"
   },
   "users": [],
   "forwards": []
@@ -91,38 +23,34 @@ EOF
 
 PFWD_CONFIG_INITIALIZED=0
 
-config_cleanup_legacy_dependencies_file() {
+config_store_load() {
+    pfwd_service_store_get config_json 2>/dev/null
+}
+
+config_store_save_file() {
     local file="$1"
-    local tmp
-    [ -f "$file" ] || pfwd_die "配置文件不存在：$file"
-    tmp="$(mktemp "${file}.cleanup.XXXXXX")"
-    jq '
-      del(
-        .settings.whitelist.source_url,
-        .settings.whitelist.last_good_source,
-        .settings.whitelist.last_good_updated_at,
-        .settings.egress_whitelist.source_url,
-        .settings.egress_whitelist.last_good_source,
-        .settings.egress_whitelist.last_good_updated_at
-      )
-    ' "$file" > "$tmp"
-    config_validate_file "$tmp"
-    if cmp -s "$tmp" "$file"; then
-        rm -f "$tmp"
-    else
-        mv "$tmp" "$file"
-    fi
+    jq '.' "$file" | pfwd_service_store_put config_json
+}
+
+config_sync_cache_from_store() {
+    local payload
+    payload="$(config_store_load)" || return 1
+    printf '%s\n' "$payload" | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
 }
 
 config_init() {
     [ "$PFWD_CONFIG_INITIALIZED" = "1" ] && [ -f "$PFWD_CONFIG_FILE" ] && return 0
     pfwd_require_jq
     pfwd_mkdirs
-    if [ ! -f "$PFWD_CONFIG_FILE" ]; then
-        config_default_json | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
+    if ! config_sync_cache_from_store; then
+        if [ ! -f "$PFWD_CONFIG_FILE" ]; then
+            config_default_json | jq '.' | pfwd_write_atomic "$PFWD_CONFIG_FILE"
+        fi
+        config_validate_file "$PFWD_CONFIG_FILE"
+        config_store_save_file "$PFWD_CONFIG_FILE"
     fi
     config_validate_file "$PFWD_CONFIG_FILE"
-    config_cleanup_legacy_dependencies_file "$PFWD_CONFIG_FILE"
+    config_store_save_file "$PFWD_CONFIG_FILE"
     PFWD_CONFIG_INITIALIZED=1
 }
 
@@ -145,7 +73,6 @@ config_validate_file() {
       and (.settings.forward | type == "object")
       and ((.settings.forward.interface // "") | type == "string")
       and all(.forwards[]?; (type == "object") and (.net | type == "object"))
-      and ((.settings.downmask // {}) | type == "object")
     ' "$file" >/dev/null || pfwd_die "无效配置文件：$file"
 }
 
@@ -197,20 +124,11 @@ config_import_bundle() {
 
     config_validate_file "$config_tmp"
     stats_validate_file "$stats_tmp"
-    if command -v egress_whitelist_validate_config_file >/dev/null 2>&1 &&
-       ! egress_whitelist_validate_config_file "$config_tmp"; then
-        rm -f "$config_tmp" "$stats_tmp"
-        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-    fi
-
-    local defaults config_filled
-    defaults="$(config_default_json)"
-    config_filled="$(jq --argjson defaults "$defaults" '.settings.downmask //= $defaults.settings.downmask' "$config_tmp")"
-    printf '%s\n' "$config_filled" > "$config_tmp"
-    config_cleanup_legacy_dependencies_file "$config_tmp"
 
     mv "$config_tmp" "$PFWD_CONFIG_FILE"
     mv "$stats_tmp" "$PFWD_STATS_FILE"
+    config_store_save_file "$PFWD_CONFIG_FILE"
+    stats_store_save_file "$PFWD_STATS_FILE"
     PFWD_CONFIG_INITIALIZED=1
     config_disable_expired "$(pfwd_today)"
 }
@@ -228,6 +146,7 @@ config_update() {
     jq "${args[@]}" "$filter" "$PFWD_CONFIG_FILE" > "$tmp"
     config_validate_file "$tmp"
     mv "$tmp" "$PFWD_CONFIG_FILE"
+    config_store_save_file "$PFWD_CONFIG_FILE"
     PFWD_CONFIG_INITIALIZED=1
 }
 
@@ -597,10 +516,6 @@ config_validate_new_forward() {
     local parsed remote_host
     parsed="$(parse_host_port "$remote")"
     remote_host="${parsed%	*}"
-    if command -v egress_whitelist_validate_remote_host >/dev/null 2>&1 &&
-       ! egress_whitelist_validate_remote_host "$remote_host" "$listen_ip" "$snat_mode" "$snat_source"; then
-        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-    fi
 }
 
 config_validate_forward_batch() {
@@ -669,10 +584,6 @@ config_validate_forward_batch() {
         validate_port "$port"
     done <<< "$remote_ports"
 
-    if command -v egress_whitelist_validate_remote_host >/dev/null 2>&1 &&
-       ! egress_whitelist_validate_remote_host "$remote_host" "$listen_ip" "$snat_mode" "$snat_source"; then
-        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
-    fi
 }
 
 config_add_forward() {
@@ -1189,11 +1100,6 @@ config_update_forward() {
         [ -n "$new_snat_source" ] || pfwd_die "snat 模式必须提供 snat_source"
     elif [ -n "$new_snat_source" ]; then
         pfwd_die "masquerade 模式不允许设置 snat_source"
-    fi
-
-    if command -v egress_whitelist_validate_remote_host >/dev/null 2>&1 &&
-       ! egress_whitelist_validate_remote_host "$new_remote_host" "$new_listen_ip" "$new_snat_mode" "$new_snat_source" "$forward_id"; then
-        pfwd_die "$EGRESS_WHITELIST_LAST_ERROR"
     fi
 
     local conflict_rows conflict_port conflict_protocol

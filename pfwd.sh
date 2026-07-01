@@ -28,7 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
-PFWD_LIB_FILES=(core config validate whitelist egress_whitelist forwarder runtime firewall stats notify guard downmask/core downmask/ab downmask/state downmask/public downmask/service downmask/commands leaseweb service commands/core commands/update commands/user commands/forward commands/notify commands/guard commands/reconcile commands/doctor ui/core ui/table ui/status ui/io ui/form ui/actions ui/format ui/install ui/data ui/print ui/select ui/guard_ports ui/menus_core ui/guard ui/leaseweb ui/whitelist ui/downmask ui/main)
+PFWD_LIB_FILES=(core config validate forwarder runtime firewall stats notify service commands/core commands/update commands/user commands/forward commands/notify commands/reconcile commands/doctor ui/core ui/table ui/status ui/io ui/form ui/actions ui/format ui/install ui/data ui/print ui/select ui/menus_core ui/main)
 
 pfwd_lib_rel_path() {
     printf 'lib/%s.sh\n' "$1"
@@ -48,22 +48,12 @@ pfwd_bootstrap_xdp_asset_name() {
     esac
 }
 
-pfwd_bootstrap_downmask_asset_name() {
+pfwd_bootstrap_service_asset_name() {
     local arch
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64) echo "pfwd-downmask-linux-amd64" ;;
-        aarch64|arm64) echo "pfwd-downmask-linux-arm64" ;;
-        *) return 1 ;;
-    esac
-}
-
-pfwd_bootstrap_leaseweb_asset_name() {
-    local arch
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64) echo "pfwd-leaseweb-linux-amd64" ;;
-        aarch64|arm64) echo "pfwd-leaseweb-linux-arm64" ;;
+        x86_64|amd64) echo "pfwd-service-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-service-linux-arm64" ;;
         *) return 1 ;;
     esac
 }
@@ -107,72 +97,38 @@ pfwd_bootstrap_download() {
 }
 
 pfwd_bootstrap_cleanup_partial_install() {
-    local install_dir bin_path bbr_bin_path bbr_alias_path systemd_dir unit
+    local install_dir bin_path systemd_dir unit
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
-    bbr_bin_path="$(pfwd_bootstrap_path usr/local/bin/bbr.sh)"
-    bbr_alias_path="$(pfwd_bootstrap_path usr/local/bin/pfwd-bbr)"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
 
-    rm -f "$bin_path" "$bbr_bin_path" "$bbr_alias_path"
-    for unit in pfwd-forward.service pfwd.service pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service; do
-        rm -f "$systemd_dir/$unit"
-    done
+    rm -f "$bin_path"
+    rm -f "$systemd_dir/pfwd.service"
     rm -rf "$install_dir"
 }
 
 pfwd_bootstrap_install() {
-    local install_dir bin_path systemd_dir lib_dir xdp_asset status
+    local install_dir bin_path systemd_dir lib_dir xdp_asset service_asset status
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
 
-    mkdir -p "$lib_dir" "$install_dir/assets" "$install_dir/bin" "$install_dir/scripts" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$install_dir/assets" "$install_dir/bin" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/bbr.sh" "$install_dir/bbr.sh"
-    chmod +x "$install_dir/bbr.sh"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/scripts/pfwd_lease_command.sh" "$install_dir/scripts/pfwd_lease_command.sh"
-    chmod +x "$install_dir/scripts/pfwd_lease_command.sh"
     xdp_asset="$(pfwd_bootstrap_xdp_asset_name)" || {
         echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
     }
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$install_dir/assets/$xdp_asset"
     chmod +x "$install_dir/assets/$xdp_asset"
-    local downmask_asset
-    if downmask_asset="$(pfwd_bootstrap_downmask_asset_name)"; then
-        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$downmask_asset" "$install_dir/assets/$downmask_asset"; then
-            echo "错误：缺少必需的 downmask 预编译资产：assets/$downmask_asset" >&2
-            echo "请补齐发布源中的该文件，或在源码仓库中先执行 ./downmask/build.sh 后再安装。" >&2
-            exit 1
-        fi
-        chmod +x "$install_dir/assets/$downmask_asset"
-    fi
-    local leaseweb_asset
-    if leaseweb_asset="$(pfwd_bootstrap_leaseweb_asset_name)"; then
-        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$leaseweb_asset" "$install_dir/assets/$leaseweb_asset"; then
-            echo "错误：缺少必需的 leaseweb 预编译资产：assets/$leaseweb_asset" >&2
-            echo "请补齐发布源中的该文件，或在源码仓库中先执行 ./leaseweb/build.sh 后再安装。" >&2
-            exit 1
-        fi
-        chmod +x "$install_dir/assets/$leaseweb_asset"
-    fi
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v4.bin" "$install_dir/assets/pfwd-geo-cn-v4.bin"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-cn-v6.bin" "$install_dir/assets/pfwd-geo-cn-v6.bin"
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/pfwd-geo-meta.json" "$install_dir/assets/pfwd-geo-meta.json"
-    local city_asset
-    for city_asset in pfwd-city-cn-meta.json pfwd-city-cn-v4.bin; do
-        if ! pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$city_asset" "$install_dir/assets/$city_asset"; then
-            echo "错误：缺少必需的 city 资产：assets/$city_asset" >&2
-            echo "请补齐发布源中的 city 资产，或使用已更新 bootstrap 的版本重新安装。" >&2
-            status=1
-            echo "bootstrap 安装失败，正在回滚临时安装文件" >&2
-            pfwd_bootstrap_cleanup_partial_install || true
-            exit "$status"
-        fi
-    done
+    service_asset="$(pfwd_bootstrap_service_asset_name)" || {
+        echo "错误：当前架构暂不支持 service 预编译二进制：$(uname -m)" >&2
+        exit 1
+    }
+    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$service_asset" "$install_dir/assets/$service_asset"
+    chmod +x "$install_dir/assets/$service_asset"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -222,7 +178,7 @@ pfwd_command_lock_mode() {
     local cmd="${1:-}"
     case "$cmd" in
         reconcile) printf 'try\n' ;;
-        init|user|add|start|stop|delete|forward|expire|limit|user-forwards-limit|traffic|import|refresh|restart|notify-test|notify-enable|notify-schedule|notify-disable|notify-delete|guard|downmask|leaseweb|install|update|uninstall|__forward_boot|__update_finalize)
+        init|user|add|start|stop|delete|forward|expire|limit|user-forwards-limit|traffic|import|refresh|restart|notify-test|notify-enable|notify-schedule|notify-disable|notify-delete|install|update|uninstall|__update_finalize)
             printf 'wait\n'
             ;;
         *) printf 'none\n' ;;
@@ -261,14 +217,11 @@ pfwd_dispatch() {
         notify-schedule) cmd_notify_schedule "$@" ;;
         notify-disable) cmd_notify_disable "$@" ;;
         notify-delete) cmd_notify_delete "$@" ;;
-        guard) cmd_guard "$@" ;;
-        downmask) cmd_downmask "$@" ;;
-        leaseweb) cmd_leaseweb "$@" ;;
+        service) cmd_service "$@" ;;
         doctor) cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         update) cmd_update "$@" ;;
         uninstall) cmd_uninstall "$@" ;;
-        __forward_boot) cmd_forward_boot "$@" ;;
         __update_finalize) cmd_update_finalize "$@" ;;
         *)
             pfwd_die "未知命令：$cmd"
@@ -343,46 +296,15 @@ pfwd - XDP 端口转发管理脚本
   pfwd stats [--user-id ID|--forward-id ID]
   pfwd export [file]
   pfwd import <file>
-  pfwd render [forwarder|status|xdp|nft|tc|guard|units]
+  pfwd render [forwarder|status|xdp|nft|tc|units]
   pfwd refresh
   pfwd restart
   pfwd reconcile
+  pfwd service status|reload|daemon [--socket PATH] [--db PATH] [--pfwd-bin PATH]
   pfwd notify-test --user-id ID
   pfwd notify-schedule --user-id ID [--interval-minutes 60|--clear-interval] [--daily-time 09:30|--clear-daily]
   pfwd notify-disable --user-id ID
   pfwd notify-delete --user-id ID
-  pfwd guard enable|disable|status|apply|remove
-  pfwd guard protocols [--http on|off] [--https on|off] [--tls on|off] [--socks on|off] [--skip-port PORT[,PORT]|START-END] [--replace-skip-ports] [--clear-skip-ports]
-  pfwd guard whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
-  pfwd guard whitelist status
-  pfwd guard whitelist check --address IP [--listen-port PORT] [--protocol tcp|udp]
-  pfwd guard whitelist-cn list|status|all|off|select <省份...>
-  pfwd guard whitelist-city list [省份]|status|add <省份> <城市...>|delete <序号...>|clear
-  pfwd guard whitelist-port list
-  pfwd guard whitelist-port status --listen-port PORT
-  pfwd guard whitelist-port clear --listen-port PORT
-  pfwd guard whitelist-port-cn --listen-port PORT all|off|select <省份...>
-  pfwd guard whitelist-port-city --listen-port PORT list|status|add <省份> <城市...>|delete <序号...>|clear
-  pfwd guard whitelist-custom list|add|clear|delete|update ...
-  pfwd guard whitelist-lease list|status|add|delete|clear ...
-  pfwd guard egress-whitelist [--enabled true|false] [--include-cn true|false] [--cn-mode off|all|provinces] [--cidr IPv4/IPv6 CIDR|单个IP] [--replace-custom] [--clear-custom]
-  pfwd guard egress-whitelist status
-  pfwd guard egress-whitelist-cn list|status|all|off|select <省份...>
-  pfwd guard egress-whitelist-custom list|add|clear|delete|update ...
-  pfwd downmask status
-  pfwd downmask policy [--pull-mode off|public|ab] [--min-ratio 1.5] [--max-ratio 2.8] [--time-window-start HH:MM|empty=all-day] [--time-window-end HH:MM|empty=all-day] [--max-jitter SEC] [--min-deficit-bytes 20MB] [--max-bytes-per-run 800MB] [--iface NAME]
-  pfwd downmask public [--active-source NAME(cloudflare_dynamic|linode_tokyo_100mb|cachefly_100mb)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)]
-  pfwd downmask public custom list|add|delete|clear ...   # query 源 URL 用 {bytes} 占位；range 源需支持 Range
-  pfwd downmask ab-pull [--protocol tcp|udp] [--protocol-mode single|parallel] [--tcp-enabled true|false] [--udp-enabled true|false] [--remote-host HOST(IP)] [--remote-port PORT] [--local-ip IP] [--token TOKEN(openssl rand -hex 16)] [--speed-limit 4M(default, bytes/s; also 32Mbps/4MB/s)] [--timeout SEC] [--parallel-limit N] [--speed-jitter-percent 12] [--bytes-jitter-percent 18]
-  pfwd downmask ab-pull targets list|add|delete|update|clear ...
-  pfwd downmask ab-feed [--tcp-enabled true|false] [--udp-enabled true|false] [--bind-ip IP] [--tcp-port PORT] [--udp-port PORT] [--token TOKEN(openssl rand -hex 16)] [--seed-file PATH] [--udp-payload-bytes 1200|1.2KB]
-  pfwd downmask seed generate [--path PATH] [--size 1GB]   # 推荐 256MB-4GB
-  pfwd leaseweb run --config /etc/pfwd/leaseweb.json
-  pfwd leaseweb init|status
-  pfwd leaseweb config show|reset|set [--listen-host HOST] [--listen-port PORT] [--request-timeout-sec SEC]
-  pfwd leaseweb trusted-proxy list|add|delete|clear ...
-  pfwd leaseweb route list|add|update|delete ...   # add/update 支持 [--ssh-port PORT] [--ssh-options '...'] [--ipv4-prefix-len N] [--ipv6-prefix-len N]
-  pfwd leaseweb service status|start|stop|restart|enable|disable
   pfwd doctor [--bench]
   pfwd install
   pfwd update [--check|--yes]
@@ -390,7 +312,9 @@ pfwd - XDP 端口转发管理脚本
 
 环境变量：
   PFWD_ROOT_PREFIX   测试/安装根目录前缀。默认：/
-  PFWD_CONFIG_FILE   覆盖配置文件路径。
+  PFWD_CONFIG_FILE   覆盖运行期配置 cache 路径。
+  PFWD_DB_FILE       覆盖持久化 SQLite 数据库路径。
+  PFWD_SERVICE_SOCKET 覆盖本地 Unix socket 路径。
   PFWD_DRY_RUN       设置为 1 时只打印会修改系统的命令，不实际执行。
 
 无参数运行时默认进入交互菜单；使用 pfwd help 查看命令列表。
@@ -401,14 +325,6 @@ pfwd - XDP 端口转发管理脚本
   `refresh` 会按当前配置重新应用运行态；`restart` 会先停止当前 XDP/nft/tc 运行态，再重新应用。
   MSS 和固定 SNAT 通过 `.forwards[].net` 字段持久化；转发网卡通过 `settings.forward.interface` 指定。
   MSS 默认不设置；SNAT 默认使用 masquerade。交互界面添加/修改转发时也可直接设置。
-  内核调优已拆分到 `pfwd-bbr`（兼容入口仍保留 `bbr.sh`）。
-  流量防护（协议封锁 + 入口白名单 + 出口白名单）由 `guard` 子命令管理。
-  入口白名单限制的是入站来源 IPv4 / IPv6 CIDR；可选关闭国内段、允许全部国内 IP，或按省份批量允许；也可额外追加市级 IPv4 白名单和自定义 CIDR，且支持输入单个 IP（自动规范化为 /32 或 /128）。省白名单和市白名单不互斥，最终取并集。
-  入口白名单支持按监听端口覆盖国内 IP / 省份 / 市策略：未配置端口继承全局默认；配置端口后仅覆盖该端口的国内 IP / 省份 / 市选择；入口自定义 CIDR 仍是全局共享。
-  入口防护跳过端口由 `guard protocols --skip-port` 设置，匹配公网监听端口；命中后跳过入口白名单和协议封锁，不影响出口白名单。
-  `guard whitelist check` 可诊断某个来源 IP 在指定监听端口/协议下应放行、拦截或因跳过端口放行。
-  出口白名单限制的是转发目标解析出的 IPv4 / IPv6 CIDR；规则目标仍可填写域名，但解析出的每个目标 IP 都必须命中出口白名单；同时会作用于宿主机全部非 loopback 出口流量，并共享同一套国内 IP / 省份策略。
-  两类白名单的国内 IP / 省份匹配默认使用随 `pfwd-xdp` 一起发布的预编译 geo 资产；自定义 CIDR 仍独立生效。
 EOF
 }
 

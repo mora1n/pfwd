@@ -3,20 +3,31 @@
 service_manager_unit() {
     cat <<EOF
 [Unit]
-Description=pfwd 到期检查与状态同步
+Description=pfwd local daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=$PFWD_BIN_PATH reconcile
+Type=simple
+ExecStart=$PFWD_SERVICE_BIN_PATH daemon --socket $PFWD_SERVICE_SOCKET --db $PFWD_DB_FILE --pfwd-bin $PFWD_BIN_PATH
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=pfwd
+RuntimeDirectoryMode=0750
+StateDirectory=pfwd
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
 EOF
 }
 
 service_installation_present() {
     [ -f "$PFWD_INSTALL_DIR/pfwd.sh" ] || return 1
-    [ -f "$PFWD_INSTALL_DIR/bbr.sh" ] || return 1
     [ -x "$PFWD_XDP_BIN_PATH" ] || return 1
+    [ -x "$PFWD_SERVICE_BIN_PATH" ] || return 1
     [ -d "$PFWD_INSTALL_DIR/lib" ] || return 1
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -24,63 +35,12 @@ service_installation_present() {
     done
 }
 
-service_timer_unit() {
-    cat <<'EOF'
-[Unit]
-Description=定期执行 pfwd 状态同步
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=60s
-Unit=pfwd.service
-
-[Install]
-WantedBy=timers.target
-EOF
-}
-
-bbr_service_unit() {
-    cat <<EOF
-[Unit]
-Description=pfwd bbr runtime restore
-After=network-online.target systemd-sysctl.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$PFWD_BBR_BIN_PATH __restore
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-xdp_service_unit() {
-    cat <<EOF
-[Unit]
-Description=pfwd XDP runtime restore
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$PFWD_BIN_PATH refresh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-guard_service_unit() {
-    xdp_service_unit
-}
-
-downmask_asset_name() {
+service_asset_name() {
     local arch
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64) echo "pfwd-downmask-linux-amd64" ;;
-        aarch64|arm64) echo "pfwd-downmask-linux-arm64" ;;
+        x86_64|amd64) echo "pfwd-service-linux-amd64" ;;
+        aarch64|arm64) echo "pfwd-service-linux-arm64" ;;
         *) return 1 ;;
     esac
 }
@@ -88,54 +48,27 @@ downmask_asset_name() {
 service_unit_names() {
     cat <<'EOF'
 pfwd.service
-pfwd.timer
-pfwd-bbr.service
-pfwd-xdp.service
-pfwd-downmask-feed.service
-pfwd-leaseweb.service
 EOF
 }
 
 service_update_managed_unit_rows() {
     cat <<'EOF'
-pfwd.service	runtime-manager	false
-pfwd.timer	runtime-timer	true
-pfwd-bbr.service	bbr-runtime	true
-pfwd-xdp.service	xdp-runtime	true
-pfwd-downmask-feed.service	downmask-feed	true
-pfwd-leaseweb.service	leaseweb	true
+pfwd.service	local-daemon	true
 EOF
-}
-
-service_update_optional_bundle_rows() {
-    local leaseweb_asset=""
-    leaseweb_asset="assets/$(leaseweb_asset_name 2>/dev/null || true)"
-    if [ -n "$leaseweb_asset" ]; then
-        printf '0755\t%s\tbin/pfwd-leaseweb\tleaseweb\n' "$leaseweb_asset"
-    fi
 }
 
 service_shortcut_rows() {
     printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/pfwd.sh" "$PFWD_BIN_PATH" "pfwd"
-    printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_BIN_PATH" "bbr.sh"
-    printf '%s\t%s\t%s\n' "$PFWD_INSTALL_DIR/bbr.sh" "$PFWD_BBR_ALIAS_BIN_PATH" "pfwd-bbr"
 }
 
 service_bundle_rows() {
-    local asset_rel="assets/$(guard_asset_name)"
-    local downmask_rel="assets/$(downmask_asset_name 2>/dev/null || echo pfwd-downmask-linux-amd64)"
+    local xdp_asset_rel="assets/$(pfwd_bootstrap_xdp_asset_name)"
+    local service_asset_rel="assets/$(service_asset_name)"
     local lib
 
     printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
-    printf '0755\tbbr.sh\tbbr.sh\tbbr.sh\n'
-    printf '0755\tscripts/pfwd_lease_command.sh\tbin/%s\tlease-command\n' "$(leaseweb_restricted_command_script_name)"
-    printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$asset_rel"
-    printf '0755\t%s\tbin/pfwd-downmask\tdownmask\n' "$downmask_rel"
-    printf '0644\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\tassets/pfwd-geo-cn-v4.bin\n'
-    printf '0644\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\tassets/pfwd-geo-cn-v6.bin\n'
-    printf '0644\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\tassets/pfwd-geo-meta.json\n'
-    printf '0644\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\tassets/pfwd-city-cn-meta.json\n'
-    printf '0644\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\tassets/pfwd-city-cn-v4.bin\n'
+    printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$xdp_asset_rel"
+    printf '0755\t%s\tbin/pfwd-service\tservice\n' "$service_asset_rel"
     for lib in "${PFWD_LIB_FILES[@]}"; do
         printf '0644\t%s\t%s\t%s\n' "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")"
     done
@@ -144,17 +77,11 @@ service_bundle_rows() {
 service_missing_bundle_hint() {
     local source_path="$1"
     case "$source_path" in
-        */assets/pfwd-downmask-linux-*)
-            printf '请先执行 ./downmask/build.sh 生成预编译资产，或使用包含 pfwd-downmask 资产的完整源码/发布包。\n'
-            ;;
         */assets/pfwd-xdp-linux-*)
             printf '请先执行 ./xdp/build.sh 生成预编译资产，或使用包含 pfwd-xdp 资产的完整源码/发布包。\n'
             ;;
-        */assets/pfwd-city-cn-*)
-            printf '请使用包含 city 资产的完整安装包，或使用已更新 bootstrap 的版本重新安装。\n'
-            ;;
-        */assets/pfwd-leaseweb-linux-*)
-            printf '请先构建 pfwd-leaseweb 预编译资产，或使用包含该可选组件的完整源码/发布包。\n'
+        */assets/pfwd-service-linux-*)
+            printf '请先执行 ./service/build.sh 生成预编译资产，或使用包含 pfwd-service 资产的完整源码/发布包。\n'
             ;;
         *)
             return 0
@@ -171,13 +98,8 @@ service_prepare_install_dirs() {
         "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_INSTALL_DIR/bin" \
         "$(dirname "$PFWD_BIN_PATH")" \
-        "$(dirname "$PFWD_BBR_BIN_PATH")" \
-        "$(dirname "$PFWD_BBR_ALIAS_BIN_PATH")" \
         "$(dirname "$PFWD_XDP_BIN_PATH")" \
-        "$(dirname "$PFWD_DOWNMASK_BIN_PATH")" \
-        "$(dirname "$PFWD_LEASEWEB_BIN_PATH")" \
-        "$PFWD_DOWNMASK_STATE_DIR" \
-        "$PFWD_LEASEWEB_STATE_DIR" \
+        "$(dirname "$PFWD_SERVICE_BIN_PATH")" \
         "$PFWD_SYSTEMD_DIR"
 }
 
@@ -273,40 +195,8 @@ service_copy_bundle_from_dir() {
     done < <(service_bundle_rows)
 }
 
-service_copy_optional_leaseweb_from_dir() {
-    local source_root="$1"
-    local asset_rel target_path source_path
-    asset_rel="assets/$(leaseweb_asset_name 2>/dev/null || true)"
-    [ -n "$asset_rel" ] || return 0
-    source_path="${source_root%/}/$asset_rel"
-    [ -f "$source_path" ] || return 0
-    target_path="$(service_install_target_path "bin/pfwd-leaseweb")"
-    install -m 0755 "$source_path" "$target_path"
-}
-
-service_update_installed_optional_rows() {
-    local mode source_rel install_rel digest_label target_path unit_name
-    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
-        [ -n "$source_rel" ] || continue
-        target_path="$(service_install_target_path "$install_rel")"
-        unit_name=""
-        case "$digest_label" in
-            leaseweb) unit_name="pfwd-leaseweb.service" ;;
-        esac
-        if [ -f "$target_path" ] || { [ -n "$unit_name" ] && service_unit_exists "$unit_name"; }; then
-            printf '%s\t%s\t%s\t%s\n' "$mode" "$source_rel" "$install_rel" "$digest_label"
-        fi
-    done < <(service_update_optional_bundle_rows)
-}
-
 service_update_bundle_rows() {
     service_bundle_rows
-    service_update_installed_optional_rows
-}
-
-service_cleanup_legacy_install_artifacts() {
-    rm -f "$PFWD_INSTALL_DIR/assets/cn-aggregated.zone" \
-          "$PFWD_INSTALL_DIR/assets/cn-aggregated-v6.zone"
 }
 
 service_verify_bundle_from_dir() {
@@ -329,13 +219,6 @@ service_verify_bundle_from_dir() {
 service_write_unit_files() {
     mkdir -p "$PFWD_SYSTEMD_DIR"
     service_manager_unit > "$PFWD_SYSTEMD_DIR/pfwd.service"
-    service_timer_unit > "$PFWD_SYSTEMD_DIR/pfwd.timer"
-    bbr_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-bbr.service"
-    xdp_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-xdp.service"
-    leaseweb_service_unit > "$PFWD_SYSTEMD_DIR/pfwd-leaseweb.service"
-    if command -v downmask_write_feed_unit_if_needed >/dev/null 2>&1; then
-        downmask_write_feed_unit_if_needed || true
-    fi
 }
 
 service_install_files() {
@@ -343,8 +226,6 @@ service_install_files() {
     service_prepare_install_dirs
     service_verify_bundle_from_dir "$PFWD_SCRIPT_DIR"
     service_copy_bundle_from_dir "$PFWD_SCRIPT_DIR"
-    service_copy_optional_leaseweb_from_dir "$PFWD_SCRIPT_DIR"
-    service_cleanup_legacy_install_artifacts
     service_write_shortcuts
     service_write_unit_files
 }
@@ -365,12 +246,7 @@ service_ensure_shortcut() {
 service_enable() {
     command -v systemctl >/dev/null 2>&1 || pfwd_die "需要 systemctl"
     pfwd_run systemctl daemon-reload
-    pfwd_run systemctl enable pfwd-xdp.service pfwd.timer
-    pfwd_run systemctl start pfwd.timer
-    if [ -f "$PFWD_LEASEWEB_CONFIG_FILE" ]; then
-        [ -x "$PFWD_LEASEWEB_BIN_PATH" ] || pfwd_die "pfwd-leaseweb 二进制不存在：$PFWD_LEASEWEB_BIN_PATH"
-        pfwd_run systemctl enable pfwd-leaseweb.service || true
-    fi
+    pfwd_run systemctl enable --now pfwd.service
 }
 
 service_unit_exists() {
@@ -380,19 +256,11 @@ service_unit_exists() {
 }
 
 service_runtime_installed() {
-    service_unit_exists pfwd-xdp.service && service_unit_exists pfwd.timer
+    service_unit_exists pfwd.service
 }
 
 service_primary_runtime_unit() {
-    echo "pfwd-xdp.service"
-}
-
-service_timer_unit_name() {
-    echo "pfwd.timer"
-}
-
-service_guard_unit_name() {
-    echo "pfwd-xdp.service"
+    echo "pfwd.service"
 }
 
 service_runtime_status_label() {
@@ -405,8 +273,8 @@ service_runtime_status_label() {
 
 service_disable() {
     if command -v systemctl >/dev/null 2>&1; then
-        pfwd_run systemctl stop pfwd.timer pfwd.service pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service || true
-        pfwd_run systemctl disable pfwd.timer pfwd-bbr.service pfwd-xdp.service pfwd-downmask-feed.service pfwd-leaseweb.service || true
+        pfwd_run systemctl stop pfwd.service || true
+        pfwd_run systemctl disable pfwd.service || true
         pfwd_run systemctl daemon-reload
     fi
 }
@@ -453,7 +321,6 @@ service_remove_binary_artifacts() {
     while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
         rm -f "$(service_install_target_path "$install_rel")"
     done < <(service_bundle_rows)
-    rm -f "$PFWD_LEASEWEB_BIN_PATH" "$PFWD_INSTALL_DIR/bin/pfwd-leaseweb"
 }
 
 service_remove_asset_artifacts() {
@@ -472,10 +339,8 @@ service_uninstall_files() {
 
     service_disable || status=1
     service_cleanup_pfwd_tc || status=1
-    guard_remove_runtime true || status=1
     runtime_clear_accounting_runtime || status=1
     runtime_remove_runtime_artifacts || status=1
-    runtime_remove_whitelist_runtime_files || status=1
     runtime_remove_runtime_state_dirs || status=1
     service_remove_installation_artifacts || status=1
 
@@ -483,32 +348,19 @@ service_uninstall_files() {
 }
 
 service_purge_state() {
-    rm -rf "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_DOWNMASK_STATE_DIR"
+    rm -rf "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"
 }
 
 service_verify_removed() {
     local leftovers=()
     local path _ source_rel install_rel __
     for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
-        "$PFWD_GUARD_STATE_DIR" "$PFWD_GUARD_STATUS_FILE" "$PFWD_GUARD_LINK_INGRESS_PATH" \
-        "$PFWD_DOWNMASK_STATE_DIR" "$PFWD_DOWNMASK_STATUS_FILE" "$PFWD_DOWNMASK_BIN_PATH" \
-        "$PFWD_LEASEWEB_CONFIG_FILE" "$PFWD_LEASEWEB_BIN_PATH" "$PFWD_LEASEWEB_STATE_DIR" \
+        "$PFWD_SERVICE_BIN_PATH" "$PFWD_DB_FILE" "$PFWD_SERVICE_SOCKET" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
-        "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_INGRESS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
+        "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
         "$PFWD_XDP_SK_LOOKUP_PIN_PATH" "$PFWD_XDP_SETTINGS_PIN_PATH" "$PFWD_XDP_RULES_PIN_PATH" "$PFWD_XDP_CONNECTIONS_PIN_PATH" \
-        "$PFWD_XDP_REVERSE_PIN_PATH" "$PFWD_XDP_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_V6_PIN_PATH" \
-        "$PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH" \
-        "$PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH" \
-        "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH" "$PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH" \
-        "$PFWD_XDP_ALLOWED_FLOWS_PIN_PATH" "$PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH" "$PFWD_XDP_GUARD_PREFIXES_PIN_PATH" "$PFWD_XDP_SKIP_PORTS_PIN_PATH" \
-        "$PFWD_XDP_GEO_BUCKET_V4_PIN_PATH" "$PFWD_XDP_GEO_BUCKET_V6_PIN_PATH" "$PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH" \
-        "$PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH" "$PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH" \
-        "$PFWD_XDP_INGRESS_GEO_V4_PIN_PATH" "$PFWD_XDP_INGRESS_GEO_V6_PIN_PATH" "$PFWD_XDP_INGRESS_CITY_V4_PIN_PATH" \
-        "$PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH" "$PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH" \
+        "$PFWD_XDP_REVERSE_PIN_PATH" \
         "$PFWD_XDP_RULE_COUNTER_PIN_PATH" "$PFWD_XDP_USER_COUNTER_PIN_PATH" "$PFWD_XDP_STATS_PIN_PATH" \
-        "$PFWD_WHITELIST_STATE_DIR" "$PFWD_WHITELIST_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_ALLOW_IPV6_FILE" "$PFWD_WHITELIST_CITY_IPV4_FILE" \
-        "$PFWD_WHITELIST_LEASES_FILE" "$PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE" "$PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE" \
-        "${PFWD_WHITELIST_ALLOW_IPV4_FILE}.cn" "${PFWD_WHITELIST_ALLOW_IPV6_FILE}.cn" \
         "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR"; do
         [ ! -e "$path" ] || leftovers+=("$path")
     done
@@ -658,38 +510,6 @@ service_update_capture_service_states_json() {
     '
 }
 
-service_update_legacy_service_states_json() {
-    local runtime_enabled="${1:-false}"
-    local timer_enabled="${2:-false}"
-    local guard_enabled="${3:-false}"
-    local xdp_enabled="false"
-
-    if [ "$runtime_enabled" = "true" ] || [ "$guard_enabled" = "true" ]; then
-        xdp_enabled="true"
-    fi
-
-    jq -cn \
-      --argjson xdp_enabled "$xdp_enabled" \
-      --argjson timer_enabled "$timer_enabled" '
-      [
-        {
-          unit: "pfwd-xdp.service",
-          label: "legacy-xdp-runtime",
-          enable_capable: true,
-          enabled: $xdp_enabled,
-          active: false
-        },
-        {
-          unit: "pfwd.timer",
-          label: "legacy-runtime-timer",
-          enable_capable: true,
-          enabled: $timer_enabled,
-          active: $timer_enabled
-        }
-      ]
-    '
-}
-
 service_update_restore_service_states() {
     local states_json="$1"
 
@@ -728,15 +548,6 @@ service_update_stop_active_services() {
     fi
     jq -r '
       map(select(.active == true))
-      | sort_by(
-          if .unit == "pfwd.timer" then 0
-          elif .unit == "pfwd.service" then 1
-          elif .unit == "pfwd-bbr.service" then 2
-          elif .unit == "pfwd-xdp.service" then 3
-          elif .unit == "pfwd-downmask-feed.service" then 4
-          elif .unit == "pfwd-leaseweb.service" then 5
-          else 99 end
-        )
       | .[].unit
     ' <<< "$states_json" |
     while IFS= read -r unit; do
@@ -784,8 +595,6 @@ service_update_apply_staged() {
     service_update_stop_active_services "$states_json"
     service_prepare_install_dirs
     service_copy_bundle_from_dir "$staged_dir"
-    service_copy_optional_leaseweb_from_dir "$staged_dir"
-    service_cleanup_legacy_install_artifacts
     service_write_shortcuts
 }
 

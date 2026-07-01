@@ -27,11 +27,11 @@ PFWD_RUN_DIR="${PFWD_RUN_DIR:-$(pfwd_path run/pfwd)}"
 PFWD_RUNTIME_LOCK_FILE="${PFWD_RUNTIME_LOCK_FILE:-$PFWD_RUN_DIR/pfwd-runtime.lock}"
 PFWD_INSTALL_DIR="${PFWD_INSTALL_DIR:-$(pfwd_path usr/local/lib/pfwd)}"
 PFWD_BIN_PATH="${PFWD_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd)}"
-PFWD_BBR_BIN_PATH="${PFWD_BBR_BIN_PATH:-$(pfwd_path usr/local/bin/bbr.sh)}"
-PFWD_BBR_ALIAS_BIN_PATH="${PFWD_BBR_ALIAS_BIN_PATH:-$(pfwd_path usr/local/bin/pfwd-bbr)}"
 PFWD_SYSTEMD_DIR="${PFWD_SYSTEMD_DIR:-$(pfwd_path etc/systemd/system)}"
-PFWD_CONFIG_FILE="${PFWD_CONFIG_FILE:-$PFWD_ETC_DIR/config.json}"
-PFWD_STATS_FILE="${PFWD_STATS_FILE:-$PFWD_STATE_DIR/stats.json}"
+PFWD_DB_FILE="${PFWD_DB_FILE:-$PFWD_STATE_DIR/sqlite.db}"
+PFWD_SERVICE_SOCKET="${PFWD_SERVICE_SOCKET:-$PFWD_RUN_DIR/pfwd.sock}"
+PFWD_CONFIG_FILE="${PFWD_CONFIG_FILE:-$PFWD_RUN_DIR/config.json}"
+PFWD_STATS_FILE="${PFWD_STATS_FILE:-$PFWD_RUN_DIR/stats.json}"
 PFWD_FORWARDER_RUNTIME_FILE="${PFWD_FORWARDER_RUNTIME_FILE:-$PFWD_RUN_DIR/runtime.json}"
 PFWD_FORWARDER_XDP_RUNTIME_FILE="${PFWD_FORWARDER_XDP_RUNTIME_FILE:-$PFWD_RUN_DIR/runtime.xdp.json}"
 PFWD_FORWARDER_NFT_RUNTIME_FILE="${PFWD_FORWARDER_NFT_RUNTIME_FILE:-$PFWD_RUN_DIR/runtime.nft.json}"
@@ -39,11 +39,8 @@ PFWD_FORWARDER_NFT_RENDER_FILE="${PFWD_FORWARDER_NFT_RENDER_FILE:-$PFWD_RUN_DIR/
 PFWD_FORWARDER_STATUS_FILE="${PFWD_FORWARDER_STATUS_FILE:-$PFWD_STATE_DIR/forwarder/status.json}"
 PFWD_XDP_STATUS_FILE="${PFWD_XDP_STATUS_FILE:-$PFWD_STATE_DIR/xdp/status.json}"
 PFWD_XDP_INDEX_FILE="${PFWD_XDP_INDEX_FILE:-$PFWD_STATE_DIR/xdp/indexes.json}"
-PFWD_BBR_STATE_FILE="${PFWD_BBR_STATE_FILE:-$PFWD_STATE_DIR/bbr-state.env}"
 PFWD_XDP_BIN_PATH="${PFWD_XDP_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-xdp}"
-PFWD_DOWNMASK_STATE_DIR="${PFWD_DOWNMASK_STATE_DIR:-$PFWD_STATE_DIR/downmask}"
-PFWD_DOWNMASK_STATUS_FILE="${PFWD_DOWNMASK_STATUS_FILE:-$PFWD_DOWNMASK_STATE_DIR/status.json}"
-PFWD_DOWNMASK_BIN_PATH="${PFWD_DOWNMASK_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-downmask}"
+PFWD_SERVICE_BIN_PATH="${PFWD_SERVICE_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-service}"
 if [ -z "${PFWD_ASSETS_DIR:-}" ]; then
     if [ -n "${PFWD_SCRIPT_DIR:-}" ] && [ -d "$PFWD_SCRIPT_DIR/assets" ]; then
         PFWD_ASSETS_DIR="$PFWD_SCRIPT_DIR/assets"
@@ -51,11 +48,7 @@ if [ -z "${PFWD_ASSETS_DIR:-}" ]; then
         PFWD_ASSETS_DIR="$PFWD_INSTALL_DIR/assets"
     fi
 fi
-PFWD_GUARD_STATE_DIR="${PFWD_GUARD_STATE_DIR:-$PFWD_STATE_DIR/guard}"
-PFWD_GUARD_STATUS_FILE="${PFWD_GUARD_STATUS_FILE:-$PFWD_GUARD_STATE_DIR/status.json}"
 PFWD_XDP_LINK_PIN_PATH="${PFWD_XDP_LINK_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_link}"
-PFWD_XDP_INGRESS_PIN_PATH="${PFWD_XDP_INGRESS_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_ingress}"
-PFWD_XDP_HOST_EGRESS_PIN_PATH="${PFWD_XDP_HOST_EGRESS_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_host_egress}"
 PFWD_XDP_LOOPBACK_PIN_PATH="${PFWD_XDP_LOOPBACK_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_loopback}"
 PFWD_XDP_SK_LOOKUP_PIN_PATH="${PFWD_XDP_SK_LOOKUP_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_sk_lookup}"
 PFWD_XDP_SETTINGS_PIN_PATH="${PFWD_XDP_SETTINGS_PIN_PATH:-/sys/fs/bpf/pfwd_settings}"
@@ -69,47 +62,9 @@ PFWD_TC_INGRESS_PREF="${PFWD_TC_INGRESS_PREF:-20}"
 PFWD_TC_BPF_INGRESS_PREF="${PFWD_TC_BPF_INGRESS_PREF:-10}"
 PFWD_TC_IFB_DEV="${PFWD_TC_IFB_DEV:-ifb-pfwd0}"
 PFWD_TC_STATE_FILE="${PFWD_TC_STATE_FILE:-$PFWD_STATE_DIR/tc.env}"
-PFWD_XDP_WHITELIST_V4_PIN_PATH="${PFWD_XDP_WHITELIST_V4_PIN_PATH:-/sys/fs/bpf/pfwd_whitelist_v4}"
-PFWD_XDP_WHITELIST_V6_PIN_PATH="${PFWD_XDP_WHITELIST_V6_PIN_PATH:-/sys/fs/bpf/pfwd_whitelist_v6}"
-PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH="${PFWD_XDP_WHITELIST_CACHE_V4_PIN_PATH:-/sys/fs/bpf/pfwd_whitelist_cache_v4}"
-PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH="${PFWD_XDP_WHITELIST_CACHE_V6_PIN_PATH:-/sys/fs/bpf/pfwd_whitelist_cache_v6}"
-PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH="${PFWD_XDP_EGRESS_WHITELIST_V4_PIN_PATH:-/sys/fs/bpf/pfwd_egress_whitelist_v4}"
-PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH="${PFWD_XDP_EGRESS_WHITELIST_V6_PIN_PATH:-/sys/fs/bpf/pfwd_egress_whitelist_v6}"
-PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH="${PFWD_XDP_EGRESS_WHITELIST_CACHE_V4_PIN_PATH:-/sys/fs/bpf/pfwd_egress_whitelist_cache_v4}"
-PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH="${PFWD_XDP_EGRESS_WHITELIST_CACHE_V6_PIN_PATH:-/sys/fs/bpf/pfwd_egress_whitelist_cache_v6}"
-PFWD_XDP_ALLOWED_FLOWS_PIN_PATH="${PFWD_XDP_ALLOWED_FLOWS_PIN_PATH:-/sys/fs/bpf/pfwd_allowed_flows}"
-PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH="${PFWD_XDP_HOST_EGRESS_FLOWS_PIN_PATH:-/sys/fs/bpf/pfwd_host_egress_flows}"
-PFWD_XDP_GUARD_PREFIXES_PIN_PATH="${PFWD_XDP_GUARD_PREFIXES_PIN_PATH:-/sys/fs/bpf/pfwd_guard_prefixes}"
-PFWD_XDP_SKIP_PORTS_PIN_PATH="${PFWD_XDP_SKIP_PORTS_PIN_PATH:-/sys/fs/bpf/pfwd_protocol_skip_ports}"
-PFWD_XDP_GEO_BUCKET_V4_PIN_PATH="${PFWD_XDP_GEO_BUCKET_V4_PIN_PATH:-/sys/fs/bpf/pfwd_geo_bucket_v4}"
-PFWD_XDP_GEO_BUCKET_V6_PIN_PATH="${PFWD_XDP_GEO_BUCKET_V6_PIN_PATH:-/sys/fs/bpf/pfwd_geo_bucket_v6}"
-PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH="${PFWD_XDP_GEO_SEGMENTS_V4_PIN_PATH:-/sys/fs/bpf/pfwd_geo_segments_v4}"
-PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH="${PFWD_XDP_GEO_SEGMENTS_V6_PIN_PATH:-/sys/fs/bpf/pfwd_geo_segments_v6}"
-PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH="${PFWD_XDP_GEO_PROVINCE_POLICY_PIN_PATH:-/sys/fs/bpf/pfwd_geo_province_policy}"
-PFWD_XDP_INGRESS_GEO_V4_PIN_PATH="${PFWD_XDP_INGRESS_GEO_V4_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_geo_v4}"
-PFWD_XDP_INGRESS_GEO_V6_PIN_PATH="${PFWD_XDP_INGRESS_GEO_V6_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_geo_v6}"
-PFWD_XDP_INGRESS_CITY_V4_PIN_PATH="${PFWD_XDP_INGRESS_CITY_V4_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_city_v4}"
-PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH="${PFWD_XDP_INGRESS_POLICY_MODES_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_policy_modes}"
-PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH="${PFWD_XDP_INGRESS_POLICY_PROVINCES_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_policy_provinces}"
-PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH="${PFWD_XDP_INGRESS_POLICY_CITIES_PIN_PATH:-/sys/fs/bpf/pfwd_ingress_policy_cities}"
-PFWD_GUARD_XDP_PIN_PATH="${PFWD_GUARD_XDP_PIN_PATH:-$PFWD_XDP_LINK_PIN_PATH}"
-PFWD_GUARD_LINK_INGRESS_PATH="${PFWD_GUARD_LINK_INGRESS_PATH:-$PFWD_XDP_INGRESS_PIN_PATH}"
-PFWD_WHITELIST_STATE_DIR="${PFWD_WHITELIST_STATE_DIR:-$PFWD_STATE_DIR/whitelist}"
-PFWD_WHITELIST_ALLOW_IPV4_FILE="${PFWD_WHITELIST_ALLOW_IPV4_FILE:-$PFWD_WHITELIST_STATE_DIR/allow_ipv4.txt}"
-PFWD_WHITELIST_ALLOW_IPV6_FILE="${PFWD_WHITELIST_ALLOW_IPV6_FILE:-$PFWD_WHITELIST_STATE_DIR/allow_ipv6.txt}"
-PFWD_WHITELIST_CITY_IPV4_FILE="${PFWD_WHITELIST_CITY_IPV4_FILE:-$PFWD_WHITELIST_STATE_DIR/city_ipv4.tsv}"
-PFWD_EGRESS_WHITELIST_STATE_DIR="${PFWD_EGRESS_WHITELIST_STATE_DIR:-$PFWD_STATE_DIR/egress_whitelist}"
-PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE="${PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV4_FILE:-$PFWD_EGRESS_WHITELIST_STATE_DIR/host_allow_ipv4.txt}"
-PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE="${PFWD_EGRESS_WHITELIST_HOST_ALLOW_IPV6_FILE:-$PFWD_EGRESS_WHITELIST_STATE_DIR/host_allow_ipv6.txt}"
 PFWD_SCRIPT_NAME="pfwd"
 PFWD_XDP_DATAPLANE_VERSION="${PFWD_XDP_DATAPLANE_VERSION:-2}"
-PFWD_XDP_MAP_ABI_VERSION="${PFWD_XDP_MAP_ABI_VERSION:-16}"
-PFWD_LEASEWEB_CONFIG_FILE="${PFWD_LEASEWEB_CONFIG_FILE:-$PFWD_ETC_DIR/leaseweb.json}"
-PFWD_LEASEWEB_BIN_PATH="${PFWD_LEASEWEB_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-leaseweb}"
-PFWD_LEASEWEB_STATE_DIR="${PFWD_LEASEWEB_STATE_DIR:-$PFWD_STATE_DIR/leaseweb}"
-PFWD_WHITELIST_LEASES_FILE="${PFWD_WHITELIST_LEASES_FILE:-$PFWD_WHITELIST_STATE_DIR/leases.json}"
-PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV4_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv4.txt}"
-PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE="${PFWD_WHITELIST_TEMP_ALLOW_IPV6_FILE:-$PFWD_WHITELIST_STATE_DIR/temp_allow_ipv6.txt}"
+PFWD_XDP_MAP_ABI_VERSION="${PFWD_XDP_MAP_ABI_VERSION:-17}"
 
 pfwd_die() {
     echo "错误：$*" >&2
@@ -268,7 +223,7 @@ pfwd_stop_at_expired() {
 }
 
 pfwd_mkdirs() {
-    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$PFWD_GUARD_STATE_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")" "$PFWD_WHITELIST_STATE_DIR" "$PFWD_LEASEWEB_STATE_DIR" "$PFWD_DOWNMASK_STATE_DIR"
+    mkdir -p "$PFWD_ETC_DIR" "$PFWD_STATE_DIR" "$PFWD_RUN_DIR" "$(dirname "$PFWD_XDP_STATUS_FILE")" "$(dirname "$PFWD_XDP_INDEX_FILE")" "$(dirname "$PFWD_FORWARDER_STATUS_FILE")"
 }
 
 forwarder_bin_path() {
@@ -286,6 +241,47 @@ forwarder_bin_path() {
         return 0
     fi
     printf '%s\n' "$PFWD_XDP_BIN_PATH"
+}
+
+service_bin_path() {
+    if [ -x "$PFWD_SERVICE_BIN_PATH" ]; then
+        printf '%s\n' "$PFWD_SERVICE_BIN_PATH"
+        return 0
+    fi
+    local local_asset=""
+    case "$(uname -m)" in
+        x86_64|amd64) local_asset="$PFWD_ASSETS_DIR/pfwd-service-linux-amd64" ;;
+        aarch64|arm64) local_asset="$PFWD_ASSETS_DIR/pfwd-service-linux-arm64" ;;
+    esac
+    if [ -n "$local_asset" ] && [ -x "$local_asset" ]; then
+        printf '%s\n' "$local_asset"
+        return 0
+    fi
+    printf '%s\n' "$PFWD_SERVICE_BIN_PATH"
+}
+
+pfwd_service_store_get() {
+    local key="$1"
+    local bin_path
+    bin_path="$(service_bin_path)"
+    [ -x "$bin_path" ] || return 127
+    if [ -S "$PFWD_SERVICE_SOCKET" ]; then
+        "$bin_path" store get --socket "$PFWD_SERVICE_SOCKET" --key "$key"
+        return
+    fi
+    "$bin_path" store get --db "$PFWD_DB_FILE" --key "$key"
+}
+
+pfwd_service_store_put() {
+    local key="$1"
+    local bin_path
+    bin_path="$(service_bin_path)"
+    [ -x "$bin_path" ] || pfwd_die "pfwd-service 不可执行：$bin_path；请先执行 ./service/build.sh 或 pfwd install"
+    if [ -S "$PFWD_SERVICE_SOCKET" ]; then
+        "$bin_path" store put --socket "$PFWD_SERVICE_SOCKET" --key "$key"
+        return
+    fi
+    "$bin_path" store put --db "$PFWD_DB_FILE" --key "$key"
 }
 
 pfwd_write_atomic() {

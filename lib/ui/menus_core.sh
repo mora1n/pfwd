@@ -30,8 +30,9 @@ ui_print_telegram_configured_users() {
 
 ui_print_export_import_summary() {
     local rows=""
-    rows+="当前配置"$'\t'"$PFWD_CONFIG_FILE"$'\n'
-    rows+="当前状态"$'\t'"$PFWD_STATS_FILE"$'\n'
+    rows+="SQLite"$'\t'"$PFWD_DB_FILE"$'\n'
+    rows+="配置 cache"$'\t'"$PFWD_CONFIG_FILE"$'\n'
+    rows+="状态 cache"$'\t'"$PFWD_STATS_FILE"$'\n'
     rows+="说明"$'\t'"导出会包含主配置和流量状态；导入会覆盖当前内容。"
     ui_table_render $'项目\t值' "$rows" "2"
 }
