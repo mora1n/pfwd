@@ -16,11 +16,16 @@ curl -fsSL https://raw.githubusercontent.com/mora1n/pfwd/main/install.sh | sh
 
 ## 快速开始
 
+打开交互界面：
+
 ```bash
 pfwd
 ```
 
-CLI:
+也可以显式执行 `pfwd tui`。
+
+CLI：
+
 ```bash
 pfwd init
 pfwd user add alice
@@ -46,6 +51,7 @@ pfwd add \
 
 | 场景 | 命令 |
 | --- | --- |
+| 打开交互界面 | `pfwd` 或 `pfwd tui` |
 | 初始化本机状态 | `pfwd init` |
 | 添加用户 | `pfwd user add alice` |
 | 删除用户 | `pfwd user delete alice` |

@@ -175,10 +175,18 @@ func (a *App) runDoctor(args []string) error {
 		fmt.Printf("forwards: %d\n", len(cfg.Forwards))
 		fmt.Printf("stats_users: %d\n", len(stats.Users))
 		fmt.Printf("stats_forwards: %d\n", len(stats.Forwards))
-		if matches, _ := filepath.Glob(filepath.Join(a.Paths.RunDir, "*.json")); len(matches) > 0 {
-			return fmt.Errorf("/run/pfwd 下仍存在 JSON 文件：%s", strings.Join(matches, ", "))
+		fmt.Println("runtime_state: db")
+		for _, key := range []string{keyConfig, keyStats, keyRuntime, keyRuntimeXDP, keyRuntimeNFT, keyRenderedNFT, keyForwarderStatus, keyXDPStatus} {
+			_, ok, err := store.GetRaw(ctx, key)
+			if err != nil {
+				return err
+			}
+			status := "missing"
+			if ok {
+				status = "present"
+			}
+			fmt.Printf("%s: %s\n", key, status)
 		}
-		fmt.Println("run_json: none")
 		return nil
 	})
 }

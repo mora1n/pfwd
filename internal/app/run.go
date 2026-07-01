@@ -32,6 +32,11 @@ func (a *App) run(args []string) error {
 		return nil
 	case "version", "--version":
 		return a.runVersion()
+	case "tui":
+		if len(args) != 0 {
+			return fmt.Errorf("用法：pfwd tui")
+		}
+		return a.runMenu()
 	case "init":
 		return a.withStore(func(ctx context.Context, store *Store) error {
 			if _, err := loadConfig(ctx, store); err != nil {
@@ -120,7 +125,7 @@ func (a *App) runMenu() error {
 	if !isTerminal(os.Stdin.Fd()) {
 		return fmt.Errorf("请在交互式终端运行 pfwd，或使用 pfwd help 查看命令")
 	}
-	return a.runList(nil)
+	return a.runTUI()
 }
 
 func isTerminal(fd uintptr) bool {
@@ -133,6 +138,7 @@ func (a *App) printHelp(w io.Writer) {
 
 用法：
   pfwd
+  pfwd tui
   pfwd init
   pfwd user add <username>
   pfwd user list
