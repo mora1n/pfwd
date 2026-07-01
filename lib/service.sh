@@ -45,6 +45,14 @@ service_asset_name() {
     esac
 }
 
+service_xdp_asset_name() {
+    pfwd_bootstrap_xdp_asset_name
+}
+
+service_release_asset_url() {
+    printf '%s/%s\n' "${PFWD_RELEASE_ASSET_BASE_URL%/}" "$1"
+}
+
 service_unit_names() {
     cat <<'EOF'
 pfwd.service
@@ -62,26 +70,24 @@ service_shortcut_rows() {
 }
 
 service_bundle_rows() {
-    local xdp_asset_rel="assets/$(pfwd_bootstrap_xdp_asset_name)"
-    local service_asset_rel="assets/$(service_asset_name)"
     local lib
 
-    printf '0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
-    printf '0755\t%s\tbin/pfwd-xdp\txdp\n' "$xdp_asset_rel"
-    printf '0755\t%s\tbin/pfwd-service\tservice\n' "$service_asset_rel"
+    printf 'source\t0755\tpfwd.sh\tpfwd.sh\tpfwd.sh\n'
+    printf 'release\t0755\t%s\tbin/pfwd-xdp\txdp\n' "$(service_xdp_asset_name)"
+    printf 'release\t0755\t%s\tbin/pfwd-service\tservice\n' "$(service_asset_name)"
     for lib in "${PFWD_LIB_FILES[@]}"; do
-        printf '0644\t%s\t%s\t%s\n' "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")"
+        printf 'source\t0644\t%s\t%s\t%s\n' "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")" "$(pfwd_lib_rel_path "$lib")"
     done
 }
 
 service_missing_bundle_hint() {
     local source_path="$1"
     case "$source_path" in
-        */assets/pfwd-xdp-linux-*)
-            printf '请先执行 ./xdp/build.sh 生成预编译资产，或使用包含 pfwd-xdp 资产的完整源码/发布包。\n'
+        */pfwd-xdp-linux-*)
+            printf '请确认 GitHub Release 已发布对应架构的 pfwd-xdp 资产，或设置 PFWD_RELEASE_ASSET_DIR 指向本地 dist 目录。\n'
             ;;
-        */assets/pfwd-service-linux-*)
-            printf '请先执行 ./service/build.sh 生成预编译资产，或使用包含 pfwd-service 资产的完整源码/发布包。\n'
+        */pfwd-service-linux-*)
+            printf '请确认 GitHub Release 已发布对应架构的 pfwd-service 资产，或设置 PFWD_RELEASE_ASSET_DIR 指向本地 dist 目录。\n'
             ;;
         *)
             return 0
@@ -95,7 +101,6 @@ service_install_target_path() {
 
 service_prepare_install_dirs() {
     mkdir -p "$PFWD_INSTALL_DIR/lib" \
-        "$PFWD_INSTALL_DIR/assets" \
         "$PFWD_INSTALL_DIR/bin" \
         "$(dirname "$PFWD_BIN_PATH")" \
         "$(dirname "$PFWD_XDP_BIN_PATH")" \
@@ -172,11 +177,15 @@ service_restore_unit_files() {
 
 service_copy_bundle_from_dir() {
     local source_root="$1"
-    local mode source_rel install_rel _
+    local kind mode source_rel install_rel _
     local source_path target_path
 
-    while IFS=$'\t' read -r mode source_rel install_rel _; do
-        source_path="${source_root%/}/$source_rel"
+    while IFS=$'\t' read -r kind mode source_rel install_rel _; do
+        if [ "$kind" = "release" ]; then
+            source_path="${PFWD_RELEASE_ASSET_DIR%/}/$source_rel"
+        else
+            source_path="${source_root%/}/$source_rel"
+        fi
         target_path="$(service_install_target_path "$install_rel")"
 
         if [ ! -f "$source_path" ]; then
@@ -201,11 +210,15 @@ service_update_bundle_rows() {
 
 service_verify_bundle_from_dir() {
     local source_root="$1"
-    local _ source_rel __ ___
+    local kind _ source_rel __ ___
     local source_path
 
-    while IFS=$'\t' read -r _ source_rel __ ___; do
-        source_path="${source_root%/}/$source_rel"
+    while IFS=$'\t' read -r kind _ source_rel __ ___; do
+        if [ "$kind" = "release" ]; then
+            source_path="${PFWD_RELEASE_ASSET_DIR%/}/$source_rel"
+        else
+            source_path="${source_root%/}/$source_rel"
+        fi
         if [ ! -f "$source_path" ]; then
             {
                 printf '安装包不完整：缺少 %s\n' "$source_path"
@@ -316,21 +329,16 @@ service_remove_unit_files() {
 }
 
 service_remove_binary_artifacts() {
-    local mode source_rel install_rel digest_label
+    local kind mode source_rel install_rel digest_label
     service_remove_shortcuts
-    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
+    while IFS=$'\t' read -r kind mode source_rel install_rel digest_label; do
         rm -f "$(service_install_target_path "$install_rel")"
     done < <(service_bundle_rows)
-}
-
-service_remove_asset_artifacts() {
-    rm -rf "$PFWD_INSTALL_DIR/assets"
 }
 
 service_remove_installation_artifacts() {
     service_remove_unit_files
     service_remove_binary_artifacts
-    service_remove_asset_artifacts
     rm -rf "$PFWD_INSTALL_DIR"
 }
 
@@ -354,7 +362,7 @@ service_purge_state() {
 service_verify_removed() {
     local leftovers=()
     local path _ source_rel install_rel __
-    for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" "$PFWD_INSTALL_DIR/assets" \
+    for path in "$PFWD_INSTALL_DIR/lib" "$PFWD_INSTALL_DIR/bin" \
         "$PFWD_SERVICE_BIN_PATH" "$PFWD_DB_FILE" "$PFWD_SERVICE_SOCKET" \
         "$PFWD_FORWARDER_RUNTIME_FILE" "$PFWD_FORWARDER_XDP_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RUNTIME_FILE" "$PFWD_FORWARDER_NFT_RENDER_FILE" "$PFWD_FORWARDER_STATUS_FILE" \
         "$PFWD_XDP_STATUS_FILE" "$PFWD_XDP_LINK_PIN_PATH" "$PFWD_XDP_LOOPBACK_PIN_PATH" \
@@ -367,7 +375,7 @@ service_verify_removed() {
     while IFS=$'\t' read -r _ path __; do
         [ ! -e "$path" ] || leftovers+=("$path")
     done < <(service_shortcut_rows)
-    while IFS=$'\t' read -r _ source_rel install_rel __; do
+    while IFS=$'\t' read -r _ __ source_rel install_rel ___; do
         path="$(service_install_target_path "$install_rel")"
         [ ! -e "$path" ] || leftovers+=("$path")
     done < <(service_bundle_rows)
@@ -416,25 +424,37 @@ service_update_download_bundle() {
     local work_dir="$1"
     local staged_dir="$work_dir/staged"
 
-    mkdir -p "$staged_dir/lib" "$staged_dir/assets" "$staged_dir/scripts"
-    local _ source_rel __ ___
-    while IFS=$'\t' read -r _ source_rel __ ___; do
-        mkdir -p "$(dirname "$staged_dir/$source_rel")"
-        pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/$source_rel" "$staged_dir/$source_rel" || return 1
+    mkdir -p "$staged_dir/lib" "$staged_dir/release"
+    local kind _ source_rel __ ___ url target_rel
+    while IFS=$'\t' read -r kind _ source_rel __ ___; do
+        if [ "$kind" = "release" ]; then
+            url="$(service_release_asset_url "$source_rel")"
+            target_rel="release/$source_rel"
+        else
+            url="$PFWD_REPO_RAW_URL/$source_rel"
+            target_rel="$source_rel"
+        fi
+        mkdir -p "$(dirname "$staged_dir/$target_rel")"
+        pfwd_bootstrap_download "$url" "$staged_dir/$target_rel" || return 1
     done < <(service_update_bundle_rows)
 }
 
 service_update_validate_bundle() {
     local dir="$1"
-    local _ source_rel __ ___
-    while IFS=$'\t' read -r _ source_rel __ ___; do
-        [ -f "$dir/$source_rel" ] || {
+    local kind _ source_rel __ ___ path
+    while IFS=$'\t' read -r kind _ source_rel __ ___; do
+        if [ "$kind" = "release" ]; then
+            path="$dir/release/$source_rel"
+        else
+            path="$dir/$source_rel"
+        fi
+        [ -f "$path" ] || {
             echo "更新包不完整：缺少 $source_rel" >&2
-            service_missing_bundle_hint "$dir/$source_rel" >&2 || true
+            service_missing_bundle_hint "$path" >&2 || true
             return 1
         }
         case "$source_rel" in
-            *.sh) bash -n "$dir/$source_rel" || return 1 ;;
+            *.sh) bash -n "$path" || return 1 ;;
         esac
     done < <(service_update_bundle_rows)
 }
@@ -442,13 +462,19 @@ service_update_validate_bundle() {
 service_update_bundle_digest() {
     local dir="$1"
     local layout="${2:-staged}"
-    local payload="" mode source_rel install_rel digest_label
+    local payload="" kind mode source_rel install_rel digest_label
     local digest_path=""
 
-    while IFS=$'\t' read -r mode source_rel install_rel digest_label; do
+    while IFS=$'\t' read -r kind mode source_rel install_rel digest_label; do
         case "$layout" in
             install) digest_path="$dir/$install_rel" ;;
-            staged) digest_path="$dir/$source_rel" ;;
+            staged)
+                if [ "$kind" = "release" ]; then
+                    digest_path="$dir/release/$source_rel"
+                else
+                    digest_path="$dir/$source_rel"
+                fi
+                ;;
             *) pfwd_die "未知更新包布局：$layout" ;;
         esac
         [ -f "$digest_path" ] || pfwd_die "缺少更新产物用于生成摘要：$digest_path"
@@ -594,7 +620,7 @@ service_update_apply_staged() {
 
     service_update_stop_active_services "$states_json"
     service_prepare_install_dirs
-    service_copy_bundle_from_dir "$staged_dir"
+    PFWD_RELEASE_ASSET_DIR="$staged_dir/release" service_copy_bundle_from_dir "$staged_dir"
     service_write_shortcuts
 }
 

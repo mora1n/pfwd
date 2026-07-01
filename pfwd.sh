@@ -28,6 +28,7 @@ else
 fi
 PFWD_LIB_DIR="${PFWD_LIB_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/lib}}"
 PFWD_REPO_RAW_URL="${PFWD_REPO_RAW_URL:-https://raw.githubusercontent.com/mora1n/pfwd/main}"
+PFWD_RELEASE_ASSET_BASE_URL="${PFWD_RELEASE_ASSET_BASE_URL:-https://github.com/mora1n/pfwd/releases/latest/download}"
 PFWD_LIB_FILES=(core config validate forwarder runtime firewall stats notify service commands/core commands/update commands/user commands/forward commands/notify commands/reconcile commands/doctor ui/core ui/table ui/status ui/io ui/form ui/actions ui/format ui/install ui/data ui/print ui/select ui/menus_core ui/main)
 
 pfwd_lib_rel_path() {
@@ -107,28 +108,33 @@ pfwd_bootstrap_cleanup_partial_install() {
     rm -rf "$install_dir"
 }
 
+pfwd_bootstrap_release_asset_url() {
+    printf '%s/%s\n' "${PFWD_RELEASE_ASSET_BASE_URL%/}" "$1"
+}
+
 pfwd_bootstrap_install() {
-    local install_dir bin_path systemd_dir lib_dir xdp_asset service_asset status
+    local install_dir bin_path systemd_dir lib_dir dist_dir xdp_asset service_asset status
     install_dir="$(pfwd_bootstrap_path usr/local/lib/pfwd)"
     bin_path="$(pfwd_bootstrap_path usr/local/bin/pfwd)"
     systemd_dir="$(pfwd_bootstrap_path etc/systemd/system)"
     lib_dir="$install_dir/lib"
+    dist_dir="$install_dir/dist"
 
-    mkdir -p "$lib_dir" "$install_dir/assets" "$install_dir/bin" "$(dirname "$bin_path")" "$systemd_dir"
+    mkdir -p "$lib_dir" "$dist_dir" "$install_dir/bin" "$(dirname "$bin_path")" "$systemd_dir"
     pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/pfwd.sh" "$install_dir/pfwd.sh"
     chmod +x "$install_dir/pfwd.sh"
     xdp_asset="$(pfwd_bootstrap_xdp_asset_name)" || {
         echo "错误：当前架构暂不支持 XDP 预编译二进制：$(uname -m)" >&2
         exit 1
     }
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$xdp_asset" "$install_dir/assets/$xdp_asset"
-    chmod +x "$install_dir/assets/$xdp_asset"
+    pfwd_bootstrap_download "$(pfwd_bootstrap_release_asset_url "$xdp_asset")" "$dist_dir/$xdp_asset"
+    chmod +x "$dist_dir/$xdp_asset"
     service_asset="$(pfwd_bootstrap_service_asset_name)" || {
         echo "错误：当前架构暂不支持 service 预编译二进制：$(uname -m)" >&2
         exit 1
     }
-    pfwd_bootstrap_download "$PFWD_REPO_RAW_URL/assets/$service_asset" "$install_dir/assets/$service_asset"
-    chmod +x "$install_dir/assets/$service_asset"
+    pfwd_bootstrap_download "$(pfwd_bootstrap_release_asset_url "$service_asset")" "$dist_dir/$service_asset"
+    chmod +x "$dist_dir/$service_asset"
 
     local lib
     for lib in "${PFWD_LIB_FILES[@]}"; do
@@ -315,6 +321,8 @@ pfwd - XDP 端口转发管理脚本
   PFWD_CONFIG_FILE   覆盖运行期配置 cache 路径。
   PFWD_DB_FILE       覆盖持久化 SQLite 数据库路径。
   PFWD_SERVICE_SOCKET 覆盖本地 Unix socket 路径。
+  PFWD_RELEASE_ASSET_BASE_URL 覆盖 GitHub Release 产物下载基址。
+  PFWD_RELEASE_ASSET_DIR 本地安装/开发时使用的预编译产物目录。默认：脚本目录/dist。
   PFWD_DRY_RUN       设置为 1 时只打印会修改系统的命令，不实际执行。
 
 无参数运行时默认进入交互菜单；使用 pfwd help 查看命令列表。

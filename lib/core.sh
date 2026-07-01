@@ -41,13 +41,8 @@ PFWD_XDP_STATUS_FILE="${PFWD_XDP_STATUS_FILE:-$PFWD_STATE_DIR/xdp/status.json}"
 PFWD_XDP_INDEX_FILE="${PFWD_XDP_INDEX_FILE:-$PFWD_STATE_DIR/xdp/indexes.json}"
 PFWD_XDP_BIN_PATH="${PFWD_XDP_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-xdp}"
 PFWD_SERVICE_BIN_PATH="${PFWD_SERVICE_BIN_PATH:-$PFWD_INSTALL_DIR/bin/pfwd-service}"
-if [ -z "${PFWD_ASSETS_DIR:-}" ]; then
-    if [ -n "${PFWD_SCRIPT_DIR:-}" ] && [ -d "$PFWD_SCRIPT_DIR/assets" ]; then
-        PFWD_ASSETS_DIR="$PFWD_SCRIPT_DIR/assets"
-    else
-        PFWD_ASSETS_DIR="$PFWD_INSTALL_DIR/assets"
-    fi
-fi
+PFWD_RELEASE_ASSET_BASE_URL="${PFWD_RELEASE_ASSET_BASE_URL:-https://github.com/mora1n/pfwd/releases/latest/download}"
+PFWD_RELEASE_ASSET_DIR="${PFWD_RELEASE_ASSET_DIR:-${PFWD_SCRIPT_DIR:+$PFWD_SCRIPT_DIR/dist}}"
 PFWD_XDP_LINK_PIN_PATH="${PFWD_XDP_LINK_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_link}"
 PFWD_XDP_LOOPBACK_PIN_PATH="${PFWD_XDP_LOOPBACK_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_loopback}"
 PFWD_XDP_SK_LOOKUP_PIN_PATH="${PFWD_XDP_SK_LOOKUP_PIN_PATH:-/sys/fs/bpf/pfwd_xdp_sk_lookup}"
@@ -233,8 +228,8 @@ forwarder_bin_path() {
     fi
     local local_asset=""
     case "$(uname -m)" in
-        x86_64|amd64) local_asset="$PFWD_ASSETS_DIR/pfwd-xdp-linux-amd64" ;;
-        aarch64|arm64) local_asset="$PFWD_ASSETS_DIR/pfwd-xdp-linux-arm64" ;;
+        x86_64|amd64) local_asset="$PFWD_RELEASE_ASSET_DIR/pfwd-xdp-linux-amd64" ;;
+        aarch64|arm64) local_asset="$PFWD_RELEASE_ASSET_DIR/pfwd-xdp-linux-arm64" ;;
     esac
     if [ -n "$local_asset" ] && [ -x "$local_asset" ]; then
         printf '%s\n' "$local_asset"
@@ -250,8 +245,8 @@ service_bin_path() {
     fi
     local local_asset=""
     case "$(uname -m)" in
-        x86_64|amd64) local_asset="$PFWD_ASSETS_DIR/pfwd-service-linux-amd64" ;;
-        aarch64|arm64) local_asset="$PFWD_ASSETS_DIR/pfwd-service-linux-arm64" ;;
+        x86_64|amd64) local_asset="$PFWD_RELEASE_ASSET_DIR/pfwd-service-linux-amd64" ;;
+        aarch64|arm64) local_asset="$PFWD_RELEASE_ASSET_DIR/pfwd-service-linux-arm64" ;;
     esac
     if [ -n "$local_asset" ] && [ -x "$local_asset" ]; then
         printf '%s\n' "$local_asset"

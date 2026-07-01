@@ -15,7 +15,8 @@ cmd_update_check() {
 
     echo "当前版本：$local_version"
     echo "远端版本：$remote_version"
-    echo "更新源：$PFWD_REPO_RAW_URL"
+    echo "源码更新源：$PFWD_REPO_RAW_URL"
+    echo "产物更新源：$PFWD_RELEASE_ASSET_BASE_URL"
 
     if [ "$cmp" -lt 0 ]; then
         echo "远端版本低于当前版本，已跳过"

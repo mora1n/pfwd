@@ -15,7 +15,7 @@
 - `curl` 或 `wget`
 - 挂载在 `/sys/fs/bpf` 的 bpffs
 
-只有自己构建资产时才需要 Go、clang 和 eBPF 工具链。
+在线安装会从 GitHub Release 下载当前架构的 `pfwd-xdp` 和 `pfwd-service` 产物。只有自己构建或发布产物时才需要 Go、clang 和 eBPF 工具链。
 
 ### 在线安装
 
@@ -33,20 +33,20 @@ pfwd doctor
 
 ### 离线安装
 
-先在打包机生成资产：
+先在打包机生成产物：
 
 ```bash
 ./xdp/build.sh
 ./service/build.sh
 ```
 
-打包 amd64 离线包：
+构建结果会写入本地 `dist/`，该目录不进入源码仓。打包 amd64 离线包：
 
 ```bash
 tar -czf pfwd-amd64.tar.gz \
   pfwd.sh lib/ service/ xdp/ \
-  assets/pfwd-xdp-linux-amd64 \
-  assets/pfwd-service-linux-amd64
+  dist/pfwd-xdp-linux-amd64 \
+  dist/pfwd-service-linux-amd64
 ```
 
 目标机安装：
